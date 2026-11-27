@@ -1,0 +1,308 @@
+// 20_end_to_end_lakehouse_service — lakehouse pipeline (LAW-BENCH-001: no host FFI).
+use std.sec.sha2
+use std.fmt.compress
+use std.core.collections
+use std.core.str
++MOD, +NCUST, +NPROD, +NREG, +NTIER, +NGRP, +BATCHES, +ROWS_PB, +NREQ, +NCLIENT, +ITERS = 1000000007, 500, 50, 8, 4, 32, 6, 4000, 3000, 8, 400
++put_str(@buf, pos: i64, s: str) : i64 {
+    n = byte_len(s)
+    for 0..n { buf[pos + it] = ord(s[it]) }
+    pos + n
+}
++put_int(@buf, pos: i64, v: i64) : i64 {
+    tmp = [0; 24]
+    n = 0
+    x = v
+    while true {
+        tmp[n] = 48 + x % 10
+        n += 1
+        x = x / 10
+        if x == 0 { break }
+    }
+    for 0..n { buf[pos + it] = tmp[n - 1 - it] }
+    pos + n
+}
++put_hex(@buf, pos: i64, d, n: i64) : i64 {
+    for 0..n {
+        hi = d[it] >> 4
+        lo = d[it] & 15
+        buf[pos + 2 * it] = if hi < 10 { 48 + hi } else { 87 + hi }
+        buf[pos + 2 * it + 1] = if lo < 10 { 48 + lo } else { 87 + lo }
+    }
+    pos + 2 * n
+}
++scan_int(buf: _, @cur) : i64 {
+    v = 0
+    have = 0
+    while buf[cur[0]] >= 48 && buf[cur[0]] <= 57 {
+        v = v * 10 + buf[cur[0]] - 48
+        cur[0] += 1
+        have = 1
+    }
+    if have == 1 { v } else { -1 }
+}
++match_at(buf: _, blen: i64, pat: str, at: i64) : i64 {
+    m = byte_len(pat)
+    if at + m > blen { return 0 }
+    for j in 0..m { if buf[at + j] != ord(pat[j]) { return 0 } }
+    1
+}
++index_of(buf: _, blen: i64, pat: str, from: i64) : i64 {
+    for i in from..blen { if match_at(buf, blen, pat, i) == 1 { return i } }
+    -1
+}
++main() {
+    rng = Lcg.{s: 20020}
+    cs = 0
+    cbuf = [0; 24064]
+    clen = 0
+    line = [0; 64]
+    for i in 0..NCUST {
+        id = i * 7919 % NCUST
+        r = @rng.roll() % NREG
+        t = @rng.roll() % NTIER
+        n = @put_str(@line, 0, "\{\"id\":")
+        n = @put_int(@line, n, id)
+        n = @put_str(@line, n, ",\"region\":")
+        n = @put_int(@line, n, r)
+        n = @put_str(@line, n, ",\"tier\":")
+        n = @put_int(@line, n, t)
+        n = @put_str(@line, n, "}\n")
+        for 0..n { cbuf[clen + it] = line[it] }
+        clen += n
+    }
+    region_of = [-1; 500]
+    tier_of = [-1; 500]
+    ncust = 0
+    cur = [0]
+    while cur[0] < clen {
+        while cur[0] < clen && (cbuf[cur[0]] < 48 || cbuf[cur[0]] > 57) { cur[0] = cur[0] + 1 }
+        id = scan_int(cbuf, @cur)
+        while cbuf[cur[0]] < 48 || cbuf[cur[0]] > 57 { cur[0] = cur[0] + 1 }
+        r = scan_int(cbuf, @cur)
+        while cbuf[cur[0]] < 48 || cbuf[cur[0]] > 57 { cur[0] = cur[0] + 1 }
+        t = scan_int(cbuf, @cur)
+        region_of[id] = r
+        tier_of[id] = t
+        ncust += 1
+        while cur[0] < clen && cbuf[cur[0]] != 10 { cur[0] = cur[0] + 1 }
+        cur[0] = cur[0] + 1
+    }
+    grp_cnt, grp_qty, grp_rev = [0; 32], [0; 32], [0; 32]
+    prod_cnt, prod_rev, prod_price = [0; 50], [0; 50], [0; 50]
+    reg_prod_rev = [0; 400]
+    obuf = [0; 160128]
+    row = [0; 40]
+    oid = 0
+    rows = 0
+    null_cust = 0
+    bad_qty = 0
+    valid = 0
+    for 0..BATCHES {
+        olen = @put_str(@obuf, 0, "order_id,cust_id,product,qty,price_cents\n")
+        for 0..ROWS_PB {
+            nf = @rng.roll() % 100
+            c = @rng.roll() % NCUST
+            p = @rng.roll() % NPROD
+            q = @rng.roll() % 9
+            pr = 100 + p * 37 + @rng.roll() % 200
+            n = @put_int(@row, 0, oid)
+            row[n] = 44
+            n += 1
+            if nf != 0 { n = @put_int(@row, n, c) }
+            row[n] = 44
+            n = @put_int(@row, n + 1, p)
+            row[n] = 44
+            n = @put_int(@row, n + 1, q)
+            row[n] = 44
+            n = @put_int(@row, n + 1, pr)
+            row[n] = 10
+            n += 1
+            for 0..n { obuf[olen + it] = row[it] }
+            olen += n
+            oid += 1
+        }
+        cur[0] = 0
+        while obuf[cur[0]] != 10 { cur[0] = cur[0] + 1 }
+        cur[0] = cur[0] + 1
+        f = [0; 5]
+        while cur[0] < olen {
+            for k in 0..5 {
+                f[k] = scan_int(obuf, @cur)
+                cur[0] = cur[0] + 1
+            }
+            rows += 1
+            if f[1] < 0 {
+                null_cust += 1
+            } else {
+                if f[3] <= 0 {
+                    bad_qty += 1
+                } else {
+                    valid += 1
+                    rev = f[3] * f[4]
+                    g = region_of[f[1]] * NTIER + tier_of[f[1]]
+                    grp_cnt[g] += 1
+                    grp_qty[g] += f[3]
+                    grp_rev[g] += rev
+                    prod_cnt[f[2]] += 1
+                    prod_rev[f[2]] += rev
+                    prod_price[f[2]] += f[4]
+                    reg_prod_rev[region_of[f[1]] * NPROD + f[2]] += rev
+                }
+            }
+        }
+    }
+    xs = [0; 50]
+    ys = [0; 50]
+    n = 0
+    for p in 0..NPROD {
+        if prod_cnt[p] > 0 {
+            xs[n] = prod_price[p] / prod_cnt[p] / 16
+            ys[n] = prod_rev[p] / prod_cnt[p] / 16
+            n += 1
+        }
+    }
+    fit = gd_lin_fit_i(@xs, @ys, n, ITERS)
+    w, bias, loss = fit.w, fit.bias, fit.loss
+    pred_cents = [0; 50]
+    for p in 0..NPROD {
+        x = if prod_cnt[p] > 0 { prod_price[p] / prod_cnt[p] / 16 } else { 0 }
+        y = i_sdiv(w * x, 65536) + bias
+        pred_cents[p] = if y > 0 { y * 16 } else { 0 }
+    }
+    lv = [0; 1024]
+    leaf = [0; 32]
+    cat = [0; 64]
+    for g in 0..NGRP {
+        vals = [g, grp_cnt[g], grp_qty[g], grp_rev[g]]
+        for k in 0..4 {
+            for j in 0..8 { leaf[k * 8 + j] = (vals[k] >> (56 - 8 * j)) & 255 }
+        }
+        d = sha2_256(leaf)
+        for j in 0..32 { lv[g * 32 + j] = d[j] }
+    }
+    m = NGRP
+    while m > 1 {
+        for i in 0..(m / 2) {
+            for j in 0..32 {
+                cat[j] = lv[2 * i * 32 + j]
+                cat[32 + j] = lv[(2 * i + 1) * 32 + j]
+            }
+            d = sha2_256(cat)
+            for j in 0..32 { lv[i * 32 + j] = d[j] }
+        }
+        m = m / 2
+    }
+    root = [0; 32]
+    for j in 0..32 { root[j] = lv[j] }
+    tokens = [0; 128]
+    th = [0; 16]
+    for k in 0..NCLIENT {
+        d = sha2_256([107, 101, 121, 45, 48 + k])
+        _ = @put_hex(@th, 0, d, 8)
+        for j in 0..16 { tokens[k * 16 + j] = th[j] }
+    }
+    ok200 = 0
+    un401 = 0
+    nf404 = 0
+    total_bytes = 0
+    resp_cs = 0
+    req = [0; 512]
+    body = [0; 512]
+    resp = [0; 1024]
+    for 0..NREQ {
+        k = @rng.roll() % NCLIENT
+        p = @rng.roll() % 60
+        rg = @rng.roll() % NREG
+        bad = @rng.roll() % 100
+        at = @rng.roll() % 16
+        rl = @put_str(@req, 0, "GET /v1/product/")
+        rl = @put_int(@req, rl, p)
+        rl = @put_str(@req, rl, "?region=")
+        rl = @put_int(@req, rl, rg)
+        rl = @put_str(@req, rl, " HTTP/1.1\r\nHost: lake\r\nX-Client: ")
+        rl = @put_int(@req, rl, k)
+        rl = @put_str(@req, rl, "\r\nAuthorization: Bearer ")
+        tpos = rl
+        for j in 0..16 { req[rl + j] = tokens[k * 16 + j] }
+        rl += 16
+        if bad < 8 { req[tpos + at] = 122 }
+        rl = @put_str(@req, rl, "\r\n\r\n")
+        status = 400
+        pp = -1
+        rr = -1
+        if rl > 16 && match_at(req, rl, "GET /v1/product/", 0) == 1 {
+            cur[0] = 16
+            pp = scan_int(req, @cur)
+            cur[0] = cur[0] + 8
+            rr = scan_int(req, @cur)
+            xc = index_of(req, rl, "X-Client: ", cur[0])
+            bt = index_of(req, rl, "Bearer ", cur[0])
+            if xc >= 0 && bt >= 0 {
+                cur[0] = xc + 10
+                kk = scan_int(req, @cur)
+                good = 0
+                if kk >= 0 && kk < NCLIENT && bt + 7 + 16 <= rl {
+                    good = 1
+                    ki = kk % NCLIENT
+                    for j in 0..16 {
+                        if req[bt + 7 + j] != tokens[ki * 16 + j] { good = 0 }
+                    }
+                }
+                if good == 1 {
+                    status = if pp >= 0 && pp < NPROD && rr >= 0 && rr < NREG && prod_cnt[pp] > 0 { 200 } else { 404 }
+                } else {
+                    status = 401
+                }
+            }
+        }
+        bl = 0
+        when status {
+            200 => {
+                bl = @put_str(@body, 0, "\{\"product\":")
+                bl = @put_int(@body, bl, pp)
+                bl = @put_str(@body, bl, ",\"region\":")
+                bl = @put_int(@body, bl, rr)
+                bl = @put_str(@body, bl, ",\"orders\":")
+                bl = @put_int(@body, bl, prod_cnt[pp])
+                bl = @put_str(@body, bl, ",\"revenue\":")
+                bl = @put_int(@body, bl, prod_rev[pp])
+                bl = @put_str(@body, bl, ",\"region_revenue\":")
+                bl = @put_int(@body, bl, reg_prod_rev[rr * NPROD + pp])
+                bl = @put_str(@body, bl, ",\"forecast\":")
+                bl = @put_int(@body, bl, pred_cents[pp])
+                bl = @put_str(@body, bl, ",\"root\":\"")
+                bl = @put_hex(@body, bl, root, 32)
+                bl = @put_str(@body, bl, "\"}")
+                ok200 += 1
+            }
+            404 => {
+                bl = @put_str(@body, 0, "\{\"error\":\"not found\"}")
+                nf404 += 1
+            }
+            401 => {
+                bl = @put_str(@body, 0, "\{\"error\":\"unauthorized\"}")
+                un401 += 1
+            }
+            else => bl = @put_str(@body, 0, "\{\"error\":\"bad request\"}")
+        }
+        head = "HTTP/1.1 400 Bad Request\r\nContent-Length: "
+        if status == 200 { head = "HTTP/1.1 200 OK\r\nContent-Length: " }
+        if status == 404 { head = "HTTP/1.1 404 Not Found\r\nContent-Length: " }
+        if status == 401 { head = "HTTP/1.1 401 Unauthorized\r\nContent-Length: " }
+        ol = @put_str(@resp, 0, head)
+        ol = @put_int(@resp, ol, bl)
+        ol = @put_str(@resp, ol, "\r\n\r\n")
+        for j in 0..bl { resp[ol + j] = body[j] }
+        ol += bl
+        total_bytes += ol
+        resp_cs = (resp_cs * 131 + crc32_bytes_range(resp, 0, ol)) % MOD
+    }
+    for v in [ncust, rows, null_cust, bad_qty, valid] { cs = (cs * 131 + v) % MOD }
+    for g in 0..NGRP { for v in [grp_cnt[g], grp_qty[g], grp_rev[g]] { cs = (cs * 131 + v) % MOD } }
+    for p in 0..NPROD { for v in [prod_cnt[p], prod_rev[p]] { cs = (cs * 131 + v) % MOD } }
+    for v in [w, bias, loss] { cs = (cs * 131 + v) % MOD }
+    for j in 0..32 { cs = (cs * 131 + root[j]) % MOD }
+    for v in [ok200, un401, nf404, total_bytes, resp_cs] { cs = (cs * 131 + v) % MOD }
+    print("CHECKSUM={cs}")
+}

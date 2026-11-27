@@ -1,0 +1,20 @@
+//! Laws for std.core.bytes — real `bytes_len` / `bytes_equal` (Round 7).
+//! Implementation: `bytes_len` / `bytes_equal` in `bytes.sr`.
+
+#law("bytes_len of a three-byte array")
+bytes_len_three() {
+    #assert(bytes_len([1, 2, 3]) == 3)
+}
+
+#law("bytes_equal is reflexive and distinguishes unequal tails")
+bytes_equal_cases() {
+    #assert(bytes_equal([5], [5]))
+    #assert(!bytes_equal([5], [6]))
+    #assert(bytes_equal([1, 2, 3], [1, 2, 3]))
+}
+
+#law("bytes_last_index finds last occurrence")
+bytes_last_index_cases() {
+    #assert(bytes_last_index([1, 2, 1, 2], [1, 2]) == 2)
+    #assert(bytes_last_index([9, 9, 9], [1]) == -1)
+}

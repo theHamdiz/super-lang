@@ -1,0 +1,192 @@
+//! std.datetime.cron -- one-shot, interval, and cron schedules with TZ
+//!
+//! Import: use std.datetime.cron
+
+use std.datetime
+use std.core.str
+
++Scheduler = {
+    jobs: _ = []
+    persisted: str = ""
+    clock_unix: i64 = 0
+
+    new() : Scheduler => Scheduler.{jobs: [], persisted: "", clock_unix: 0}
+
+    set_clock(@self, unix: i64) { self.clock_unix = unix }
+    now(self) : i64 => self.clock_unix
+
+    once(@self, id: str, at_unix: i64) {
+        self.jobs = host.sys_arr_push(self.jobs, {id: id, kind: "once", at: at_unix, every: 0, expr: "", cancelled: false})
+    }
+
+    interval(@self, id: str, every_sec: i64, next_unix: i64) {
+        self.jobs = host.sys_arr_push(self.jobs, {id: id, kind: "interval", at: next_unix, every: every_sec, expr: "", cancelled: false})
+    }
+
+    cron(@self, id: str, expr: str, zone: Zone, from_unix: i64) {
+        nxt = cron_next(expr, zone, from_unix) or from_unix
+        self.jobs = host.sys_arr_push(self.jobs, {id: id, kind: "cron", at: nxt, every: 0, expr: expr, cancelled: false})
+    }
+
+    cancel(@self, id: str) {
+        n = host.sys_arr_len(self.jobs)
+        for 0..n {
+            j = self.jobs[it]
+            if j.id == id {
+                self.jobs = host.sys_arr_set(self.jobs, it, {id: j.id, kind: j.kind, at: j.at, every: j.every, expr: j.expr, cancelled: true})
+            }
+        }
+    }
+
+    tick(@self) : _ {
+        now = self.clock_unix
+        fired = []
+        n = host.sys_arr_len(self.jobs)
+        for 0..n {
+            j = self.jobs[it]
+            if j.cancelled { continue }
+            if j.kind == "once" {
+                if now >= j.at {
+                    fired = host.sys_arr_push(fired, j.id)
+                    self.jobs = host.sys_arr_set(self.jobs, it, {id: j.id, kind: j.kind, at: j.at, every: j.every, expr: j.expr, cancelled: true})
+                }
+            }
+            if j.kind == "interval" {
+                nxt = j.at
+                while now >= nxt {
+                    fired = host.sys_arr_push(fired, j.id)
+                    nxt = nxt + j.every
+                }
+                self.jobs = host.sys_arr_set(self.jobs, it, {id: j.id, kind: j.kind, at: nxt, every: j.every, expr: j.expr, cancelled: false})
+            }
+            if j.kind == "cron" {
+                if now >= j.at {
+                    fired = host.sys_arr_push(fired, j.id)
+                    z = Zone.of("UTC") or Zone.fixed("UTC", 0)
+                    nxt = cron_next(j.expr, z, j.at + 60) or (j.at + 3600)
+                    self.jobs = host.sys_arr_set(self.jobs, it, {id: j.id, kind: j.kind, at: nxt, every: j.every, expr: j.expr, cancelled: false})
+                }
+            }
+        }
+        @self.persist()
+        fired
+    }
+
+    persist(@self) {
+        out = ""
+        n = host.sys_arr_len(self.jobs)
+        for 0..n {
+            j = self.jobs[it]
+            if j.cancelled { continue }
+            out = out + j.id + "=" + "{j.at}" + "\n"
+        }
+        self.persisted = out
+    }
+}
+
++cron_next(expr: str, zone: Zone, after_unix: i64) : i64! {
+    parts = cron_split(expr)
+    ensure host.sys_arr_len(parts) == 5 else {
+        fail "cron: need 5 fields"
+        return
+    }
+    t = (after_unix / 60) * 60 + 60
+    for 0..(366 * 24 * 60) {
+        off = zone.offset_at(t)
+        local = t + off
+        day = local / 86400
+        sod = local % 86400
+        if sod < 0 { sod = sod + 86400 }
+        c = civil_from_days(day)
+        minute = (sod / 60) % 60
+        hour = sod / 3600
+        dow = (day + 4) % 7
+        if cron_match(parts[0], minute) && cron_match(parts[1], hour) && cron_match(parts[2], c.day) && cron_match(parts[3], c.month) && cron_match(parts[4], dow) {
+            return t
+        }
+        t = t + 60
+    }
+    fail "cron: no match in search window"
+}
+
++cron_split(expr: str) : _ {
+    out = []
+    cur = ""
+    n = host.sys_str_len(expr)
+    for 0..n {
+        c = expr[it]
+        if c == " " {
+            if host.sys_str_len(cur) > 0 {
+                out = host.sys_arr_push(out, cur)
+                cur = ""
+            }
+        } else {
+            cur = cur + c
+        }
+    }
+    if host.sys_str_len(cur) > 0 { out = host.sys_arr_push(out, cur) }
+    out
+}
+
+/// Accumulate one decimal digit into `v`, or `-1` when `cp` is not ASCII digit.
++cron_digit_acc(v: i64, cp: i64) : i64 {
+    if cp < 48 || cp > 57 { return -1 }
+    v * 10 + (cp - 48)
+}
+
++cron_match(field: str, value: i64) : bool {
+    if field == "*" { return true }
+    v = 0
+    n = byte_len(field)
+    for 0..n {
+        cp = ord(field[it])
+        nv = cron_digit_acc(v, cp)
+        if nv < 0 { return false }
+        v = nv
+    }
+    v == value
+}
+
+test "one-shot fires once then cancels" {
+    s = Scheduler.new()
+    @s.set_clock(1000)
+    @s.once("a", 1005)
+    assert_eq(host.sys_arr_len(@s.tick()), 0)
+    @s.set_clock(1005)
+    f = @s.tick()
+    assert_eq(host.sys_arr_len(f), 1)
+    assert_eq(f[0], "a")
+    assert_eq(host.sys_arr_len(@s.tick()), 0)
+}
+
+test "interval catches up after downtime" {
+    s = Scheduler.new()
+    @s.set_clock(0)
+    @s.interval("i", 10, 0)
+    @s.set_clock(35)
+    f = @s.tick()
+    assert_eq(host.sys_arr_len(f), 4)
+}
+
+test "cancel prevents fire" {
+    s = Scheduler.new()
+    @s.set_clock(0)
+    @s.once("x", 5)
+    @s.cancel("x")
+    @s.set_clock(10)
+    assert_eq(host.sys_arr_len(@s.tick()), 0)
+}
+
+test "cron next honors UTC zone" {
+    z = Zone.of("UTC") or Zone.fixed("UTC", 0)
+    nxt = cron_next("0 12 * * *", z, 0) or 0
+    assert_eq(nxt, 43200)
+}
+
+test "persist hook records next times" {
+    s = Scheduler.new()
+    @s.set_clock(0)
+    @s.once("job", 50)
+    @s.tick()
+    #assert(host.sys_str_find(s.persisted, "job=50") >= 0)
+}

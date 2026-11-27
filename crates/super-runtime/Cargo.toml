@@ -1,0 +1,18 @@
+[package]
+name = "super-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Scoped data stacks, bytecode VM, and native JIT for Super"
+
+[dependencies]
+super-core.workspace = true
+super-frontend.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+
+[lints]
+workspace = true

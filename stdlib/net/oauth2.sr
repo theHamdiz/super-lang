@@ -1,0 +1,599 @@
+//! std.net.oauth2 — OAuth 2.0 authorization-code flow with PKCE (RFC 6749, RFC 7636), offline
+//!
+//! Import with:
+//!   use std.net.oauth2
+//!
+//!   c = OAuthClient.new("my-app", "https://idp.test/authorize", "https://idp.test/token", "https://app.test/cb")
+//!   v = oa_new_verifier(32)                           // 64-char code_verifier
+//!   ch = oa_challenge_s256(v)                         // BASE64URL(SHA256(v)), no padding
+//!   url = c.auth_url(["openid", "profile"], "xyz", ch) // redirect the browser here
+//!   cb = oa_parse_callback("https://app.test/cb?code=abc&state=xyz") or err { return }
+//!   ok = oa_state_ok("xyz", cb.csrf)                  // constant-shape compare
+//!   body = c.token_body(cb.code, v)                    // POST this as application/x-www-form-urlencoded
+//!   tok = oa_token_from_json(response_text) or err { return }
+//!
+//! Everything here is pure string building and parsing: no sockets, no clocks. You send the
+//! authorization URL to the browser and POST the token body with `std.net.http`; this module
+//! makes both requests correct. `oa_challenge_s256` follows RFC 7636 section 4.2 exactly (it is
+//! asserted against the RFC's Appendix B vector). Query and form values are percent-encoded
+//! byte-wise (UTF-8) with the RFC 3986 unreserved set; a space becomes `%20`, and `+` is also
+//! accepted as a space when decoding. Token responses can be parsed from JSON (the usual form)
+//! or from `application/x-www-form-urlencoded` (GitHub style). Public helpers are prefixed `oa_`
+//! (modules merge flat).
+
+use std.fmt.json
+
+/// `OA_UNRESERVED` is the RFC 3986 unreserved set used for the PKCE verifier and percent-encoding.
++OA_UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+/// `OA_B64URL` is the base64url alphabet.
++OA_B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+/// `OA_HEX_UP` is the uppercase hex alphabet used by percent-escapes.
++OA_HEX_UP = "0123456789ABCDEF"
+/// `OA_VERIFIER_MIN` is the shortest legal code_verifier (`43`).
++OA_VERIFIER_MIN = 43
+/// `OA_VERIFIER_MAX` is the longest legal code_verifier (`128`).
++OA_VERIFIER_MAX = 128
+
+// --- encoding helpers -------------------------------------------------------------------------
+
+/// True when the byte `b` is in the RFC 3986 unreserved set.
++oa_is_unreserved(b: i64) : bool {
+    ok = false
+    for 0..host.sys_str_len(OA_UNRESERVED) {
+        if host.sys_ord(OA_UNRESERVED[it]) == b { ok = true }
+    }
+    ok
+}
+
+/// Percent-encode `s` (UTF-8 bytes outside the unreserved set become `%XX`).
++oa_enc(s: str) : str {
+    out = ""
+    for host.sys_str_to_bytes(s) {
+        b = it
+        if oa_is_unreserved(b) {
+            out = out + host.sys_chr(b)
+        } else {
+            out = out + "%" + OA_HEX_UP[(b / 16) % 16] + OA_HEX_UP[b % 16]
+        }
+    }
+    out
+}
+
+/// Value of one hex digit, or -1.
++oa_hex_val(c: str) : i64 {
+    o = host.sys_ord(c)
+    if o >= 48 && o <= 57 { return o - 48 }
+    if o >= 65 && o <= 70 { return o - 55 }
+    if o >= 97 && o <= 102 { return o - 87 }
+    -1
+}
+
+/// Percent-decode `s` (`+` becomes a space); fails on a truncated or non-hex escape.
++oa_dec(s: str) : str! {
+    raw = host.sys_str_to_bytes(s)
+    n = host.sys_arr_len(raw)
+    out = []
+    i = 0
+    bad = false
+    while i < n {
+        b = raw[i]
+        if b == 37 {
+            if i + 2 < n {
+                hi = oa_hex_val(host.sys_chr(raw[i + 1]))
+                lo = oa_hex_val(host.sys_chr(raw[i + 2]))
+                if hi < 0 || lo < 0 {
+                    bad = true
+                    i += 3
+                } else {
+                    out = host.sys_arr_push(out, hi * 16 + lo)
+                    i += 3
+                }
+            } else {
+                bad = true
+                i += 3
+            }
+        } else {
+            if b == 43 { out = host.sys_arr_push(out, 32) } else { out = host.sys_arr_push(out, b) }
+            i += 1
+        }
+    }
+    ensure !bad else {
+        fail "oauth2: malformed percent-escape"
+        return
+    }
+    host.sys_bytes_to_str(out)
+}
+
+/// Unpadded base64url of a byte array (RFC 4648 section 5).
++oa_b64url(bytes: _) : str {
+    out = ""
+    n = host.sys_arr_len(bytes)
+    i = 0
+    while i < n {
+        b0 = bytes[i]
+        b1 = 0
+        b2 = 0
+        if i + 1 < n { b1 = bytes[i + 1] }
+        if i + 2 < n { b2 = bytes[i + 2] }
+        out = out + OA_B64URL[b0 / 4]
+        out = out + OA_B64URL[(b0 % 4) * 16 + b1 / 16]
+        if i + 1 < n { out = out + OA_B64URL[(b1 % 16) * 4 + b2 / 64] }
+        if i + 2 < n { out = out + OA_B64URL[b2 % 64] }
+        i += 3
+    }
+    out
+}
+
+/// Hex text -> byte array (invalid digits count as 0).
++oa_hex_bytes(h: str) {
+    out = []
+    for 0..(host.sys_str_len(h) / 2) {
+        hi = oa_hex_val(h[it * 2])
+        lo = oa_hex_val(h[it * 2 + 1])
+        if hi < 0 { hi = 0 }
+        if lo < 0 { lo = 0 }
+        out = host.sys_arr_push(out, hi * 16 + lo)
+    }
+    out
+}
+
+/// Constant-shape string equality.
++oa_ct_eq(a: str, b: str) : bool {
+    na = host.sys_str_len(a)
+    nb = host.sys_str_len(b)
+    diff = 0
+    if na != nb { diff = 1 }
+    n = na
+    if nb > n { n = nb }
+    for 0..n {
+        if a[it] != b[it] { diff = 1 }
+    }
+    diff == 0
+}
+
+// --- PKCE ---------------------------------------------------------------------------------------
+
+/// True for a legal code_verifier: 43..128 characters, all unreserved.
++oa_verifier_valid(v: str) : bool {
+    n = host.sys_str_len(v)
+    ensure n >= OA_VERIFIER_MIN && n <= OA_VERIFIER_MAX else { return false }
+    ok = true
+    for 0..n {
+        if !oa_is_unreserved(host.sys_ord(v[it])) { ok = false }
+    }
+    ok
+}
+
+/// A fresh code_verifier from `bytes` random bytes (hex, so 2 x bytes characters; clamped to 22..64 bytes).
++oa_new_verifier(bytes: i64) : str {
+    n = bytes
+    if n < 22 { n = 22 }
+    if n > 64 { n = 64 }
+    host.sys_hex_encode(host.sys_rand_bytes(n))
+}
+
+/// code_challenge for method S256: `BASE64URL(SHA256(ASCII(verifier)))`.
++oa_challenge_s256(verifier: str) : str => oa_b64url(oa_hex_bytes(host.sys_sha256(verifier)))
+
+/// code_challenge for `method`: `S256` hashes, `plain` repeats the verifier, anything else is "".
++oa_challenge(verifier: str, method: str) : str {
+    if method == "S256" { return oa_challenge_s256(verifier) }
+    if method == "plain" { return verifier }
+    ""
+}
+
+/// True when `verifier` is legal and reproduces `challenge` under `method`.
++oa_pkce_verify(verifier: str, challenge: str, method: str) : bool {
+    ensure oa_verifier_valid(verifier) else { return false }
+    expected = oa_challenge(verifier, method)
+    ensure expected != "" else { return false }
+    oa_ct_eq(expected, challenge)
+}
+
+// --- form / query building and parsing ---------------------------------------------------------
+
+/// `k1=v1&k2=v2` with every key and value percent-encoded; keys and values are parallel arrays.
++oa_form(keys: _, vals: _) : str {
+    out = ""
+    n = host.sys_arr_len(keys)
+    for 0..n {
+        if it > 0 { out = out + "&" }
+        out = out + oa_enc(keys[it]) + "=" + oa_enc(vals[it])
+    }
+    out
+}
+
+/// Decoded value of `key` in a form or query string, or `none`.
++oa_form_get(form: str, key: str) : str? {
+    n = host.sys_str_len(form)
+    found = false
+    value = ""
+    start = 0
+    for 0..(n + 1) {
+        pos = it
+        if pos == n || form[pos] == "&" {
+            pair = form[start..pos]
+            eq = -1
+            for 0..host.sys_str_len(pair) {
+                if eq < 0 && pair[it] == "=" { eq = it }
+            }
+            if eq >= 0 && !found {
+                k = oa_dec(pair[0..eq]) or ""
+                if k == key {
+                    found = true
+                    value = oa_dec(pair[(eq + 1)..host.sys_str_len(pair)]) or ""
+                }
+            }
+            start = pos + 1
+        }
+    }
+    ensure found else { return none }
+    value
+}
+
+/// `OAuthCallback` is what the redirect URI receives.
++OAuthCallback = {
+    /// Authorization code (empty when the provider reported an error). Defaults to `""`.
+    code: str = ""
+    /// Echoed `state` value (CSRF token). Defaults to `""`.
+    csrf: str = ""
+    /// Provider error code such as `access_denied` (empty on success). Defaults to `""`.
+    error: str = ""
+}
+
+/// Parse the redirect URL: the query after `?` (a `#` fragment is ignored). Fails when it has neither a code nor an error.
++oa_parse_callback(url: str) : OAuthCallback! {
+    n = host.sys_str_len(url)
+    q = -1
+    h = n
+    for 0..n {
+        if q < 0 && url[it] == "?" { q = it }
+        if h == n && url[it] == "#" { h = it }
+    }
+    ensure q >= 0 && q < h else {
+        fail "oauth2: callback has no query"
+        return
+    }
+    query = url[(q + 1)..h]
+    code = oa_form_get(query, "code") or ""
+    csrf = oa_form_get(query, "state") or ""
+    error = oa_form_get(query, "error") or ""
+    ensure code != "" || error != "" else {
+        fail "oauth2: callback has neither code nor error"
+        return
+    }
+    OAuthCallback.{code, csrf, error}
+}
+
+/// True when the returned `got` state equals the `expected` one and is non-empty.
++oa_state_ok(expected: str, got: str) : bool {
+    ensure expected != "" else { return false }
+    oa_ct_eq(expected, got)
+}
+
+/// Scopes joined by single spaces (the wire format of the `scope` parameter).
++oa_scope_join(scopes: _) : str {
+    out = ""
+    for scopes {
+        if out != "" { out = out + " " }
+        out = out + it
+    }
+    out
+}
+
+// --- client -------------------------------------------------------------------------------------
+
+/// `OAuthClient` holds the registration of one OAuth application.
++OAuthClient = {
+    /// Client identifier. Defaults to `""`.
+    client_id: str = ""
+    /// Confidential-client secret; leave empty for public (PKCE-only) clients. Defaults to `""`.
+    client_secret: str = ""
+    /// Authorization endpoint URL. Defaults to `""`.
+    auth_endpoint: str = ""
+    /// Token endpoint URL. Defaults to `""`.
+    token_endpoint: str = ""
+    /// Registered redirect URI. Defaults to `""`.
+    redirect_uri: str = ""
+
+    /// A public client (no secret).
+    new(client_id: str, auth_endpoint: str, token_endpoint: str, redirect_uri: str) : OAuthClient {
+        OAuthClient.{client_id, client_secret: "", auth_endpoint, token_endpoint, redirect_uri}
+    }
+
+    /// The same client with a secret (confidential client).
+    with_secret(self, secret: str) : OAuthClient {
+        OAuthClient.{client_id: self.client_id, client_secret: secret, auth_endpoint: self.auth_endpoint, token_endpoint: self.token_endpoint, redirect_uri: self.redirect_uri}
+    }
+
+    /// Authorization URL for the code flow with an S256 `challenge`; keeps an existing `?` in the endpoint.
+    auth_url(self, scopes: _, csrf: str, challenge: str) : str {
+        keys = ["response_type", "client_id", "redirect_uri"]
+        vals = ["code", self.client_id, self.redirect_uri]
+        if host.sys_arr_len(scopes) > 0 {
+            keys = host.sys_arr_push(keys, "scope")
+            vals = host.sys_arr_push(vals, oa_scope_join(scopes))
+        }
+        if csrf != "" {
+            keys = host.sys_arr_push(keys, "state")
+            vals = host.sys_arr_push(vals, csrf)
+        }
+        if challenge != "" {
+            keys = host.sys_arr_push(keys, "code_challenge")
+            vals = host.sys_arr_push(vals, challenge)
+            keys = host.sys_arr_push(keys, "code_challenge_method")
+            vals = host.sys_arr_push(vals, "S256")
+        }
+        sep = "?"
+        for 0..host.sys_str_len(self.auth_endpoint) {
+            if self.auth_endpoint[it] == "?" { sep = "&" }
+        }
+        self.auth_endpoint + sep + oa_form(keys, vals)
+    }
+
+    /// Form body for exchanging an authorization `code` (include the PKCE `verifier` when you used one).
+    token_body(self, code: str, verifier: str) : str {
+        keys = ["grant_type", "code", "redirect_uri", "client_id"]
+        vals = ["authorization_code", code, self.redirect_uri, self.client_id]
+        if verifier != "" {
+            keys = host.sys_arr_push(keys, "code_verifier")
+            vals = host.sys_arr_push(vals, verifier)
+        }
+        if self.client_secret != "" {
+            keys = host.sys_arr_push(keys, "client_secret")
+            vals = host.sys_arr_push(vals, self.client_secret)
+        }
+        oa_form(keys, vals)
+    }
+
+    /// Form body for refreshing an access token.
+    refresh_body(self, refresh_token: str) : str {
+        keys = ["grant_type", "refresh_token", "client_id"]
+        vals = ["refresh_token", refresh_token, self.client_id]
+        if self.client_secret != "" {
+            keys = host.sys_arr_push(keys, "client_secret")
+            vals = host.sys_arr_push(vals, self.client_secret)
+        }
+        oa_form(keys, vals)
+    }
+
+    /// Form body for the client-credentials grant (requires a secret).
+    client_credentials_body(self, scopes: _) : str {
+        keys = ["grant_type", "client_id", "client_secret"]
+        vals = ["client_credentials", self.client_id, self.client_secret]
+        if host.sys_arr_len(scopes) > 0 {
+            keys = host.sys_arr_push(keys, "scope")
+            vals = host.sys_arr_push(vals, oa_scope_join(scopes))
+        }
+        oa_form(keys, vals)
+    }
+}
+
+// --- tokens ---------------------------------------------------------------------------------------
+
+/// `OAuthToken` is a parsed token endpoint response.
++OAuthToken = {
+    /// The access token. Defaults to `""`.
+    access_token: str = ""
+    /// Token type, normally `Bearer`. Defaults to `"Bearer"`.
+    token_type: str = "Bearer"
+    /// Lifetime in seconds (0 when absent). Defaults to `0`.
+    expires_in: i64 = 0
+    /// Refresh token (empty when absent). Defaults to `""`.
+    refresh_token: str = ""
+    /// Granted scope text. Defaults to `""`.
+    granted: str = ""
+
+    /// `Authorization` header value, e.g. `Bearer abc`.
+    header(self) : str => self.token_type + " " + self.access_token
+
+    /// True once `now` is within `skew` seconds of `issued_at + expires_in` (never for tokens without a lifetime).
+    expired(self, issued_at: i64, now: i64, skew: i64) : bool {
+        ensure self.expires_in > 0 else { return false }
+        now + skew >= issued_at + self.expires_in
+    }
+}
+
+/// Token from a JSON response body; fails when `access_token` is missing.
++oa_token_from_json(body: str) : OAuthToken! {
+    access = json_get_str(body, "access_token") or ""
+    ensure access != "" else {
+        fail "oauth2: response has no access_token"
+        return
+    }
+    OAuthToken.{
+        access_token: access,
+        token_type: json_get_str(body, "token_type") or "Bearer",
+        expires_in: json_get_int(body, "expires_in") or 0,
+        refresh_token: json_get_str(body, "refresh_token") or "",
+        granted: json_get_str(body, "scope") or "",
+    }
+}
+
+/// Token from a form-encoded response body (GitHub style); fails when `access_token` is missing.
++oa_token_from_form(body: str) : OAuthToken! {
+    access = oa_form_get(body, "access_token") or ""
+    ensure access != "" else {
+        fail "oauth2: response has no access_token"
+        return
+    }
+    lifetime = oa_form_get(body, "expires_in") or "0"
+    secs = 0
+    for 0..host.sys_str_len(lifetime) {
+        d = host.sys_ord(lifetime[it]) - 48
+        if d >= 0 && d <= 9 { secs = secs * 10 + d }
+    }
+    OAuthToken.{
+        access_token: access,
+        token_type: oa_form_get(body, "token_type") or "Bearer",
+        expires_in: secs,
+        refresh_token: oa_form_get(body, "refresh_token") or "",
+        granted: oa_form_get(body, "scope") or "",
+    }
+}
+
+// --- tests ----------------------------------------------------------------------------------------------
+
+/// Test that PKCE S256 matches the RFC 7636 vector.
+test "PKCE S256 matches the RFC 7636 vector" {
+    v = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    #assert(oa_verifier_valid(v))
+    assert_eq(oa_challenge_s256(v), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+    assert_eq(oa_challenge(v, "S256"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+    assert_eq(oa_challenge(v, "plain"), v)
+    assert_eq(oa_challenge(v, "md5"), "")
+    #assert(oa_pkce_verify(v, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "S256"))
+    #assert(!(oa_pkce_verify(v, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cX", "S256")))
+    #assert(oa_pkce_verify(v, v, "plain"))
+    #assert(!(oa_pkce_verify(v, v, "bogus")))
+    #assert(!(oa_pkce_verify("short", "short", "plain")))
+}
+
+/// Test that verifier rules and generation hold.
+test "verifier rules and generation hold" {
+    #assert(!(oa_verifier_valid("")))
+    short = "abcdefghijklmnopqrstuvwxyz0123456789-._~AB"
+    assert_eq(host.sys_str_len(short), 42)
+    #assert(!(oa_verifier_valid(short)))
+    #assert(oa_verifier_valid(short + "C"))
+    #assert(!(oa_verifier_valid("abcdefghijklmnopqrstuvwxyz0123456789-._~AB+")))
+    long = ""
+    for 0..129 { long = long + "a" }
+    #assert(!(oa_verifier_valid(long)))
+    fresh = oa_new_verifier(32)
+    assert_eq(host.sys_str_len(fresh), 64)
+    #assert(oa_verifier_valid(fresh))
+    #assert(oa_new_verifier(32) != fresh)
+    assert_eq(host.sys_str_len(oa_new_verifier(1)), 44)
+    assert_eq(host.sys_str_len(oa_new_verifier(500)), 128)
+    #assert(oa_verifier_valid(oa_new_verifier(500)))
+}
+
+/// Test that base64url encodes without padding.
+test "base64url encodes without padding" {
+    assert_eq(oa_b64url([]), "")
+    assert_eq(oa_b64url([102]), "Zg")
+    assert_eq(oa_b64url([102, 111]), "Zm8")
+    assert_eq(oa_b64url([102, 111, 111]), "Zm9v")
+    assert_eq(oa_b64url([251, 255, 254]), "-__-")
+    assert_eq(oa_b64url(host.sys_str_to_bytes("foobar")), "Zm9vYmFy")
+    assert_eq(host.sys_str_len(oa_b64url(oa_hex_bytes(host.sys_sha256("x")))), 43)
+}
+
+/// Test that percent encoding round trips UTF-8.
+test "percent encoding round trips UTF-8" {
+    assert_eq(oa_enc("abc-._~123"), "abc-._~123")
+    assert_eq(oa_enc("a b&c=d"), "a%20b%26c%3Dd")
+    assert_eq(oa_enc("https://x.test/cb?a=1"), "https%3A%2F%2Fx.test%2Fcb%3Fa%3D1")
+    assert_eq(oa_enc("é"), "%C3%A9")
+    assert_eq(oa_dec("a%20b%26c%3Dd") or "bad", "a b&c=d")
+    assert_eq(oa_dec("a+b") or "bad", "a b")
+    assert_eq(oa_dec("%C3%A9") or "bad", "é")
+    assert_eq(oa_dec("%2") or "bad", "bad")
+    assert_eq(oa_dec("%zz") or "bad", "bad")
+    assert_eq(oa_dec("") or "bad", "")
+    assert_eq(oa_dec(oa_enc("naïve café/100%")) or "bad", "naïve café/100%")
+}
+
+/// Test that forms build and parse.
+test "forms build and parse" {
+    f = oa_form(["a", "b c", "d"], ["1", "x&y", ""])
+    assert_eq(f, "a=1&b%20c=x%26y&d=")
+    assert_eq(oa_form_get(f, "a") or "none", "1")
+    assert_eq(oa_form_get(f, "b c") or "none", "x&y")
+    assert_eq(oa_form_get(f, "d") or "none", "")
+    assert_eq(oa_form_get(f, "zzz") or "none", "none")
+    assert_eq(oa_form_get("", "a") or "none", "none")
+    assert_eq(oa_form_get("x=1&x=2", "x") or "none", "1")
+    assert_eq(oa_form([], []), "")
+    assert_eq(oa_scope_join(["openid", "profile", "email"]), "openid profile email")
+    assert_eq(oa_scope_join([]), "")
+}
+
+/// Test that the authorization URL carries every parameter.
+test "the authorization URL carries every parameter" {
+    c = OAuthClient.new("my-app", "https://idp.test/authorize", "https://idp.test/token", "https://app.test/cb")
+    url = c.auth_url(["openid", "profile"], "st4te", "CHALLENGE")
+    assert_eq(url, "https://idp.test/authorize?response_type=code&client_id=my-app&redirect_uri=https%3A%2F%2Fapp.test%2Fcb&scope=openid%20profile&state=st4te&code_challenge=CHALLENGE&code_challenge_method=S256")
+    assert_eq(oa_form_get(url[27..host.sys_str_len(url)], "redirect_uri") or "none", "https://app.test/cb")
+    bare = c.auth_url([], "", "")
+    assert_eq(bare, "https://idp.test/authorize?response_type=code&client_id=my-app&redirect_uri=https%3A%2F%2Fapp.test%2Fcb")
+    withq = OAuthClient.new("id", "https://idp.test/auth?tenant=t1", "t", "r")
+    assert_eq(withq.auth_url([], "", ""), "https://idp.test/auth?tenant=t1&response_type=code&client_id=id&redirect_uri=r")
+}
+
+/// Test that token request bodies are well formed.
+test "token request bodies are well formed" {
+    c = OAuthClient.new("my-app", "a", "https://idp.test/token", "https://app.test/cb")
+    body = c.token_body("abc 123", "verifier-value")
+    assert_eq(body, "grant_type=authorization_code&code=abc%20123&redirect_uri=https%3A%2F%2Fapp.test%2Fcb&client_id=my-app&code_verifier=verifier-value")
+    assert_eq(oa_form_get(body, "code") or "none", "abc 123")
+    assert_eq(oa_form_get(body, "client_secret") or "none", "none")
+    conf = c.with_secret("s3cret")
+    assert_eq(conf.client_id, "my-app")
+    assert_eq(oa_form_get(conf.token_body("c", "") , "client_secret") or "none", "s3cret")
+    assert_eq(oa_form_get(conf.token_body("c", ""), "code_verifier") or "none", "none")
+    refresh = c.refresh_body("r-token")
+    assert_eq(refresh, "grant_type=refresh_token&refresh_token=r-token&client_id=my-app")
+    assert_eq(conf.refresh_body("r") , "grant_type=refresh_token&refresh_token=r&client_id=my-app&client_secret=s3cret")
+    cc = conf.client_credentials_body(["read", "write"])
+    assert_eq(cc, "grant_type=client_credentials&client_id=my-app&client_secret=s3cret&scope=read%20write")
+    assert_eq(conf.client_credentials_body([]), "grant_type=client_credentials&client_id=my-app&client_secret=s3cret")
+}
+
+/// Test that callbacks parse codes, errors and state.
+test "callbacks parse codes, errors and state" {
+    ok = oa_parse_callback("https://app.test/cb?code=abc%20d&state=xyz") or OAuthCallback.{code: "", csrf: "", error: "bad"}
+    assert_eq(ok.code, "abc d")
+    assert_eq(ok.csrf, "xyz")
+    assert_eq(ok.error, "")
+    denied = oa_parse_callback("https://app.test/cb?error=access_denied&state=xyz#frag") or OAuthCallback.{code: "", csrf: "", error: "bad"}
+    assert_eq(denied.error, "access_denied")
+    assert_eq(denied.code, "")
+    frag = oa_parse_callback("https://app.test/cb?code=1#code=2") or OAuthCallback.{code: "", csrf: "", error: "bad"}
+    assert_eq(frag.code, "1")
+    none_q = oa_parse_callback("https://app.test/cb") or OAuthCallback.{code: "", csrf: "", error: "bad"}
+    assert_eq(none_q.error, "bad")
+    empty = oa_parse_callback("https://app.test/cb?foo=bar") or OAuthCallback.{code: "", csrf: "", error: "bad"}
+    assert_eq(empty.error, "bad")
+    #assert(oa_state_ok("xyz", ok.csrf))
+    #assert(!(oa_state_ok("xyz", "xyY")))
+    #assert(!(oa_state_ok("xyz", "")))
+    #assert(!(oa_state_ok("", "")))
+}
+
+/// Test that token responses parse from JSON and forms.
+test "token responses parse from JSON and forms" {
+    body = "\{\"access_token\":\"abc\",\"token_type\":\"bearer\",\"expires_in\":3600,\"refresh_token\":\"r1\",\"scope\":\"openid profile\"\}"
+    t = oa_token_from_json(body) or OAuthToken.{access_token: "", token_type: "", expires_in: -1, refresh_token: "", granted: ""}
+    assert_eq(t.access_token, "abc")
+    assert_eq(t.token_type, "bearer")
+    assert_eq(t.expires_in, 3600)
+    assert_eq(t.refresh_token, "r1")
+    assert_eq(t.granted, "openid profile")
+    assert_eq(t.header(), "bearer abc")
+    minimal = oa_token_from_json("\{\"access_token\":\"z\"\}") or OAuthToken.{access_token: "", token_type: "", expires_in: -1, refresh_token: "", granted: ""}
+    assert_eq(minimal.token_type, "Bearer")
+    assert_eq(minimal.expires_in, 0)
+    assert_eq(minimal.refresh_token, "")
+    failed = oa_token_from_json("\{\"error\":\"invalid_grant\"\}") or OAuthToken.{access_token: "none", token_type: "", expires_in: -1, refresh_token: "", granted: ""}
+    assert_eq(failed.access_token, "none")
+    gh = oa_token_from_form("access_token=gho_1&token_type=bearer&scope=repo%2Cuser&expires_in=28800") or OAuthToken.{access_token: "", token_type: "", expires_in: -1, refresh_token: "", granted: ""}
+    assert_eq(gh.access_token, "gho_1")
+    assert_eq(gh.granted, "repo,user")
+    assert_eq(gh.expires_in, 28800)
+    nogh = oa_token_from_form("error=bad_verification_code") or OAuthToken.{access_token: "none", token_type: "", expires_in: -1, refresh_token: "", granted: ""}
+    assert_eq(nogh.access_token, "none")
+}
+
+/// Test that token expiry honours skew and missing lifetimes.
+test "token expiry honours skew and missing lifetimes" {
+    t = OAuthToken.{access_token: "a", token_type: "Bearer", expires_in: 3600, refresh_token: "", granted: ""}
+    #assert(!(t.expired(1000, 1000, 0)))
+    #assert(!(t.expired(1000, 4599, 0)))
+    #assert(t.expired(1000, 4600, 0))
+    #assert(t.expired(1000, 4540, 60))
+    #assert(!(t.expired(1000, 4539, 60)))
+    forever = OAuthToken.{access_token: "a", token_type: "Bearer", expires_in: 0, refresh_token: "", granted: ""}
+    #assert(!(forever.expired(0, 999999999, 0)))
+}

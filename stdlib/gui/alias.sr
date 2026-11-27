@@ -1,0 +1,14 @@
+//! Import aliasing: the module name and a renamed export.
+
+use std.gui as App
+use std.gui.{Gui as Desk}
+use std.core.str.{byte_len as nchars}
+
+/// Test that `as` binds the module and a renamed export constructs the type.
+test "an import alias is the module and a rename is the type" {
+    width = App.measure_text("Tasks", 16, 0)
+    #assert(width > 0)
+    desk = Desk.new("Desk", 80, 40)
+    assert_eq(desk.title, "Desk")
+    assert_eq(nchars("App"), 3)
+}

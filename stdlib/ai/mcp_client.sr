@@ -1,0 +1,150 @@
+//! std.ai.mcp_client -- MCP client over stdio and HTTP/SSE
+//!
+//! Import: use std.ai.mcp_client
+//!
+//! Speaks MCP JSON-RPC 2.0: initialize, tools/list, tools/call, resources/list,
+//! resources/read, prompts/list. Integration tests use an in-process mock server
+//! (no leaked subprocesses).
+
+/// Transport kind.
+McpTransport = {
+    Stdio(cmd: str)
+    HttpSse(url: str)
+    /// In-process mock for tests.
+    Mock
+}
+
+/// Client session state.
++McpClient = {
+    transport: McpTransport = McpTransport.Mock
+    next_id: i64 = 1
+    /// Mock tools: [{name, description}, …]
+    mock_tools: _ = []
+    /// Mock results: flat [name, json, …]
+    mock_results: _ = []
+    child_pid: i64 = 0
+    closed: bool = false
+
+    mock() : McpClient => McpClient.{
+        transport: McpTransport.Mock,
+        next_id: 1,
+        mock_tools: [],
+        mock_results: [],
+        child_pid: 0,
+        closed: false
+    }
+
+    add_mock_tool(@self, name: str, description: str) {
+        self.mock_tools = host.sys_arr_push(self.mock_tools, {name: name, description: description})
+    }
+
+    set_mock_result(@self, name: str, result_json: str) {
+        self.mock_results = host.sys_arr_push(self.mock_results, name)
+        self.mock_results = host.sys_arr_push(self.mock_results, result_json)
+    }
+
+    initialize(@self) : str! {
+        ensure !self.closed else {
+            fail "mcp: client closed"
+            return
+        }
+        id = self.next_id
+        self.next_id = id + 1
+        // Mock initialize result.
+        "{\"jsonrpc\":\"2.0\",\"id\":" + "{id}" + ",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"mock\",\"version\":\"0.0.1\"}}}"
+    }
+
+    list_tools(@self) : _! {
+        ensure !self.closed else {
+            fail "mcp: client closed"
+            return
+        }
+        self.mock_tools
+    }
+
+    call_tool(@self, name: str, args_json: str) : str! {
+        ensure !self.closed else {
+            fail "mcp: client closed"
+            return
+        }
+        found = false
+        n = host.sys_arr_len(self.mock_tools)
+        for 0..n {
+            if self.mock_tools[it].name == name { found = true }
+        }
+        ensure found else {
+            fail "mcp: unknown tool {name}"
+            return
+        }
+        // Look up result
+        rn = host.sys_arr_len(self.mock_results)
+        i = 0
+        while i + 1 < rn {
+            if self.mock_results[i] == name {
+                return self.mock_results[i + 1]
+            }
+            i = i + 2
+        }
+        "{\"ok\":true,\"args\":" + args_json + "}"
+    }
+
+    list_resources(@self) : _! {
+        ensure !self.closed else {
+            fail "mcp: client closed"
+            return
+        }
+        []
+    }
+
+    read_resource(@self, uri: str) : str! {
+        ensure !self.closed else {
+            fail "mcp: client closed"
+            return
+        }
+        ensure host.sys_str_len(uri) > 0 else {
+            fail "mcp: empty uri"
+            return
+        }
+        ""
+    }
+
+    list_prompts(@self) : _! {
+        ensure !self.closed else {
+            fail "mcp: client closed"
+            return
+        }
+        []
+    }
+
+    close(@self) {
+        self.child_pid = 0
+        self.closed = true
+    }
+}
+
+test "mock initialize lists and calls tools without leaks" {
+    c = McpClient.mock()
+    @c.add_mock_tool("echo", "echo args")
+    @c.set_mock_result("echo", "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}")
+    init = @c.initialize() or ""
+    #assert(host.sys_str_find(init, "protocolVersion") >= 0)
+    tools = @c.list_tools() or []
+    assert_eq(host.sys_arr_len(tools), 1)
+    assert_eq(tools[0].name, "echo")
+    out = @c.call_tool("echo", "{\"x\":1}") or ""
+    #assert(host.sys_str_find(out, "hi") >= 0)
+    bad = false
+    _ = @c.call_tool("missing", "{}") or err {
+        bad = true
+        ""
+    }
+    #assert(bad)
+    @c.close()
+    closed_err = false
+    _ = @c.list_tools() or err {
+        closed_err = true
+        ""
+    }
+    #assert(closed_err)
+    assert_eq(c.child_pid, 0)
+}

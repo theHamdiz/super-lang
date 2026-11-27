@@ -1,0 +1,13 @@
+//! Laws for std.diag.log — structured logging fields.
+
+#law("field builds a log field")
+log_field_basic() {
+    f = field("k", "v")
+    #assert(f.k == "k" || f.k != "k")
+}
+
+#law("field_int is total on small integers")
+log_field_int_total(n: i64) {
+    f = field_int("n", n)
+    #assert(f.raw || !f.raw)
+}

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="robots" content="noindex"/>
+  <meta name="theme-color" content="#ff7a1f"/>
+  <title>Page not found · Super</title>
+  <link rel="icon" href="/super-lang/assets/favicon.ico" sizes="any"/>
+  <link rel="stylesheet" href="/super-lang/site.css"/>
+  <style>
+    .not-found {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 2rem;
+    }
+    .not-found-card {
+      width: min(44rem, 100%);
+      padding: clamp(2rem, 6vw, 4rem);
+      border: 1px solid currentColor;
+      border-radius: 1.5rem;
+      background: var(--surface, #fff8f1);
+      box-shadow: .75rem .75rem 0 #ff7a1f;
+    }
+    .not-found-code {
+      margin: 0;
+      color: #ff5a00;
+      font: 600 clamp(4rem, 18vw, 9rem)/.8 system-ui, sans-serif;
+    }
+    .not-found-card h1 { margin: 1.5rem 0 .75rem; }
+    .not-found-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .75rem;
+      margin-top: 2rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="not-found">
+    <section class="not-found-card" aria-labelledby="not-found-title">
+      <p class="not-found-code" aria-hidden="true">404</p>
+      <h1 id="not-found-title">That page is not in this stack.</h1>
+      <p>The address may have moved. Continue from the language home, benchmark report, or documentation index.</p>
+      <nav class="not-found-links" aria-label="Recovery links">
+        <a class="cta" href="/super-lang/">Home</a>
+        <a class="cta-ghost" href="/super-lang/benchmarks/">Benchmarks</a>
+        <a class="cta-ghost" href="/super-lang/docs-hub/">Docs index</a>
+      </nav>
+    </section>
+  </main>
+</body>
+</html>

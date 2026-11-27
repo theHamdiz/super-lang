@@ -1,0 +1,151 @@
+// 15_http_radix_framework — zero-copy request slicing and prefix routing.
+
+use std.core.str
+use std.cli.cmd
+use std.diag.log
+
++ROUTE_COUNT = 8
++REQUEST_COUNT = 10000
+
++METHOD_GET = 1
++METHOD_POST = 2
++METHOD_DELETE = 3
+
++RouteMatch = {
+    handler: i64 = 0
+    parameter: i64 = 0
+    matched: bool = false
+}
+
++method_code(method: str) : i64 {
+    return METHOD_GET if method == "GET"
+    return METHOD_POST if method == "POST"
+    return METHOD_DELETE if method == "DELETE"
+    0
+}
+
++parse_decimal(value: str) : i64 {
+    parsed = to_i64(value) or 0
+    parsed
+}
+
++radix_match(method: i64, path: str) : RouteMatch {
+    if method == METHOD_GET && path == "/health" {
+        return RouteMatch{handler: 1, parameter: 0, matched: true}
+    }
+    if method == METHOD_GET && path == "/users" {
+        return RouteMatch{handler: 2, parameter: 0, matched: true}
+    }
+    if method == METHOD_POST && path == "/users" {
+        return RouteMatch{handler: 3, parameter: 0, matched: true}
+    }
+    if method == METHOD_GET && starts_with(path, "/users/") {
+        return RouteMatch{
+            handler: 4,
+            parameter: parse_decimal(path[7..byte_len(path)]),
+            matched: true,
+        }
+    }
+    if method == METHOD_DELETE && starts_with(path, "/users/") {
+        return RouteMatch{
+            handler: 5,
+            parameter: parse_decimal(path[7..byte_len(path)]),
+            matched: true,
+        }
+    }
+    if method == METHOD_GET && starts_with(path, "/assets/") {
+        return RouteMatch{handler: 6, parameter: byte_len(path) - 8, matched: true}
+    }
+    RouteMatch{handler: 0, parameter: 0, matched: false}
+}
+
++dispatch(method: str, path: str) : i64 {
+    found = radix_match(method_code(method), path)
+    if found.handler == 0 { return 404 }
+    if found.handler == 1 { return 200 }
+    if found.handler == 3 { return 201 }
+    if found.handler == 5 { return 204 }
+    200 + found.parameter
+}
+
++run_requests(n: i64) : i64 {
+    buckets = [0; ROUTE_COUNT]
+    parameter_sum = 0
+    status_sum = 0
+    for i in 0..n {
+        selector = i % 6
+        if selector == 0 {
+            m = radix_match(METHOD_GET, "/health")
+            buckets[m.handler] += 1
+            status_sum += 200
+        }
+        if selector == 1 {
+            m = radix_match(METHOD_GET, "/users")
+            buckets[m.handler] += 1
+            status_sum += 200
+        }
+        if selector == 2 {
+            m = radix_match(METHOD_POST, "/users")
+            buckets[m.handler] += 1
+            status_sum += 201
+        }
+        if selector == 3 {
+            m = radix_match(METHOD_GET, "/users/42")
+            buckets[m.handler] += 1
+            parameter_sum += m.parameter
+        }
+        if selector == 4 {
+            m = radix_match(METHOD_DELETE, "/users/7")
+            buckets[m.handler] += 1
+            parameter_sum += m.parameter
+        }
+        if selector == 5 {
+            m = radix_match(METHOD_GET, "/assets/app.js")
+            buckets[m.handler] += 1
+            parameter_sum += m.parameter
+        }
+    }
+    (buckets.sum()) * 97 + parameter_sum * 3 + status_sum
+}
+
++request_budget(argv: _) : i64 {
+    cmd = Command.new("radix")
+    cmd = cmd.opt("n", "n", "N", "10000", "requests", false)
+    cmd = cmd.as_int()
+    m = cmd.parse(argv) or err { return REQUEST_COUNT }
+    m.get_int("n", REQUEST_COUNT)
+}
+
++main() {
+    lg = Logger.console("http_radix")
+    checksum = run_requests(REQUEST_COUNT)
+    @lg.info("CHECKSUM={checksum}")
+}
+
+test "static radix routes match" {
+    assert_eq(dispatch("GET", "/health"), 200)
+    assert_eq(dispatch("POST", "/users"), 201)
+    assert_eq(dispatch("GET", "/missing"), 404)
+}
+
+test "parameter route uses zero copy slice" {
+    matched = radix_match(METHOD_GET, "/users/123")
+    assert_eq(matched.handler, 4)
+    assert_eq(matched.parameter, 123)
+}
+
+test "method participates in routing" {
+    assert_eq(radix_match(METHOD_DELETE, "/users/9").handler, 5)
+    #assert(!(radix_match(METHOD_POST, "/users/9").matched))
+}
+
+test "request budget reads -n and keeps the checksum default" {
+    assert_eq(request_budget([]), REQUEST_COUNT)
+    assert_eq(request_budget(["-n", "100"]), 100)
+    assert_eq(run_requests(request_budget(["-n", "100"])), run_requests(100))
+}
+
+test "route workload is deterministic" {
+    assert_eq(run_requests(100), run_requests(100))
+    #assert(run_requests(100) > 0)
+}

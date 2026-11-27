@@ -1,0 +1,22 @@
+# Super · Reproduce benchmarks
+
+<h1 id="reproduce-benchmarks-on-your-hardware">Reproduce benchmarks on your hardware</h1>
+<p>The published Stage-1 <strong>scoreboard is frozen</strong> in <a href="REPORT.md"><code>REPORT.md</code></a> and <a href="../results.json"><code>results.json</code></a>. Do <strong>not</strong> overwrite those files. This guide is for optional local reruns and <strong>community submissions</strong>.</p>
+<p>Start with <a href="../benchmarks/REPRODUCE.md"><code>../benchmarks/REPRODUCE.md</code></a> (integrity smoke, checksum-only rescoring).</p>
+<h2 id="record-your-environment">Record your environment</h2>
+<p>Before any timed run, capture:</p>
+<div class="table-wrap"><table class="data"><thead><tr><th>Field</th><th>Example</th></tr></thead><tbody><tr><td>CPU model</td><td><code>lscpu</code> / <code>sysctl -n machdep.cpu.brand_string</code></td></tr><tr><td>OS + kernel</td><td><code>uname -a</code></td></tr><tr><td>Compiler versions</td><td>Toolchain block in your local <code>results.json</code></td></tr><tr><td>CPU governor</td><td><code>performance</code> vs <code>powersave</code> (note if not pinned)</td></tr><tr><td>Git commit</td><td><code>git rev-parse HEAD</code></td></tr><tr><td>Harness protocol</td><td><code>2.0.0</code> (see <code>benchmarks/laws/LAW-BENCH-001.md</code>)</td></tr></tbody></table></div>
+<h2 id="integrity-only-no-timing">Integrity-only (no timing)</h2>
+<pre><code class="language-bash">cd benchmarks
+sha256sum -c SHA256SUMS
+sha256sum -c data/SHA256SUMS
+python3 -m unittest discover -s . -p &#x27;test_*.py&#x27; -q</code></pre>
+<h2 id="optional-single-algorithm-timing-local-only">Optional single-algorithm timing (local only)</h2>
+<pre><code class="language-bash">cd benchmarks
+python3 runner.py --only 01_nbody</code></pre>
+<p>Compare emitted <code>CHECKSUM=</code> lines to the frozen row in <code>data/results.json</code> — mismatches indicate environment or port drift, not an automatic scoreboard update.</p>
+<h2 id="submit-community-results">Submit community results</h2>
+<ol><li>Run the harness on your machine (full or subset — say which).</li><li>Export a JSON artifact plus <code>CHECKSUM=</code> lines and the environment table above.</li><li>Open a <strong>Benchmark result</strong> issue (<code>.github/ISSUE_TEMPLATE/benchmark_result.yml</code>).</li><li>Maintainers may copy approved submissions into <code>benchmarks/results/community/</code> — <strong>never</strong> into <code>docs/results.json</code> without a formal protocol bump.</li></ol>
+<h2 id="site-regeneration-no-re-measure">Site regeneration (no re-measure)</h2>
+<pre><code class="language-bash">./scripts/publish_site.sh</code></pre>
+<p>Reads existing <code>docs/results.json</code>; does not rerun language binaries.</p><p><strong>Related:</strong> <a href="platform.html">Platform</a> · <a href="install-security.html">Install security</a></p>

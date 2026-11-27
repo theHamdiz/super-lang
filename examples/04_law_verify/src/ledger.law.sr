@@ -1,0 +1,15 @@
+//! Human-locked ledger invariants (merged with `main.sr` at verify time).
+
+#law("transfer preserves total balance across all valid amounts")
+transfer_conserves_total(src: Account, dst: Account, amount: i64) {
+    ensure amount >= 0 && src.balance >= amount else { return }
+    s = src
+    d = dst
+    ok = transfer(@s, @d, amount)
+    #assert(ok && (s.balance + d.balance == src.balance + dst.balance))
+}
+
+#law("addition is commutative")
+add_comm(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}

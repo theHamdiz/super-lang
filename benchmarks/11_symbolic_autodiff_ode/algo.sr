@@ -1,0 +1,245 @@
+// 11_symbolic_autodiff_ode — 20k random expressions: tuple-`when` rewrite rules + std.math.ad Dual64
+// forward AD, then Dual64-RK4 sensitivities dy/dlam of a stiff-ish ODE
+use std.math.{ad, core}
+use std.core.collections
+
++EXPRS = 20000
++POINTS = 7
++TRAJ = 1024
++STEPS = 1000
++MAXN = 64
+
+// Node ops and child shapes are plain i64 tags so the hot dispatch stays unboxed in C23 AOT.
+OP_CONST, OP_VAR, OP_ADD, OP_SUB, OP_MUL, OP_NEG, OP_SIN = 0, 1, 2, 3, 4, 5, 6
+
+// What a rewrite rule needs to know about an already-simplified child.
+ZERO, ONE, NUM, EXPR = 0, 1, 2, 3
+
+Node = {
+    op: i64 = 0
+    a: i64 = 0
+    b: i64 = 0
+    c: f64 = 0.0
+}
+
+// Post-order node arrays (struct-of-arrays): children always precede their parent.
+Tree = {
+    op: _
+    a: _
+    b: _
+    c: _
+    cnt: i64 = 0
+
+    push(@self, op: i64, a: i64, b: i64, c: f64) : i64 {
+        n = self.cnt
+        self.op[n], self.a[n], self.b[n], self.c[n] = op, a, b, c
+        self.cnt = n + 1
+        n
+    }
+    konst(@self, c: f64) : i64 {
+        n = @self.push(OP_CONST, 0, 0, c)
+        n
+    }
+    node(self, i: i64) : Node => Node.{op: self.op[i], a: self.a[i], b: self.b[i], c: self.c[i]}
+
+    shape(self, i: i64) : i64 {
+        return EXPR if self.op[i] != OP_CONST
+        return ZERO if self.c[i] == 0.0
+        return ONE if self.c[i] == 1.0
+        NUM
+    }
+    cv(self, i: i64) : f64 => self.c[i]
+}
+
+// Dual64 values, stored as value / derivative lanes.
+Duals = {
+    v: _
+    d: _
+    at(self, i: i64) : Dual64 => dual(self.v[i], self.d[i])
+    put(@self, i: i64, x: Dual64) {
+        self.v[i], self.d[i] = x.v, x.d
+    }
+}
+
+tree(n: i64) : Tree => Tree.{op: [0; n], a: [0; n], b: [0; n], c: [0.0; n]}
+duals(n: i64) : Duals => Duals.{v: [0.0; n], d: [0.0; n]}
+
+leaf_const(m: i64) : f64 {
+    when m {
+        0 => 0.0
+        1 => 1.0
+        2 => 2.0
+        3 => 0.5
+        else => -1.0
+    }
+}
+
+op_for(k: i64) : i64 {
+    return OP_ADD if k < 4
+    return OP_SUB if k == 4
+    return OP_MUL if k < 8
+    return OP_NEG if k == 8
+    OP_SIN
+}
+
+gen(@t: Tree, @rng: LcgGlibc, depth: i64) : i64 {
+    k = @rng.pick(10)
+    if k < 2 || depth == 0 {
+        m = @rng.pick(8)
+        return @t.push(OP_VAR, 0, 0, 0.0) if m < 3
+        return @t.konst(leaf_const(m - 3))
+    }
+    a = gen(@t, @rng, depth - 1)
+    kind = op_for(k)
+    b = 0
+    if kind == OP_ADD || kind == OP_SUB || kind == OP_MUL { b = gen(@t, @rng, depth - 1) }
+    @t.push(kind, a, b, 0.0)
+}
+
+// Rewrite rules as decision tables over the shapes of the simplified children `l` and `r`.
+add_rule(@s: Tree, l: i64, r: i64) : i64 {
+    when (s.shape(l), s.shape(r)) {
+        (ZERO, _) => r
+        (ONE, ZERO) => l
+        (ONE, EXPR) => @s.push(OP_ADD, l, r, 0.0)
+        (ONE, _) => @s.konst(s.cv(l) + s.cv(r))
+        (NUM, ZERO) => l
+        (NUM, EXPR) => @s.push(OP_ADD, l, r, 0.0)
+        (NUM, _) => @s.konst(s.cv(l) + s.cv(r))
+        (EXPR, ZERO) => l
+        else => @s.push(OP_ADD, l, r, 0.0)
+    }
+}
+
+// Keyed right-child first: `x - 0` wins over every left shape.
+sub_rule(@s: Tree, l: i64, r: i64) : i64 {
+    when (s.shape(r), s.shape(l)) {
+        (ZERO, _) => l
+        (ONE, EXPR) => @s.push(OP_SUB, l, r, 0.0)
+        (ONE, _) => @s.konst(s.cv(l) - s.cv(r))
+        (NUM, EXPR) => @s.push(OP_SUB, l, r, 0.0)
+        (NUM, _) => @s.konst(s.cv(l) - s.cv(r))
+        else => if l == r { @s.konst(0.0) } else { @s.push(OP_SUB, l, r, 0.0) }
+    }
+}
+
+mul_rule(@s: Tree, l: i64, r: i64) : i64 {
+    when (s.shape(l), s.shape(r)) {
+        (ZERO, _) => @s.konst(0.0)
+        (ONE, ZERO) => @s.konst(0.0)
+        (ONE, _) => r
+        (NUM, ZERO) => @s.konst(0.0)
+        (NUM, ONE) => l
+        (NUM, EXPR) => @s.push(OP_MUL, l, r, 0.0)
+        (NUM, _) => @s.konst(s.cv(l) * s.cv(r))
+        (EXPR, ZERO) => @s.konst(0.0)
+        (EXPR, ONE) => l
+        else => @s.push(OP_MUL, l, r, 0.0)
+    }
+}
+
+neg_rule(@s: Tree, l: i64) : i64 {
+    child = s.node(l)
+    when child.op {
+        OP_CONST => @s.konst(-child.c)
+        OP_NEG => child.a
+        else => @s.push(OP_NEG, l, 0, 0.0)
+    }
+}
+
+// Simplified image of one node given the images `l`, `r` of its children.
+simp_node(@s: Tree, n: Node, l: i64, r: i64) : i64 {
+    when n.op {
+        OP_CONST => @s.konst(n.c)
+        OP_VAR => @s.push(OP_VAR, 0, 0, 0.0)
+        OP_ADD => add_rule(@s, l, r)
+        OP_SUB => sub_rule(@s, l, r)
+        OP_MUL => mul_rule(@s, l, r)
+        OP_NEG => neg_rule(@s, l)
+        else => if s.shape(l) == ZERO { @s.konst(0.0) } else { @s.push(OP_SIN, l, 0, 0.0) }
+    }
+}
+
+// One bottom-up pass; `rep[i]` is the simplified image of node i.
+simplify(t: Tree, @s: Tree, @rep) {
+    s.cnt = 0
+    for i in 0..t.cnt {
+        n = t.node(i)
+        rep[i] = simp_node(@s, n, rep[n.a], rep[n.b])
+    }
+}
+
+// d sin(a) = cos(a) da. Built directly: `Dual64.sin` routes through the generic `apply` op table.
+dsin(a: Dual64) : Dual64 => dual(sin(a.v), cos(a.v) * a.d)
+
+dual_node(n: Node, x: f64, ev: Duals) : Dual64 {
+    when n.op {
+        OP_CONST => dual_const(n.c)
+        OP_VAR => dual_var(x)
+        OP_ADD => ev.at(n.a).add(ev.at(n.b))
+        OP_SUB => ev.at(n.a).sub(ev.at(n.b))
+        OP_MUL => ev.at(n.a).mul(ev.at(n.b))
+        OP_NEG => ev.at(n.a).neg()
+        else => dsin(ev.at(n.a))
+    }
+}
+
+eval_dual(t: Tree, x: f64, @ev: Duals) {
+    for i in 0..t.cnt { @ev.put(i, dual_node(t.node(i), x, ev)) }
+}
+
+// y' = -lam (y - sin t) + cos(t) / 2 with lam seeded as the dual variable: `.d` is dy/dlam.
+rhs(t: f64, y: Dual64, lam: Dual64) : Dual64 => lam.mul(y.sub(dual_const(sin(t)))).neg().shift(0.5 * cos(t))
+
+rk4_final(lam: f64, y0: f64, h: f64, steps: i64) : Dual64 {
+    ld, y = dual_var(lam), dual_const(y0)
+    hh, h6 = 0.5 * h, h / 6.0
+    for k in 0..steps {
+        t = k * h
+        k1 = rhs(t, y, ld)
+        k2 = rhs(t + hh, y.add(k1.scale(hh)), ld)
+        k3 = rhs(t + hh, y.add(k2.scale(hh)), ld)
+        k4 = rhs(t + h, y.add(k3.scale(h)), ld)
+        y = y.add(k1.add(k2.scale(2.0)).add(k3.scale(2.0)).add(k4).scale(h6))
+    }
+    y
+}
+
+drifted(a: f64, b: f64) : i64 => if abs(a - b) > 0.000000001 * (1.0 + abs(a)) { 1 } else { 0 }
+
++main() {
+    rng = LcgGlibc.{s: 20240611}
+    t, s, rep = tree(MAXN), tree(MAXN), [0; MAXN]
+    ev, sev = duals(MAXN), duals(MAXN)
+    orig_nodes, simp_nodes, mismatch = 0, 0, 0
+    acc_v, acc_d = 0.0, 0.0
+    for 0..EXPRS {
+        t.cnt = 0
+        gen(@t, @rng, 4)
+        simplify(t, @s, @rep)
+        n = t.cnt
+        orig_nodes += n
+        simp_nodes += s.cnt
+        for p in 0..POINTS {
+            x = (p - 3) / 4.0
+            eval_dual(t, x, @ev)
+            eval_dual(s, x, @sev)
+            o, q = ev.at(n - 1), sev.at(rep[n - 1])
+            mismatch += drifted(o.v, q.v) + drifted(o.d, q.d)
+            acc_v += q.v
+            acc_d += q.d
+        }
+    }
+
+    sum_y, sum_dy = 0.0, 0.0
+    for j in 0..TRAJ {
+        r = rk4_final(10.0 + j * 0.25, 1.0, 0.002, STEPS)
+        sum_y += r.v
+        sum_dy += r.d
+    }
+
+    q, qd = to_int(floor(acc_v * 10000.0)), to_int(floor(acc_d * 10000.0))
+    y1, y2 = to_int(floor(sum_y * 1000000.0)), to_int(floor(sum_dy * 1000000000.0))
+    cs = orig_nodes + simp_nodes * 7 + mismatch * 13 + q * 3 + qd * 5 + y1 * 11 + y2 * 17
+    print("CHECKSUM={cs}")
+}

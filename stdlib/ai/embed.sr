@@ -1,0 +1,438 @@
+//! std.ai.embed — vector similarity, flat top-k search and a tiny BPE tokenizer
+//!
+//! Import with:
+//!   use std.ai.embed
+//!
+//!   s = emb_cosine([1.0, 0.0], [1.0, 1.0])                  // 0.7071...
+//!   hits = emb_search([1.0, 0.0], rows, 3, EMB_COSINE)       // best 3 rows, best first
+//!   best = hits[0].index
+//!
+//!   v = EmbVocab.mini()
+//!   ids = emb_bpe_encode(v, "the thing")                    // merged token ids
+//!   txt = emb_bpe_decode(v, ids)                            // "the thing"
+//!   vec = emb_hash_embed(v, "the thing", 16)                // unit-length bag-of-tokens vector
+//!
+//! Vectors are plain `f64` arrays. Similarity functions return 0.0 for mismatched lengths or
+//! zero vectors instead of failing, so scoring loops never need a guard. `emb_search` is an
+//! exact flat scan (O(rows x dim)) with a stable selection top-k: ties keep the lower row
+//! index. For `EMB_L2` the score is the negated distance so "larger is better" holds for
+//! every metric. The BPE helpers implement real byte-pair merging over a vocabulary: units
+//! start as single characters, then the lowest-ranked adjacent merge is applied to every
+//! non-overlapping occurrence until none apply. Unknown characters map to id 0 (`<unk>`).
+//! Public helpers are prefixed `emb_` (modules merge flat).
+
+/// `EMB_COSINE` selects cosine similarity (`0`).
++EMB_COSINE = 0
+/// `EMB_DOT` selects the raw dot product (`1`).
++EMB_DOT = 1
+/// `EMB_L2` selects negated Euclidean distance (`2`).
++EMB_L2 = 2
+/// `EMB_EPS` is `0.000000001`, the zero-norm guard.
++EMB_EPS = 0.000000001
+
+// --- similarity ----------------------------------------------------------------------------
+
+/// Dot product; 0.0 when the lengths differ.
++emb_dot(a: _, b: _) : f64 {
+    n = host.sys_arr_len(a)
+    ensure n == host.sys_arr_len(b) else { return 0.0 }
+    acc = 0.0
+    for 0..n { acc += a[it] * b[it] }
+    acc
+}
+
+/// Euclidean norm.
++emb_norm(a: _) : f64 => host.sys_sqrt(emb_dot(a, a))
+
+/// Euclidean distance; 0.0 when the lengths differ.
++emb_l2(a: _, b: _) : f64 {
+    n = host.sys_arr_len(a)
+    ensure n == host.sys_arr_len(b) else { return 0.0 }
+    acc = 0.0
+    for 0..n {
+        d = a[it] - b[it]
+        acc += d * d
+    }
+    host.sys_sqrt(acc)
+}
+
+/// Cosine similarity in [-1, 1]; 0.0 for zero vectors or mismatched lengths.
++emb_cosine(a: _, b: _) : f64 {
+    na = emb_norm(a)
+    nb = emb_norm(b)
+    ensure na > EMB_EPS && nb > EMB_EPS else { return 0.0 }
+    emb_dot(a, b) / (na * nb)
+}
+
+/// Unit-length copy of `a` (a zero vector stays zero).
++emb_normalize(a: _) {
+    n = emb_norm(a)
+    out = []
+    for a {
+        if n > EMB_EPS { out = host.sys_arr_push(out, it / n) } else { out = host.sys_arr_push(out, 0.0) }
+    }
+    out
+}
+
+/// Score of `b` against query `a` under `metric` (larger is better for every metric).
++emb_score(a: _, b: _, metric: i64) : f64 {
+    if metric == EMB_DOT { return emb_dot(a, b) }
+    if metric == EMB_L2 { return 0.0 - emb_l2(a, b) }
+    emb_cosine(a, b)
+}
+
+// --- flat top-k search --------------------------------------------------------------------
+
+/// `EmbHit` is one search result: the row `index` and its `score`.
++EmbHit = {
+    /// Row position in the searched array. Defaults to `0`.
+    index: i64 = 0
+    /// Metric score (larger is better). Defaults to `0.0`.
+    score: f64 = 0.0
+}
+
+/// Best `k` rows of `rows` for `query`, best first; ties keep the lower index.
++emb_search(query: _, rows: _, k: i64, metric: i64) {
+    n = host.sys_arr_len(rows)
+    scores = []
+    taken = []
+    for 0..n {
+        scores = host.sys_arr_push(scores, emb_score(query, rows[it], metric))
+        taken = host.sys_arr_push(taken, 0)
+    }
+    want = k
+    if want > n { want = n }
+    hits = []
+    for 0..want {
+        best = -1
+        for 0..n {
+            if taken[it] == 0 {
+                if best < 0 { best = it } else {
+                    if scores[it] > scores[best] { best = it }
+                }
+            }
+        }
+        taken = host.sys_arr_set(taken, best, 1)
+        hits = host.sys_arr_push(hits, EmbHit.{index: best, score: scores[best]})
+    }
+    hits
+}
+
+/// Row indices of the best `k` rows (convenience over `emb_search`).
++emb_top_k(query: _, rows: _, k: i64, metric: i64) {
+    ids = []
+    hits = emb_search(query, rows, k, metric)
+    for hits { ids = host.sys_arr_push(ids, it.index) }
+    ids
+}
+
+// --- tiny BPE -----------------------------------------------------------------------------------
+
+/// `EmbVocab` is a BPE vocabulary: token strings plus ordered merge rules.
++EmbVocab = {
+    /// Token text by id; id 0 must be the unknown token. Defaults to `[]`.
+    tokens: _ = []
+    /// Left side of merge rule `r` (lower `r` = higher priority). Defaults to `[]`.
+    merge_left: _ = []
+    /// Right side of merge rule `r`. Defaults to `[]`.
+    merge_right: _ = []
+
+    /// A vocabulary with only the `<unk>` token.
+    empty() : EmbVocab => EmbVocab.{tokens: ["<unk>"], merge_left: [], merge_right: []}
+
+    /// Small English vocabulary: lowercase letters, space, digits and common merges.
+    mini() : EmbVocab {
+        v = EmbVocab.empty()
+        for emb_chars("abcdefghijklmnopqrstuvwxyz 0123456789.,!?") { @v.add_token(it) }
+        merges = ["t h", "th e", "i n", "in g", "e r", "a n", "an d", "o u", "e s", "r e", "o n", "h a", "s t"]
+        for merges {
+            parts = emb_split_space(it)
+            @v.add_merge(parts[0], parts[1])
+        }
+        v
+    }
+
+    /// Append `tok` unless present; returns its id.
+    add_token(@self, tok: str) : i64 {
+        if self.id_of(tok) < 0 { self.tokens = host.sys_arr_push(self.tokens, tok) }
+        self.id_of(tok)
+    }
+
+    /// Add merge rule `left right`, creating the merged token when needed. Rules added first rank
+    /// first. Returns the rank of the new rule.
+    add_merge(@self, left: str, right: str) : i64 {
+        self.merge_left = host.sys_arr_push(self.merge_left, left)
+        self.merge_right = host.sys_arr_push(self.merge_right, right)
+        @self.add_token(left + right)
+        host.sys_arr_len(self.merge_left) - 1
+    }
+
+    /// Id of `tok`, or -1.
+    id_of(self, tok: str) : i64 {
+        pos = -1
+        ts = self.tokens
+        for ts {
+            if pos < 0 && it == tok { pos = index }
+        }
+        pos
+    }
+
+    /// Number of tokens.
+    size(self) : i64 => host.sys_arr_len(self.tokens)
+
+    /// Rank of the merge `left right`, or -1.
+    rank(self, left: str, right: str) : i64 {
+        pos = -1
+        n = host.sys_arr_len(self.merge_left)
+        for 0..n {
+            if pos < 0 && self.merge_left[it] == left && self.merge_right[it] == right { pos = it }
+        }
+        pos
+    }
+}
+
+/// Split `s` at its first space into [left, right] (right is "" when there is no space).
++emb_split_space(s: str) {
+    n = host.sys_str_len(s)
+    cut = n
+    for 0..n {
+        if cut == n && s[it] == " " { cut = it }
+    }
+    left = s[0..cut]
+    right = ""
+    if cut < n { right = s[(cut + 1)..n] }
+    out = [left, right]
+    out
+}
+
+/// Characters of `text` as single-character strings.
++emb_chars(text: str) {
+    out = []
+    n = host.sys_str_len(text)
+    for 0..n { out = host.sys_arr_push(out, text[it]) }
+    out
+}
+
+/// One BPE pass: merge every non-overlapping `left right` pair in `units`, left to right.
++emb_merge_pair(units: _, left: str, right: str) {
+    n = host.sys_arr_len(units)
+    out = []
+    i = 0
+    while i < n {
+        merged = false
+        if i + 1 < n {
+            if units[i] == left && units[i + 1] == right { merged = true }
+        }
+        if merged {
+            out = host.sys_arr_push(out, left + right)
+            i += 2
+        } else {
+            out = host.sys_arr_push(out, units[i])
+            i += 1
+        }
+    }
+    out
+}
+
+/// Token strings of `text` after applying the vocabulary's merges in rank order.
++emb_bpe_units(v: EmbVocab, text: str) {
+    units = emb_chars(text)
+    live = true
+    while live {
+        n = host.sys_arr_len(units)
+        best = -1
+        for 0..(n - 1) {
+            r = v.rank(units[it], units[it + 1])
+            if r >= 0 {
+                if best < 0 { best = r } else {
+                    if r < best { best = r }
+                }
+            }
+        }
+        if best < 0 {
+            live = false
+        } else {
+            units = emb_merge_pair(units, v.merge_left[best], v.merge_right[best])
+        }
+    }
+    units
+}
+
+/// Token ids of `text`; unknown units become 0.
++emb_bpe_encode(v: EmbVocab, text: str) {
+    ids = []
+    for emb_bpe_units(v, text) {
+        id = v.id_of(it)
+        if id < 0 { id = 0 }
+        ids = host.sys_arr_push(ids, id)
+    }
+    ids
+}
+
+/// Text for `ids` (unknown and out-of-range ids render as nothing).
++emb_bpe_decode(v: EmbVocab, ids: _) : str {
+    out = ""
+    n = v.size()
+    for ids {
+        if it > 0 {
+            if it < n { out = out + v.tokens[it] }
+        }
+    }
+    out
+}
+
+/// Unit-length bag-of-tokens vector of `dim` slots: token id hashed into a slot, counts L2-normalised.
++emb_hash_embed(v: EmbVocab, text: str, dim: i64) {
+    vec = []
+    for 0..dim { vec = host.sys_arr_push(vec, 0.0) }
+    ensure dim > 0 else { return vec }
+    for emb_bpe_encode(v, text) {
+        slot = (it * 31 + 7) % dim
+        vec = host.sys_arr_set(vec, slot, vec[slot] + 1.0)
+    }
+    emb_normalize(vec)
+}
+
+// --- tests ----------------------------------------------------------------------------------------
+
+/// Test that dot, norm and l2 are correct.
+test "dot, norm and l2 are correct" {
+    assert_eq(emb_dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]), 32.0)
+    assert_eq(emb_dot([1.0], [1.0, 2.0]), 0.0)
+    assert_eq(emb_norm([3.0, 4.0]), 5.0)
+    assert_eq(emb_l2([0.0, 0.0], [3.0, 4.0]), 5.0)
+    assert_eq(emb_l2([1.0, 1.0], [1.0, 1.0]), 0.0)
+    assert_eq(emb_l2([1.0], [1.0, 2.0]), 0.0)
+}
+
+/// Test that cosine handles identical, orthogonal, opposite and zero vectors.
+test "cosine handles identical, orthogonal, opposite and zero vectors" {
+    #assert(host.sys_abs(emb_cosine([1.0, 2.0], [2.0, 4.0]) - 1.0) < 0.000001)
+    assert_eq(emb_cosine([1.0, 0.0], [0.0, 1.0]), 0.0)
+    #assert(host.sys_abs(emb_cosine([1.0, 0.0], [0.0 - 1.0, 0.0]) + 1.0) < 0.000001)
+    assert_eq(emb_cosine([0.0, 0.0], [1.0, 1.0]), 0.0)
+    assert_eq(emb_cosine([1.0], [1.0, 1.0]), 0.0)
+    #assert(host.sys_abs(emb_cosine([1.0, 0.0], [1.0, 1.0]) - 0.7071067811865476) < 0.000001)
+}
+
+/// Test that normalize yields unit vectors.
+test "normalize yields unit vectors" {
+    u = emb_normalize([3.0, 4.0])
+    #assert(host.sys_abs(emb_norm(u) - 1.0) < 0.000001)
+    #assert(host.sys_abs(u[0] - 0.6) < 0.000001)
+    z = emb_normalize([0.0, 0.0])
+    assert_eq(z[0], 0.0)
+    assert_eq(host.sys_arr_len(z), 2)
+}
+
+/// Test that scores orient every metric so larger is better.
+test "scores orient every metric so larger is better" {
+    q = [1.0, 0.0]
+    near = [1.0, 0.1]
+    far = [0.0, 5.0]
+    #assert(emb_score(q, near, EMB_COSINE) > emb_score(q, far, EMB_COSINE))
+    #assert(emb_score(q, near, EMB_DOT) > emb_score(q, far, EMB_DOT))
+    #assert(emb_score(q, near, EMB_L2) > emb_score(q, far, EMB_L2))
+    assert_eq(emb_score(q, q, EMB_L2), 0.0)
+}
+
+/// Test that flat search returns the best rows in order.
+test "flat search returns the best rows in order" {
+    rows = [[0.0, 1.0], [1.0, 0.0], [0.9, 0.1], [0.5, 0.5]]
+    hits = emb_search([1.0, 0.0], rows, 3, EMB_COSINE)
+    assert_eq(host.sys_arr_len(hits), 3)
+    assert_eq(hits[0].index, 1)
+    assert_eq(hits[1].index, 2)
+    assert_eq(hits[2].index, 3)
+    #assert(hits[0].score >= hits[1].score)
+    #assert(hits[1].score >= hits[2].score)
+    ids = emb_top_k([1.0, 0.0], rows, 2, EMB_DOT)
+    assert_eq(ids[0], 1)
+    assert_eq(ids[1], 2)
+    l2 = emb_top_k([0.0, 1.0], rows, 1, EMB_L2)
+    assert_eq(l2[0], 0)
+}
+
+/// Test that search clamps k and keeps lower index on ties.
+test "search clamps k and keeps lower index on ties" {
+    rows = [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+    all = emb_search([1.0, 0.0], rows, 10, EMB_COSINE)
+    assert_eq(host.sys_arr_len(all), 3)
+    assert_eq(all[0].index, 0)
+    assert_eq(all[1].index, 1)
+    assert_eq(all[2].index, 2)
+    assert_eq(host.sys_arr_len(emb_search([1.0, 0.0], rows, 0, EMB_COSINE)), 0)
+    assert_eq(host.sys_arr_len(emb_search([1.0, 0.0], [], 3, EMB_COSINE)), 0)
+}
+
+/// Test that the vocabulary builds tokens and ranks merges.
+test "the vocabulary builds tokens and ranks merges" {
+    v = EmbVocab.empty()
+    assert_eq(v.size(), 1)
+    assert_eq(v.id_of("<unk>"), 0)
+    assert_eq(@v.add_token("a"), 1)
+    assert_eq(@v.add_token("b"), 2)
+    assert_eq(@v.add_token("a"), 1)
+    assert_eq(v.size(), 3)
+    assert_eq(v.id_of("b"), 2)
+    assert_eq(v.id_of("zz"), -1)
+    assert_eq(@v.add_merge("a", "b"), 0)
+    assert_eq(v.id_of("ab"), 3)
+    assert_eq(v.rank("a", "b"), 0)
+    assert_eq(v.rank("b", "a"), -1)
+    parts = emb_split_space("th e")
+    assert_eq(parts[0], "th")
+    assert_eq(parts[1], "e")
+    assert_eq(emb_split_space("x")[1], "")
+}
+
+/// Test that BPE merges follow rank order and round trip.
+test "BPE merges follow rank order and round trip" {
+    v = EmbVocab.mini()
+    units = emb_bpe_units(v, "the thing")
+    assert_eq(host.sys_arr_len(units), 4)
+    assert_eq(units[0], "the")
+    assert_eq(units[1], " ")
+    assert_eq(units[2], "th")
+    assert_eq(units[3], "ing")
+    ids = emb_bpe_encode(v, "the thing")
+    assert_eq(host.sys_arr_len(ids), 4)
+    assert_eq(emb_bpe_decode(v, ids), "the thing")
+    assert_eq(host.sys_arr_len(emb_bpe_units(v, "thing")), 2)
+    ing = emb_bpe_units(v, "ing")
+    assert_eq(ing[0], "ing")
+    assert_eq(host.sys_arr_len(ing), 1)
+    assert_eq(emb_bpe_decode(v, emb_bpe_encode(v, "hello, world! 42")), "hello, world! 42")
+    assert_eq(host.sys_arr_len(emb_bpe_encode(v, "")), 0)
+}
+
+/// Test that unknown characters map to id zero.
+test "unknown characters map to id zero" {
+    v = EmbVocab.mini()
+    ids = emb_bpe_encode(v, "a#b")
+    assert_eq(host.sys_arr_len(ids), 3)
+    assert_eq(ids[1], 0)
+    assert_eq(emb_bpe_decode(v, ids), "ab")
+    assert_eq(emb_bpe_decode(v, [-3, 9999, 0]), "")
+    merged = emb_merge_pair(["t", "h", "t", "h", "t"], "t", "h")
+    assert_eq(host.sys_arr_len(merged), 3)
+    assert_eq(merged[0], "th")
+    assert_eq(merged[2], "t")
+    assert_eq(host.sys_arr_len(emb_chars("héy")), 3)
+}
+
+/// Test that hashed embeddings rank similar text first.
+test "hashed embeddings rank similar text first" {
+    v = EmbVocab.mini()
+    docs = ["the thing", "an order", "ring ring", "the rest"]
+    rows = []
+    for docs { rows = host.sys_arr_push(rows, emb_hash_embed(v, it, 32)) }
+    q = emb_hash_embed(v, "the thing", 32)
+    #assert(host.sys_abs(emb_norm(q) - 1.0) < 0.000001)
+    hits = emb_search(q, rows, 2, EMB_COSINE)
+    assert_eq(hits[0].index, 0)
+    #assert(host.sys_abs(hits[0].score - 1.0) < 0.000001)
+    #assert(hits[0].score >= hits[1].score)
+    assert_eq(emb_norm(emb_hash_embed(v, "", 8)), 0.0)
+    assert_eq(host.sys_arr_len(emb_hash_embed(v, "abc", 0)), 0)
+}

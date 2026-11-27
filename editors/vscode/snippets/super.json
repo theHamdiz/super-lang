@@ -1,0 +1,62 @@
+{
+  "Use module": {
+    "prefix": "use",
+    "body": ["use ${1:std.${2:http}}"],
+    "description": "Import a module"
+  },
+  "Mod re-export": {
+    "prefix": "mod",
+    "body": ["mod ${1:path}"],
+    "description": "Module path / manifest segment"
+  },
+  "Doc comment": {
+    "prefix": "///",
+    "body": ["/// ${1:description}"],
+    "description": "Documentation line comment"
+  },
+  "Inline function": {
+    "prefix": "=>",
+    "body": ["${1:name}(${2:args}) => ${3:expr}"],
+    "description": "Single-expression inline function"
+  },
+  "Stack array": {
+    "prefix": "[;",
+    "body": ["[${1:val}; ${2:N}]"],
+    "description": "Zero-heap stack array [val; N]"
+  },
+  "Parallel range": {
+    "prefix": "par",
+    "body": ["par 0..${1:N} (+) {", "  ${2}", "}"],
+    "description": "Parallel range reduction"
+  },
+  "Loop forever": {
+    "prefix": "loop",
+    "body": ["loop {", "  ${1}", "}"],
+    "description": "Infinite loop"
+  },
+  "Mutable borrow param": {
+    "prefix": "@param",
+    "body": ["@${1:name}"],
+    "description": "In-place mutable @ parameter"
+  },
+  "Ternary": {
+    "prefix": "?:",
+    "body": ["${1:cond} ? ${2:then} : ${3:else}"],
+    "description": "Ternary conditional"
+  },
+  "Postfix if": {
+    "prefix": "ifpost",
+    "body": ["${1:stmt} if ${2:cond}"],
+    "description": "Postfix if guard"
+  },
+  "Sum for": {
+    "prefix": "sumfor",
+    "body": ["sum ${1:acc} for ${2:xs}"],
+    "description": "Destination sum: sum acc for xs"
+  },
+  "Sum for expression": {
+    "prefix": "sumforexpr",
+    "body": ["sum ${1:it} for ${2:x} in ${3:xs} if ${4:true}"],
+    "description": "Sum reduction over range"
+  }
+}

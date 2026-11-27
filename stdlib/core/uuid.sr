@@ -1,0 +1,214 @@
+//! std.core.uuid — 128-bit UUID with v4 (CSPRNG) and v7 (Unix-ms ordered)
+//!
+//! Import: use std.core.uuid
+//!
+//! Flat C-ABI: 16 byte lanes. Wire form is 8-4-4-4-12 hex.
+
+/// `UUID_HEX` is `"0123456789abcdef"`.
++UUID_HEX = "0123456789abcdef"
+
+/// `Uuid` is a 16-byte identifier (nil, v4, or v7).
++Uuid: Display, ToString = {
+    /// B0 on `Uuid` (`i64`). Defaults to `0`.
+    b0: i64 = 0
+    /// B1 on `Uuid` (`i64`). Defaults to `0`.
+    b1: i64 = 0
+    /// B2 on `Uuid` (`i64`). Defaults to `0`.
+    b2: i64 = 0
+    /// B3 on `Uuid` (`i64`). Defaults to `0`.
+    b3: i64 = 0
+    /// B4 on `Uuid` (`i64`). Defaults to `0`.
+    b4: i64 = 0
+    /// B5 on `Uuid` (`i64`). Defaults to `0`.
+    b5: i64 = 0
+    /// B6 on `Uuid` (`i64`). Defaults to `0`.
+    b6: i64 = 0
+    /// B7 on `Uuid` (`i64`). Defaults to `0`.
+    b7: i64 = 0
+    /// B8 on `Uuid` (`i64`). Defaults to `0`.
+    b8: i64 = 0
+    /// B9 on `Uuid` (`i64`). Defaults to `0`.
+    b9: i64 = 0
+    /// B10 on `Uuid` (`i64`). Defaults to `0`.
+    b10: i64 = 0
+    /// B11 on `Uuid` (`i64`). Defaults to `0`.
+    b11: i64 = 0
+    /// B12 on `Uuid` (`i64`). Defaults to `0`.
+    b12: i64 = 0
+    /// B13 on `Uuid` (`i64`). Defaults to `0`.
+    b13: i64 = 0
+    /// B14 on `Uuid` (`i64`). Defaults to `0`.
+    b14: i64 = 0
+    /// B15 on `Uuid` (`i64`). Defaults to `0`.
+    b15: i64 = 0
+
+    /// The all-zero UUID.
+    nil() : Uuid => Uuid.{}
+
+    /// True when this UUID is all zeros.
+    is_nil(self) : bool {
+        self.b0 == 0 && self.b1 == 0 && self.b2 == 0 && self.b3 == 0 && self.b4 == 0 && self.b5 == 0 && self.b6 == 0 && self.b7 == 0 && self.b8 == 0 && self.b9 == 0 && self.b10 == 0 && self.b11 == 0 && self.b12 == 0 && self.b13 == 0 && self.b14 == 0 && self.b15 == 0
+    }
+
+    /// Byte at on this `Uuid` (`i`). Returns `i64`.
+    byte_at(self, i: i64) : i64 {
+        if i == 0 { return self.b0 }
+        if i == 1 { return self.b1 }
+        if i == 2 { return self.b2 }
+        if i == 3 { return self.b3 }
+        if i == 4 { return self.b4 }
+        if i == 5 { return self.b5 }
+        if i == 6 { return self.b6 }
+        if i == 7 { return self.b7 }
+        if i == 8 { return self.b8 }
+        if i == 9 { return self.b9 }
+        if i == 10 { return self.b10 }
+        if i == 11 { return self.b11 }
+        if i == 12 { return self.b12 }
+        if i == 13 { return self.b13 }
+        if i == 14 { return self.b14 }
+        self.b15
+    }
+
+    /// UUID whose 16 bytes are `b`.
+    from_bytes(b: _) : Uuid {
+        Uuid.{
+            b0: b[0] % 256, b1: b[1] % 256, b2: b[2] % 256, b3: b[3] % 256,
+            b4: b[4] % 256, b5: b[5] % 256, b6: b[6] % 256, b7: b[7] % 256,
+            b8: b[8] % 256, b9: b[9] % 256, b10: b[10] % 256, b11: b[11] % 256,
+            b12: b[12] % 256, b13: b[13] % 256, b14: b[14] % 256, b15: b[15] % 256
+        }
+    }
+
+    /// Random version-4 UUID.
+    v4() : Uuid {
+        hex = host.sys_hex_encode(host.sys_rand_bytes(16))
+        b = uuid_hex_to_bytes(hex)
+        b = host.sys_arr_set(b, 6, uuid_set_hi_nibble(b[6], 4))
+        b = host.sys_arr_set(b, 8, 128 + (b[8] % 64))
+        Uuid.from_bytes(b)
+    }
+
+    /// Time-ordered version-7 UUID.
+    v7() : Uuid {
+        ms = host.sys_unix_ns() / 1000000
+        hex = host.sys_hex_encode(host.sys_rand_bytes(10))
+        r = uuid_hex_to_bytes(hex)
+        b = host.sys_arr_new(16, 0)
+        for 0..6 {
+            shift = (5 - it) * 8
+            b = host.sys_arr_set(b, it, uuid_shr(ms, shift) % 256)
+        }
+        b = host.sys_arr_set(b, 6, 112 + (r[0] % 16))
+        b = host.sys_arr_set(b, 7, r[1] % 256)
+        b = host.sys_arr_set(b, 8, 128 + (r[2] % 64))
+        for 0..7 {
+            b = host.sys_arr_set(b, 9 + it, r[3 + it] % 256)
+        }
+        Uuid.from_bytes(b)
+    }
+
+    /// Canonical 8-4-4-4-12 text for this UUID.
+    /// Display witness. Same text as `to_str`.
+    display(self) : str => self.to_str()
+
+    to_str(self) : str {
+        out = ""
+        for 0..16 {
+            v = self.byte_at(it)
+            out = out + UUID_HEX[v / 16] + UUID_HEX[v % 16]
+            if it == 3 || it == 5 || it == 7 || it == 9 { out = out + "-" }
+        }
+        out
+    }
+
+    /// UUID parsed from the canonical text `s`, or fail.
+    parse(s: str) : Uuid! {
+        n = host.sys_str_len(s)
+        ensure n == 36 else {
+            fail "uuid: expected 8-4-4-4-12 form"
+            return
+        }
+        ensure s[8] == "-" && s[13] == "-" && s[18] == "-" && s[23] == "-" else {
+            fail "uuid: missing dashes"
+            return
+        }
+        compact = ""
+        for 0..n {
+            if s[it] != "-" { compact = compact + s[it] }
+        }
+        ensure host.sys_str_len(compact) == 32 else {
+            fail "uuid: incomplete"
+            return
+        }
+        Uuid.from_bytes(uuid_hex_to_bytes(compact))
+    }
+}
+
+/// Set hi nibble (`b`, `ver`). Returns `i64`.
++uuid_set_hi_nibble(b: i64, ver: i64) : i64 => ver * 16 + (b % 16)
+
+/// Shr (`v`, `bits`). Returns `i64`.
++uuid_shr(v: i64, bits: i64) : i64 {
+    out = v
+    for 0..bits { out = out / 2 }
+    out
+}
+
+/// Hex val (`c`). Returns `i64`.
++uuid_hex_val(c: str) : i64 {
+    found = 0
+    for 0..16 {
+        if UUID_HEX[it] == c { found = it }
+    }
+    up = "ABCDEF"
+    for 0..6 {
+        if up[it] == c { found = 10 + it }
+    }
+    found
+}
+
+/// Hex to bytes (`hex`).
++uuid_hex_to_bytes(hex: str) : _ {
+    s = hex
+    n = host.sys_str_len(s) / 2
+    if n > 16 { n = 16 }
+    out = host.sys_arr_new(16, 0)
+    for 0..n {
+        i = it
+        idx = i * 2
+        hv = uuid_hex_val(s[idx])
+        lv = uuid_hex_val(s[idx + 1])
+        out = host.sys_arr_set(out, i, hv * 16 + lv)
+    }
+    out
+}
+
+/// Test that stdlib.uuid v4 version and variant.
+test "stdlib.uuid v4 version and variant" {
+    u = Uuid.v4()
+    #assert(!(u.is_nil()))
+    s = u.to_str()
+    assert_eq(host.sys_str_len(s), 36)
+    assert_eq(s[14], "4")
+    v = s[19]
+    ok = v == "8" || v == "9" || v == "a" || v == "b"
+    #assert(ok)
+}
+
+/// Test that stdlib.uuid v7 version nibble.
+test "stdlib.uuid v7 version nibble" {
+    u = Uuid.v7()
+    s = u.to_str()
+    assert_eq(host.sys_str_len(s), 36)
+    assert_eq(s[14], "7")
+}
+
+/// Test that stdlib.uuid parse roundtrip.
+test "stdlib.uuid parse roundtrip" {
+    u = Uuid.v4()
+    s = u.to_str()
+    p = Uuid.parse(s) or Uuid.nil()
+    assert_eq(p.to_str(), s)
+    assert_eq(host.sys_str_len(s), 36)
+}

@@ -1,0 +1,118 @@
+//! seedance — ByteDance Seedance / Ark video generation
+//!
+//!   use seedance
+//!   s = Seedance.new("key")
+//!   res = @s.video("a cat surfing", "seedance-1-0-pro-250528", 5)
+//!   res = @s.poll(res.text)   // task id from create
+
+use std.ai.client
+use std.core.str
+use std.net.http
+
++SEEDANCE_BASE = "https://ark.cn-beijing.volces.com"
+
++Seedance = {
+    client: AiClient = AiClient.new("seedance", "", "")
+
+    new(api_key: str) : Seedance {
+        Seedance.{client: AiClient.with_auth("seedance", SEEDANCE_BASE, api_key, AI_AUTH_ARK)}
+    }
+
+    set_offline(@self, on: bool) : bool {
+        c = self.client
+        @c.set_offline(on)
+        self.client = c
+        on
+    }
+
+    set_timeout(@self, ms: i64) : i64 {
+        c = self.client
+        @c.set_timeout(ms)
+        self.client = c
+        ms
+    }
+
+    push_mock(@self, body: str) : i64 {
+        c = self.client
+        n = @c.push_mock(body)
+        self.client = c
+        n
+    }
+
+    -run(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        c = self.client
+        res = @c.request(path, req, body)
+        self.client = c
+        res
+    }
+
+    video(@self, prompt: str, model: str, duration_s: i64) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_VIDEO, messages: [], prompt, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: "", size: "1280x720", duration_s, stop: []
+        }
+        body = "{\"model\":" + ai_json_str(model) + ",\"content\":[{\"type\":\"text\",\"text\":" + ai_json_str(prompt) + "}]"
+        body = body + ",\"duration\":" + "{duration_s}" + "}"
+        @self.run("/api/v3/contents/generations/tasks", req, body)
+    }
+
+    /// Image-to-video: `media_url` is the source frame.
+    video_from_image(@self, prompt: str, media_url: str, model: str, duration_s: i64) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_VIDEO, messages: [], prompt, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url,
+            voice: "", size: "1280x720", duration_s, stop: []
+        }
+        body = "{\"model\":" + ai_json_str(model) + ",\"content\":["
+        body = body + "{\"type\":\"text\",\"text\":" + ai_json_str(prompt) + "},"
+        body = body + "{\"type\":\"image_url\",\"image_url\":{\"url\":" + ai_json_str(media_url) + "}}"
+        body = body + "],\"duration\":" + "{duration_s}" + "}"
+        @self.run("/api/v3/contents/generations/tasks", req, body)
+    }
+
+    /// Poll a previously created task by id (GET).
+    poll(@self, task_id: str) : AiResponse {
+        req = AiRequest.{
+            model: "", modality: AI_VIDEO, messages: [], prompt: "", system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: "", size: "", duration_s: 0, stop: []
+        }
+        path = "/api/v3/contents/generations/tasks/" + task_id
+        // Offline: reuse request() with empty POST body for mock queue parity.
+        if self.client.offline {
+            return @self.run(path, req, "")
+        }
+        url = self.client.resolve_url(path)
+        httpc = Client.new()
+        httpc.timeout_ms = self.client.timeout_ms
+        hs = self.client.auth_headers()
+        res = @httpc.fetch("GET", url, hs, "") or err {
+            @httpc.close_idle()
+            return AiResponse.{
+                ok: false, provider: "seedance", model: "", modality: AI_VIDEO, text: "", json: "",
+                status: 0, error: "ai: poll failed: {err}", usage_in: 0, usage_out: 0,
+                finish: "", embedding: [], tool_calls: "", media_b64: ""
+            }
+        }
+        @httpc.close_idle()
+        ai_parse_response("seedance", req, res.status, res.body)
+    }
+}
+
+test "seedance video offline" {
+    s = Seedance.new("key")
+    @s.push_mock("{\"id\":\"task-1\",\"status\":\"submitted\",\"text\":\"task-1\"}")
+    res = @s.video("cat surfing", "seedance-1-0-pro-250528", 5)
+    #assert(res.ok)
+    assert_eq(res.modality, AI_VIDEO)
+    #assert(contains(s.client.last_body, "cat surfing"))
+}
+
+test "seedance poll offline" {
+    s = Seedance.new("key")
+    @s.push_mock("{\"id\":\"task-1\",\"status\":\"succeeded\",\"content\":{\"video_url\":\"https://x/v.mp4\"}}")
+    res = @s.poll("task-1")
+    #assert(res.ok)
+    #assert(contains(res.json, "succeeded"))
+}

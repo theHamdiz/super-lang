@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/"/>
+<link rel="icon" href="assets/favicon.ico" sizes="any"/>
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png"/>
+<link rel="icon" type="image/png" href="assets/icons/super.png"/>
+<link rel="apple-touch-icon" href="assets/icons/super.png"/>
+<meta name="description" content="Low-boilerplate .sr with SuperAot and SuperJit — scoped stacks, UFCS, @ mutation, and Pod.toml."/>
+<meta name="theme-color" content="#ff7a1f"/>
+<meta property="og:type" content="website"/>
+<meta property="og:site_name" content="Super"/>
+<meta property="og:locale" content="en_US"/>
+<meta property="og:title" content="Super · Home"/>
+<meta property="og:description" content="Low-boilerplate .sr with SuperAot and SuperJit — scoped stacks, UFCS, @ mutation, and Pod.toml."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/"/>
+<meta property="og:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<meta property="og:image:width" content="1200"/>
+<meta property="og:image:height" content="630"/>
+<meta property="og:image:alt" content="Super language"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="Super · Home"/>
+<meta name="twitter:description" content="Low-boilerplate .sr with SuperAot and SuperJit — scoped stacks, UFCS, @ mutation, and Pod.toml."/>
+<meta name="twitter:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Super", "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux, macOS, FreeBSD, Windows", "softwareVersion": "0.1.0", "license": "https://opensource.org/licenses/MIT", "url": "https://thehamdiz.github.io/super-lang/", "description": "Low-boilerplate .sr with SuperAot and SuperJit — scoped stacks, UFCS, @ mutation, and Pod.toml.", "downloadUrl": "https://thehamdiz.github.io/super-lang/install/", "author": {"@type": "Person", "name": "Ahmad Hamdi"}}</script>
+<title>Super · Home</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="site.css"/>
+<script src="super-highlight.js" defer></script>
+
+</head>
+<body>
+
+<header class="site-nav">
+  <a class="mark" href="./">Super</a>
+  <nav><a href="./">Home</a><a href="benchmarks/">Benchmarks</a><a href="winners/">Winners</a><a href="charts/">Charts</a><a href="spec/">Spec</a><a href="book/">Book</a><a href="examples/">Examples</a><a href="install/">Install</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a><a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a></nav>
+  <a class="cta" href="downloads/SUPER_BOOK.pdf" download>Download book</a>
+</header>
+<section class="landing-excerpt" id="what-is-super">
+  <h1>Super for APIs and ECS</h1>
+  <p class="landing-lead">Super (<code>.sr</code>) is a stack-oriented language with low-boilerplate expression syntax, scoped data stacks, heavy comptime, C23 AOT, a bytecode VM, and a numeric-loop JIT — plus optional law/proof files beside ordinary tests. One tree feeds SuperAot and SuperJit for backends and data-oriented engines.</p>
+  <ul class="landing-points" data-reveal>
+    <li data-reveal>Expression syntax without <code>fn</code> / <code>let</code> ceremony</li>
+    <li data-reveal>Frame-local allocation via scoped data stacks (Memory axis leader)</li>
+    <li data-reveal><code>super verify</code> for law/proof sidecars (experimental checker)</li>
+  </ul>
+  <div class="hero-actions" data-reveal>
+    <a class="cta" href="quickstart/">Quickstart</a>
+    <a class="cta" href="install/">Install Super</a>
+    <a class="cta-ghost" href="http-server/">Build an API</a>
+    <a class="cta-ghost" href="docs-hub/">Docs</a>
+    <a class="cta-ghost" href="benchmarks/">Scoreboard</a>
+    <a class="cta-ghost" href="spec/">Read the spec</a>
+  </div>
+  <div class="install-copy" data-ui data-reveal>
+    <p class="install-copy-label">Install in one line</p>
+    <pre><code id="install-snippet">sh -c &#x27;f=$(mktemp) &amp;&amp; trap &quot;rm -f -- \&quot;$f\&quot;&quot; 0 &amp;&amp; curl --proto =https -fL https://thehamdiz.github.io/super-lang/install.sh -o &quot;$f&quot; &amp;&amp; sh &quot;$f&quot; &quot;$@&quot;&#x27; sh</code></pre>
+    <button type="button" class="cta" data-copy-target="install-snippet">Copy command</button>
+  </div>
+</section>
+<section class="section">
+  <h2>Syntax without ceremony</h2>
+  <div class="code-stage" data-ui data-reveal>
+    <pre class="sr-block"><code class="language-sr">+TaxRate = 0.14
+
++User = {
+  id: i64
+  name: str
+  balance: f64 = 0.0
+
+  discount(@self, percent: f64) : f64 {
+    cut = self.balance * (percent / 100.0)
+    self.balance -= cut
+    self.balance
+  }
+}
+
++add_tax(amount: f64) =&gt; amount * (1.0 + TaxRate)
+
+final = @u.discount(10.0).add_tax().round(2)
+</code></pre>
+  </div>
+</section>
+<section class="section band-surface">
+  <h2>Two runtimes</h2>
+  <div class="runtime-board" data-ui data-reveal>
+    <div data-reveal><strong>SuperAot</strong><em>Native ahead-of-time binary from algo.sr</em></div>
+    <div data-reveal><strong>SuperJit</strong><em>Sub-millisecond hot reload path</em></div>
+    <div data-reveal><strong>UFCS</strong><em>@ mutation, implicit it, value errors</em></div>
+    <div data-reveal><strong>Pod.toml</strong><em>One manifest for deps, targets, profiles</em></div>
+  </div>
+</section>
+<section class="section band-ink">
+  <h2>Scoreboard</h2>
+  <p class="note chart-note">Stage-1 composite scores are on the benchmarks page. The composite weights are:</p>
+  <div class="weight-poster" data-ui data-reveal>
+    <p class="weight-line" data-reveal><strong>40</strong> Speed</p>
+    <p class="weight-line" data-reveal><strong>25</strong> Memory</p>
+    <p class="weight-line" data-reveal><strong>15</strong> Reliability</p>
+    <p class="weight-line" data-reveal><strong>10</strong> Cycle</p>
+    <p class="weight-line" data-reveal><strong>10</strong> LoC</p>
+  </div>
+</section>
+<section class="section">
+  <h2>Pipeline shape</h2>
+  <div class="pipeline-board" data-ui data-reveal>
+    <ol data-stagger>
+      <li data-reveal>Lex · arena tokens</li>
+      <li data-reveal>Parse · NodeId AST</li>
+      <li data-reveal>Sema · single-pass types</li>
+      <li data-reveal>VM / JIT · hot path</li>
+    </ol>
+  </div>
+</section>
+<section class="cta-band">
+  <div class="cta-main" data-reveal>
+    <h2>Prove it</h2>
+    <p style="color:#ffb07a;max-width:42ch">Stage-1 equal-algorithm suite with checksum gates. Scores are frozen from one run on a single machine (<a href="https://github.com/theHamdiz/super-lang/blob/main/docs/REPORT.md">full report</a>). Zig wins Speed; overlapping confidence intervals on nbody, astar, and json are labelled within noise.</p>
+    <a class="cta" href="benchmarks/" style="background:var(--accent-ink);color:var(--ink);margin-top:1.25rem">Open scoreboard</a>
+    <p style="margin-top:0.75rem"><a href="https://github.com/theHamdiz/super-lang/blob/main/benchmarks/REPRODUCE.md">REPRODUCE.md</a> · <a href="benchmarks/#toolchain">Toolchain and LoC notes</a></p>
+  </div>
+  <aside class="cta-side book-panel" data-reveal>
+    <h3>Read the book</h3>
+    <p><a href="spec/">Specification</a> (normative) · <a href="book/">Book</a> (narrative) · <a href="downloads/SUPER_BOOK.pdf">PDF</a></p>
+    <a class="cta" href="spec/">Open spec</a>
+  </aside>
+</section>
+<footer class="site-footer">
+  <div class="footer-links">
+    <a href="benchmarks/">Benchmarks</a>
+    <a href="winners/">Winners</a>
+    <a href="charts/">Charts</a>
+    <a href="book/">Book</a>
+    <a href="install/">Install</a>
+    <a href="safety-claims/">Safety</a>
+    <a href="reproduce-benchmarks/">Reproduce</a>
+    <a href="https://github.com/theHamdiz/super-lang/blob/main/ROADMAP.md" rel="noopener noreferrer">Roadmap</a>
+    <a href="https://github.com/theHamdiz/super-lang/blob/main/SECURITY.md" rel="noopener noreferrer">Security</a>
+    <a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a>
+    <a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a>
+    <a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a>
+  </div>
+  <div class="footer-mark" aria-hidden="true">
+    <span>S</span><span>u</span><span>p</span><span>e</span><span>r</span>
+  </div>
+  <div class="footer-legal">
+    <span>Super language</span>
+  </div>
+</footer>
+<script>(function () {
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((e) => {
+      if (e.isIntersecting) {
+        e.target.classList.add("in");
+        const delayKids = e.target.querySelectorAll(":scope > [data-reveal], :scope [data-stagger] > *");
+        delayKids.forEach((kid, i) => {
+          kid.style.transitionDelay = (i * 70) + "ms";
+          kid.classList.add("in");
+        });
+      }
+    });
+  }, { threshold: 0.12 });
+  document.querySelectorAll("[data-reveal]").forEach((el) => io.observe(el));
+})();
+(function () {
+  document.querySelectorAll("[data-copy-target]").forEach((btn) => {
+    const label = btn.textContent || "Copy";
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-copy-target");
+      const el = id ? document.getElementById(id) : null;
+      if (!el) return;
+      const text = el.textContent || "";
+      const done = () => {
+        btn.textContent = "Copied";
+        setTimeout(() => { btn.textContent = label; }, 1800);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(() => {
+          window.prompt("Copy install command", text);
+        });
+      } else {
+        window.prompt("Copy install command", text);
+      }
+    });
+  });
+})();</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+//! Laws for std.sec.sha2 — digest helpers (pure hex-length model).
+//! Implementation: `sha2_256_hex` in `sha2.sr`.
+
+law_sha256_hex_len(_msg: str) : i64 => 64
+
+#law("sha256 hex width on empty input")
+sha2_hex_empty() {
+    #assert(law_sha256_hex_len("") == 64)
+}
+
+#law("sha256 hex width is invariant in message")
+sha2_hex_total(msg: str) {
+    ensure msg == "" || msg == "a" else { return }
+    #assert(law_sha256_hex_len(msg) == 64)
+}

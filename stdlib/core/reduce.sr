@@ -1,0 +1,168 @@
+//! std.core.reduce — associative reducers and Iterable helpers
+//!
+//! Import with:
+//!   use std.core.reduce
+//!
+//! Reductions are ordinary UFCS methods on arrays and ranges
+//! (`xs.sum()`, `xs.map(it * 2).sum()`, `xs.mean()`). This module
+//! exports named `AssociativeReducer` witnesses for custom / parallel folds:
+//!
+//!   partials = [0; workers]
+//!   par w in 0..workers { partials[w] = chunk.sum() }
+//!   total = partials.sum()
+//!
+//! Complexity for pure reductions: O(n) time, O(1) auxiliary space.
+//! `mean` / `variance` use Welford (and its associative merge). Order
+//! statistics (`median`, `quantile`) live on contiguous slices in
+//! `std.math.stats` and use in-place selection — not streaming iterators.
+
+/// Integer / float addition monoid.
++SumReducer: AssociativeReducer = {
+    total: _ = 0
+    identity() : SumReducer => SumReducer.{total: 0}
+    accumulate(@self, item) {
+        self.total += item
+        self
+    }
+    merge(@self, other: SumReducer) {
+        self.total += other.total
+        self
+    }
+    finalize(self)  => self.total
+}
+
+/// Multiplication monoid (identity 1).
++ProductReducer: AssociativeReducer = {
+    total: _ = 1
+    identity() : ProductReducer => ProductReducer.{total: 1}
+    accumulate(@self, item) {
+        self.total *= item
+        self
+    }
+    merge(@self, other: ProductReducer) {
+        self.total *= other.total
+        self
+    }
+    finalize(self)  => self.total
+}
+
+/// Running minimum (empty finalize yields 0).
++MinReducer: AssociativeReducer = {
+    value: _ = 0
+    seen: i64 = 0
+    identity() : MinReducer => MinReducer.{value: 0, seen: 0}
+    accumulate(@self, item) {
+        if self.seen == 0 || item < self.value {
+            self.value = item
+            self.seen = 1
+        }
+        self
+    }
+    merge(@self, other: MinReducer) {
+        if other.seen != 0 {
+            if self.seen == 0 || other.value < self.value {
+                self.value = other.value
+                self.seen = 1
+            }
+        }
+        self
+    }
+    finalize(self)  => self.value
+}
+
+/// Running maximum (empty finalize yields 0).
++MaxReducer: AssociativeReducer = {
+    value: _ = 0
+    seen: i64 = 0
+    identity() : MaxReducer => MaxReducer.{value: 0, seen: 0}
+    accumulate(@self, item) {
+        if self.seen == 0 || item > self.value {
+            self.value = item
+            self.seen = 1
+        }
+        self
+    }
+    merge(@self, other: MaxReducer) {
+        if other.seen != 0 {
+            if self.seen == 0 || other.value > self.value {
+                self.value = other.value
+                self.seen = 1
+            }
+        }
+        self
+    }
+    finalize(self)  => self.value
+}
+
+/// Welford mean/variance acc. `finalize` returns the mean; use
+/// `welford_variance` for the population variance. Parallel merge is the
+/// Chan / Pébay associative combination of first and second moments.
++WelfordReducer: AssociativeReducer = {
+    count: i64 = 0
+    mean: f64 = 0.0
+    m2: f64 = 0.0
+    identity() : WelfordReducer => WelfordReducer.{count: 0, mean: 0.0, m2: 0.0}
+    accumulate(@self, item) {
+        x = host.sys_to_float(item)
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / host.sys_to_float(self.count)
+        delta2 = x - self.mean
+        self.m2 += delta * delta2
+        self
+    }
+    merge(@self, other: WelfordReducer) {
+        ensure other.count > 0 else { return self }
+        ensure self.count > 0 else {
+            self.count = other.count
+            self.mean = other.mean
+            self.m2 = other.m2
+            return self
+        }
+        n = self.count + other.count
+        delta = other.mean - self.mean
+        self.mean = (self.mean * host.sys_to_float(self.count) + other.mean * host.sys_to_float(other.count)) / host.sys_to_float(n)
+        self.m2 += other.m2 + delta * delta * host.sys_to_float(self.count) * host.sys_to_float(other.count) / host.sys_to_float(n)
+        self.count = n
+        self
+    }
+    finalize(self) : f64 => self.mean
+}
+
+/// Population variance from a Welford acc (0 when empty).
++welford_variance(acc: WelfordReducer) : f64 {
+    ensure acc.count > 0 else { return 0.0 }
+    acc.m2 / host.sys_to_float(acc.count)
+}
+
+/// Sample variance (Bessel) from a Welford acc.
++welford_sample_variance(acc: WelfordReducer) : f64 {
+    ensure acc.count > 1 else { return 0.0 }
+    acc.m2 / host.sys_to_float(acc.count - 1)
+}
+
+/// Fold `xs` starting from an `AssociativeReducer` seed (sequential). Prefer
+/// `xs.sum()` / `xs.mean()` pipelines when the reducer is a builtin.
++reduce_with(xs: _, seed: _) {
+    // Prefer fused Iterable pipelines (`xs.sum()`) for builtins. This helper
+    // exists for custom AssociativeReducer seeds when merge/finalize matter.
+    acc = seed
+    for xs {
+        acc = @acc.accumulate(it)
+    }
+    acc.finalize()
+}
+
+test "iterable pipelines sum product min max" {
+    xs = [2, 3, 4]
+    assert_eq(xs.sum(), 9)
+    assert_eq(xs.product(), 24)
+    assert_eq(xs.min(), 2)
+    assert_eq(xs.max(), 4)
+}
+
+test "welford mean and variance match pipeline" {
+    xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert_eq(xs.mean(), 3.0)
+    #assert(host.sys_abs(xs.variance() - 2.0) < 0.0001)
+}

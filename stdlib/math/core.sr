@@ -1,0 +1,490 @@
+//! std.math.core — enterprise scalar mathematics (libm + pure Super)
+//!
+//! Import with:
+//!   use std.math.core
+//!
+//! Covers: constants, classification, rounding, powers/logs, trig & hyperbolic,
+//! integer number theory, bit helpers, and polynomial evaluation. Vector/matrix
+//! work lives in `use std.math.linalg`; RNG in `std.math.rand`; noise in `std.math.noise`.
+
+use std.core.collections
+
+/// `M_PI` is `3.141592653589793`.
++M_PI = 3.141592653589793
+/// `M_TAU` is `6.283185307179586`.
++M_TAU = 6.283185307179586
+/// `M_E` is `2.718281828459045`.
++M_E = 2.718281828459045
+/// `M_LN2` is `0.6931471805599453`.
++M_LN2 = 0.6931471805599453
+/// `M_LN10` is `2.302585092994046`.
++M_LN10 = 2.302585092994046
+/// `M_SQRT2` is `1.4142135623730951`.
++M_SQRT2 = 1.4142135623730951
+/// `M_EPS` is `0.000000000000001`.
++M_EPS = 0.000000000000001
+/// `M_INF` is `1.0 / 0.0`.
++M_INF = 1.0 / 0.0
+
+// --- classification / compare ------------------------------------------------
+
+/// Absolute value of `x`, from the host.
++m_abs(x: f64) : f64 => host.sys_abs(x)
+/// Sign of `x`: `-1` when negative, `0` when zero, `1` when positive.
++m_sign(x: f64) : f64 {
+    if x > 0.0 { return 1.0 }
+    if x < 0.0 { return 0.0 - 1.0 }
+    0.0
+}
+/// Lesser of `a` and `b`.
++m_min(a: f64, b: f64) : f64 {
+    if a < b { return a }
+    b
+}
+/// Greater of `a` and `b`.
++m_max(a: f64, b: f64) : f64 {
+    if a > b { return a }
+    b
+}
+/// `x` clamped into the inclusive range `lo`..`hi`.
++m_clamp(x: f64, lo: f64, hi: f64) : f64 => m_min(m_max(x, lo), hi)
+/// Ergonomic aliases (prefer these at call sites; `m_*` keeps the full surface explicit).
++abs(x: f64) : f64 => m_abs(x)
+/// Lesser of `a` and `b`.
++min(a: f64, b: f64) : f64 => m_min(a, b)
+/// Greater of `a` and `b`.
++max(a: f64, b: f64) : f64 => m_max(a, b)
+/// `x` clamped into the inclusive range `lo`..`hi`.
++clamp(x: f64, lo: f64, hi: f64) : f64 => m_min(m_max(x, lo), hi)
+/// True when `a` and `b` are nearly equal.
++m_close(a: f64, b: f64) : bool => m_abs(a - b) < 0.000001
+/// M close eps (`a`, `b`, `eps`). Returns `f64`.
++m_close_eps(a: f64, b: f64, eps: f64) : f64 {
+    if m_abs(a - b) < eps { return 1.0 }
+    0.0
+}
+/// M is finite (`x`).
++m_is_finite(x: f64) : bool => x == x && x != M_INF && x != (0.0 - M_INF)
+/// M is nan (`x`).
++m_is_nan(x: f64) : bool => x != x
+
+// --- rounding ----------------------------------------------------------------
+
+/// Floor of `x`.
++m_floor(x: f64) : f64 => host.sys_floor(x)
+/// Ceiling of `x`.
++m_ceil(x: f64) : f64 => host.sys_ceil(x)
+/// `x` truncated toward zero.
++m_trunc(x: f64) : f64 => host.sys_trunc(x)
+/// `x` rounded to the nearest integer.
++m_round(x: f64) : f64 => host.sys_round(x)
+/// Fractional part of `x`.
++m_fract(x: f64) : f64 => x - host.sys_floor(x)
+/// `x` truncated toward zero as an `i64`.
++m_to_i64(x: f64) : i64 => host.sys_to_int(x)
+/// `n` widened to `f64`.
++m_from_i64(n: i64) : f64 => host.sys_to_float(n)
+/// `n` widened to `f64`.
++to_float(n: i64) : f64 => m_from_i64(n)
+/// Greatest integer less than or equal to `x`, as a float.
++floor(x: f64) : f64 => m_floor(x)
+/// Smallest integer greater than or equal to `x`, as a float.
++ceil(x: f64) : f64 => m_ceil(x)
+/// `x` rounded to the nearest integer, as a float.
++round(x: f64) : f64 => m_round(x)
+/// `x` truncated toward zero as an `i64`.
++to_int(x: f64) : i64 => m_to_i64(x)
+
+// --- powers / logs / roots ---------------------------------------------------
+
+/// Square root of `x`.
++m_sqrt(x: f64) : f64 => host.sys_sqrt(x)
+/// Cube root of `x`.
++m_cbrt(x: f64) : f64 => host.sys_cbrt(x)
+/// Euclidean length of the vector (`x`, `y`).
++m_hypot(x: f64, y: f64) : f64 => host.sys_hypot(x, y)
+/// `base` raised to the power `exp`.
++m_pow(base: f64, exp: f64) : f64 => host.sys_pow(base, exp)
+/// `e` raised to `x`.
++m_exp(x: f64) : f64 => host.sys_exp(x)
+/// Natural logarithm of `x`.
++m_ln(x: f64) : f64 => host.sys_ln(x)
+/// Base-2 logarithm of `x`.
++m_log2(x: f64) : f64 => host.sys_log2(x)
+/// Base-10 logarithm of `x`.
++m_log10(x: f64) : f64 => host.sys_log10(x)
+/// Square root of `x`.
++sqrt(x: f64) : f64 => m_sqrt(x)
+/// Cube root of `x`.
++cbrt(x: f64) : f64 => m_cbrt(x)
+/// Euclidean length of the vector (`x`, `y`).
++hypot(x: f64, y: f64) : f64 => m_hypot(x, y)
+/// `base` raised to the power `exp`.
++pow(base: f64, exp: f64) : f64 => m_pow(base, exp)
+/// `e` raised to `x`.
++exp(x: f64) : f64 => m_exp(x)
+/// Natural logarithm of `x`.
++ln(x: f64) : f64 => m_ln(x)
+/// Base-2 logarithm of `x`.
++log2(x: f64) : f64 => m_log2(x)
+/// Base-10 logarithm of `x`.
++log10(x: f64) : f64 => m_log10(x)
+/// Logarithm of `base` in base `x`.
++m_log(base: f64, x: f64) : f64 => host.sys_ln(x) / host.sys_ln(base)
+/// `e` raised to `x`, minus 1.
++m_expm1(x: f64) : f64 => host.sys_exp(x) - 1.0
+/// Natural logarithm of `1 + `x``.
++m_ln1p(x: f64) : f64 => host.sys_ln(1.0 + x)
+/// Remainder of `x` divided by `y`.
++m_fmod(x: f64, y: f64) : f64 => host.sys_fmod(x, y)
+
+// --- trig / hyperbolic -------------------------------------------------------
+
+/// Sine of `x` radians.
++m_sin(x: f64) : f64 => host.sys_sin(x)
+/// Cosine of `x` radians.
++m_cos(x: f64) : f64 => host.sys_cos(x)
+/// Tangent of `x` radians.
++m_tan(x: f64) : f64 => host.sys_tan(x)
+/// Arcsine of `x`, in radians.
++m_asin(x: f64) : f64 => host.sys_asin(x)
+/// Arccosine of `x`, in radians.
++m_acos(x: f64) : f64 => host.sys_acos(x)
+/// Arctangent of `x`, in radians.
++m_atan(x: f64) : f64 => host.sys_atan(x)
+/// Arctangent of `y` / `x`, in radians, using both signs.
++m_atan2(y: f64, x: f64) : f64 => host.sys_atan2(y, x)
+/// Hyperbolic sine of `x`.
++m_sinh(x: f64) : f64 => host.sys_sinh(x)
+/// Hyperbolic cosine of `x`.
++m_cosh(x: f64) : f64 => host.sys_cosh(x)
+/// Hyperbolic tangent of `x`.
++m_tanh(x: f64) : f64 => host.sys_tanh(x)
+/// Sine of `x` radians.
++sin(x: f64) : f64 => m_sin(x)
+/// Cosine of `x` radians.
++cos(x: f64) : f64 => m_cos(x)
+/// Tangent of `x` radians.
++tan(x: f64) : f64 => m_tan(x)
+/// Arcsine of `x`, in radians.
++asin(x: f64) : f64 => m_asin(x)
+/// Arccosine of `x`, in radians.
++acos(x: f64) : f64 => m_acos(x)
+/// Arctangent of `x`, in radians.
++atan(x: f64) : f64 => m_atan(x)
+/// Arctangent of `y` / `x`, in radians, using both signs.
++atan2(y: f64, x: f64) : f64 => m_atan2(y, x)
+/// `d` degrees converted to radians.
++deg_to_rad(d: f64) : f64 => d * M_PI / 180.0
+/// `r` radians converted to degrees.
++rad_to_deg(r: f64) : f64 => r * 180.0 / M_PI
+
+/// Wrap angle into (-π, π].
++m_wrap_pi(x: f64) : f64 {
+    t = host.sys_fmod(x + M_PI, M_TAU)
+    if t < 0.0 { t += M_TAU }
+    t - M_PI
+}
+
+// --- interpolation / easing --------------------------------------------------
+
+/// Linear blend from `a` toward `b` by fraction `t`.
++m_lerp(a: f64, b: f64, t: f64) : f64 => a + (b - a) * t
+/// Where `v` sits between `a` and `b`, as a 0..1 fraction.
++m_inv_lerp(a: f64, b: f64, v: f64) : f64 {
+    ensure m_abs(b - a) > M_EPS else { return 0.0 }
+    (v - a) / (b - a)
+}
+/// `a1` mapped from the range `v`..`a0` into another range. Extra arguments are the destination bounds.
++m_remap(v: f64, a0: f64, a1: f64, b0: f64, b1: f64) : f64 => m_lerp(b0, b1, m_inv_lerp(a0, a1, v))
+/// Hermite smoothstep of `x` between edges `e0` and `e1`.
++m_smoothstep(e0: f64, e1: f64, x: f64) : f64 {
+    t = m_clamp((x - e0) / (e1 - e0), 0.0, 1.0)
+    t * t * (3.0 - 2.0 * t)
+}
+/// Perlin smootherstep of `x` between edges `e0` and `e1`.
++m_smootherstep(e0: f64, e1: f64, x: f64) : f64 {
+    t = m_clamp((x - e0) / (e1 - e0), 0.0, 1.0)
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+/// Horner evaluation of coeffs[0] + coeffs[1]*x + … (low degree first).
++m_poly(coeffs: _, x: f64) : f64 {
+    n = host.sys_arr_len(coeffs)
+    ensure n > 0 else { return 0.0 }
+    acc = 0.0
+    i = n - 1
+    for 0..n {
+        acc = acc * x + coeffs[i]
+        i = i - 1
+    }
+    acc
+}
+
+// --- integer number theory ---------------------------------------------------
+
+/// Absolute value of `n`.
++i_abs(n: i64) : i64 {
+    if n < 0 { return -n }
+    n
+}
+/// Lesser of `a` and `b`.
++i_min(a: i64, b: i64) : i64 {
+    if a < b { return a }
+    b
+}
+/// Greater of `a` and `b`.
++i_max(a: i64, b: i64) : i64 {
+    if a > b { return a }
+    b
+}
+/// `n` clamped into the inclusive range `lo`..`hi`.
++i_clamp(n: i64, lo: i64, hi: i64) : i64 => i_min(i_max(n, lo), hi)
+
+/// Greatest common divisor of `a` and `b`.
++i_gcd(a: i64, b: i64) : i64 {
+    x = i_abs(a)
+    y = i_abs(b)
+    for 0..128 {
+        ensure y != 0 else { return x }
+        t = y
+        y = x % y
+        x = t
+    }
+    x
+}
+
+/// Least common multiple of `a` and `b`.
++i_lcm(a: i64, b: i64) : i64 {
+    ensure a != 0 && b != 0 else { return 0 }
+    g = i_gcd(a, b)
+    i_abs(a / g * b)
+}
+
+/// `base` raised to the power `exp`.
++i_pow(base: i64, exp: i64) : i64 {
+    ensure exp >= 0 else { return 0 }
+    acc = 1
+    b = base
+    e = exp
+    for 0..63 {
+        if e == 0 { return acc }
+        if e % 2 == 1 { acc = acc * b }
+        b = b * b
+        e = e / 2
+    }
+    acc
+}
+
+/// True when `n` is even.
++i_is_even(n: i64) : bool => n % 2 == 0
+/// True when `n` is odd.
++i_is_odd(n: i64) : bool => n % 2 != 0
+
+/// True when `n` is a prime integer.
++i_is_prime(n: i64) : bool {
+    ensure n >= 2 else { return false }
+    ensure n > 3 else { return true }
+    ensure n % 2 != 0 && n % 3 != 0 else { return false }
+    i = 5
+    ok = true
+    for 0..100000 {
+        if i * i > n { return ok }
+        if n % i == 0 || n % (i + 2) == 0 { ok = false }
+        i += 6
+    }
+    ok
+}
+
+/// Next prime >= n (small n; returns n when already prime).
++i_next_prime(n: i64) : i64 {
+    x = n
+    if x < 2 { x = 2 }
+    for 0..100000 {
+        if i_is_prime(x) { return x }
+        x += 1
+    }
+    x
+}
+
+/// Integer square root (Newton).
++i_sqrt(n: i64) : i64 {
+    if n <= 0 { return 0 }
+    x = n
+    y = (n + 1) >> 1
+    while y < x {
+        x = y
+        y = (x + n / x) >> 1
+    }
+    x
+}
+
+/// Q10 series for `exp(-f/1024)` fractional part (`f` in 0..1023).
++exp_frac_q10(f: i64) : i64 {
+    term = 1024
+    sum = 1024
+    for k in 1..7 {
+        term = ((term * f) >> 10) / k
+        if k % 2 == 1 { sum -= term } else { sum += term }
+    }
+    i_max(sum, 0)
+}
+
+/// Q10 `exp(-x/1024)` with integer reduction by `e1 = exp_frac_q10(1024)`.
++exp_q10(x: i64, e1: i64) : i64 {
+    a = 0 - x
+    n = a >> 10
+    if n >= 16 { return 0 }
+    r = exp_frac_q10(a & 1023)
+    for 0..n { r = (r * e1) >> 10 }
+    r
+}
+
+/// `y[t,o] = (sum_i x[t,i]*w[i,o]) >> 10` for `rows` tokens.
++matmul_q10(x, w, @y, rows: i64, din: i64, dout: i64) {
+    for t in 0..rows {
+        for o in 0..dout {
+            s = 0
+            for i in 0..din { s += x[t * din + i] * w[i * dout + o] }
+            y[t * dout + o] = s >> 10
+        }
+    }
+}
+
+/// Per-token RMS norm over width `d` (Q10 inverse scale).
++rms_norm_q10(@h, rows: i64, d: i64) {
+    for t in 0..rows {
+        ss = 0
+        for i in 0..d {
+            v = h[t * d + i]
+            ss += v * v
+        }
+        inv = (1 << 20) / (i_sqrt(ss / d) + 1)
+        for i in 0..d { h[t * d + i] = (h[t * d + i] * inv) >> 10 }
+    }
+}
+
+/// Fill `w[0..n)` with `Lcg.roll() % 257 - 128`. Typed `@rng: Lcg` avoids Dyn `roll` CallHost.
++fill_w_pm128(@rng: Lcg, @w, n: i64) {
+    for i in 0..n { w[i] = @rng.roll() % 257 - 128 }
+}
+
+/// Factorial for n in 0..20 (fits i64).
++i_fact(n: i64) : i64 {
+    ensure n >= 0 && n <= 20 else { return 0 }
+    acc = 1
+    for 1..(n + 1) { acc = acc * it }
+    acc
+}
+
+/// Binomial coefficient C(`n`, `k`).
++i_binom(n: i64, k: i64) : i64 {
+    ensure n >= 0 && k >= 0 && k <= n else { return 0 }
+    kk = k
+    if kk > n - kk { kk = n - kk }
+    acc = 1
+    for 0..kk {
+        i = it
+        acc = acc * (n - i) / (i + 1)
+    }
+    acc
+}
+
+/// Test that constants and classification.
+test "constants and classification" {
+    #assert(m_close(M_PI, 3.141592653589793))
+    assert_eq(m_abs(0.0 - 3.5), 3.5)
+    assert_eq(abs(0.0 - 3.5), 3.5)
+    assert_eq(m_sign(0.0 - 2.0), 0.0 - 1.0)
+    assert_eq(m_clamp(5.0, 0.0, 1.0), 1.0)
+    assert_eq(clamp(5.0, 0.0, 1.0), 1.0)
+    assert_eq(min(2.0, 3.0), 2.0)
+    assert_eq(max(2.0, 3.0), 3.0)
+    #assert(m_is_nan(0.0 / 0.0))
+    #assert(m_is_finite(1.0))
+}
+
+/// Test that english aliases match m_* kernels.
+test "english aliases match m_* kernels" {
+    assert_eq(sqrt(16.0), 4.0)
+    assert_eq(cbrt(27.0), 3.0)
+    assert_eq(hypot(3.0, 4.0), 5.0)
+    assert_eq(pow(2.0, 10.0), 1024.0)
+    assert_eq(exp(0.0), 1.0)
+    assert_eq(ln(1.0), 0.0)
+    assert_eq(log2(8.0), 3.0)
+    assert_eq(log10(1000.0), 3.0)
+    assert_eq(floor(1.9), 1.0)
+    assert_eq(floor(0.0 - 1.1), 0.0 - 2.0)
+    assert_eq(ceil(1.1), 2.0)
+    assert_eq(round(2.5), 3.0)
+    assert_eq(round(0.0 - 2.4), 0.0 - 2.0)
+    assert_eq(sin(0.0), 0.0)
+    assert_eq(cos(0.0), 1.0)
+    assert_eq(tan(0.0), 0.0)
+    assert_eq(asin(0.0), 0.0)
+    assert_eq(acos(1.0), 0.0)
+    assert_eq(atan(0.0), 0.0)
+    #assert(m_close(atan2(1.0, 1.0), M_PI / 4.0))
+    #assert(m_close(atan2(0.0, 0.0 - 1.0), M_PI))
+    assert_eq(to_int(3.99), 3)
+    assert_eq(to_int(0.0 - 3.99), 0 - 3)
+    assert_eq(abs(0.0 - 7.25), 7.25)
+    assert_eq(min(0.0 - 1.0, 1.0), 0.0 - 1.0)
+    assert_eq(max(0.0 - 1.0, 1.0), 1.0)
+    assert_eq(clamp(0.0 - 5.0, 0.0, 1.0), 0.0)
+    assert_eq(clamp(0.5, 0.0, 1.0), 0.5)
+    #assert(m_close(sqrt(2.0) * sqrt(2.0), 2.0))
+}
+
+/// Test that rounding and roots.
+test "rounding and roots" {
+    assert_eq(m_floor(1.9), 1.0)
+    assert_eq(m_ceil(1.1), 2.0)
+    assert_eq(m_round(1.5), 2.0)
+    assert_eq(m_trunc(0.0 - 1.9), 0.0 - 1.0)
+    #assert(m_close(m_fract(3.25), 0.25))
+    #assert(m_close(m_sqrt(9.0), 3.0))
+    #assert(m_close(m_cbrt(8.0), 2.0))
+    #assert(m_close(m_hypot(3.0, 4.0), 5.0))
+}
+
+/// Test that powers logs trig.
+test "powers logs trig" {
+    #assert(m_close(m_pow(2.0, 10.0), 1024.0))
+    #assert(m_close(m_exp(0.0), 1.0))
+    #assert(m_close(m_ln(M_E), 1.0))
+    #assert(m_close(m_log2(8.0), 3.0))
+    #assert(m_close(m_log10(1000.0), 3.0))
+    #assert(m_close(m_sin(0.0), 0.0))
+    #assert(m_close(m_cos(0.0), 1.0))
+    #assert(m_close(m_tan(0.0), 0.0))
+    #assert(m_close(deg_to_rad(180.0), M_PI))
+    #assert(m_close(rad_to_deg(M_PI), 180.0))
+    #assert(m_close(m_asin(0.0), 0.0))
+    #assert(m_close(m_atan2(0.0, 1.0), 0.0))
+}
+
+/// Test that lerp remap easing poly.
+test "lerp remap easing poly" {
+    #assert(m_close(m_lerp(0.0, 10.0, 0.5), 5.0))
+    #assert(m_close(m_inv_lerp(0.0, 10.0, 5.0), 0.5))
+    #assert(m_close(m_remap(5.0, 0.0, 10.0, 0.0, 100.0), 50.0))
+    #assert(m_close(m_smoothstep(0.0, 1.0, 0.5), 0.5))
+    // 1 + 2x + 3x^2 at x=2 → 1+4+12 = 17
+    #assert(m_close(m_poly([1.0, 2.0, 3.0], 2.0), 17.0))
+}
+
+/// Test that integer number theory.
+test "integer number theory" {
+    assert_eq(i_gcd(54, 24), 6)
+    assert_eq(i_lcm(4, 6), 12)
+    assert_eq(i_pow(2, 10), 1024)
+    #assert(i_is_prime(2))
+    #assert(i_is_prime(97))
+    #assert(!(i_is_prime(100)))
+    assert_eq(i_next_prime(14), 17)
+    assert_eq(i_fact(5), 120)
+    assert_eq(i_binom(10, 3), 120)
+    assert_eq(i_clamp(50, 0, 10), 10)
+}

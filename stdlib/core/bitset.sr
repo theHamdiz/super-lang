@@ -1,0 +1,839 @@
+//! std.core.bitset — dense bit sets, bloom filters and sparse bitmaps
+//!
+//! Import with:
+//!   use std.core.bitset
+//!
+//! `BitSet` packs 32 bits per array word and grows on demand:
+//!
+//!   seen = BitSet.new(1000)
+//!   @seen.set(42)
+//!   if seen.test(42) { print("{seen.count()} bit(s)") }
+//!
+//! `Bloom` answers "definitely absent / maybe present" for string keys in fixed memory:
+//!
+//!   filter = Bloom.for_items(10000, 10)
+//!   @filter.insert("alice")
+//!   filter.maybe_contains("alice")     // true
+//!   filter.maybe_contains("bob")       // almost certainly false
+//!
+//! `SparseBits` stores only the non-zero words of a huge, mostly-empty index space.
+//! The pure helpers (`bs_get`, `bs_with`, `bs_without`, `bs_popcount32`) work directly on
+//! word arrays for callers that keep the words themselves.
+
+/// Bits stored per array word.
++BS_WORD_BITS = 32
+/// Mask selecting the low 32 bits.
++BS_MASK32 = 4294967295
+
+/// Number of 32-bit words needed to hold `nbits` bits.
++bs_word_count(nbits: i64) : i64 {
+    if nbits <= 0 { return 0 }
+    padded = nbits + 31
+    padded / 32
+}
+
+/// Number of one bits in the low 32 bits of `v`.
++bs_popcount32(v: i64) : i64 {
+    x = v & 4294967295
+    x = x - ((x >>> 1) & 1431655765)
+    x = (x & 858993459) + ((x >>> 2) & 858993459)
+    x = (x + (x >>> 4)) & 252645135
+    folded = ((x * 16843009) & 4294967295) >>> 24
+    folded
+}
+
+/// Index of the lowest set bit of the low 32 bits of `v` (32 when `v` has none). Isolates the
+/// lowest bit with `v & -v`, then counts the ones below it: branch-free, no bit-by-bit scan.
++bs_ctz32(v: i64) : i64 {
+    x = v & 4294967295
+    if x == 0 { return 32 }
+    bs_popcount32((x & (0 - x)) - 1)
+}
+
+/// Index of the highest set bit of the low 32 bits of `v` (-1 when `v` has none): smear the
+/// top bit downward, then popcount.
++bs_msb32(v: i64) : i64 {
+    x = v & 4294967295
+    if x == 0 { return -1 }
+    x = x | (x >>> 1)
+    x = x | (x >>> 2)
+    x = x | (x >>> 4)
+    x = x | (x >>> 8)
+    x = x | (x >>> 16)
+    bs_popcount32(x) - 1
+}
+
+/// True when every bit set in `a` is also set in `b` (word-wise, no allocation; missing words are 0).
++bs_words_subset(a: _, b: _) : bool {
+    na = host.sys_arr_len(a)
+    nb = host.sys_arr_len(b)
+    for 0..na {
+        w = 0
+        if it < nb { w = b[it] }
+        if (a[it] & (BS_MASK32 ^ w)) != 0 { return false }
+    }
+    true
+}
+
+/// `n` zero words.
++bs_zero_words(n: i64) : _ {
+    if n <= 0 { return [] }
+    host.sys_arr_new(n, 0)
+}
+
+/// True when bit `i` of the word array `words` is set (false when out of range).
++bs_get(words: _, i: i64) : bool {
+    if i < 0 { return false }
+    w = i / 32
+    if w >= host.sys_arr_len(words) { return false }
+    bit = (words[w] >>> (i % 32)) & 1
+    bit == 1
+}
+
+/// `words` with bit `i` set, growing the array when needed. Negative `i` is ignored.
++bs_with(words: _, i: i64) : _ {
+    if i < 0 { return words }
+    w = i / 32
+    out = words
+    n = host.sys_arr_len(out)
+    while n <= w {
+        out = host.sys_arr_push(out, 0)
+        n += 1
+    }
+    host.sys_arr_set(out, w, out[w] | (1 << (i % 32)))
+}
+
+/// `words` with bit `i` cleared. Out-of-range or negative `i` is ignored.
++bs_without(words: _, i: i64) : _ {
+    if i < 0 { return words }
+    w = i / 32
+    if w >= host.sys_arr_len(words) { return words }
+    host.sys_arr_set(words, w, words[w] & (BS_MASK32 ^ (1 << (i % 32))))
+}
+
+/// Total one bits across `words`.
++bs_count(words: _) : i64 {
+    total = 0
+    for words { total += bs_popcount32(it) }
+    total
+}
+
+/// `BitSet` is a growable set of non-negative integers backed by 32-bit words.
++BitSet: Eq = {
+    /// Packed words, least significant bit first. Defaults to `[]`.
+    words: _ = []
+
+    /// Empty set with room for `nbits` bits (it still grows past that).
+    new(nbits: i64) : BitSet => BitSet.{words: bs_zero_words(bs_word_count(nbits))}
+
+    /// Set containing every index in `indices`.
+    from_indices(indices: _) : BitSet {
+        b = BitSet.new(0)
+        for indices { @b.set(it) }
+        b
+    }
+
+    /// Bits of capacity currently allocated.
+    capacity(self) : i64 => host.sys_arr_len(self.words) * 32
+
+    /// Add `i`. Returns true when it was newly added. Negative `i` is ignored (false).
+    set(@self, i: i64) : bool {
+        if i < 0 { return false }
+        was = bs_get(self.words, i)
+        self.words = bs_with(self.words, i)
+        !was
+    }
+
+    /// Remove `i`. Returns true when it was present.
+    clear(@self, i: i64) : bool {
+        was = bs_get(self.words, i)
+        self.words = bs_without(self.words, i)
+        was
+    }
+
+    /// Flip `i` and return its new state. Negative `i` is ignored (false).
+    toggle(@self, i: i64) : bool {
+        if i < 0 { return false }
+        if bs_get(self.words, i) {
+            self.words = bs_without(self.words, i)
+            return false
+        }
+        self.words = bs_with(self.words, i)
+        true
+    }
+
+    /// True when `i` is in the set.
+    test(self, i: i64) : bool => bs_get(self.words, i)
+
+    /// Remove every element (capacity is kept).
+    reset(@self) {
+        self.words = bs_zero_words(host.sys_arr_len(self.words))
+    }
+
+    /// Number of elements.
+    count(self) : i64 => bs_count(self.words)
+
+    /// True when no bit is set (stops at the first non-zero word).
+    is_empty(self) : bool {
+        for self.words {
+            if it != 0 { return false }
+        }
+        true
+    }
+
+    /// Smallest element at or after `from`, or -1 when there is none. Skips empty words and
+    /// finds the bit inside a word with `bs_ctz32`.
+    next_set(self, from: i64) : i64 {
+        start = from
+        if start < 0 { start = 0 }
+        nw = host.sys_arr_len(self.words)
+        w0 = start / 32
+        for w0..nw {
+            word = self.words[it]
+            if it == w0 { word = word & (BS_MASK32 ^ ((1 << (start % 32)) - 1)) }
+            if word != 0 { return it * 32 + bs_ctz32(word) }
+        }
+        -1
+    }
+
+    /// Smallest element, or -1 when empty.
+    first_set(self) : i64 => self.next_set(0)
+
+    /// Largest element, or -1 when empty. Scans words from the top and uses `bs_msb32`.
+    last_set(self) : i64 {
+        nw = host.sys_arr_len(self.words)
+        for 0..nw {
+            w = nw - 1 - it
+            if self.words[w] != 0 { return w * 32 + bs_msb32(self.words[w]) }
+        }
+        -1
+    }
+
+    /// Elements in ascending order. Peels the lowest set bit of each word instead of testing all 32.
+    to_indices(self) : _ {
+        out = []
+        for 0..host.sys_arr_len(self.words) {
+            w = it
+            word = self.words[w] & BS_MASK32
+            while word != 0 {
+                low = word & (0 - word)
+                out = host.sys_arr_push(out, w * 32 + bs_popcount32(low - 1))
+                word = word ^ low
+            }
+        }
+        out
+    }
+
+    /// Elements present in `self` or `other`.
+    union(self, other: BitSet) : BitSet {
+        na = host.sys_arr_len(self.words)
+        nb = host.sys_arr_len(other.words)
+        n = na
+        if nb > n { n = nb }
+        out = bs_zero_words(n)
+        for 0..n {
+            a = 0
+            b = 0
+            if it < na { a = self.words[it] }
+            if it < nb { b = other.words[it] }
+            out = host.sys_arr_set(out, it, a | b)
+        }
+        BitSet.{words: out}
+    }
+
+    /// Elements present in both `self` and `other`.
+    intersect(self, other: BitSet) : BitSet {
+        na = host.sys_arr_len(self.words)
+        nb = host.sys_arr_len(other.words)
+        n = na
+        if nb < n { n = nb }
+        out = bs_zero_words(n)
+        for 0..n {
+            out = host.sys_arr_set(out, it, self.words[it] & other.words[it])
+        }
+        BitSet.{words: out}
+    }
+
+    /// Elements of `self` that are not in `other`.
+    difference(self, other: BitSet) : BitSet {
+        na = host.sys_arr_len(self.words)
+        nb = host.sys_arr_len(other.words)
+        out = bs_zero_words(na)
+        for 0..na {
+            b = 0
+            if it < nb { b = other.words[it] }
+            out = host.sys_arr_set(out, it, self.words[it] & (BS_MASK32 ^ b))
+        }
+        BitSet.{words: out}
+    }
+
+    /// True when every element of `self` is also in `other` (word-wise, no allocation).
+    is_subset_of(self, other: BitSet) : bool => bs_words_subset(self.words, other.words)
+
+    /// Set equality (trailing zero words do not matter).
+    eq(self, other: BitSet) : bool => bs_words_subset(self.words, other.words) && bs_words_subset(other.words, self.words)
+
+    /// Number of elements in both `self` and `other`, by popcount of the word-wise AND (no allocation).
+    intersect_count(self, other: BitSet) : i64 {
+        n = host.sys_arr_len(self.words)
+        nb = host.sys_arr_len(other.words)
+        if nb < n { n = nb }
+        total = 0
+        for 0..n { total += bs_popcount32(self.words[it] & other.words[it]) }
+        total
+    }
+}
+
+// --- bloom filter ------------------------------------------------------------------------
+
+/// 32-bit FNV-1a hash of `key`, seeded with `seed`.
++bloom_hash(key: str, seed: i64) : i64 {
+    h = (2166136261 ^ seed) & 4294967295
+    n = host.sys_str_len(key)
+    for 0..n {
+        h = ((h ^ host.sys_ord(key[it])) * 16777619) & 4294967295
+    }
+    h
+}
+
+/// Fixed-size bloom filter over string keys, using double hashing.
++Bloom = {
+    /// Packed filter bits. Defaults to `[]`.
+    words: _ = []
+    /// Filter size in bits. Defaults to `0`.
+    nbits: i64 = 0
+    /// Number of hash probes per key. Defaults to `0`.
+    k: i64 = 0
+    /// Keys inserted so far (duplicates counted). Defaults to `0`.
+    inserted: i64 = 0
+
+    /// Filter of `nbits` bits (at least 8) probing `k` positions (at least 1) per key.
+    new(nbits: i64, k: i64) : Bloom {
+        m = nbits
+        if m < 8 { m = 8 }
+        probes = k
+        if probes < 1 { probes = 1 }
+        Bloom.{words: bs_zero_words(bs_word_count(m)), nbits: m, k: probes, inserted: 0}
+    }
+
+    /// Filter sized for about `items` keys at `bits_per_item` bits each (10 gives roughly a
+    /// 1% false-positive rate); the probe count is the optimal `bits_per_item * ln 2`.
+    for_items(items: i64, bits_per_item: i64) : Bloom {
+        n = items
+        if n < 1 { n = 1 }
+        bpi = bits_per_item
+        if bpi < 1 { bpi = 1 }
+        probes = bpi * 693 / 1000
+        if probes < 1 { probes = 1 }
+        Bloom.new(n * bpi, probes)
+    }
+
+    /// Bit position of probe `i` for `key` (Kirsch-Mitzenmacher double hashing).
+    probe(self, key: str, i: i64) : i64 {
+        h1 = bloom_hash(key, 0)
+        h2 = bloom_hash(key, 2654435769) | 1
+        at = (h1 + i * h2) % self.nbits
+        at
+    }
+
+    /// Add `key` to the filter.
+    insert(@self, key: str) {
+        for 0..self.k {
+            self.words = bs_with(self.words, self.probe(key, it))
+        }
+        self.inserted += 1
+    }
+
+    /// False when `key` was definitely never inserted; true when it may have been.
+    maybe_contains(self, key: str) : bool {
+        hit = true
+        for 0..self.k {
+            if !bs_get(self.words, self.probe(key, it)) { hit = false }
+        }
+        hit
+    }
+
+    /// Bits currently set.
+    bits_set(self) : i64 => bs_count(self.words)
+
+    /// Fraction of bits set, in parts per thousand.
+    fill_permille(self) : i64 => self.bits_set() * 1000 / self.nbits
+
+    /// Merge `other` (same size and probe count) into `dst`. Returns false on a mismatch.
+    merge(@dst, other: Bloom) : bool {
+        if dst.nbits != other.nbits { return false }
+        if dst.k != other.k { return false }
+        for 0..host.sys_arr_len(dst.words) {
+            dst.words = host.sys_arr_set(dst.words, it, dst.words[it] | other.words[it])
+        }
+        dst.inserted += other.inserted
+        true
+    }
+
+    /// Forget every key.
+    reset(@self) {
+        self.words = bs_zero_words(host.sys_arr_len(self.words))
+        self.inserted = 0
+    }
+}
+
+// --- sparse bitmap -----------------------------------------------------------------------
+
+/// Sparse set of non-negative integers: parallel sorted arrays of word indices and 32-bit
+/// word values, so memory scales with the populated words, not the index range.
++SparseBits = {
+    /// Sorted word indices (`i / 32`) that hold at least one bit. Defaults to `[]`.
+    keys: _ = []
+    /// Word value for each entry of `keys`. Defaults to `[]`.
+    vals: _ = []
+
+    /// Empty sparse set.
+    new() : SparseBits => SparseBits.{keys: [], vals: []}
+
+    /// Set containing every index in `indices`.
+    from_indices(indices: _) : SparseBits {
+        s = SparseBits.new()
+        for indices { @s.set(it) }
+        s
+    }
+
+    /// Position of word index `key` in `keys`, or `-(insertion point) - 1` when absent.
+    find(self, key: i64) : i64 {
+        lo = 0
+        hi = host.sys_arr_len(self.keys)
+        for 0..40 {
+            if lo < hi {
+                mid = (lo + hi) / 2
+                if self.keys[mid] < key {
+                    lo = mid + 1
+                } else {
+                    hi = mid
+                }
+            }
+        }
+        if lo < host.sys_arr_len(self.keys) {
+            if self.keys[lo] == key { return lo }
+        }
+        -lo - 1
+    }
+
+    /// True when `i` is in the set.
+    test(self, i: i64) : bool {
+        if i < 0 { return false }
+        pos = self.find(i / 32)
+        if pos < 0 { return false }
+        bit = (self.vals[pos] >>> (i % 32)) & 1
+        bit == 1
+    }
+
+    /// Add `i`. Returns true when it was newly added.
+    set(@self, i: i64) : bool {
+        if i < 0 { return false }
+        key = i / 32
+        mask = 1 << (i % 32)
+        pos = self.find(key)
+        if pos >= 0 {
+            old = self.vals[pos]
+            self.vals = host.sys_arr_set(self.vals, pos, old | mask)
+            return (old & mask) == 0
+        }
+        at = -pos - 1
+        ks = []
+        vs = []
+        n = host.sys_arr_len(self.keys)
+        for 0..at {
+            ks = host.sys_arr_push(ks, self.keys[it])
+            vs = host.sys_arr_push(vs, self.vals[it])
+        }
+        ks = host.sys_arr_push(ks, key)
+        vs = host.sys_arr_push(vs, mask)
+        for at..n {
+            ks = host.sys_arr_push(ks, self.keys[it])
+            vs = host.sys_arr_push(vs, self.vals[it])
+        }
+        self.keys = ks
+        self.vals = vs
+        true
+    }
+
+    /// Remove `i`. Returns true when it was present. Empty words are dropped.
+    clear(@self, i: i64) : bool {
+        if i < 0 { return false }
+        pos = self.find(i / 32)
+        if pos < 0 { return false }
+        mask = 1 << (i % 32)
+        old = self.vals[pos]
+        if (old & mask) == 0 { return false }
+        left = old & (BS_MASK32 ^ mask)
+        if left != 0 {
+            self.vals = host.sys_arr_set(self.vals, pos, left)
+            return true
+        }
+        ks = []
+        vs = []
+        for 0..host.sys_arr_len(self.keys) {
+            if it != pos {
+                ks = host.sys_arr_push(ks, self.keys[it])
+                vs = host.sys_arr_push(vs, self.vals[it])
+            }
+        }
+        self.keys = ks
+        self.vals = vs
+        true
+    }
+
+    /// Number of elements.
+    count(self) : i64 => bs_count(self.vals)
+
+    /// Number of populated words (the memory cost).
+    word_count(self) : i64 => host.sys_arr_len(self.keys)
+
+    /// Elements in ascending order.
+    to_indices(self) : _ {
+        out = []
+        for 0..host.sys_arr_len(self.keys) {
+            p = it
+            for 0..32 {
+                if ((self.vals[p] >>> it) & 1) == 1 {
+                    out = host.sys_arr_push(out, self.keys[p] * 32 + it)
+                }
+            }
+        }
+        out
+    }
+
+    /// Elements present in `self` or `other`.
+    union(self, other: SparseBits) : SparseBits {
+        out = SparseBits.from_indices(self.to_indices())
+        for other.to_indices() { @out.set(it) }
+        out
+    }
+
+    /// Number of elements present in both `self` and `other`.
+    intersect_count(self, other: SparseBits) : i64 {
+        total = 0
+        for 0..host.sys_arr_len(self.keys) {
+            pos = other.find(self.keys[it])
+            if pos >= 0 { total += bs_popcount32(self.vals[it] & other.vals[pos]) }
+        }
+        total
+    }
+
+    /// Dense `BitSet` with the same elements.
+    to_dense(self) : BitSet => BitSet.from_indices(self.to_indices())
+}
+
+/// Sparse copy of the dense set `b`.
++bitset_to_sparse(b: BitSet) : SparseBits => SparseBits.from_indices(b.to_indices())
+
+// --- tests -------------------------------------------------------------------------------
+
+/// Test that popcount and word helpers are exact.
+test "bs_popcount32 and word helpers" {
+    assert_eq(bs_popcount32(0), 0)
+    assert_eq(bs_popcount32(1), 1)
+    assert_eq(bs_popcount32(255), 8)
+    assert_eq(bs_popcount32(4294967295), 32)
+    assert_eq(bs_popcount32(2863311530), 16)
+    assert_eq(bs_popcount32(2147483648), 1)
+    assert_eq(bs_word_count(0), 0)
+    assert_eq(bs_word_count(1), 1)
+    assert_eq(bs_word_count(32), 1)
+    assert_eq(bs_word_count(33), 2)
+    w = bs_with([], 70)
+    assert_eq(host.sys_arr_len(w), 3)
+    #assert(bs_get(w, 70))
+    #assert(!(bs_get(w, 71)))
+    #assert(!(bs_get(w, 5000)))
+    #assert(!(bs_get(w, -1)))
+    w2 = bs_without(w, 70)
+    #assert(!(bs_get(w2, 70)))
+    assert_eq(bs_count(w2), 0)
+    assert_eq(host.sys_arr_len(bs_with([], -4)), 0)
+}
+
+/// Test that set, clear, test and count behave across word boundaries.
+test "BitSet set clear test count" {
+    b = BitSet.new(100)
+    assert_eq(b.capacity(), 128)
+    #assert(b.is_empty())
+    #assert(@b.set(0))
+    #assert(!(@b.set(0)))
+    #assert(@b.set(31))
+    #assert(@b.set(32))
+    #assert(@b.set(99))
+    assert_eq(b.count(), 4)
+    #assert(b.test(31))
+    #assert(!(b.test(33)))
+    #assert(!(b.test(-5)))
+    #assert(@b.clear(31))
+    #assert(!(@b.clear(31)))
+    #assert(!(@b.clear(5000)))
+    assert_eq(b.count(), 3)
+    #assert(!(@b.set(-1)))
+    assert_eq(b.count(), 3)
+    @b.reset()
+    assert_eq(b.count(), 0)
+    assert_eq(b.capacity(), 128)
+}
+
+/// Test that BitSet grows past its initial capacity and toggles.
+test "BitSet grows and toggles" {
+    b = BitSet.new(0)
+    assert_eq(b.capacity(), 0)
+    #assert(@b.set(1000))
+    #assert(b.test(1000))
+    #assert(b.capacity() >= 1001)
+    #assert(!(@b.toggle(1000)))
+    #assert(!(b.test(1000)))
+    #assert(@b.toggle(7))
+    #assert(b.test(7))
+    #assert(!(@b.toggle(-3)))
+}
+
+/// Test that iteration helpers return sorted indices.
+test "BitSet iteration" {
+    b = BitSet.from_indices([70, 3, 3, 31, 32, 64])
+    assert_eq(b.count(), 5)
+    idx = b.to_indices()
+    assert_eq(host.sys_arr_len(idx), 5)
+    assert_eq(idx[0], 3)
+    assert_eq(idx[1], 31)
+    assert_eq(idx[2], 32)
+    assert_eq(idx[3], 64)
+    assert_eq(idx[4], 70)
+    assert_eq(b.first_set(), 3)
+    assert_eq(b.next_set(4), 31)
+    assert_eq(b.next_set(33), 64)
+    assert_eq(b.next_set(71), -1)
+    assert_eq(b.last_set(), 70)
+    assert_eq(BitSet.new(10).first_set(), -1)
+    assert_eq(BitSet.new(10).last_set(), -1)
+}
+
+/// Test that set algebra is exact.
+test "BitSet union intersect difference" {
+    a = BitSet.from_indices([1, 2, 3, 40])
+    b = BitSet.from_indices([3, 4, 40, 100])
+    u = a.union(b)
+    i = a.intersect(b)
+    d = a.difference(b)
+    assert_eq(u.count(), 6)
+    assert_eq(host.sys_arr_len(i.to_indices()), 2)
+    #assert(i.test(3))
+    #assert(i.test(40))
+    assert_eq(d.count(), 2)
+    #assert(d.test(1))
+    #assert(!(d.test(3)))
+    #assert(i.is_subset_of(a))
+    #assert(!(a.is_subset_of(i)))
+    #assert(!(u.is_subset_of(a)))
+}
+
+/// Test that Eq ignores trailing zero words.
+test "BitSet equality" {
+    a = BitSet.from_indices([5, 6])
+    b = BitSet.new(500)
+    @b.set(5)
+    @b.set(6)
+    #assert(a == b)
+    @b.set(300)
+    #assert(!(a == b))
+    #assert(a != b)
+    #assert(BitSet.new(0) == BitSet.new(64))
+}
+
+/// Test that a bloom filter never forgets and rarely lies.
+test "Bloom insert and maybe_contains" {
+    f = Bloom.for_items(200, 12)
+    assert_eq(f.k, 8)
+    assert_eq(f.nbits, 2400)
+    #assert(!(f.maybe_contains("alice")))
+    for 0..100 {
+        @f.insert("user-{it}")
+    }
+    assert_eq(f.inserted, 100)
+    missing = 0
+    for 0..100 {
+        if !f.maybe_contains("user-{it}") { missing += 1 }
+    }
+    assert_eq(missing, 0)
+    false_pos = 0
+    for 0..200 {
+        if f.maybe_contains("other-{it}") { false_pos += 1 }
+    }
+    #assert(false_pos < 10)
+    #assert(f.bits_set() > 0)
+    #assert(f.fill_permille() < 500)
+}
+
+/// Test that bloom hashing is deterministic and seed dependent.
+test "bloom_hash determinism" {
+    assert_eq(bloom_hash("abc", 0), bloom_hash("abc", 0))
+    #assert(!(bloom_hash("abc", 0) == bloom_hash("abd", 0)))
+    #assert(!(bloom_hash("abc", 0) == bloom_hash("abc", 1)))
+    assert_eq(bloom_hash("", 0), 2166136261)
+    assert_eq(bloom_hash("a", 0), 3826002220)
+}
+
+/// Test that bloom filters merge and reset.
+test "Bloom merge and reset" {
+    a = Bloom.new(512, 3)
+    b = Bloom.new(512, 3)
+    @a.insert("x")
+    @b.insert("y")
+    #assert(@a.merge(b))
+    #assert(a.maybe_contains("x"))
+    #assert(a.maybe_contains("y"))
+    assert_eq(a.inserted, 2)
+    other = Bloom.new(256, 3)
+    #assert(!(@a.merge(other)))
+    other_k = Bloom.new(512, 4)
+    #assert(!(@a.merge(other_k)))
+    @a.reset()
+    assert_eq(a.bits_set(), 0)
+    #assert(!(a.maybe_contains("x")))
+    tiny = Bloom.new(0, 0)
+    assert_eq(tiny.nbits, 8)
+    assert_eq(tiny.k, 1)
+}
+
+/// Test that SparseBits matches a dense set on random-looking input.
+test "SparseBits set clear test" {
+    s = SparseBits.new()
+    #assert(@s.set(1000000))
+    #assert(!(@s.set(1000000)))
+    #assert(@s.set(5))
+    #assert(@s.set(6))
+    #assert(@s.set(33))
+    #assert(!(@s.set(-9)))
+    assert_eq(s.count(), 4)
+    assert_eq(s.word_count(), 3)
+    #assert(s.test(1000000))
+    #assert(!(s.test(999999)))
+    #assert(!(s.test(-1)))
+    idx = s.to_indices()
+    assert_eq(idx[0], 5)
+    assert_eq(idx[1], 6)
+    assert_eq(idx[2], 33)
+    assert_eq(idx[3], 1000000)
+    #assert(@s.clear(33))
+    #assert(!(@s.clear(33)))
+    assert_eq(s.word_count(), 2)
+    #assert(@s.clear(5))
+    assert_eq(s.word_count(), 2)
+    #assert(@s.clear(6))
+    assert_eq(s.word_count(), 1)
+    #assert(!(@s.clear(-2)))
+    assert_eq(s.count(), 1)
+}
+
+/// Test that sparse algebra and dense conversion agree.
+test "SparseBits union intersect and dense conversion" {
+    a = SparseBits.from_indices([1, 2, 64, 5000])
+    b = SparseBits.from_indices([2, 64, 65, 9000])
+    u = a.union(b)
+    assert_eq(u.count(), 6)
+    assert_eq(a.intersect_count(b), 2)
+    assert_eq(b.intersect_count(a), 2)
+    assert_eq(SparseBits.new().intersect_count(a), 0)
+    dense = a.to_dense()
+    assert_eq(dense.count(), 4)
+    #assert(dense.test(5000))
+    back = bitset_to_sparse(dense)
+    assert_eq(back.count(), 4)
+    #assert(back.test(64))
+    assert_eq(back.word_count(), a.word_count())
+}
+
+/// Test that ctz/msb helpers agree with a naive bit scan for every single bit and mixed words.
+test "bs_ctz32 and bs_msb32 are exact" {
+    assert_eq(bs_ctz32(0), 32)
+    assert_eq(bs_msb32(0), -1)
+    for 0..32 {
+        v = 1 << it
+        assert_eq(bs_ctz32(v), it)
+        assert_eq(bs_msb32(v), it)
+    }
+    assert_eq(bs_ctz32(4294967295), 0)
+    assert_eq(bs_msb32(4294967295), 31)
+    assert_eq(bs_ctz32(2863311530), 1)
+    assert_eq(bs_msb32(2863311530), 31)
+    assert_eq(bs_ctz32(96), 5)
+    assert_eq(bs_msb32(96), 6)
+    assert_eq(bs_ctz32(4294967296 + 8), 3)
+    assert_eq(bs_msb32(4294967296 + 8), 3)
+}
+
+/// Test that word-skipping next_set/last_set/to_indices match a per-bit reference.
+test "next_set, last_set and to_indices skip words correctly" {
+    b = BitSet.new(0)
+    for [3, 31, 32, 63, 64, 200, 1000] { @b.set(it) }
+    assert_eq(b.first_set(), 3)
+    assert_eq(b.next_set(3), 3)
+    assert_eq(b.next_set(4), 31)
+    assert_eq(b.next_set(32), 32)
+    assert_eq(b.next_set(33), 63)
+    assert_eq(b.next_set(64), 64)
+    assert_eq(b.next_set(65), 200)
+    assert_eq(b.next_set(201), 1000)
+    assert_eq(b.next_set(1001), -1)
+    assert_eq(b.next_set(5000), -1)
+    assert_eq(b.next_set(-7), 3)
+    assert_eq(b.last_set(), 1000)
+    idx = b.to_indices()
+    assert_eq(host.sys_arr_len(idx), 7)
+    assert_eq(idx[0], 3)
+    assert_eq(idx[1], 31)
+    assert_eq(idx[2], 32)
+    assert_eq(idx[6], 1000)
+    for 1..host.sys_arr_len(idx) { #assert(idx[it] > idx[it - 1]) }
+    @b.clear(1000)
+    assert_eq(b.last_set(), 200)
+    top = BitSet.new(0)
+    @top.set(31)
+    assert_eq(top.last_set(), 31)
+    assert_eq(top.next_set(31), 31)
+    assert_eq(top.next_set(32), -1)
+    assert_eq(BitSet.new(64).last_set(), -1)
+    assert_eq(BitSet.new(64).next_set(0), -1)
+    assert_eq(host.sys_arr_len(BitSet.new(64).to_indices()), 0)
+    full = BitSet.new(64)
+    for 0..64 { @full.set(it) }
+    assert_eq(host.sys_arr_len(full.to_indices()), 64)
+    assert_eq(full.to_indices()[63], 63)
+    assert_eq(full.count(), 64)
+}
+
+/// Test that allocation-free subset, equality, emptiness and intersect_count are consistent.
+test "subset, eq, is_empty and intersect_count without allocation" {
+    a = BitSet.from_indices([1, 5, 40])
+    b = BitSet.from_indices([1, 5, 40, 90])
+    c = BitSet.from_indices([5, 90, 7])
+    #assert(a.is_subset_of(b))
+    #assert(!(b.is_subset_of(a)))
+    #assert(!(a.is_subset_of(c)))
+    #assert(BitSet.new(0).is_subset_of(a))
+    #assert(a.eq(BitSet.from_indices([40, 5, 1])))
+    #assert(!(a.eq(b)))
+    padded = BitSet.new(512)
+    @padded.set(1)
+    @padded.set(5)
+    @padded.set(40)
+    #assert(a.eq(padded))
+    #assert(padded.eq(a))
+    assert_eq(a.intersect_count(b), 3)
+    assert_eq(b.intersect_count(c), 2)
+    assert_eq(a.intersect_count(c), 1)
+    assert_eq(a.intersect_count(BitSet.new(0)), 0)
+    assert_eq(a.intersect_count(b), a.intersect(b).count())
+    #assert(!(padded.is_empty()))
+    @padded.reset()
+    #assert(padded.is_empty())
+    far = BitSet.new(0)
+    @far.set(4000)
+    #assert(!(far.is_empty()))
+    #assert(bs_words_subset([], [1]))
+    #assert(!(bs_words_subset([1], [])))
+    #assert(bs_words_subset([0, 0], []))
+}

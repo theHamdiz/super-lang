@@ -1,0 +1,5174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/examples/"/>
+<link rel="icon" href="../assets/favicon.ico" sizes="any"/>
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png"/>
+<link rel="icon" type="image/png" href="../assets/icons/super.png"/>
+<link rel="apple-touch-icon" href="../assets/icons/super.png"/>
+<meta name="description" content="Space shooter, task API, and log analyzer — runnable .sr projects with first-class tests."/>
+<meta name="theme-color" content="#ff7a1f"/>
+<meta property="og:type" content="website"/>
+<meta property="og:site_name" content="Super"/>
+<meta property="og:locale" content="en_US"/>
+<meta property="og:title" content="Super · Examples"/>
+<meta property="og:description" content="Space shooter, task API, and log analyzer — runnable .sr projects with first-class tests."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/examples/"/>
+<meta property="og:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<meta property="og:image:width" content="1200"/>
+<meta property="og:image:height" content="630"/>
+<meta property="og:image:alt" content="Super language"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="Super · Examples"/>
+<meta name="twitter:description" content="Space shooter, task API, and log analyzer — runnable .sr projects with first-class tests."/>
+<meta name="twitter:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Super", "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux, macOS, FreeBSD, Windows", "softwareVersion": "0.1.0", "license": "https://opensource.org/licenses/MIT", "url": "https://thehamdiz.github.io/super-lang/", "description": "Space shooter, task API, and log analyzer — runnable .sr projects with first-class tests.", "downloadUrl": "https://thehamdiz.github.io/super-lang/install/", "author": {"@type": "Person", "name": "Ahmad Hamdi"}}</script>
+<title>Super · Examples</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="../site.css"/>
+<script src="../super-highlight.js" defer></script>
+
+</head>
+<body>
+
+<header class="site-nav">
+  <a class="mark" href="./">Super</a>
+  <nav><a href="../">Home</a><a href="../benchmarks/">Benchmarks</a><a href="../winners/">Winners</a><a href="../charts/">Charts</a><a href="../spec/">Spec</a><a href="../book/">Book</a><a href="./">Examples</a><a href="../install/">Install</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a><a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a></nav>
+  <a class="cta" href="../downloads/SUPER_BOOK.pdf" download>Download book</a>
+</header>
+<section class="page-hero">
+  <h1>Projects and algorithms</h1>
+  <p>Every example project and every benchmark algorithm, with Super source highlighted.</p>
+</section>
+<section class="section band-ink">
+  <h2>Jump</h2>
+  <div class="example-nav" data-reveal><a href="#ex-00_hello_api-main">00 hello api</a><a href="#ex-01_space_shooter-main">01 space shooter</a><a href="#ex-02_task_api-auth">02 task api</a><a href="#ex-03_log_analyzer-main">03 log analyzer</a><a href="#ex-04_law_verify-ledger.law">04 law verify</a><a href="#ex-04_roguelike_dungeon-main">04 roguelike dungeon</a><a href="#ex-05_tower_defense-main">05 tower defense</a><a href="#ex-06_physics_sandbox-main">06 physics sandbox</a><a href="#ex-07_realtime_chat_broker-main">07 realtime chat broker</a><a href="#ex-08_kv_cache_engine-main">08 kv cache engine</a><a href="#ex-09_http_load_tester-main">09 http load tester</a><a href="#ex-10_mapreduce_kv-main">10 mapreduce kv</a><a href="#ex-11_voxel_raycast-main">11 voxel raycast</a><a href="#ex-12_boids_flocking-main">12 boids flocking</a><a href="#ex-13_multiplayer_tick-main">13 multiplayer tick</a><a href="#ex-14_tcp_message_broker-main">14 tcp message broker</a><a href="#ex-15_http_radix_framework-main">15 http radix framework</a><a href="#ex-16_resp_lru_cache-main">16 resp lru cache</a><a href="#ex-17_log_ingest_pipeline-main">17 log ingest pipeline</a><a href="#ex-18_rigidbody_sandbox-main">18 rigidbody sandbox</a><a href="#ex-19_ws_multiroom_chat-main">19 ws multiroom chat</a><a href="#ex-20_game_server_ws_sync-main">20 game server ws sync</a><a href="#ex-21_cli_ledger-main">21 cli ledger</a><a href="#ex-22_cli_ship-main">22 cli ship</a><a href="#ex-23_tui_ops-main">23 tui ops</a><a href="#ex-24_tui_inbox-main">24 tui inbox</a><a href="#ex-25_gui_studio-main">25 gui studio</a><a href="#ex-26_gui_atlas-main">26 gui atlas</a><a href="#ex-27_gui_todo-main">27 gui todo</a><a href="#ex-28_gui_breakout-main">28 gui breakout</a><a href="#ex-29_gui_invaders-main">29 gui invaders</a><a href="#ex-30_gui_snake-main">30 gui snake</a><a href="#ex-agent-main">agent</a><a href="#ex-algorithms-main">algorithms</a><a href="#ex-doc_ai-main">doc ai</a><a href="#ex-doc_cli-main">doc cli</a><a href="#ex-doc_comptime-main">doc comptime</a><a href="#ex-doc_data_stack-main">doc data stack</a><a href="#ex-doc_errors-main">doc errors</a><a href="#ex-doc_features-main">doc features</a><a href="#ex-doc_hello-hello">doc hello</a><a href="#ex-doc_http_json-main">doc http json</a><a href="#ex-doc_law-ledger.law">doc law</a><a href="#ex-doc_macros-main">doc macros</a><a href="#ex-doc_pod-main">doc pod</a><a href="#ex-doc_test-main">doc test</a><a href="#ex-interop_c-physics">interop c</a><a href="#ex-interop_cpp-combat">interop cpp</a><a href="#ex-interop_rust-ai">interop rust</a><a href="#ex-stress_c23_outline-main">stress c23 outline</a></div>
+</section>
+<section class="section examples-stage">
+  <article class="example-block" id="ex-00_hello_api-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>00 hello api</h3><p class="note">examples/00_hello_api/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Complete JSON API and its tests.
+//
+//   super test .
+//   SUPER_ADDR=127.0.0.1:3011 super run src/main.sr
+
+use std.net.http
+use std.sys.env
+
++build_app() : App {
+    #routes {
+        get &quot;/health&quot; { ok({ok: true, service: &quot;super-hello-api&quot;}) }
+        get &quot;/ping&quot; { ok(&quot;pong&quot;) }
+        post &quot;/echo&quot; |req| {
+            body = req.body
+            ensure body != &quot;&quot; else {
+                return bad_request({error: &quot;empty body&quot;})
+            }
+            ok({echo: body})
+        }
+    }
+}
+
++main() {
+    addr = env_get_or(&quot;SUPER_ADDR&quot;, &quot;127.0.0.1:3011&quot;)
+    app = build_app()
+    print(&quot;listening on {addr}&quot;)
+    handled = @app.serve(addr) or err {
+        print(&quot;serve failed on {addr}: {err}&quot;)
+        return 1
+    }
+    print(&quot;shutdown after {handled} requests&quot;)
+    0
+}
+
+test &quot;health via TestClient&quot; {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.get(&quot;/health&quot;)
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, &quot;super-hello-api&quot;))
+}
+
+test &quot;echo requires body&quot; {
+    app = build_app()
+    tc = TestClient.new(app)
+    bad = @tc.post(&quot;/echo&quot;, &quot;&quot;)
+    assert_eq(bad.status, 400)
+    ok_res = @tc.post(&quot;/echo&quot;, &quot;{\&quot;msg\&quot;:\&quot;ping\&quot;}&quot;)
+    assert_eq(ok_res.status, 200)
+    #assert(contains(ok_res.body, &quot;ping&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-01_space_shooter-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>01 space shooter</h3><p class="note">examples/01_space_shooter/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Game #1 — Arcade Space Shooter with parallel physics + collision channel
+//
+//   par @(pos: Pos), (vel: Vel)  — multi-core physics
+//   chan[CollisionEvent]                  — audio/particle fiber pipeline
+//
+// Run: super test examples/01_space_shooter/
+
+use std.game.{ecs, physics2d}
+use std.math.linalg
+use std.tui
+
+#TRIG_STEPS = 16
+#SIN_TABLE = #for i in 0..#TRIG_STEPS { sin_approx(i * 0.393) }
+#COS_TABLE = #for i in 0..#TRIG_STEPS { cos_approx(i * 0.393) }
+
+#assert_size(Pos, 16)
++Pos = {
+    x: f64 = 0.0
+    y: f64 = 0.0
+
+    translate(@self, dx: f64, dy: f64) : f64 {
+        self.x += dx
+        self.y += dy
+        self.x
+    }
+}
+
+#assert_size(Vel, 16)
++Vel = {
+    vx: f64 = 0.0
+    vy: f64 = 0.0
+}
+
+#assert_size(Collider, 8)
++Collider = {
+    radius: f64 = 1.0
+}
+
++Enemy = {
+    hp: i64 = 3
+    score: i64 = 100
+
+    damage(@self, amount: i64) : i64 {
+        self.hp = self.hp - amount
+        self.hp
+    }
+
+    is_alive(self) : bool =&gt; self.hp &gt; 0
+}
+
++CollisionEvent = {
+    a: i64 = 0
+    b: i64 = 0
+    kind: i64 = 0
+}
+
+state world = ecs.World{}
+
++Circle = {
+    x: f64 = 0.0
+    y: f64 = 0.0
+    r: f64 = 1.0
+
+    hits(self, other: Circle) : bool {
+        dx = self.x - other.x
+        dy = self.y - other.y
+        reach = self.r + other.r
+        dx * dx + dy * dy &lt;= reach * reach
+    }
+}
+
++spawn_wave(count: i64) : i64 {
+    n = 0
+    for 0..count {
+        n += 1
+    }
+    n
+}
+
++warmup_slots() : i64 {
+    n = 0
+    #unroll(4)
+    for 0..4 {
+        n += 1
+    }
+    n
+}
+
++trig_sample(idx: i64) : f64 {
+    if idx &lt; 0 {
+        return 0.0
+    }
+    if idx &gt;= #TRIG_STEPS {
+        return 0.0
+    }
+    #SIN_TABLE[idx]
+}
+
++update(dt: f64) {
+    #simd
+    par @(pos: Pos), (vel: Vel) in world {
+        pos.x += vel.vx * dt
+        pos.y += vel.vy * dt
+    }
+}
+
++hud_line(score: i64, health: i64) : str {
+    text = &quot;SCORE={score} HP={health}&quot;
+    view = Screen.new(byte_len(text), 1)
+    @view.print_at(0, 0, text, 7, 0, 0)
+    view.row(0)
+}
+
++render_hud(score: i64, health: i64) {
+    print(hud_line(score, health))
+}
+
++run_fx_fiber(inbox: i64) : i64 {
+    // Particle/audio consumer — counts events until channel closed by caller.
+    n = 0
+    n + inbox
+}
+
++main() {
+    // Demo path stays on ops the C23 AOT backend lowers today (`par` / Shared
+    // stay covered by `super test` / the VM).
+    render_hud(0, 3)
+    waves = spawn_wave(5)
+    print(&quot;wave={waves} slots={warmup_slots()} sin0={trig_sample(0)}&quot;)
+    0
+}
+
+test &quot;comptime trig tables start at the unit circle&quot; {
+    assert_eq(#SIN_TABLE[0] &lt; 0.01, true)
+    assert_eq(#COS_TABLE[0] &gt; 0.99, true)
+}
+
+test &quot;hud line is one terminal row&quot; {
+    assert_eq(hud_line(120, 3), &quot;SCORE=120 HP=3&quot;)
+}
+
+test &quot;collision detects overlapping circles&quot; {
+    origin = Circle{x: 0.0, y: 0.0, r: 1.0}
+    near = Circle{x: 0.5, y: 0.0, r: 1.0}
+    far = Circle{x: 5.0, y: 0.0, r: 1.0}
+    #assert(origin.hits(near))
+    #assert(!(origin.hits(far)))
+}
+
+test &quot;type method damage + chaining&quot; {
+    e = Enemy{hp: 3, score: 100}
+    left = @e.damage(1)
+    assert_eq(left, 2)
+    assert_eq(e.hp, 2)
+    #assert(e.is_alive())
+    left2 = @e.damage(2)
+    assert_eq(left2, 0)
+    #assert(!(e.is_alive()))
+}
+
+test &quot;pos.translate mutates via @self&quot; {
+    p = Pos{x: 1.0, y: 2.0}
+    @p.translate(3.0, 4.0)
+    assert_eq(p.x, 4.0)
+    assert_eq(p.y, 6.0)
+}
+
+test &quot;wave spawner counts entities&quot; {
+    count = 5
+    assert_eq(spawn_wave(.), 5)
+}
+
+test &quot;collision channel + scope spawn fx fiber&quot; {
+    events = chan[CollisionEvent](32)
+    scope {
+        fx = spawn {
+            n = 0
+            for _ev in events {
+                n += 1
+            }
+            n
+        }
+        events.send(CollisionEvent{a: 1, b: 2, kind: 1})
+        events.send(CollisionEvent{a: 3, b: 4, kind: 1})
+        events.close()
+        got = await fx
+        assert_eq(got, 2)
+    }
+}
+
+test &quot;parallel physics update compiles&quot; {
+    update(0.016)
+    assert_eq(1, 1)
+}
+
+test &quot;comptime sin table length&quot; {
+    assert_eq(#TRIG_STEPS, 16)
+    assert_eq(trig_sample(0), 0.0)
+}
+
+test &quot;unroll warmup slots&quot; {
+    assert_eq(warmup_slots(), 4)
+}
+
+test &quot;stdlib: Vec2 length and circle overlap agree with Circle.hits&quot; {
+    origin = Circle{x: 0.0, y: 0.0, r: 1.0}
+    near = Circle{x: 0.5, y: 0.0, r: 1.0}
+    far = Circle{x: 5.0, y: 0.0, r: 1.0}
+    assert_eq(v2_len(v2(3.0, 4.0)), 5.0)
+    assert_eq(v2_dist(v2(0.0, 0.0), v2(0.5, 0.0)), 0.5)
+    assert_eq(p2_point_in_circle(0.5, 0.0, 0.0, 0.0, 1.0), origin.hits(near))
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(5.0, 0.0, 1.0, 1.0)
+    assert_eq(p2_bounds_overlap(a, b), origin.hits(far))
+}
+
+test &quot;Vec2 add and Display agree&quot; {
+    c = v2(1.0, 2.0) + v2(3.0, 4.0)
+    assert_eq(&quot;{c}&quot;, &quot;(4, 6)&quot;)
+    #assert(c == v2(4.0, 6.0))
+}
+</code></pre></article><article class="example-block" id="ex-02_task_api-auth" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>02 task api</h3><p class="note">examples/02_task_api/src/auth.sr</p></div><pre class="sr-block"><code class="language-sr">+AuthToken = {
+    user_id: i64
+    token: str
+}
+
++authenticate(user: str, pass: str) : AuthToken! {
+    ensure user != &quot;&quot; else {
+        fail &quot;empty user&quot;
+        return
+    }
+    ensure pass != &quot;&quot; else {
+        fail &quot;empty pass&quot;
+        return
+    }
+    AuthToken.{user_id: 1, token: &quot;tok_demo&quot;}
+}
+
++require_token(token: str) : i64! {
+    ensure token != &quot;&quot; else {
+        fail &quot;missing token&quot;
+        return
+    }
+    1
+}
+
+test &quot;authenticate ok&quot; {
+    t = authenticate(&quot;amina&quot;, &quot;secret&quot;) or .{user_id: 0, token: &quot;&quot;}
+    // Destructuring binding refinement
+    {user_id, token} = t
+    assert_eq(user_id, 1)
+    assert_eq(token, &quot;tok_demo&quot;)
+}
+
+test &quot;require_token rejects empty&quot; {
+    v = require_token(&quot;&quot;) or 0
+    assert_eq(v, 0)
+}
+
+test &quot;require_token accepts&quot; {
+    v = require_token(&quot;tok&quot;) or 0
+    assert_eq(v, 1)
+}
+</code></pre></article><article class="example-block" id="ex-02_task_api-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>02 task api</h3><p class="note">examples/02_task_api/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Backend API — concurrent DB/cache via scope/spawn + audit channel pool
+//
+// Run:   super test examples/02_task_api/
+// Build: super b -r examples/02_task_api/
+// Serve: ./examples/02_task_api/target/release/02_task_api
+// CI:    ./…/02_task_api --self-test
+
+use std.net.http
+use std.sec.{jwt, hash, pq}
+use std.diag.log
+use models.{User}
+use std.cli.cmd
+use routes
+
++AuditEvent = {
+    user_id: i64 = 0
+    action: str = &quot;&quot;
+}
+
++fetch_user(id: i64) : User {
+    User{id, name: &quot;Amina&quot;}
+}
+
++fetch_cache(id: i64) : i64 {
+    id * 10
+}
+
++handle_profile(id: i64) : i64 {
+    audit = chan[AuditEvent](16)
+    total = 0
+    scope {
+        worker = spawn {
+            n = 0
+            for _ev in audit {
+                n += 1
+            }
+            n
+        }
+        // Same-line `await spawn` — equivalent to `t = spawn …; await t`.
+        u = await spawn fetch_user(id)
+        c = await spawn fetch_cache(id)
+        audit.send(AuditEvent{user_id: u.id, action: &quot;profile&quot;})
+        audit.close()
+        processed = await worker
+        total = u.id + c + processed
+    }
+    total
+}
+
+/// Default listen port — avoid 8080; Docker proxies often already own it.
++DEFAULT_PORT = 8787
+
++listen_port(argv: _) : i64 {
+    m = Command.new(&quot;task_api&quot;)
+        .flag(&quot;self-test&quot;, &quot;&quot;, &quot;run one health+create request then exit&quot;)
+        .opt(&quot;port&quot;, &quot;p&quot;, &quot;PORT&quot;, &quot;{DEFAULT_PORT}&quot;, &quot;listen port&quot;, false)
+        .as_int()
+        .parse(argv) or err { return DEFAULT_PORT }
+    m.get_int(&quot;port&quot;, DEFAULT_PORT)
+}
+
++wants_self_test(argv: _) : bool {
+    for arg in argv {
+        if arg == &quot;--self-test&quot; || arg == &quot;--self_test&quot; { return true }
+    }
+    false
+}
+
+/// Fluent app: first-class callables via get / post / crud (no Handler ids).
++build_app() : App {
+    app = App.new()
+    app = @app
+        .use(Mw.Recover)
+        .use(Mw.RequestId)
+        .use(Mw.Logger)
+        .use(Mw.Security)
+        .use(Mw.StripSlash)
+        .use_cors([&quot;*&quot;], false)
+        .get(&quot;/health&quot;, |req| { handle_health(req) })
+        .group(&quot;/api&quot;)
+        .use(Mw.Json)
+        .use_max_body(1048576)
+        .post(&quot;/login&quot;, |req| { handle_login(req) })
+        .crud(&quot;/tasks&quot;, CrudHandlers.rest(
+            |req| { handle_list_tasks(req) },
+            |req| { handle_create_task(req) },
+            |req| { handle_show_task(req) },
+            |req| { handle_update_task(req) },
+            |req| { handle_destroy_task(req) }
+        ))
+        .get(r&quot;/profile/{id}&quot;, |req| { handle_profile_route(req) })
+        .end()
+        .mount(&quot;GET&quot;, &quot;/debug/stats&quot;, |req| { handle_debug_stats(req) })
+    app
+}
+
++main() {
+    argv = cli_args()
+    n = len(argv)
+    rest = if n &gt; 1 { argv[1..n] } else { [] }
+    port = listen_port(rest)
+    self_test = wants_self_test(rest)
+    lg = Logger.console(&quot;task_api&quot;)
+    addr = &quot;127.0.0.1:{port}&quot;
+    app = build_app()
+    if self_test {
+        tc = TestClient.new(app)
+        res = @tc.get(&quot;/health&quot;)
+        ensure res.status == 200 else {
+            @lg.error(&quot;self-test: bad status {res.status}&quot;)
+            return 1
+        }
+        create = @tc.post(&quot;/api/tasks&quot;, {title: &quot;Ship&quot;, owner_id: 1})
+        ensure create.status == 200 else {
+            @lg.error(&quot;self-test: create failed {create.status}&quot;)
+            return 1
+        }
+        @lg.info(&quot;self-test ok status={res.status}&quot;)
+        return 0
+    }
+    @lg.info(&quot;listening on {addr}&quot;)
+    handled = @app.serve(addr) or err {
+        @lg.error(&quot;serve failed on {addr}: {err} (try --port &lt;free&gt;)&quot;)
+        return 1
+    }
+    @lg.info(&quot;shutdown after {handled} requests&quot;)
+    0
+}
+
+test &quot;listen port defaults to 8787 and reads --port&quot; {
+    assert_eq(listen_port([]), 8787)
+    assert_eq(listen_port([&quot;--port&quot;, &quot;9090&quot;]), 9090)
+    assert_eq(listen_port([&quot;-p&quot;, &quot;3000&quot;]), 3000)
+    assert_eq(listen_port([&quot;--self-test&quot;]), 8787)
+}
+
+test &quot;self-test flag detection&quot; {
+    #assert(!(wants_self_test([])))
+    #assert(wants_self_test([&quot;--self-test&quot;]))
+}
+
+test &quot;models construct via import&quot; {
+    u = User{id: 1, name: &quot;Amina&quot;}
+    assert_eq(u.id, 1)
+}
+
+test &quot;http helpers require std.net.http&quot; {
+    res = http.ok(.{ok: true})
+    assert_eq(res.status, 200)
+}
+
+test &quot;app.handle health and tasks CRUD&quot; {
+    app = build_app()
+    tc = TestClient.new(app)
+    assert_eq(@tc.get(&quot;/health&quot;).status, 200)
+    assert_eq(@tc.post(&quot;/api/login&quot;, {}).status, 200)
+    assert_eq(@tc.get(&quot;/api/tasks&quot;).status, 200)
+    show = @tc.get(&quot;/api/tasks/9&quot;)
+    assert_eq(show.status, 200)
+    #assert(contains(show.body, &quot;9&quot;))
+    assert_eq(@tc.get(&quot;/api/profile/3&quot;).status, 200)
+    assert_eq(@tc.get(&quot;/debug/stats&quot;).status, 200)
+}
+
+test &quot;TestClient self-test path&quot; {
+    app = build_app()
+    tc = TestClient.new(app)
+    assert_eq(@tc.get(&quot;/health&quot;).status, 200)
+    assert_eq(@tc.get(&quot;/missing&quot;).status, 404)
+    assert_eq(@tc.post(&quot;/api/tasks&quot;, {title: &quot;x&quot;, owner_id: 1}).status, 200)
+    assert_eq(@tc.get(&quot;/api/tasks/7&quot;).status, 200)
+}
+
+test &quot;scope spawn concurrent profile + audit&quot; {
+    // user.id(7) + cache(70) + 1 audit event = 78
+    assert_eq(handle_profile(7), 78)
+}
+
+test &quot;stdlib: jwt roundtrip for authenticated user&quot; {
+    tok = jwt_make(&quot;s3cret&quot;, &quot;user-1&quot;, 1000, 2000)
+    r = jwt_verify(&quot;s3cret&quot;, tok, 1500)
+    #assert(r.valid)
+    assert_eq(r.sub, &quot;user-1&quot;)
+    #assert(!(jwt_verify(&quot;wrong&quot;, tok, 1500).valid))
+    #assert(!(jwt_verify(&quot;s3cret&quot;, tok, 2500).valid))
+}
+
+test &quot;stdlib: log line format offline&quot; {
+    lg = Logger.new(&quot;task_api&quot;)
+    @lg.set_clock(1700000000000)
+    @lg.info(&quot;order created&quot;)
+    assert_eq(lg.last(), &quot;2023-11-14T22:13:20.000Z INFO  [task_api] order created&quot;)
+}
+
+test &quot;stdlib: blake3 integrity for audit payload&quot; {
+    dig = blake3_hex(&quot;user-7:profile&quot;)
+    assert_eq(dig.byte_len(), 64)
+    #assert(dig == blake3_hex(&quot;user-7:profile&quot;))
+}
+
+test &quot;stdlib: pq kem seals session key&quot; {
+    kp = pq_kem_keygen()
+    enc = pq_kem_encaps(kp.ek)
+    assert_eq(pq_kem_decaps(kp.seed, enc.ct), enc.ss)
+}
+
+test &quot;a command displays its name&quot; {
+    cmd = Command.new(&quot;tasks&quot;)
+    assert_eq(&quot;{cmd}&quot;, &quot;tasks&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-02_task_api-models" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>02 task api</h3><p class="note">examples/02_task_api/src/models.sr</p></div><pre class="sr-block"><code class="language-sr">#assert_size(User, 24)
++User = {
+    id: i64
+    name: str
+    -password_hash: str = &quot;&quot;
+}
+
+#USER_SZ = User.size
+#USER_JSON_GOAL = #goal_type
+
++Task = {
+    id: i64
+    title: str
+    done: bool = false
+    owner_id: i64
+}
+
++CreateTask = {
+    title: str
+    owner_id: i64
+}
+
++AuthToken = {
+    user_id: i64
+    token: str
+}
+
+#USER_FIELD_LABELS = User.fields.join(&quot;, &quot;)
+
++user_fields_json(id: i64, name: str) : str {
+    head = &quot;{ \&quot;id\&quot;: &quot;
+    tail = &quot;, \&quot;name\&quot;: \&quot;&quot; + name + &quot;\&quot; }&quot;
+    head + id + tail + &quot; /* &quot; + #USER_FIELD_LABELS + &quot; */&quot;
+}
+
+test &quot;user C-ABI size via reflection&quot; {
+    assert_eq(#USER_SZ, 24)
+}
+
+test &quot;goal_type stub for JSON builders&quot; {
+    assert_eq(#USER_JSON_GOAL, &quot;goal&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-02_task_api-routes" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>02 task api</h3><p class="note">examples/02_task_api/src/routes.sr</p></div><pre class="sr-block"><code class="language-sr">// Routes — callable handlers for App.handle / Server.serve / TestClient.
+
+use std.net.http
+use auth
+use models.{Task, CreateTask}
+
++tasks, +next_id = [], 1
+
++handle_create_task(req: Request) : Response {
+    body = req.body
+    ensure body != &quot;&quot; else {
+        return bad_request({error: &quot;empty body&quot;})
+    }
+    ensure body.contains(&quot;title&quot;) else {
+        return bad_request({error: &quot;title required&quot;})
+    }
+    id = next_id
+    next_id = id + 1
+    draft = CreateTask.{title: &quot;task&quot;, owner_id: 1}
+    ok(Task.{id, title: draft.title, done: false, owner_id: draft.owner_id})
+}
+
++handle_list_tasks(_req: Request) : Response {
+    ok({tasks: []})
+}
+
++handle_login(_req: Request) : Response {
+    tok = authenticate(&quot;amina&quot;, &quot;secret&quot;) or err {
+        return bad_request({error: &quot;{err}&quot;})
+    }
+    ok({user_id: tok.user_id, token: tok.token})
+}
+
++handle_health(_req: Request) : Response {
+    ok({ok: true})
+}
+
++handle_show_task(req: Request) : Response {
+    id = req.param_int(&quot;id&quot;, 0)
+    ok(Task.{id, title: &quot;task&quot;, done: false, owner_id: 1})
+}
+
++handle_update_task(req: Request) : Response {
+    id = req.param_int(&quot;id&quot;, 0)
+    ensure req.body != &quot;&quot; else {
+        return bad_request({error: &quot;empty body&quot;})
+    }
+    ok(Task.{id, title: &quot;updated&quot;, done: true, owner_id: 1})
+}
+
++handle_destroy_task(req: Request) : Response {
+    id = req.param_int(&quot;id&quot;, 0)
+    ok({deleted: id})
+}
+
++handle_profile_route(req: Request) : Response {
+    id = req.param_int(&quot;id&quot;, 0)
+    ok({id, profile: true})
+}
+
++handle_debug_stats(_req: Request) : Response {
+    ok({stats: next_id - 1, tasks: len(tasks)})
+}
+
+test &quot;handlers return JSON responses&quot; {
+    r = handle_health(request(&quot;GET&quot;, &quot;/health&quot;, &quot;&quot;))
+    assert_eq(r.status, 200)
+    assert_eq(r.body, &quot;{\&quot;ok\&quot;:true}&quot;)
+    r2 = handle_list_tasks(request(&quot;GET&quot;, &quot;/tasks&quot;, &quot;&quot;))
+    assert_eq(r2.status, 200)
+    assert_eq(r2.body, &quot;{\&quot;tasks\&quot;:[]}&quot;)
+    r3 = handle_create_task(request(&quot;POST&quot;, &quot;/tasks&quot;, &quot;{\&quot;title\&quot;:\&quot;x\&quot;,\&quot;owner_id\&quot;:1}&quot;))
+    assert_eq(r3.status, 200)
+    r4 = handle_login(request(&quot;POST&quot;, &quot;/login&quot;, &quot;{}&quot;))
+    assert_eq(r4.status, 200)
+    empty = handle_create_task(request(&quot;POST&quot;, &quot;/tasks&quot;, &quot;&quot;))
+    assert_eq(empty.status, 400)
+    assert_eq(empty.body, &quot;{\&quot;error\&quot;:\&quot;empty body\&quot;}&quot;)
+}
+
+test &quot;param_int extracts path id&quot; {
+    req = request(&quot;GET&quot;, &quot;/api/tasks/9&quot;, &quot;&quot;)
+    req.match_keys = [&quot;id&quot;]
+    req.match_vals = [&quot;9&quot;]
+    r = handle_show_task(req)
+    assert_eq(r.status, 200)
+    #assert(contains(r.body, &quot;9&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-03_log_analyzer-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>03 log analyzer</h3><p class="note">examples/03_log_analyzer/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Log pipeline — chunk workers over chan[LogChunk] + shared atomic counters
+//
+// Run: super test examples/03_log_analyzer/
+
+use std.core.{str, regex}
+use std.diag.metrics
+use std.cli.cmd
+use std.tui
+
+#ASCII_CLASS = #for i in 0..64 { i % 32 }
+
++Fixture = embed &quot;assets/fixture.txt&quot;
+
++Status = {
+    Ok
+    Warn(code: i64)
+    Err(reason: str)
+
+    is_err(self) : bool {
+        when self {
+            Status.Err =&gt; true
+            else =&gt; false
+        }
+    }
+
+    code_or(self, fallback: i64) : i64 {
+        when self {
+            Status.Warn { code } =&gt; code
+            else =&gt; fallback
+        }
+    }
+}
+
++LogRecord = {
+    ts: i64
+    level: str
+    msg: str
+    status: Status = Status.Ok
+}
+
++LogChunk = {
+    start: i64 = 0
+    end: i64 = 0
+}
+
++make_records(n: i64) : i64 {
+    _count = 0
+    for 0..n {
+        _count += 1
+    }
+    _count
+}
+
++min_level(argv: _) : i64 {
+    cmd = Command.new(&quot;logs&quot;)
+    cmd = cmd.opt(&quot;level&quot;, &quot;l&quot;, &quot;N&quot;, &quot;25&quot;, &quot;minimum level&quot;, false)
+    cmd = cmd.as_int()
+    m = cmd.parse(argv) or err { return 25 }
+    m.get_int(&quot;level&quot;, 25)
+}
+
++report_line(total: i64) : str {
+    text = &quot;TOTAL={total}&quot;
+    view = Screen.new(byte_len(text), 1)
+    @view.print_at(0, 0, text, 7, 0, 0)
+    view.row(0)
+}
+
++analyze(_sample: i64) : i64 {
+    scores = [10, 20, 30, 40, 50, 5, 15]
+    total = scores.keep(it &gt;= 25).map(it * 2).sum()
+    total
+}
+
++slice_msg(msg: str, start: i64, end: i64) : str {
+    msg[start..end]
+}
+
++scan_bytes() : i64 {
+    acc = 0
+    #unroll(8)
+    for 0..8 {
+        acc += 1
+    }
+    acc
+}
+
++ascii_bucket(c: i64) : i64 {
+    if c &lt; 0 {
+        return 0
+    }
+    if c &gt;= 64 {
+        return 0
+    }
+    #ASCII_CLASS[c]
+}
+
++distribute(n_chunks: i64) : i64 {
+    hits = shared 0
+    inbox = chan[LogChunk](64)
+    scope {
+        w1 = spawn {
+            n = 0
+            for _chunk in inbox {
+                @hits += 1
+                n += 1
+            }
+            n
+        }
+        for 0..n_chunks {
+            inbox.send(LogChunk{start: it, end: it + 1})
+        }
+        inbox.close()
+        processed = await w1
+        total = hits.load()
+        total + processed
+    }
+}
+
++main() {
+    // CLI + pipeline demo. `distribute` (shared/chan) stays under `super test`.
+    argv = cli_args()
+    n = len(argv)
+    rest = if n &gt; 1 { argv[1..n] } else { [] }
+    level = min_level(rest)
+    total = analyze(7)
+    print(report_line(total))
+    print(&quot;level={level} fixture={Fixture[0..2]}&quot;)
+    0
+}
+
+test &quot;make_records scales to one million&quot; {
+    assert_eq(make_records(1000000), 1000000)
+}
+
+test &quot;pipeline chaining sum&quot; {
+    assert_eq(analyze(7), 240)
+}
+
+test &quot;level flag and report row&quot; {
+    assert_eq(min_level([]), 25)
+    assert_eq(min_level([&quot;--level&quot;, &quot;40&quot;]), 40)
+    assert_eq(report_line(analyze(7)), &quot;TOTAL=240&quot;)
+}
+
+test &quot;slice shorthand&quot; {
+    s = &quot;abcdef&quot;
+    assert_eq(s[1..4], &quot;bcd&quot;)
+    assert_eq(slice_msg(&quot;hello&quot;, 1, 4), &quot;ell&quot;)
+}
+
+test &quot;embed fixture is non-empty&quot; {
+    assert_eq(Fixture[0..2], &quot;ok&quot;)
+}
+
+test &quot;status sum type unit&quot; {
+    ok = Status.Ok
+    warn = Status.Warn(503)
+    err = Status.Err(&quot;timeout&quot;)
+    #assert(ok == Status.Ok)
+    #assert(warn == Status.Warn(503))
+    #assert(err == Status.Err(&quot;timeout&quot;))
+    #assert(!(ok.is_err()))
+    #assert(err.is_err())
+    assert_eq(warn.code_or(0), 503)
+    assert_eq(ok.code_or(9), 9)
+    kind = 0
+    reason = &quot;&quot;
+    when err {
+        Status.Ok =&gt; kind = 0
+        Status.Warn { code } =&gt; kind = code
+        Status.Err { reason: r } =&gt; {
+            kind = 2
+            reason = r
+        }
+    }
+    assert_eq(kind, 2)
+    assert_eq(reason, &quot;timeout&quot;)
+    rec = LogRecord{ts: 1, level: &quot;ERROR&quot;, msg: &quot;x&quot;, status: Status.Warn(503)}
+    #assert(rec.status == warn)
+}
+
+test &quot;chunk workers + shared counters&quot; {
+    // 4 chunks → worker counts 4, shared hits 4 → 8
+    assert_eq(distribute(4), 8)
+}
+
+test &quot;comptime ASCII class table&quot; {
+    assert_eq(ascii_bucket(31), 31)
+    assert_eq(scan_bytes(), 8)
+}
+
+test &quot;stdlib: str + regex parse a log line, metrics count levels&quot; {
+    line = &quot;ERROR 503 upstream timeout&quot;
+    #assert(starts_with(line, &quot;ERROR&quot;))
+    assert_eq(split_nth(line, &quot; &quot;, 1), &quot;503&quot;)
+    assert_eq(to_i64(split_nth(line, &quot; &quot;, 1)) or 0, 503)
+    re = compile(&quot;[0-9]+&quot;) or regex_none()
+    #assert(is_match(re, line))
+    assert_eq(match_text(re, line), &quot;503&quot;)
+    m = Metrics.new()
+    for 0..3 { @m.inc(&quot;log_errors&quot;, 1) }
+    assert_eq(m.counter(&quot;log_errors&quot;), 3)
+}
+
+test &quot;arrays and maps display and compare&quot; {
+    scores = [10, 20, 30]
+    ports = {http: 80, https: 443}
+    assert_eq(&quot;{scores}&quot;, &quot;[10, 20, 30]&quot;)
+    assert_eq(&quot;{ports}&quot;, &quot;{http: 80, https: 443}&quot;)
+    #assert(scores == [10, 20, 30])
+    #assert(!([1, 2] == [1, 3]))
+}
+</code></pre></article><article class="example-block" id="ex-04_law_verify-ledger.law" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>04 law verify</h3><p class="note">examples/04_law_verify/src/ledger.law.sr</p></div><pre class="sr-block"><code class="language-sr">//! Human-locked ledger invariants (merged with `main.sr` at verify time).
+
+#law(&quot;transfer preserves total balance across all valid amounts&quot;)
+transfer_conserves_total(src: Account, dst: Account, amount: i64) {
+    ensure amount &gt;= 0 &amp;&amp; src.balance &gt;= amount else { return }
+    s = src
+    d = dst
+    ok = transfer(@s, @d, amount)
+    #assert(ok &amp;&amp; (s.balance + d.balance == src.balance + dst.balance))
+}
+
+#law(&quot;addition is commutative&quot;)
+add_comm(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}
+</code></pre></article><article class="example-block" id="ex-04_law_verify-ledger.proof" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>04 law verify</h3><p class="note">examples/04_law_verify/src/ledger.proof.sr</p></div><pre class="sr-block"><code class="language-sr">//! AI-authored lemmas for ledger laws.
+
+#proof(transfer_conserves_total)
+prove_transfer_conserves(src: Account, dst: Account, amount: i64) {
+    #assert(src.balance - amount + (dst.balance + amount) == src.balance + dst.balance)
+}
+
+#proof(add_comm)
+prove_add_comm(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}
+</code></pre></article><article class="example-block" id="ex-04_law_verify-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>04 law verify</h3><p class="note">examples/04_law_verify/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Conformance fixture for `#law` / `#proof` / `super verify`.
+//!
+//! Companions: `ledger.law.sr`, `ledger.proof.sr`.
+
++Account = {
+    balance: i64 = 0
+}
+
++transfer(@src: Account, @dst: Account, amount: i64) : bool {
+    if amount &lt; 0 { return false }
+    if src.balance &lt; amount { return false }
+    src.balance -= amount
+    dst.balance += amount
+    true
+}
+
++main() {
+    print(&quot;law verify example — run: super verify&quot;)
+}
+
+test &quot;transfer moves funds&quot; {
+    s = Account.{balance: 100}
+    d = Account.{balance: 0}
+    ok = transfer(@s, @d, 40)
+    #assert(ok)
+    assert_eq(s.balance, 60)
+    assert_eq(d.balance, 40)
+}
+</code></pre></article><article class="example-block" id="ex-04_roguelike_dungeon-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>04 roguelike dungeon</h3><p class="note">examples/04_roguelike_dungeon/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Game #2 — Roguelike dungeon: BSP rooms, A* path, FOV, ASCII, concurrency
+//
+// Run: super test examples/04_roguelike_dungeon/
+
+use std.game.ai
+use std.core.collections
+use std.tui
+
+#DIRS = #for i in 0..4 { i }
+#DIR_DX = [0, 1, 0, -1]
+#DIR_DY = [-1, 0, 1, 0]
+
+Tile = {
+    Floor
+    Wall
+    Door
+    Loot(gold: i64)
+}
+
++Pos = {
+    x: i64 = 0
+    y: i64 = 0
+}
+
++Entity = {
+    id: i64 = 0
+    hp: i64 = 10
+    x: i64 = 0
+    y: i64 = 0
+}
+
++bsp_split(width: i64, height: i64) : i64 {
+    // Count leaf rooms from a depth-limited BSP split.
+    rooms = 0
+    for 0..4 {
+        rooms += 1
+    }
+    rooms + (width / 10) + (height / 10)
+}
+
++astar_step(sx: i64, sy: i64, gx: i64, gy: i64) : i64 {
+    // Manhattan heuristic path length.
+    dx = gx - sx
+    dy = gy - sy
+    if dx &lt; 0 { dx = 0 - dx }
+    if dy &lt; 0 { dy = 0 - dy }
+    dx + dy
+}
+
++neighbor_steps(_x: i64, _y: i64) : i64 {
+    steps = 0
+    for _dir in #DIRS {
+        steps += 1
+    }
+    steps
+}
+
++fov_visible(radius: i64) : i64 {
+    cells = 0
+    for 0..radius {
+        cells += it * 2 + 1
+    }
+    cells
+}
+
++wall_row(w: i64) : str {
+    width = w
+    if width &lt; 1 { return &quot;&quot; }
+    view = Screen.new(width, 1)
+    @view.print_at(0, 0, repeat(&quot;#&quot;, width), 7, 0, 0)
+    view.row(0)
+}
+
++render_row(w: i64) : i64 =&gt; byte_len(wall_row(w))
+
++sim_turn(enemies: i64) : i64 {
+    path_q = chan[Pos](32)
+    hits = shared 0
+    scope {
+        ai = spawn {
+            n = 0
+            for _p in path_q {
+                @hits += 1
+                n += 1
+            }
+            n
+        }
+        for 0..enemies {
+            path_q.send(Pos{x: it, y: it})
+        }
+        path_q.close()
+        moved = await ai
+        moved + hits.load()
+    }
+}
+
+test &quot;bsp produces rooms&quot; {
+    #assert(bsp_split(80, 40) &gt; 0)
+}
+
+test &quot;astar manhattan&quot; {
+    assert_eq(astar_step(0, 0, 3, 4), 7)
+}
+
+test &quot;fov ray count&quot; {
+    assert_eq(fov_visible(3), 9)
+}
+
+test &quot;ascii row width&quot; {
+    assert_eq(render_row(16), 16)
+    assert_eq(wall_row(16), &quot;################&quot;)
+    assert_eq(render_row(0), 0)
+}
+
+test &quot;enemy AI path channel&quot; {
+    assert_eq(sim_turn(5), 10)
+}
+
+test &quot;comptime direction table&quot; {
+    assert_eq(neighbor_steps(5, 5), 4)
+    assert_eq(#DIR_DX[1], 1)
+    assert_eq(#DIR_DY[1], 0)
+}
+
+test &quot;stdlib: ai A* agrees with manhattan helper on an open grid&quot; {
+    g = Grid.new(8, 8)
+    p = g.astar(0, 0, 3, 4, false)
+    assert_eq(len(p), 8)
+    assert_eq(p[0], 0)
+    assert_eq(p[7], 4 * 8 + 3)
+    assert_eq(ai_heur(0, 0, 3, 4, false), astar_step(0, 0, 3, 4) * 10)
+    @g.block(1, 0)
+    #assert(!(g.free(1, 0)))
+}
+</code></pre></article><article class="example-block" id="ex-05_tower_defense-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>05 tower defense</h3><p class="note">examples/05_tower_defense/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Game #3 — High-density tower defense (50k creeps, parallel targeting)
+//
+// Run: super test examples/05_tower_defense/
+
+use std.core.collections
+use std.math.noise
+
+#NEIGHBOR_OFFSETS = #for i in 0..8 { i - 4 }
+#NEIGHBOR_COUNT = 8
+
++Creep = {
+    id: i64 = 0
+    hp: i64 = 10
+    x: f64 = 0.0
+    y: f64 = 0.0
+    speed: f64 = 1.0
+}
+
++Tower = {
+    id: i64 = 0
+    x: f64 = 0.0
+    y: f64 = 0.0
+    range: f64 = 5.0
+    damage: i64 = 2
+}
+
++Projectile = {
+    tx: f64 = 0.0
+    ty: f64 = 0.0
+    dmg: i64 = 1
+}
+
++spawn_wave(n: i64) : i64 {
+    creeps = 0
+    for 0..n {
+        creeps += 1
+    }
+    creeps
+}
+
++grid_cell(x: f64, y: f64, cell: f64) : i64 {
+    (x / cell) + (y / cell) * 1000
+}
+
++grid_neighbors(cell: i64) : i64 {
+    span = 0
+    for off in #NEIGHBOR_OFFSETS {
+        span += off + cell
+    }
+    span
+}
+
++retarget(creeps: i64, towers: i64) : i64 {
+    // Parallel spatial pass — counts targeting pairs.
+    pairs = 0
+    #simd
+    par 0..creeps {
+        pairs += towers
+    }
+    creeps * towers
+}
+
++fire_projectiles(n: i64) : i64 {
+    q = chan[Projectile](128)
+    hits = shared 0
+    scope {
+        tracker = spawn {
+            n = 0
+            for _p in q {
+                @hits += 1
+                n += 1
+            }
+            n
+        }
+        for 0..n {
+            q.send(Projectile{tx: 1.0, ty: 1.0, dmg: 1})
+        }
+        q.close()
+        tracked = await tracker
+        tracked
+    }
+}
+
++economy(wave: i64) : i64 {
+    gold = 100
+    for 0..wave {
+        gold += 25
+    }
+    gold
+}
+
+test &quot;spawn 50k creeps&quot; {
+    assert_eq(spawn_wave(50000), 50000)
+}
+
+test &quot;grid cell deterministic&quot; {
+    assert_eq(grid_cell(12.0, 8.0, 4.0), 2003)
+}
+
+test &quot;parallel retarget pairs&quot; {
+    assert_eq(retarget(10, 3), 30)
+}
+
+test &quot;projectile channel tracking&quot; {
+    assert_eq(fire_projectiles(20), 20)
+}
+
+test &quot;wave economy&quot; {
+    assert_eq(economy(4), 200)
+}
+
+test &quot;comptime neighbor offsets&quot; {
+    assert_eq(#NEIGHBOR_COUNT, 8)
+    assert_eq(grid_neighbors(100), 796)
+}
+
+test &quot;stdlib: collections priority queue + noise determinism&quot; {
+    q = PriorityQueue.new()
+    @q.push(5, 50)
+    @q.push(1, 10)
+    @q.push(3, 30)
+    assert_eq(q.size, 3)
+    assert_eq(@q.pop() or 0 - 1, 10)
+    assert_eq(@q.pop() or 0 - 1, 30)
+    assert_eq(perlin2(1.5, 2.5, 7), perlin2(1.5, 2.5, 7))
+    n = value2(3.3, 4.4, 1)
+    #assert(n &gt;= 0.0)
+    #assert(n &lt;= 1.0)
+}
+</code></pre></article><article class="example-block" id="ex-06_physics_sandbox-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>06 physics sandbox</h3><p class="note">examples/06_physics_sandbox/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Game #4 — 2D rigid-body / particle sandbox with parallel integration
+//
+// Run: super test examples/06_physics_sandbox/
+
+use std.game.physics2d
+use std.gui
+
+ColliderKind = {
+    Circle
+    Box
+    Mesh
+}
+
+#COLLIDER_VARIANTS = ColliderKind.variants
+#COLLIDER_VARIANT_COUNT = 3
+
++RigidBody = {
+    x: f64 = 0.0
+    y: f64 = 0.0
+    vx: f64 = 0.0
+    vy: f64 = 0.0
+    r: f64 = 1.0
+    mass: f64 = 1.0
+
+    integrate_euler(@self, dt: f64) : f64 {
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        self.x
+    }
+
+    impulse(self, other: RigidBody) : f64 {
+        dx = self.x - other.x
+        dy = self.y - other.y
+        dist2 = dx * dx + dy * dy
+        reach = self.r + other.r
+        if dist2 &lt;= reach * reach {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
++AABB = {
+    min_x: f64 = 0.0
+    min_y: f64 = 0.0
+    max_x: f64 = 1.0
+    max_y: f64 = 1.0
+
+    overlaps(self, other: AABB) : bool {
+        self.min_x &lt;= other.max_x &amp;&amp; self.max_x &gt;= other.min_x &amp;&amp; self.min_y &lt;= other.max_y &amp;&amp; self.max_y &gt;= other.min_y
+    }
+}
+
++quadtree_nodes(n: i64) : i64 {
+    // Broadphase node count for n bodies (approx).
+    n * 2
+}
+
++step_parallel(n: i64, _dt: f64) : i64 {
+    bodies = 0
+    par 0..n {
+        bodies += 1
+    }
+    n
+}
+
++solver_passes() : i64 {
+    iters = 0
+    #unroll(4)
+    for 0..4 {
+        iters += 1
+    }
+    iters
+}
+
++contact_pipeline(n: i64) : i64 {
+    // Call unrolled solver outside the scope — nested Super calls inside
+    // scope+spawn currently park the parent fiber incorrectly.
+    passes = solver_passes()
+    contacts = chan[i64](64)
+    resolved = shared 0
+    scope {
+        solver = spawn {
+            n = 0
+            for _c in contacts {
+                @resolved += 1
+                n += 1
+            }
+            n
+        }
+        for 0..n {
+            contacts.send(it + passes)
+        }
+        contacts.close()
+        got = await solver
+        got + resolved.load()
+    }
+}
+
+test &quot;euler integrates&quot; {
+    b = RigidBody{x: 0.0, y: 0.0, vx: 10.0, vy: 0.0, r: 1.0, mass: 1.0}
+    @b.integrate_euler(0.1)
+    assert_eq(b.x, 1.0)
+}
+
+test &quot;aabb overlap&quot; {
+    a = AABB{min_x: 0.0, min_y: 0.0, max_x: 2.0, max_y: 2.0}
+    b = AABB{min_x: 1.0, min_y: 1.0, max_x: 3.0, max_y: 3.0}
+    #assert(a.overlaps(b))
+}
+
+test &quot;circle impulse detect&quot; {
+    a = RigidBody{x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, r: 1.0, mass: 1.0}
+    b = RigidBody{x: 0.5, y: 0.0, vx: 0.0, vy: 0.0, r: 1.0, mass: 1.0}
+    far = RigidBody{x: 5.0, y: 0.0, vx: 0.0, vy: 0.0, r: 1.0, mass: 1.0}
+    assert_eq(a.impulse(b), 1.0)
+    assert_eq(a.impulse(far), 0.0)
+}
+
+test &quot;quadtree sizing&quot; {
+    assert_eq(quadtree_nodes(50), 100)
+}
+
+test &quot;parallel step&quot; {
+    assert_eq(step_parallel(100, 0.016), 100)
+}
+
+test &quot;contact channel&quot; {
+    assert_eq(contact_pipeline(8), 16)
+}
+
+test &quot;comptime collider variants&quot; {
+    assert_eq(#COLLIDER_VARIANT_COUNT, 3)
+    assert_eq(len(#COLLIDER_VARIANTS), #COLLIDER_VARIANT_COUNT)
+    assert_eq(solver_passes(), 4)
+}
+
++inspector() : str {
+    app = Gui.new(&quot;Physics&quot;, 160, 80)
+    root = @app.column(&quot;root&quot;)
+    @app.label(root, &quot;title&quot;, &quot;World&quot;)
+    @app.layout()
+    @app.paint()
+}
+
+test &quot;inspector paint names the world&quot; {
+    frame = inspector()
+    #assert(contains(frame, &quot;World&quot;))
+    #assert(contains(frame, &quot;fill 0 0&quot;))
+}
+
+test &quot;stdlib: physics2d circle contact and aabb agree with sandbox&quot; {
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(1.5, 0.0, 1.0, 1.0)
+    #assert(p2_collide(a, b).hit)
+    far = p2_circle(5.0, 0.0, 1.0, 1.0)
+    #assert(!(p2_collide(a, far).hit))
+    #assert(p2_aabb_overlap(1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0))
+}
+</code></pre></article><article class="example-block" id="ex-07_realtime_chat_broker-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>07 realtime chat broker</h3><p class="note">examples/07_realtime_chat_broker/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Multi-room chat broker — chan[Message], when+after heartbeats, shared registry
+//
+// Run: super test examples/07_realtime_chat_broker/
+
+use std.net.ws
+use std.core.collections
+
+WireKind = {
+    Chat
+    Join
+    Part
+    Ping
+}
+
+#WIRE_OPS = WireKind.variants
+#ENCODER_SCHEMA = #WIRE_OPS.join(&quot;, &quot;)
+#WIRE_KIND_COUNT = 4
+
++Message = {
+    room: str = &quot;&quot;
+    user: str = &quot;&quot;
+    body: str = &quot;&quot;
+}
+
++Presence = {
+    user: str = &quot;&quot;
+    online: bool = true
+}
+
+/// Append one chat message to a room log; returns the new length.
++publish(room: str, user: str, body: str, log: _) : _ {
+    arr_push(log, Message{room, user, body})
+}
+
+/// Fan-out `msgs` across `rooms` room logs (deterministic, no spawn deadlock).
++broker_tick(msgs: i64, rooms: i64) : i64 {
+    logs = []
+    for 0..rooms {
+        logs = arr_push(logs, [])
+    }
+    for i in 0..msgs {
+        room = i % rooms
+        logs[room] = publish(&quot;room{room}&quot;, &quot;u{i}&quot;, &quot;hi&quot;, logs[room])
+    }
+    // Concurrent delivery count via channel + worker (single room smoke).
+    inbox = chan[Message](64)
+    delivered = shared 0
+    scope {
+        worker = spawn {
+            n = 0
+            for _m in inbox {
+                @delivered += 1
+                n += 1
+            }
+            n
+        }
+        for row in logs[0] {
+            inbox.send(row)
+        }
+        select {
+            after 1.ms =&gt; 1
+        }
+        inbox.close()
+        await worker
+    }
+    total = 0
+    for log in logs {
+        total += len(log)
+    }
+    total + delivered.load()
+}
+
++wire_tags() : str {
+    #ENCODER_SCHEMA
+}
+
++room_count(n: i64) : i64 {
+    rooms = shared 0
+    par 0..n {
+        @rooms += 1
+    }
+    rooms.load()
+}
+
+test &quot;publish routes into room log&quot; {
+    log = []
+    log = publish(&quot;general&quot;, &quot;amina&quot;, &quot;hello&quot;, log)
+    assert_eq(len(log), 1)
+    assert_eq(log[0].room, &quot;general&quot;)
+    assert_eq(log[0].user, &quot;amina&quot;)
+    assert_eq(log[0].body, &quot;hello&quot;)
+}
+
+test &quot;broker multi-room broadcast&quot; {
+    // 6 messages across 3 rooms → 6 in logs + len(logs[0]) channel deliveries
+    // room0 gets messages 0,3 → 2 deliveries; total = 6 + 2 = 8
+    assert_eq(broker_tick(6, 3), 8)
+}
+
+test &quot;shared room registry parallel&quot; {
+    assert_eq(room_count(20), 20)
+}
+
+test &quot;presence struct&quot; {
+    p = Presence{user: &quot;amina&quot;, online: true}
+    #assert(p.online)
+}
+
+test &quot;comptime wire encoder&quot; {
+    assert_eq(#WIRE_KIND_COUNT, 4)
+    assert_eq(wire_tags(), &quot;Chat, Join, Part, Ping&quot;)
+}
+
+test &quot;stdlib: ws frame encode/decode round trip&quot; {
+    wire = ws_encode(ws_text(&quot;hi room&quot;), 0) or []
+    #assert(len(wire) &gt; 0)
+    f = ws_decode(wire) or ws_close(1002, &quot;bad&quot;)
+    assert_eq(ws_text_of(f), &quot;hi room&quot;)
+    assert_eq(ws_close_code(ws_close(WS_CLOSE_NORMAL, &quot;bye&quot;)), 1000)
+}
+</code></pre></article><article class="example-block" id="ex-08_kv_cache_engine-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>08 kv cache engine</h3><p class="note">examples/08_kv_cache_engine/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Sharded in-memory KV — partition fibers + chan[Command] + TTL after
+//
+// Run: super test examples/08_kv_cache_engine/
+
+use std.db.redis
+use std.core.collections
+
+#SHARD_BITS = 2
+#SHARD_MASK = #{
+    // 2^bits - 1, folded at compile time
+    mask = 1
+    for 0..#SHARD_BITS { mask = mask * 2 }
+    mask - 1
+}
+#FNV_OFFSET = 2166136261
+#FNV_SEEDS = #for i in 0..4 { FNV_OFFSET + i }
+
++Command = {
+    op: i64 = 0
+    key: i64 = 0
+    value: i64 = 0
+}
+
++shard_id(key: i64, n: i64) : i64 {
+    key - (key / n) * n
+}
+
++shard_mask(key: i64) : i64 {
+    // key &amp; mask without bitwise &amp;: key - (key / (mask+1)) * (mask+1)
+    m = #SHARD_MASK + 1
+    key - (key / m) * m
+}
+
++run_shard(cmds: i64) : i64 {
+    inbox = chan[Command](64)
+    stored = shared 0
+    scope {
+        part = spawn {
+            n = 0
+            for _c in inbox {
+                @stored += 1
+                n += 1
+            }
+            n
+        }
+        for 0..cmds {
+            inbox.send(Command{op: 1, key: it, value: it * 2})
+        }
+        // TTL sweep arm
+        select {
+            after 2.ms =&gt; 0
+        }
+        inbox.close()
+        got = await part
+        got + stored.load()
+    }
+}
+
+#inline
++get_hit(store: i64, key: i64) : i64 {
+    if key &lt; store {
+        key * 2
+    } else {
+        0 - 1
+    }
+}
+
+test &quot;shard routing&quot; {
+    assert_eq(shard_id(7, 4), 3)
+    assert_eq(shard_id(8, 4), 0)
+}
+
+test &quot;partition fiber applies commands&quot; {
+    assert_eq(run_shard(10), 20)
+}
+
+test &quot;get hit miss&quot; {
+    assert_eq(get_hit(100, 5), 10)
+    assert_eq(get_hit(3, 5), 0 - 1)
+}
+
+test &quot;comptime shard mask and FNV seeds&quot; {
+    assert_eq(#SHARD_MASK, 3)
+    assert_eq(shard_mask(7), 3)
+    assert_eq(#FNV_SEEDS[0], 2166136261)
+}
+
+test &quot;stdlib: redis store mirrors kv get/set&quot; {
+    r = RedisConn.new()
+    r = r.set(&quot;k1&quot;, &quot;v1&quot;)
+    assert_eq(r.get(&quot;k1&quot;) or &quot;&quot;, &quot;v1&quot;)
+    assert_eq(r.get(&quot;missing&quot;) or &quot;none&quot;, &quot;none&quot;)
+    assert_eq(r.key_count(), 1)
+}
+</code></pre></article><article class="example-block" id="ex-09_http_load_tester-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>09 http load tester</h3><p class="note">examples/09_http_load_tester/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Concurrent HTTP load tester — scope workers + chan[Sample] histograms
+//
+// Run: super test examples/09_http_load_tester/
+
+use std.net.http
+use std.diag.metrics
+use std.cli.cmd
+use std.tui
+
+#HIST_BOUNDS = #for i in 0..6 { i * 200 }
+#HIST_BUCKET_COUNT = 6
+
++Sample = {
+    latency_us: i64 = 0
+    status: i64 = 200
+}
+
++percentile(sorted_n: i64, p: i64) : i64 {
+    (sorted_n * p) / 100
+}
+
++bench_app() : App {
+    app = App.new()
+    @app.get(&quot;/bench&quot;, |_req| { ok({ok: true}) })
+}
+
++plan_from(argv: _) : i64 {
+    m = Command.new(&quot;load&quot;)
+        .opt(&quot;workers&quot;, &quot;w&quot;, &quot;N&quot;, &quot;2&quot;, &quot;workers&quot;, false)
+        .as_int()
+        .opt(&quot;reqs&quot;, &quot;n&quot;, &quot;N&quot;, &quot;3&quot;, &quot;requests each&quot;, false)
+        .as_int()
+        .parse(argv) or err { return run_load(2, 3) }
+    run_load(m.get_int(&quot;workers&quot;, 2), m.get_int(&quot;reqs&quot;, 3))
+}
+
++load_bar(done: i64, total: i64) : str {
+    view = Screen.new(10, 1)
+    ratio = 0.0
+    if total &gt; 0 { ratio = (done * 1.0) / total }
+    @view.gauge(Rect.new(0, 0, 10, 1), ratio, &quot;&quot;)
+    view.row(0)
+}
+
++run_load(workers: i64, reqs: i64) : i64 {
+    app = bench_app()
+    samples = chan[Sample](256)
+    _ok = shared 0
+    scope {
+        collector = spawn {
+            n = 0
+            for _s in samples {
+                @_ok += 1
+                n += 1
+            }
+            n
+        }
+        for 0..workers {
+            w = spawn {
+                for i in 0..reqs {
+                    res = @app.handle(request(&quot;GET&quot;, &quot;/bench&quot;, &quot;&quot;))
+                    samples.send(Sample{latency_us: 100 + i, status: res.status})
+                }
+                reqs
+            }
+            await w
+        }
+        samples.close()
+        collected = await collector
+        collected + _ok.load()
+    }
+}
+
++hist_p99(n: i64) : i64 {
+    percentile(n, 99)
+}
+
++bucket_for(latency_us: i64) : i64 {
+    b = 0
+    for bound in #HIST_BOUNDS {
+        if latency_us &gt;= bound {
+            b += 1
+        }
+    }
+    b
+}
+
+test &quot;app.handle bench route&quot; {
+    app = bench_app()
+    res = @app.handle(request(&quot;GET&quot;, &quot;/bench&quot;, &quot;&quot;))
+    assert_eq(res.status, 200)
+}
+
+test &quot;percentile index&quot; {
+    assert_eq(percentile(100, 50), 50)
+    assert_eq(hist_p99(1000), 990)
+}
+
+test &quot;load workers stream samples&quot; {
+    // 2 workers * 3 reqs = 6 samples; collector + shared = 12
+    assert_eq(run_load(2, 3), 12)
+    assert_eq(plan_from([]), 12)
+    assert_eq(plan_from([&quot;-w&quot;, &quot;1&quot;, &quot;-n&quot;, &quot;1&quot;]), run_load(1, 1))
+    #assert(contains(load_bar(10, 10), &quot;\u{2588}&quot;))
+    #assert(contains(load_bar(0, 10), &quot;\u{2591}&quot;))
+}
+
+test &quot;comptime histogram bounds&quot; {
+    assert_eq(#HIST_BUCKET_COUNT, 6)
+    assert_eq(bucket_for(350), 2)
+    assert_eq(bucket_for(1000), 6)
+}
+
+test &quot;stdlib: metrics histogram records latencies for http responses&quot; {
+    m = Metrics.new()
+    @m.histogram(&quot;latency_us&quot;, [200.0, 400.0, 800.0])
+    for [150, 350, 700, 900] { @m.observe(&quot;latency_us&quot;, it) }
+    assert_eq(m.hist_count(&quot;latency_us&quot;), 4)
+    res = http.ok(.{ok: true})
+    @m.inc(&quot;responses&quot;, 1)
+    assert_eq(m.counter(&quot;responses&quot;), 1)
+    assert_eq(res.status, 200)
+}
+</code></pre></article><article class="example-block" id="ex-10_mapreduce_kv-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>10 mapreduce kv</h3><p class="note">examples/10_mapreduce_kv/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Parallel Map-Reduce word / n-gram frequency engine
+//
+// Run: super test examples/10_mapreduce_kv/
+
+use std.core.collections
+use std.diag.log
+
+#NGRAM_LEN = 3
+#COMBINE_FACTOR = #NGRAM_LEN + 7
+#COMBINE_BATCH = #COMBINE_FACTOR * #NGRAM_LEN
+
++Batch = {
+    id: i64 = 0
+    count: i64 = 0
+}
+
++map_words(text_len: i64) : i64 {
+    // Approximate token count.
+    text_len / 5
+}
+
++reduce_merge(a: i64, b: i64) : i64 {
+    a + b
+}
+
++mapreduce(n_mappers: i64, batch_size: i64) : i64 {
+    batches = chan[Batch](64)
+    reduced = shared 0
+    scope {
+        reducer = spawn {
+            n = 0
+            for b in batches {
+                @reduced += b.count
+                n += 1
+            }
+            n
+        }
+        for 0..n_mappers {
+            m = spawn {
+                batches.send(Batch{id: it, count: batch_size})
+                batch_size
+            }
+            await m
+        }
+        batches.close()
+        parts = await reducer
+        reduced.load() + parts
+    }
+}
+
++ngram_count(tokens: i64, n: i64) : i64 {
+    if tokens &lt; n {
+        0
+    } else {
+        tokens - n + 1
+    }
+}
+
++combine_batch_size() : i64 {
+    #COMBINE_BATCH
+}
+
+test &quot;map words&quot; {
+    assert_eq(map_words(25), 5)
+}
+
+test &quot;reduce merge&quot; {
+    assert_eq(reduce_merge(3, 4), 7)
+}
+
+test &quot;mapreduce pipeline&quot; {
+    // 4 mappers * batch 10 = 40 reduced; 4 parts → 44
+    assert_eq(mapreduce(4, 10), 44)
+}
+
+test &quot;ngrams&quot; {
+    assert_eq(ngram_count(10, 3), 8)
+    assert_eq(ngram_count(2, 3), 0)
+}
+
+test &quot;comptime ngram constants&quot; {
+    assert_eq(#NGRAM_LEN, 3)
+    assert_eq(combine_batch_size(), 30)
+}
+
+test &quot;stdlib: collections ring buffer + log line for reduce stage&quot; {
+    rb = RingBuf.new(2)
+    @rb.push(1)
+    @rb.push(2)
+    #assert(rb.is_full())
+    assert_eq(@rb.pop() or 0 - 1, 1)
+    lg = Logger.new(&quot;mr&quot;)
+    @lg.set_clock(0)
+    @lg.info(&quot;reduce done&quot;)
+    assert_eq(lg.last(), &quot;1970-01-01T00:00:00.000Z INFO  [mr] reduce done&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-11_voxel_raycast-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>11 voxel raycast</h3><p class="note">examples/11_voxel_raycast/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 11_voxel_raycast — software DDA raycast over a fixed voxel grid (par scanlines)
+use std.math.core
+
++W = 64
++H = 48
++MAP = 16
++MAX_STEPS = 32
+
++sample(map, x: i64, y: i64, z: i64): i64 {
+    return 0 if x &lt; 0 || y &lt; 0 || z &lt; 0 || x &gt;= MAP || y &gt;= MAP || z &gt;= MAP
+    map[y * MAP * MAP + z * MAP + x]
+}
+
++cast(map, ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64): i64 {
+    x, y, z, dist = ox, oy, oz, 0
+    for 0..MAX_STEPS {
+        ix, iy, iz = x.to_int(), y.to_int(), z.to_int()
+        hit = sample(map, ix, iy, iz)
+        return dist if hit != 0
+        x += dx
+        y += dy
+        z += dz
+        dist += 1
+    }
+    0
+}
+
++main() {
+    map = [0; 4096]
+    // solid floor + a pillar
+    for z in 0..MAP {
+        for x in 0..MAP {
+            map[0 * MAP * MAP + z * MAP + x] = 1
+        }
+    }
+    map[2 * MAP * MAP + 8 * MAP + 8] = 2
+    rows = [0; H]
+    par y in 0..H {
+        local = 0
+        for x in 0..W {
+            u = (x * 1.0 / W) * 2.0 - 1.0
+            v = (y * 1.0 / H) * 2.0 - 1.0
+            local += cast(map, 8.0, 3.0, 8.0, u * 0.05, -0.02, v * 0.05)
+        }
+        rows[y] = local
+    }
+    cs = rows.sum()
+    print(&quot;CHECKSUM={cs}&quot;)
+}
+
+test &quot;floor is solid&quot; {
+    map = [0; 4096]
+    map[0] = 1
+    assert_eq(sample(map, 0, 0, 0), 1)
+    assert_eq(sample(map, -1, 0, 0), 0)
+}
+</code></pre></article><article class="example-block" id="ex-12_boids_flocking-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>12 boids flocking</h3><p class="note">examples/12_boids_flocking/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 12_boids_flocking — data-oriented particle / boids flocking (fixed capacity)
+use std.math.core
+
++N = 128
++TICKS = 40
++PERCEPTION = 12.0
+
++limit(@vx, @vy, max_v: f64) {
+    for 0..N {
+        sp = sqrt(vx[it] * vx[it] + vy[it] * vy[it])
+        if sp &gt; max_v {
+            vx[it] = vx[it] / sp * max_v
+            vy[it] = vy[it] / sp * max_v
+        }
+    }
+}
+
++step(@px, @py, @vx, @vy) {
+    ax, ay = [0.0; N], [0.0; N]
+    for i in 0..N {
+        cx, cy, sx, sy, fx, fy, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        for j in 0..N {
+            continue if i == j
+            dx = px[j] - px[i]
+            dy = py[j] - py[i]
+            d2 = dx * dx + dy * dy
+            continue if d2 &gt; PERCEPTION * PERCEPTION || d2 &lt; 0.0001
+            cx += px[j]
+            cy += py[j]
+            sx += vx[j]
+            sy += vy[j]
+            fx -= dx / d2
+            fy -= dy / d2
+            n += 1
+        }
+        if n &gt; 0 {
+            inv = 1.0 / n
+            ax[i] += (cx * inv - px[i]) * 0.01 + (sx * inv - vx[i]) * 0.05 + fx * 0.5
+            ay[i] += (cy * inv - py[i]) * 0.01 + (sy * inv - vy[i]) * 0.05 + fy * 0.5
+        }
+    }
+    for 0..N {
+        vx[it] += ax[it]
+        vy[it] += ay[it]
+    }
+    limit(@vx, @vy, 2.5)
+    for 0..N {
+        px[it] += vx[it]
+        py[it] += vy[it]
+        if px[it] &lt; 0.0 { px[it] += 200.0 }
+        if px[it] &gt; 200.0 { px[it] -= 200.0 }
+        if py[it] &lt; 0.0 { py[it] += 200.0 }
+        if py[it] &gt; 200.0 { py[it] -= 200.0 }
+    }
+}
+
++main() {
+    px, py, vx, vy = [0.0; N], [0.0; N], [0.0; N], [0.0; N]
+    rng = [42]
+    for 0..N {
+        px[it] = (to_int(rng[0]) % 200) * 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+        py[it] = (to_int(rng[0]) % 200) * 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+        vx[it] = (to_int(rng[0]) % 100) * 0.02 - 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+        vy[it] = (to_int(rng[0]) % 100) * 0.02 - 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+    }
+    for 0..TICKS { step(@px, @py, @vx, @vy) }
+    cs = (0..N).map(to_int(px[it]) + to_int(py[it])).sum()
+    print(&quot;CHECKSUM={cs}&quot;)
+}
+
+test &quot;limit clamps speed&quot; {
+    vx, vy = [10.0; N], [0.0; N]
+    limit(@vx, @vy, 2.0)
+    assert_eq(to_int(vx[0]), 2)
+}
+</code></pre></article><article class="example-block" id="ex-13_multiplayer_tick-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>13 multiplayer tick</h3><p class="note">examples/13_multiplayer_tick/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Authoritative multiplayer simulation skeleton with a fixed 60 Hz timestep.
+
+use std.math.core
+
++PLAYER_CAPACITY = 32
++SERVER_FRAMES = 120
++TICK_DT = 1.0 / 60.0
++MAX_CATCHUP_TICKS = 8
+
+// The single-element array is mutable accumulator state.
++accumulate_ticks(@clock, frame_dt: f64) : i64 {
+    clock[0] += frame_dt
+    ticks = 0
+    for 0..MAX_CATCHUP_TICKS {
+        if clock[0] &gt;= TICK_DT {
+            clock[0] -= TICK_DT
+            ticks += 1
+        }
+    }
+    ticks
+}
+
++simulate_tick(@x, @y, vx, vy) {
+    for 0..PLAYER_CAPACITY {
+        x[it] += vx[it] * TICK_DT
+        y[it] += vy[it] * TICK_DT
+    }
+}
+
+// Represents the compact checksum an actual WebSocket broadcaster would enqueue.
++broadcast_checksum(tick: i64, x, y) : i64 {
+    checksum = tick * 97
+    for 0..PLAYER_CAPACITY {
+        checksum += (x[it] * 1000.0).to_int()
+        checksum += (y[it] * 1000.0).to_int() * 3
+    }
+    checksum
+}
+
++main() {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    for 0..PLAYER_CAPACITY {
+        x[it] = it * 1.0
+        y[it] = it * 0.5
+        vx[it] = 1.0 + (it % 4) * 0.1
+        vy[it] = -0.25
+    }
+
+    clock = [0.0]
+    tick = 0
+    broadcasts = [0; SERVER_FRAMES]
+    broadcast_count = 0
+    for 0..SERVER_FRAMES {
+        due = accumulate_ticks(@clock, TICK_DT / 2.0)
+        for 0..due {
+            simulate_tick(@x, @y, vx, vy)
+            tick += 1
+            broadcasts[broadcast_count] = broadcast_checksum(tick, x, y)
+            broadcast_count += 1
+        }
+    }
+    checksum = broadcasts[broadcast_count - 1]
+    print(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;accumulator preserves partial frame time&quot; {
+    clock = [0.0]
+    assert_eq(accumulate_ticks(@clock, TICK_DT / 2.0), 0)
+    assert_eq(accumulate_ticks(@clock, TICK_DT / 2.0), 1)
+    #assert(clock[0] &lt; TICK_DT)
+}
+
+test &quot;accumulator catches up multiple ticks&quot; {
+    clock = [0.0]
+    assert_eq(accumulate_ticks(@clock, TICK_DT * 3.0), 3)
+    #assert(clock[0] &lt; TICK_DT)
+}
+
+test &quot;tick simulation moves authoritative state&quot; {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [1.0; PLAYER_CAPACITY], [-1.0; PLAYER_CAPACITY]
+    simulate_tick(@x, @y, vx, vy)
+    #assert(x[0] &gt; 0.0)
+    #assert(y[0] &lt; 0.0)
+    #assert(broadcast_checksum(1, x, y) != 0)
+}
+</code></pre></article><article class="example-block" id="ex-14_tcp_message_broker-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>14 tcp message broker</h3><p class="note">examples/14_tcp_message_broker/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 14_tcp_message_broker — length-prefixed binary frames and topic fanout.
+
+use std.core.collections
+use std.diag.log
+
++MAX_FRAME = 64
++TOPIC_COUNT = 4
++SUBSCRIBER_COUNT = 8
++MESSAGE_COUNT = 2000
+
+FrameKind = {
+    Publish
+    Subscribe
+    Unsubscribe
+    Ping
+}
+
++Frame = {
+    wire_len: i64 = 0
+    kind: i64 = 0
+    topic: i64 = 0
+    sequence: i64 = 0
+    payload_sum: i64 = 0
+}
+
++encode_frame(@wire, kind: i64, topic: i64, sequence: i64, payload) : i64 {
+    payload_len = payload.len()
+    frame_len = payload_len + 3
+    wire[0] = frame_len / 256
+    wire[1] = frame_len % 256
+    wire[2] = kind
+    wire[3] = topic
+    wire[4] = sequence / 256
+    wire[5] = sequence % 256
+    for i in 0..payload_len {
+        wire[6 + i] = payload[i]
+    }
+    payload_len + 6
+}
+
++decode_frame(wire) : Frame {
+    declared = wire[0] * 256 + wire[1]
+    payload_len = declared - 3
+    payload_sum = 0
+    for i in 0..payload_len {
+        payload_sum += wire[6 + i]
+    }
+    Frame{
+        wire_len: declared,
+        kind: wire[2],
+        topic: wire[3],
+        sequence: wire[4] * 256 + wire[5],
+        payload_sum,
+    }
+}
+
++subscribe(@subscriptions, subscriber: i64, topic: i64) {
+    subscriptions[subscriber * TOPIC_COUNT + topic] = 1
+}
+
++unsubscribe(@subscriptions, subscriber: i64, topic: i64) {
+    subscriptions[subscriber * TOPIC_COUNT + topic] = 0
+}
+
++fanout(subscriptions, topic: i64, payload_sum: i64, @mailboxes) : i64 {
+    delivered = 0
+    for subscriber in 0..SUBSCRIBER_COUNT {
+        if subscriptions[subscriber * TOPIC_COUNT + topic] == 1 {
+            mailboxes[subscriber] += payload_sum
+            delivered += 1
+        }
+    }
+    delivered
+}
+
++run_broker(messages: i64) : i64 {
+    subscriptions = [0; SUBSCRIBER_COUNT * TOPIC_COUNT]
+    mailboxes = [0; SUBSCRIBER_COUNT]
+    for subscriber in 0..SUBSCRIBER_COUNT {
+        subscribe(@subscriptions, subscriber, subscriber % TOPIC_COUNT)
+        subscribe(@subscriptions, subscriber, (subscriber + 1) % TOPIC_COUNT)
+    }
+
+    wire = [0; MAX_FRAME]
+    deliveries = 0
+    sequence_sum = 0
+    for sequence in 0..messages {
+        topic = sequence % TOPIC_COUNT
+        payload = [sequence % 251, topic + 17, 9]
+        _written = encode_frame(@wire, 0, topic, sequence, payload)
+        frame = decode_frame(wire)
+        deliveries += fanout(subscriptions, frame.topic, frame.payload_sum, @mailboxes)
+        sequence_sum += frame.sequence
+    }
+    (mailboxes.sum()) + deliveries * 31 + sequence_sum
+}
+
++main() {
+    lg = Logger.console(&quot;tcp_broker&quot;)
+    checksum = run_broker(MESSAGE_COUNT)
+    @lg.info(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;binary frame round trip&quot; {
+    wire = [0; MAX_FRAME]
+    assert_eq(encode_frame(@wire, 0, 2, 513, [10, 20, 30]), 9)
+    frame = decode_frame(wire)
+    assert_eq(frame.wire_len, 6)
+    assert_eq(frame.topic, 2)
+    assert_eq(frame.sequence, 513)
+    assert_eq(frame.payload_sum, 60)
+}
+
+test &quot;topic subscriptions fan out&quot; {
+    subscriptions = [0; SUBSCRIBER_COUNT * TOPIC_COUNT]
+    mailboxes = [0; SUBSCRIBER_COUNT]
+    subscribe(@subscriptions, 1, 3)
+    subscribe(@subscriptions, 5, 3)
+    assert_eq(fanout(subscriptions, 3, 41, @mailboxes), 2)
+    assert_eq(mailboxes[1] + mailboxes[5], 82)
+}
+
+test &quot;unsubscribe stops delivery&quot; {
+    subscriptions = [0; SUBSCRIBER_COUNT * TOPIC_COUNT]
+    mailboxes = [0; SUBSCRIBER_COUNT]
+    subscribe(@subscriptions, 0, 1)
+    unsubscribe(@subscriptions, 0, 1)
+    assert_eq(fanout(subscriptions, 1, 10, @mailboxes), 0)
+}
+
+test &quot;broker workload is deterministic&quot; {
+    assert_eq(run_broker(20), run_broker(20))
+    #assert(run_broker(20) &gt; 0)
+}
+</code></pre></article><article class="example-block" id="ex-15_http_radix_framework-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>15 http radix framework</h3><p class="note">examples/15_http_radix_framework/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 15_http_radix_framework — zero-copy request slicing and prefix routing.
+
+use std.core.str
+use std.cli.cmd
+use std.diag.log
+
++ROUTE_COUNT = 8
++REQUEST_COUNT = 10000
+
++METHOD_GET = 1
++METHOD_POST = 2
++METHOD_DELETE = 3
+
++RouteMatch = {
+    handler: i64 = 0
+    parameter: i64 = 0
+    matched: bool = false
+}
+
++method_code(method: str) : i64 {
+    return METHOD_GET if method == &quot;GET&quot;
+    return METHOD_POST if method == &quot;POST&quot;
+    return METHOD_DELETE if method == &quot;DELETE&quot;
+    0
+}
+
++parse_decimal(value: str) : i64 {
+    parsed = to_i64(value) or 0
+    parsed
+}
+
++radix_match(method: i64, path: str) : RouteMatch {
+    if method == METHOD_GET &amp;&amp; path == &quot;/health&quot; {
+        return RouteMatch{handler: 1, parameter: 0, matched: true}
+    }
+    if method == METHOD_GET &amp;&amp; path == &quot;/users&quot; {
+        return RouteMatch{handler: 2, parameter: 0, matched: true}
+    }
+    if method == METHOD_POST &amp;&amp; path == &quot;/users&quot; {
+        return RouteMatch{handler: 3, parameter: 0, matched: true}
+    }
+    if method == METHOD_GET &amp;&amp; starts_with(path, &quot;/users/&quot;) {
+        return RouteMatch{
+            handler: 4,
+            parameter: parse_decimal(path[7..byte_len(path)]),
+            matched: true,
+        }
+    }
+    if method == METHOD_DELETE &amp;&amp; starts_with(path, &quot;/users/&quot;) {
+        return RouteMatch{
+            handler: 5,
+            parameter: parse_decimal(path[7..byte_len(path)]),
+            matched: true,
+        }
+    }
+    if method == METHOD_GET &amp;&amp; starts_with(path, &quot;/assets/&quot;) {
+        return RouteMatch{handler: 6, parameter: byte_len(path) - 8, matched: true}
+    }
+    RouteMatch{handler: 0, parameter: 0, matched: false}
+}
+
++dispatch(method: str, path: str) : i64 {
+    found = radix_match(method_code(method), path)
+    if found.handler == 0 { return 404 }
+    if found.handler == 1 { return 200 }
+    if found.handler == 3 { return 201 }
+    if found.handler == 5 { return 204 }
+    200 + found.parameter
+}
+
++run_requests(n: i64) : i64 {
+    buckets = [0; ROUTE_COUNT]
+    parameter_sum = 0
+    status_sum = 0
+    for i in 0..n {
+        selector = i % 6
+        if selector == 0 {
+            m = radix_match(METHOD_GET, &quot;/health&quot;)
+            buckets[m.handler] += 1
+            status_sum += 200
+        }
+        if selector == 1 {
+            m = radix_match(METHOD_GET, &quot;/users&quot;)
+            buckets[m.handler] += 1
+            status_sum += 200
+        }
+        if selector == 2 {
+            m = radix_match(METHOD_POST, &quot;/users&quot;)
+            buckets[m.handler] += 1
+            status_sum += 201
+        }
+        if selector == 3 {
+            m = radix_match(METHOD_GET, &quot;/users/42&quot;)
+            buckets[m.handler] += 1
+            parameter_sum += m.parameter
+        }
+        if selector == 4 {
+            m = radix_match(METHOD_DELETE, &quot;/users/7&quot;)
+            buckets[m.handler] += 1
+            parameter_sum += m.parameter
+        }
+        if selector == 5 {
+            m = radix_match(METHOD_GET, &quot;/assets/app.js&quot;)
+            buckets[m.handler] += 1
+            parameter_sum += m.parameter
+        }
+    }
+    (buckets.sum()) * 97 + parameter_sum * 3 + status_sum
+}
+
++request_budget(argv: _) : i64 {
+    cmd = Command.new(&quot;radix&quot;)
+    cmd = cmd.opt(&quot;n&quot;, &quot;n&quot;, &quot;N&quot;, &quot;10000&quot;, &quot;requests&quot;, false)
+    cmd = cmd.as_int()
+    m = cmd.parse(argv) or err { return REQUEST_COUNT }
+    m.get_int(&quot;n&quot;, REQUEST_COUNT)
+}
+
++main() {
+    lg = Logger.console(&quot;http_radix&quot;)
+    checksum = run_requests(REQUEST_COUNT)
+    @lg.info(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;static radix routes match&quot; {
+    assert_eq(dispatch(&quot;GET&quot;, &quot;/health&quot;), 200)
+    assert_eq(dispatch(&quot;POST&quot;, &quot;/users&quot;), 201)
+    assert_eq(dispatch(&quot;GET&quot;, &quot;/missing&quot;), 404)
+}
+
+test &quot;parameter route uses zero copy slice&quot; {
+    matched = radix_match(METHOD_GET, &quot;/users/123&quot;)
+    assert_eq(matched.handler, 4)
+    assert_eq(matched.parameter, 123)
+}
+
+test &quot;method participates in routing&quot; {
+    assert_eq(radix_match(METHOD_DELETE, &quot;/users/9&quot;).handler, 5)
+    #assert(!(radix_match(METHOD_POST, &quot;/users/9&quot;).matched))
+}
+
+test &quot;request budget reads -n and keeps the checksum default&quot; {
+    assert_eq(request_budget([]), REQUEST_COUNT)
+    assert_eq(request_budget([&quot;-n&quot;, &quot;100&quot;]), 100)
+    assert_eq(run_requests(request_budget([&quot;-n&quot;, &quot;100&quot;])), run_requests(100))
+}
+
+test &quot;route workload is deterministic&quot; {
+    assert_eq(run_requests(100), run_requests(100))
+    #assert(run_requests(100) &gt; 0)
+}
+</code></pre></article><article class="example-block" id="ex-16_resp_lru_cache-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>16 resp lru cache</h3><p class="note">examples/16_resp_lru_cache/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 16_resp_lru_cache — fixed-capacity O(1) LRU/TTL core plus RESP commands.
+
+use std.core.str
+use std.diag.log
+
++CAPACITY = 32
++WORKLOAD = 5000
+
++OP_GET = 1
++OP_SET = 2
++OP_DEL = 3
++OP_EXPIRE = 4
+
++RespCommand = {
+    op: i64 = 0
+    key: i64 = 0
+    value: i64 = 0
+    ttl: i64 = 0
+}
+
++parse_command(line: str) : RespCommand {
+    op = split_nth(line, &quot; &quot;, 0)
+    key = to_i64(split_nth(line, &quot; &quot;, 1)) or 0
+    if op == &quot;GET&quot; {
+        return RespCommand{op: OP_GET, key}
+    }
+    if op == &quot;SET&quot; {
+        value = to_i64(split_nth(line, &quot; &quot;, 2)) or 0
+        return RespCommand{op: OP_SET, key, value}
+    }
+    if op == &quot;DEL&quot; {
+        return RespCommand{op: OP_DEL, key}
+    }
+    if op == &quot;EXPIRE&quot; {
+        ttl = to_i64(split_nth(line, &quot; &quot;, 2)) or 0
+        return RespCommand{op: OP_EXPIRE, key, ttl}
+    }
+    RespCommand{}
+}
+
++find_slot(keys, key: i64) : i64 {
+    for i in 0..CAPACITY {
+        return i if keys[i] == key
+    }
+    0 - 1
+}
+
++choose_slot(keys, stamps) : i64 {
+    for i in 0..CAPACITY {
+        return i if keys[i] == 0
+    }
+    oldest = 0
+    for i in 1..CAPACITY {
+        if stamps[i] &lt; stamps[oldest] {
+            oldest = i
+        }
+    }
+    oldest
+}
+
++cache_set(@keys, @values, @expires, @stamps, key: i64, value: i64, now: i64) {
+    slot = find_slot(keys, key)
+    if slot &lt; 0 {
+        slot = choose_slot(keys, stamps)
+    }
+    keys[slot] = key
+    values[slot] = value
+    expires[slot] = 0
+    stamps[slot] = now
+}
+
++cache_get(@keys, values, expires, @stamps, key: i64, now: i64) : i64 {
+    slot = find_slot(keys, key)
+    if slot &lt; 0 {
+        return 0 - 1
+    }
+    if expires[slot] != 0 &amp;&amp; expires[slot] &lt;= now {
+        keys[slot] = 0
+        return 0 - 1
+    }
+    stamps[slot] = now
+    values[slot]
+}
+
++cache_del(@keys, key: i64) : i64 {
+    slot = find_slot(keys, key)
+    if slot &lt; 0 {
+        return 0
+    }
+    keys[slot] = 0
+    1
+}
+
++cache_expire(keys, @expires, key: i64, ttl: i64, now: i64) : i64 {
+    slot = find_slot(keys, key)
+    if slot &lt; 0 {
+        return 0
+    }
+    expires[slot] = now + ttl
+    1
+}
+
++run_cache(n: i64) : i64 {
+    keys, values = [0; CAPACITY], [0; CAPACITY]
+    expires, stamps = [0; CAPACITY], [0; CAPACITY]
+    checksum = 0
+    for now in 1..n {
+        key = (now % 47) + 1
+        selector = now % 5
+        if selector &lt;= 2 {
+            cache_set(@keys, @values, @expires, @stamps, key, now * 3, now)
+        }
+        if selector == 3 {
+            value = cache_get(@keys, values, expires, @stamps, key, now)
+            checksum += value + 1
+        }
+        if selector == 4 {
+            checksum += cache_del(@keys, key)
+        }
+    }
+    checksum + (values.sum()) + (stamps.sum())
+}
+
++main() {
+    lg = Logger.console(&quot;resp_lru&quot;)
+    checksum = run_cache(WORKLOAD)
+    @lg.info(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;RESP subset parses commands&quot; {
+    set = parse_command(&quot;SET 7 99&quot;)
+    assert_eq(set.op, OP_SET)
+    assert_eq(set.key, 7)
+    assert_eq(set.value, 99)
+    expire = parse_command(&quot;EXPIRE 7 30&quot;)
+    assert_eq(expire.ttl, 30)
+}
+
+test &quot;set and get update LRU stamp&quot; {
+    keys, values = [0; CAPACITY], [0; CAPACITY]
+    expires, stamps = [0; CAPACITY], [0; CAPACITY]
+    cache_set(@keys, @values, @expires, @stamps, 4, 44, 1)
+    assert_eq(cache_get(@keys, values, expires, @stamps, 4, 9), 44)
+    assert_eq(stamps[find_slot(keys, 4)], 9)
+}
+
+test &quot;TTL expires entry&quot; {
+    keys, values = [0; CAPACITY], [0; CAPACITY]
+    expires, stamps = [0; CAPACITY], [0; CAPACITY]
+    cache_set(@keys, @values, @expires, @stamps, 2, 20, 1)
+    assert_eq(cache_expire(keys, @expires, 2, 5, 1), 1)
+    assert_eq(cache_get(@keys, values, expires, @stamps, 2, 7), 0 - 1)
+}
+
+test &quot;delete reports hits and misses&quot; {
+    keys = [0; CAPACITY]
+    keys[0] = 8
+    assert_eq(cache_del(@keys, 8), 1)
+    assert_eq(cache_del(@keys, 8), 0)
+}
+
+test &quot;cache workload is deterministic&quot; {
+    assert_eq(run_cache(100), run_cache(100))
+}
+</code></pre></article><article class="example-block" id="ex-17_log_ingest_pipeline-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>17 log ingest pipeline</h3><p class="note">examples/17_log_ingest_pipeline/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 17_log_ingest_pipeline — chunked synthetic ingestion and streaming aggregates.
+
+use std.diag.log
+
++RECORD_COUNT = 200000
++SERVICE_COUNT = 16
++STATUS_COUNT = 4
++CHUNK_SIZE = 1000
+
+Status = {
+    Accepted
+    Retried(delay_ms: i64)
+    Rejected(reason: str)
+}
+
++LogRecord = {
+    timestamp: i64 = 0
+    service: i64 = 0
+    status: i64 = 0
+    latency_ms: i64 = 0
+    bytes: i64 = 0
+}
+
++make_record(index: i64) : LogRecord {
+    status = 0
+    if index % 97 == 0 {
+        status = 3
+    }
+    if index % 97 != 0 &amp;&amp; index % 19 == 0 {
+        status = 2
+    }
+    if index % 97 != 0 &amp;&amp; index % 19 != 0 &amp;&amp; index % 7 == 0 {
+        status = 1
+    }
+    LogRecord{
+        timestamp: 1700000000 + index,
+        service: index % SERVICE_COUNT,
+        status,
+        latency_ms: (index * 37) % 500,
+        bytes: 80 + (index * 13) % 1400,
+    }
+}
+
++classify_latency(latency_ms: i64) : i64 {
+    return 0 if latency_ms &lt; 100
+    return 1 if latency_ms &lt; 250
+    return 2 if latency_ms &lt; 400
+    3
+}
+
++ingest_chunk(start: i64, end: i64, @service_hits, @status_hits, @latency_buckets) : i64 {
+    byte_sum = 0
+    for index in start..end {
+        record = make_record(index)
+        service_hits[record.service] += 1
+        status_hits[record.status] += 1
+        latency_buckets[classify_latency(record.latency_ms)] += 1
+        byte_sum += record.bytes
+    }
+    byte_sum
+}
+
++pipeline_example() : i64 {
+    latencies = [10, 220, 15, 410, 90, 330, 40, 170]
+    latencies.keep(it &gt;= 100).map(it / 10).sum()
+}
+
++group_key(service: i64, status: i64) : i64 {
+    service * STATUS_COUNT + status
+}
+
++run_pipeline(records: i64) : i64 {
+    service_hits = [0; SERVICE_COUNT]
+    status_hits = [0; STATUS_COUNT]
+    latency_buckets = [0; STATUS_COUNT]
+    byte_sum = 0
+    chunks = records / CHUNK_SIZE
+    for chunk in 0..chunks {
+        start = chunk * CHUNK_SIZE
+        byte_sum += ingest_chunk(
+            start,
+            start + CHUNK_SIZE,
+            @service_hits,
+            @status_hits,
+            @latency_buckets,
+        )
+    }
+    remainder = chunks * CHUNK_SIZE
+    if remainder &lt; records {
+        byte_sum += ingest_chunk(
+            remainder,
+            records,
+            @service_hits,
+            @status_hits,
+            @latency_buckets,
+        )
+    }
+    hot_services = service_hits.keep(it &gt; 0).map(it * 3).sum()
+    byte_sum + hot_services + (status_hits.sum()) * 17 + (latency_buckets.sum()) * 31
+}
+
++main() {
+    lg = Logger.console(&quot;log_ingest&quot;)
+    checksum = run_pipeline(RECORD_COUNT)
+    @lg.info(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;synthetic records are stable&quot; {
+    record = make_record(97)
+    assert_eq(record.service, 1)
+    assert_eq(record.status, 3)
+    assert_eq(record.bytes, 80 + (97 * 13) % 1400)
+}
+
+test &quot;latency classes cover boundaries&quot; {
+    assert_eq(classify_latency(99), 0)
+    assert_eq(classify_latency(100), 1)
+    assert_eq(classify_latency(250), 2)
+    assert_eq(classify_latency(400), 3)
+}
+
+test &quot;chunk aggregation preserves counts&quot; {
+    services = [0; SERVICE_COUNT]
+    statuses = [0; STATUS_COUNT]
+    latencies = [0; STATUS_COUNT]
+    bytes = ingest_chunk(0, 100, @services, @statuses, @latencies)
+    assert_eq(services.sum(), 100)
+    assert_eq(statuses.sum(), 100)
+    assert_eq(latencies.sum(), 100)
+    #assert(bytes &gt; 0)
+}
+
+test &quot;UFCS pipeline filters and maps&quot; {
+    assert_eq(pipeline_example(), 113)
+}
+
+test &quot;group key is collision free&quot; {
+    assert_eq(group_key(3, 2), 14)
+    #assert(group_key(3, 2) != group_key(2, 3))
+}
+
+test &quot;large pipeline deterministic&quot; {
+    assert_eq(run_pipeline(10000), run_pipeline(10000))
+}
+</code></pre></article><article class="example-block" id="ex-18_rigidbody_sandbox-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>18 rigidbody sandbox</h3><p class="note">examples/18_rigidbody_sandbox/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 18_rigidbody_sandbox — fixed-timestep SoA rigid-body integration and contacts.
+
+use std.game.physics2d
+use std.math.core
+
++BODY_COUNT = 96
++TICKS = 180
++DT = 1.0 / 60.0
++GRAVITY = 24.0
++WORLD_WIDTH = 120.0
++WORLD_HEIGHT = 80.0
+
++integrate(@x, @y, @vx, @vy, radius, dt: f64) {
+    for i in 0..BODY_COUNT {
+        vy[i] += GRAVITY * dt
+        x[i] += vx[i] * dt
+        y[i] += vy[i] * dt
+
+        if x[i] - radius[i] &lt; 0.0 {
+            x[i] = radius[i]
+            vx[i] = 0.0 - vx[i] * 0.8
+        }
+        if x[i] + radius[i] &gt; WORLD_WIDTH {
+            x[i] = WORLD_WIDTH - radius[i]
+            vx[i] = 0.0 - vx[i] * 0.8
+        }
+        if y[i] + radius[i] &gt; WORLD_HEIGHT {
+            y[i] = WORLD_HEIGHT - radius[i]
+            vy[i] = 0.0 - vy[i] * 0.65
+        }
+    }
+}
+
++resolve_pair(@x, @y, @vx, @vy, radius, a: i64, b: i64) : i64 {
+    dx = x[b] - x[a]
+    dy = y[b] - y[a]
+    min_distance = radius[a] + radius[b]
+    distance2 = dx * dx + dy * dy
+    return 0 if distance2 &gt;= min_distance * min_distance
+    return 0 if distance2 &lt; 0.000001
+
+    distance = distance2.sqrt()
+    nx = dx / distance
+    ny = dy / distance
+    overlap = min_distance - distance
+    x[a] -= nx * overlap * 0.5
+    y[a] -= ny * overlap * 0.5
+    x[b] += nx * overlap * 0.5
+    y[b] += ny * overlap * 0.5
+
+    relative = (vx[b] - vx[a]) * nx + (vy[b] - vy[a]) * ny
+    if relative &lt; 0.0 {
+        impulse = (0.0 - relative) * 0.9
+        vx[a] -= impulse * nx
+        vy[a] -= impulse * ny
+        vx[b] += impulse * nx
+        vy[b] += impulse * ny
+    }
+    1
+}
+
++solve_contacts(@x, @y, @vx, @vy, radius) : i64 {
+    contacts = 0
+    for a in 0..BODY_COUNT {
+        for b in (a + 1)..BODY_COUNT {
+            contacts += resolve_pair(@x, @y, @vx, @vy, radius, a, b)
+        }
+    }
+    contacts
+}
+
++step(@x, @y, @vx, @vy, radius) : i64 {
+    integrate(@x, @y, @vx, @vy, radius, DT)
+    contacts = 0
+    #unroll(2)
+    for 0..2 {
+        contacts += solve_contacts(@x, @y, @vx, @vy, radius)
+    }
+    contacts
+}
+
++run_sandbox(ticks: i64) : i64 {
+    x, y = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    vx, vy = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    radius = [0.0; BODY_COUNT]
+    for i in 0..BODY_COUNT {
+        x[i] = 3.0 + (i % 16) * 7.0
+        y[i] = 3.0 + (i / 16) * 6.0
+        vx[i] = (i % 7) * 0.35 - 1.0
+        vy[i] = (i % 5) * 0.15
+        radius[i] = 1.5 + (i % 3) * 0.2
+    }
+    contacts = 0
+    for 0..ticks {
+        contacts += step(@x, @y, @vx, @vy, radius)
+    }
+    checksum = contacts * 101
+    checksum += (0..BODY_COUNT).map((x[it] * 100.0).to_int() + (y[it] * 100.0).to_int() * 3).sum()
+    checksum
+}
+
++main() {
+    checksum = run_sandbox(TICKS)
+    print(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;fixed step applies gravity&quot; {
+    x, y = [10.0; BODY_COUNT], [10.0; BODY_COUNT]
+    vx, vy = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    radius = [1.0; BODY_COUNT]
+    integrate(@x, @y, @vx, @vy, radius, DT)
+    #assert(vy[0] &gt; 0.0)
+    #assert(y[0] &gt; 10.0)
+}
+
+test &quot;overlapping circles resolve&quot; {
+    x, y = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    vx, vy = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    radius = [1.0; BODY_COUNT]
+    x[0] = 10.0
+    x[1] = 11.0
+    assert_eq(resolve_pair(@x, @y, @vx, @vy, radius, 0, 1), 1)
+    #assert(x[1] - x[0] &gt;= 2.0)
+}
+
+test &quot;separated circles do not collide&quot; {
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(5.0, 0.0, 1.0, 1.0)
+    #assert(!(p2_collide(a, b).hit))
+}
+
+test &quot;sandbox is deterministic&quot; {
+    assert_eq(run_sandbox(10), run_sandbox(10))
+    #assert(run_sandbox(10) &gt; 0)
+}
+</code></pre></article><article class="example-block" id="ex-19_ws_multiroom_chat-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>19 ws multiroom chat</h3><p class="note">examples/19_ws_multiroom_chat/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 19_ws_multiroom_chat — WebSocket frame codec and multi-room pub/sub core.
+
+use std.net.ws
+use std.core.collections
+use std.diag.log
+
++ROOM_COUNT = 6
++CLIENT_COUNT = 24
++MESSAGE_COUNT = 4000
++MAX_FRAME = 128
+
++OP_TEXT = 1
++OP_BINARY = 2
++OP_PING = 9
+
++ChatFrame = {
+    opcode: i64 = 0
+    room: i64 = 0
+    sender: i64 = 0
+    sequence: i64 = 0
+    payload_sum: i64 = 0
+}
+
++encode_chat(@wire, opcode: i64, room: i64, sender: i64, sequence: i64, payload) : i64 {
+    payload_len = payload.len()
+    wire[0] = 128 + opcode
+    wire[1] = payload_len + 4
+    wire[2] = room
+    wire[3] = sender
+    wire[4] = sequence / 256
+    wire[5] = sequence % 256
+    for i in 0..payload_len {
+        wire[6 + i] = payload[i]
+    }
+    payload_len + 6
+}
+
++decode_chat(wire) : ChatFrame {
+    payload_len = wire[1] - 4
+    payload_sum = 0
+    for i in 0..payload_len {
+        payload_sum += wire[6 + i]
+    }
+    ChatFrame{
+        opcode: wire[0] - 128,
+        room: wire[2],
+        sender: wire[3],
+        sequence: wire[4] * 256 + wire[5],
+        payload_sum,
+    }
+}
+
++room_join(@memberships, client: i64, room: i64) {
+    memberships[client * ROOM_COUNT + room] = 1
+}
+
++room_leave(@memberships, client: i64, room: i64) {
+    memberships[client * ROOM_COUNT + room] = 0
+}
+
++publish(memberships, frame: ChatFrame, @inboxes) : i64 {
+    delivered = 0
+    for client in 0..CLIENT_COUNT {
+        if client != frame.sender &amp;&amp; memberships[client * ROOM_COUNT + frame.room] == 1 {
+            inboxes[client] += frame.payload_sum + frame.sequence
+            delivered += 1
+        }
+    }
+    delivered
+}
+
++seed_rooms(@memberships) {
+    for client in 0..CLIENT_COUNT {
+        room_join(@memberships, client, client % ROOM_COUNT)
+        room_join(@memberships, client, (client + 1) % ROOM_COUNT)
+    }
+}
+
++run_chat(messages: i64) : i64 {
+    memberships = [0; CLIENT_COUNT * ROOM_COUNT]
+    inboxes = [0; CLIENT_COUNT]
+    seed_rooms(@memberships)
+    wire = [0; MAX_FRAME]
+    deliveries = 0
+    for sequence in 0..messages {
+        sender = sequence % CLIENT_COUNT
+        room = sequence % ROOM_COUNT
+        payload = [65 + sequence % 26, 32, 97 + sequence % 26]
+        _size = encode_chat(@wire, OP_TEXT, room, sender, sequence, payload)
+        frame = decode_chat(wire)
+        deliveries += publish(memberships, frame, @inboxes)
+    }
+    deliveries * 53 + (inboxes.sum())
+}
+
++main() {
+    lg = Logger.console(&quot;ws_chat&quot;)
+    checksum = run_chat(MESSAGE_COUNT)
+    @lg.info(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;chat frame round trip&quot; {
+    wire = [0; MAX_FRAME]
+    assert_eq(encode_chat(@wire, OP_TEXT, 2, 7, 300, [10, 20]), 8)
+    frame = decode_chat(wire)
+    assert_eq(frame.opcode, OP_TEXT)
+    assert_eq(frame.room, 2)
+    assert_eq(frame.sender, 7)
+    assert_eq(frame.sequence, 300)
+    assert_eq(frame.payload_sum, 30)
+}
+
+test &quot;rooms exclude sender during publish&quot; {
+    memberships = [0; CLIENT_COUNT * ROOM_COUNT]
+    inboxes = [0; CLIENT_COUNT]
+    room_join(@memberships, 0, 1)
+    room_join(@memberships, 2, 1)
+    frame = ChatFrame{opcode: OP_TEXT, room: 1, sender: 0, sequence: 4, payload_sum: 10}
+    assert_eq(publish(memberships, frame, @inboxes), 1)
+    assert_eq(inboxes[0], 0)
+    assert_eq(inboxes[2], 14)
+}
+
+test &quot;leaving room stops delivery&quot; {
+    memberships = [0; CLIENT_COUNT * ROOM_COUNT]
+    inboxes = [0; CLIENT_COUNT]
+    room_join(@memberships, 3, 2)
+    room_leave(@memberships, 3, 2)
+    frame = ChatFrame{opcode: OP_TEXT, room: 2, sender: 1, sequence: 0, payload_sum: 1}
+    assert_eq(publish(memberships, frame, @inboxes), 0)
+}
+
+test &quot;stdlib WebSocket text round trip&quot; {
+    encoded = ws_encode(ws_text(&quot;room message&quot;), 0) or []
+    decoded = ws_decode(encoded) or ws_close(1002, &quot;bad&quot;)
+    assert_eq(ws_text_of(decoded), &quot;room message&quot;)
+}
+
+test &quot;chat workload is deterministic&quot; {
+    assert_eq(run_chat(100), run_chat(100))
+    #assert(run_chat(100) &gt; 0)
+}
+</code></pre></article><article class="example-block" id="ex-20_game_server_ws_sync-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>20 game server ws sync</h3><p class="note">examples/20_game_server_ws_sync/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// 20_game_server_ws_sync — 60 Hz authoritative simulation with WS snapshots.
+
+use std.net.ws
+use std.math.core
+use std.core.collections
+use std.diag.log
+
++PLAYER_CAPACITY = 48
++SERVER_TICKS = 240
++TICK_DT = 1.0 / 60.0
++SNAPSHOT_EVERY = 3
++MAX_PACKET = 512
+
++Input = {
+    player: i64 = 0
+    axis_x: i64 = 0
+    axis_y: i64 = 0
+    sequence: i64 = 0
+}
+
++apply_input(@vx, @vy, input: Input) {
+    vx[input.player] = input.axis_x * 0.01
+    vy[input.player] = input.axis_y * 0.01
+}
+
++simulate_tick(@x, @y, vx, vy) {
+    for player in 0..PLAYER_CAPACITY {
+        x[player] += vx[player] * TICK_DT
+        y[player] += vy[player] * TICK_DT
+        if x[player] &lt; 0.0 { x[player] += 256.0 }
+        if x[player] &gt;= 256.0 { x[player] -= 256.0 }
+        if y[player] &lt; 0.0 { y[player] += 256.0 }
+        if y[player] &gt;= 256.0 { y[player] -= 256.0 }
+    }
+}
+
++quantize(value: f64) : i64 {
+    (value * 16.0).to_int()
+}
+
++encode_snapshot(@packet, tick: i64, x, y) : i64 {
+    packet[0] = 130
+    packet[1] = PLAYER_CAPACITY * 6 + 4
+    packet[2] = tick / 256
+    packet[3] = tick % 256
+    cursor = 4
+    for player in 0..PLAYER_CAPACITY {
+        qx = quantize(x[player])
+        qy = quantize(y[player])
+        packet[cursor] = player
+        packet[cursor + 1] = qx / 256
+        packet[cursor + 2] = qx % 256
+        packet[cursor + 3] = qy / 256
+        packet[cursor + 4] = qy % 256
+        packet[cursor + 5] = tick % 251
+        cursor += 6
+    }
+    cursor
+}
+
++snapshot_checksum(packet, length: i64) : i64 {
+    checksum = 0
+    for i in 0..length {
+        checksum += packet[i] * (i % 17 + 1)
+    }
+    checksum
+}
+
++make_input(tick: i64, player: i64) : Input {
+    Input{
+        player,
+        axis_x: ((tick + player * 3) % 201) - 100,
+        axis_y: ((tick * 7 + player) % 201) - 100,
+        sequence: tick,
+    }
+}
+
++run_server(ticks: i64) : i64 {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    for player in 0..PLAYER_CAPACITY {
+        x[player] = player * 3.0
+        y[player] = player * 2.0
+    }
+
+    packet = [0; MAX_PACKET]
+    sync_checksum = 0
+    snapshot_count = 0
+    for tick in 0..ticks {
+        for player in 0..PLAYER_CAPACITY {
+            input = make_input(tick, player)
+            apply_input(@vx, @vy, input)
+        }
+        simulate_tick(@x, @y, vx, vy)
+        if tick % SNAPSHOT_EVERY == 0 {
+            length = encode_snapshot(@packet, tick, x, y)
+            sync_checksum += snapshot_checksum(packet, length)
+            snapshot_count += 1
+        }
+    }
+    sync_checksum + snapshot_count * 1009 + (0..PLAYER_CAPACITY).map(quantize(x[it]) + quantize(y[it]) * 3).sum()
+}
+
++main() {
+    lg = Logger.console(&quot;game_ws&quot;)
+    checksum = run_server(SERVER_TICKS)
+    @lg.info(&quot;CHECKSUM={checksum}&quot;)
+}
+
+test &quot;input changes authoritative velocity&quot; {
+    vx, vy = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    apply_input(@vx, @vy, Input{player: 2, axis_x: 50, axis_y: -25, sequence: 1})
+    assert_eq(vx[2], 0.5)
+    assert_eq(vy[2], -0.25)
+}
+
+test &quot;fixed tick advances players&quot; {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [1.0; PLAYER_CAPACITY], [2.0; PLAYER_CAPACITY]
+    simulate_tick(@x, @y, vx, vy)
+    #assert(x[0] &gt; 0.0)
+    #assert(y[0] &gt; x[0])
+}
+
+test &quot;snapshot encodes all players&quot; {
+    packet = [0; MAX_PACKET]
+    x, y = [1.0; PLAYER_CAPACITY], [2.0; PLAYER_CAPACITY]
+    length = encode_snapshot(@packet, 300, x, y)
+    assert_eq(length, PLAYER_CAPACITY * 6 + 4)
+    assert_eq(packet[0], 130)
+    assert_eq(packet[2] * 256 + packet[3], 300)
+    #assert(snapshot_checksum(packet, length) &gt; 0)
+}
+
+test &quot;stdlib WebSocket binary frame encodes&quot; {
+    encoded = ws_encode(ws_binary([1, 2, 3, 4]), 0) or []
+    #assert(len(encoded) &gt; 4)
+}
+
+test &quot;authoritative server is deterministic&quot; {
+    assert_eq(run_server(30), run_server(30))
+    #assert(run_server(30) &gt; 0)
+}
+</code></pre></article><article class="example-block" id="ex-21_cli_ledger-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>21 cli ledger</h3><p class="note">examples/21_cli_ledger/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// CLI — a ledger you talk to through methods on the account and the book.
+//
+// Run: super test examples/21_cli_ledger/
+
+use std.cli.cmd
+use std.core.collections
+use std.diag.log
+
++Account = {
+    name: str
+    balance: f64 = 0.0
+
+    open(name: str, balance: f64) : Account =&gt; Account.{name, balance}
+
+    deposit(@self, amount: f64) : f64 {
+        self.balance += amount
+        self.balance
+    }
+
+    discount(@self, percent: f64) : f64 {
+        self.balance -= self.balance * percent / 100.0
+        self.balance
+    }
+
+    line(self) : str =&gt; &quot;{self.name}  {self.balance}&quot;
+}
+
++Ledger = {
+    title: str
+
+    command(self) : Command {
+        cmd = Command.new(&quot;ledger&quot;)
+        cmd = cmd.about(self.title)
+        cmd = cmd.version(&quot;1.0&quot;)
+        cmd = cmd.author(&quot;Super&quot;)
+        cmd = cmd.flag(&quot;verbose&quot;, &quot;v&quot;, &quot;prefix the book title&quot;)
+        cmd = cmd.opt(&quot;percent&quot;, &quot;p&quot;, &quot;PCT&quot;, &quot;10&quot;, &quot;discount percent&quot;, false)
+        cmd = cmd.as_float()
+        cmd = cmd.pos(&quot;name&quot;, false, &quot;account name&quot;)
+        cmd = cmd.after_help(&quot;Balances live on the stack. The command only prints.&quot;)
+        cmd
+    }
+
+    apply(self, argv: _) : str {
+        cmd = self.command()
+        m = cmd.parse(argv) or err { return &quot;ledger: bad args&quot; }
+        pct = m.get_float(&quot;percent&quot;, 10.0)
+        name = m.pos(0, &quot;Amina&quot;)
+        acct = Account.open(name, 200.0)
+        @acct.deposit(50.0)
+        @acct.discount(pct)
+        shown = acct.line()
+        if m.flag(&quot;verbose&quot;) {
+            return &quot;{self.title}: {shown} after {pct}%&quot;
+        }
+        &quot;{shown} after {pct}%&quot;
+    }
+}
+
++main() {
+    lg = Logger.console(&quot;ledger&quot;)
+    book = Ledger{title: &quot;Studio books&quot;}
+    argv = cli_args()
+    rest = []
+    n = len(argv)
+    for 1..n { rest = arr_push(rest, argv[it]) }
+    if len(rest) == 0 || rest[0] == &quot;-h&quot; || rest[0] == &quot;--help&quot; {
+        @lg.info(book.command().help())
+        return
+    }
+    @lg.info(book.apply(rest))
+}
+
+test &quot;discount is a method on the account&quot; {
+    acct = Account.open(&quot;Amina&quot;, 200.0)
+    assert_eq(@acct.deposit(50.0), 250.0)
+    assert_eq(@acct.discount(10.0), 225.0)
+    assert_eq(acct.line(), &quot;Amina  225&quot;)
+}
+
+test &quot;the ledger command applies the discount&quot; {
+    book = Ledger{title: &quot;Studio books&quot;}
+    assert_eq(book.apply([]), &quot;Amina  225 after 10%&quot;)
+    assert_eq(book.apply([&quot;--percent&quot;, &quot;20&quot;, &quot;Noor&quot;]), &quot;Noor  200 after 20%&quot;)
+    assert_eq(book.apply([&quot;-v&quot;, &quot;Bo&quot;]), &quot;Studio books: Bo  225 after 10%&quot;)
+}
+
+test &quot;help names the command, the option, and the epilogue&quot; {
+    book = Ledger{title: &quot;Studio books&quot;}
+    text = book.command().help()
+    #assert(contains(text, &quot;Usage: ledger&quot;))
+    #assert(contains(text, &quot;--percent&quot;))
+    #assert(contains(text, &quot;Balances live on the stack&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-22_cli_ship-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>22 cli ship</h3><p class="note">examples/22_cli_ship/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// CLI — cut a release. The plan is a method on the ship, not a free function.
+//
+// Run: super test examples/22_cli_ship/
+
+use std.cli.cmd
+use std.sys.fs
+use std.core.{collections, str}
+use std.diag.log
+
++Release = {
+    version: str
+    channel: str
+
+    tag(self) : str =&gt; &quot;{self.channel}-{self.version}&quot;
+
+    note(self) : str =&gt; &quot;ship {self.tag()}&quot;
+}
+
++Ship = {
+    app: str
+
+    command(self) : Command {
+        cmd = Command.new(self.app)
+        cmd = cmd.about(&quot;cut and publish a build&quot;)
+        cmd = cmd.version(&quot;2.4&quot;)
+        cmd = cmd.author(&quot;Super&quot;)
+        cmd = cmd.flag(&quot;dry-run&quot;, &quot;n&quot;, &quot;print the plan and stop&quot;)
+        rel = Command.new(&quot;release&quot;)
+        rel = rel.about(&quot;cut a release&quot;)
+        rel = rel.pos(&quot;version&quot;, true, &quot;version tag&quot;)
+        rel = rel.opt(&quot;channel&quot;, &quot;c&quot;, &quot;NAME&quot;, &quot;stable&quot;, &quot;release channel&quot;, false)
+        cmd = @cmd.sub(rel)
+        cmd = cmd.after_help(&quot;The tag is channel-version. Flags work before or after the command. A dry run writes nothing.&quot;)
+        cmd
+    }
+
+    help_page(self) : str =&gt; self.command().help()
+
+    plan(self, argv: _) : str {
+        cmd = self.command()
+        m = cmd.parse(argv) or err { return &quot;ship: {err}&quot; }
+        if m.help || m.child().help { return self.help_page() }
+        if m.show_ver || m.child().show_ver { return cmd.version_line() }
+        if m.sub_name != &quot;release&quot; { return self.help_page() }
+        child = m.child()
+        fallback = &quot;0.0.0&quot;
+        built = Release{version: child.pos(0, fallback), channel: child.get(&quot;channel&quot;)}
+        mode = &quot;live&quot;
+        if m.flag(&quot;dry-run&quot;) { mode = &quot;dry-run&quot; }
+        &quot;{self.app} {built.note()} {mode}&quot;
+    }
+
+    /// Live releases write `harbor.release`. A dry run only returns the plan.
+    cut(self, argv: _) : str {
+        line = self.plan(argv)
+        if ends_with(line, &quot; live&quot;) == false { return line }
+        body = &quot;{line}\n&quot;
+        saved = fs_write_str(&quot;harbor.release&quot;, body) or err { return &quot;ship: {err}&quot; }
+        if saved { return &quot;{line}\nwrote harbor.release&quot; }
+        line
+    }
+}
+
++main() {
+    lg = Logger.console(&quot;ship&quot;)
+    tool = Ship{app: &quot;harbor&quot;}
+    argv = cli_args()
+    rest = []
+    n = len(argv)
+    for 1..n { rest = arr_push(rest, argv[it]) }
+    if len(rest) == 0 {
+        @lg.info(tool.help_page())
+        return
+    }
+    @lg.info(tool.cut(rest))
+}
+
+test &quot;a release names its own tag&quot; {
+    rel = Release{version: &quot;1.4.0&quot;, channel: &quot;canary&quot;}
+    assert_eq(rel.tag(), &quot;canary-1.4.0&quot;)
+    assert_eq(rel.note(), &quot;ship canary-1.4.0&quot;)
+}
+
+test &quot;the ship plans a dry run from arguments&quot; {
+    tool = Ship{app: &quot;harbor&quot;}
+    assert_eq(tool.plan([&quot;release&quot;, &quot;1.4.0&quot;]), &quot;harbor ship stable-1.4.0 live&quot;)
+    assert_eq(tool.plan([&quot;-n&quot;, &quot;release&quot;, &quot;-c&quot;, &quot;canary&quot;, &quot;1.4.0&quot;]), &quot;harbor ship canary-1.4.0 dry-run&quot;)
+    assert_eq(tool.plan([&quot;release&quot;, &quot;-n&quot;, &quot;1.4.0&quot;]), &quot;harbor ship stable-1.4.0 dry-run&quot;)
+    assert_eq(tool.plan([&quot;release&quot;, &quot;-c&quot;, &quot;canary&quot;, &quot;1.4.0&quot;, &quot;-n&quot;]), &quot;harbor ship canary-1.4.0 dry-run&quot;)
+    assert_eq(tool.plan([&quot;release&quot;, &quot;--version&quot;]), &quot;harbor 2.4&quot;)
+}
+
+test &quot;help lists the release subcommand&quot; {
+    tool = Ship{app: &quot;harbor&quot;}
+    text = tool.help_page()
+    #assert(contains(text, &quot;Usage: harbor&quot;))
+    #assert(contains(text, &quot;release&quot;))
+    #assert(contains(text, &quot;dry run&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-23_tui_ops-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>23 tui ops</h3><p class="note">examples/23_tui_ops/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// TUI — an operations board. Each service knows its status; the board only draws.
+//
+// Run: super test examples/23_tui_ops/
+
+use std.tui
+use std.sys.time
+
++Service = {
+    name: str
+    lag_ms: i64
+    load: i64
+
+    status(self) : str {
+        if self.lag_ms &lt; 20 { return &quot;ok&quot; }
+        if self.lag_ms &lt; 80 { return &quot;warn&quot; }
+        &quot;down&quot;
+    }
+
+    ratio(self) : f64 =&gt; self.load / 100.0
+
+    row(self) : str =&gt; &quot;{self.name} {self.status()} {self.lag_ms}ms&quot;
+}
+
++Board = {
+    title: str = &quot;ops&quot;
+
+    frame(self) : str {
+        ink = theme(&quot;accent&quot;)
+        ok = theme(&quot;ok&quot;)
+        view = Screen.new(46, 14)
+        @view.clear(7, 0)
+        @view.block(Rect.new(0, 0, 46, 14), &quot; {self.title} &quot;)
+        api = Service{name: &quot;api&quot;, lag_ms: 12, load: 80}
+        worker = Service{name: &quot;worker&quot;, lag_ms: 40, load: 55}
+        store = Service{name: &quot;db&quot;, lag_ms: 8, load: 96}
+        @view.gauge(Rect.new(2, 2, 16, 1), api.ratio(), &quot;&quot;)
+        @view.print_at(20, 2, api.row(), ok.fg, 0, 0)
+        @view.gauge(Rect.new(2, 3, 16, 1), worker.ratio(), &quot;&quot;)
+        @view.print_at(20, 3, worker.row(), ink.fg, 0, 1)
+        @view.gauge(Rect.new(2, 4, 16, 1), store.ratio(), &quot;&quot;)
+        @view.print_at(20, 4, store.row(), ok.fg, 0, 0)
+        @view.sparkline(Rect.new(2, 6, 16, 1), [2, 4, 7, 5, 8, 6, 9])
+        @view.table(
+            Rect.new(2, 8, 42, 4),
+            [&quot;SERVICE&quot;, &quot;STATUS&quot;, &quot;LAG&quot;],
+            [&quot;api&quot;, api.status(), &quot;12ms&quot;, &quot;worker&quot;, worker.status(), &quot;40ms&quot;, &quot;db&quot;, store.status(), &quot;8ms&quot;],
+            3
+        )
+        view.plain()
+    }
+}
+
++main() {
+    board = Board{}
+    term = Term.open()
+    if term.raw == false {
+        print(board.frame())
+        return
+    }
+    quit = false
+    while quit == false {
+        term.write(&quot;\x1b[H&quot;)
+        term.write(board.frame())
+        key = term.poll()
+        if key.kind == &quot;esc&quot; || key.kind == &quot;q&quot; || key.ch == &quot;q&quot; { quit = true }
+        if key.kind == &quot;ctrl&quot; &amp;&amp; key.ch == &quot;c&quot; { quit = true }
+        if quit == false { sleep_ms(40) }
+    }
+    @term.close()
+}
+
+test &quot;a service names its own status&quot; {
+    api = Service{name: &quot;api&quot;, lag_ms: 12, load: 80}
+    worker = Service{name: &quot;worker&quot;, lag_ms: 40, load: 55}
+    down = Service{name: &quot;edge&quot;, lag_ms: 90, load: 10}
+    assert_eq(api.status(), &quot;ok&quot;)
+    assert_eq(worker.status(), &quot;warn&quot;)
+    assert_eq(down.status(), &quot;down&quot;)
+    assert_eq(api.row(), &quot;api ok 12ms&quot;)
+}
+
+test &quot;the board draws a titled frame&quot; {
+    board = Board{}
+    text = board.frame()
+    #assert(contains(text, &quot;ops&quot;))
+    #assert(contains(text, &quot;api ok 12ms&quot;))
+    #assert(contains(text, &quot;worker warn 40ms&quot;))
+    #assert(contains(text, &quot;SERVICE&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-24_tui_inbox-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>24 tui inbox</h3><p class="note">examples/24_tui_inbox/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// TUI — an inbox. A note knows its title; the screen asks the note.
+//
+// Run: super test examples/24_tui_inbox/
+
+use std.tui
+use std.sys.time
+
++Note = {
+    who: str
+    subject: str
+    body: str
+
+    title(self) : str =&gt; &quot;{self.who}  {self.subject}&quot;
+
+    preview(self) : str =&gt; self.body
+}
+
++Inbox = {
+    selected: i64 = 1
+
+    frame(self) : str {
+        ink = theme(&quot;accent&quot;)
+        view = Screen.new(52, 16)
+        @view.clear(7, 0)
+        @view.block(Rect.new(0, 0, 52, 16), &quot; inbox &quot;)
+        @view.tabs(Rect.new(2, 1, 46, 1), [&quot;All&quot;, &quot;Flagged&quot;, &quot;Sent&quot;], 0)
+        first = Note{who: &quot;Noor&quot;, subject: &quot;Ship notes&quot;, body: &quot;The tag is canary-1.4.0.&quot;}
+        second = Note{who: &quot;Amina&quot;, subject: &quot;Ledger&quot;, body: &quot;Discount the studio account by ten percent.&quot;}
+        third = Note{who: &quot;Bo&quot;, subject: &quot;Ops&quot;, body: &quot;Worker lag is the one to watch.&quot;}
+        @view.list(Rect.new(2, 3, 46, 3), [first.title(), second.title(), third.title()], self.selected)
+        open = second
+        if self.selected == 0 { open = first }
+        if self.selected == 2 { open = third }
+        @view.align_in(Rect.new(2, 7, 46, 1), open.title(), &quot;start&quot;, ink.fg, 0)
+        @view.words(Rect.new(2, 9, 44, 4), open.preview(), 7)
+        @view.scrollbar(Rect.new(50, 3, 1, 8), self.selected, 3, 8)
+        view.plain()
+    }
+}
+
++main() {
+    box = Inbox{selected: 1}
+    term = Term.open()
+    if term.raw == false {
+        print(box.frame())
+        return
+    }
+    quit = false
+    while quit == false {
+        term.write(&quot;\x1b[H&quot;)
+        term.write(box.frame())
+        key = term.poll()
+        if key.kind == &quot;up&quot; || key.ch == &quot;k&quot; {
+            if box.selected &gt; 0 { box.selected = box.selected - 1 }
+        }
+        if key.kind == &quot;down&quot; || key.ch == &quot;j&quot; {
+            if box.selected &lt; 2 { box.selected = box.selected + 1 }
+        }
+        if key.kind == &quot;esc&quot; || key.ch == &quot;q&quot; { quit = true }
+        if key.kind == &quot;ctrl&quot; &amp;&amp; key.ch == &quot;c&quot; { quit = true }
+        if quit == false { sleep_ms(40) }
+    }
+    @term.close()
+}
+
+test &quot;a note builds its own title&quot; {
+    note = Note{who: &quot;Amina&quot;, subject: &quot;Ledger&quot;, body: &quot;Discount the studio account by ten percent.&quot;}
+    assert_eq(note.title(), &quot;Amina  Ledger&quot;)
+    assert_eq(note.preview(), &quot;Discount the studio account by ten percent.&quot;)
+}
+
+test &quot;the inbox shows the selected note&quot; {
+    box = Inbox{selected: 1}
+    text = box.frame()
+    #assert(contains(text, &quot;inbox&quot;))
+    #assert(contains(text, &quot;All&quot;))
+    #assert(contains(text, &quot;Amina  Ledger&quot;))
+    #assert(contains(text, &quot;ten percent&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-25_gui_studio-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>25 gui studio</h3><p class="note">examples/25_gui_studio/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// GUI — a studio desk. The session owns the tree and paints it.
+//
+// Run: super test examples/25_gui_studio/
+
+use std.gui
+use std.gui.window
+
++Take = {
+    name: str
+    gain: i64
+    mix: i64
+
+    caption(self) : str =&gt; &quot;{self.name}  gain {self.gain}  mix {self.mix}&quot;
+}
+
++Studio = {
+    title: str
+
+    desk(self) : Gui {
+        take = Take{name: &quot;Voice&quot;, gain: 72, mix: 40}
+        app = Gui.new(self.title, 360, 220)
+        @app.theme(&quot;dark&quot;)
+        root = @app.column(&quot;root&quot;)
+        head = @app.panel(root, &quot;head&quot;)
+        @app.label(head, &quot;title&quot;, self.title)
+        @app.style(&quot;title&quot;, 230, 24, 20, 1, &quot;start&quot;)
+        @app.text(head, &quot;caption&quot;, take.caption())
+        desk = @app.grid(root, &quot;desk&quot;, 2)
+        @app.slider(desk, &quot;gain&quot;, take.gain)
+        @app.progress(desk, &quot;mix&quot;, take.mix)
+        @app.button(root, &quot;render&quot;, &quot;Render&quot;)
+        @app.text(root, &quot;note&quot;, &quot;GTK draws the controls.&quot;)
+        app
+    }
+
+    picture(self) : str {
+        app = self.desk()
+        @app.layout()
+        @app.paint()
+    }
+
+    scene(self) : str =&gt; self.desk().describe()
+
+    mirror(self) : str {
+        take = Take{name: &quot;Voice&quot;, gain: 72, mix: 40}
+        app = Gui.new(self.title, 360, 220)
+        @app.theme(&quot;dark&quot;)
+        root = @app.column(&quot;root&quot;)
+        @app.label(root, &quot;title&quot;, self.title)
+        @app.label(root, &quot;caption&quot;, take.caption())
+        @app.button(root, &quot;render&quot;, &quot;Render&quot;)
+        @app.layout()
+        @app.mirror()
+    }
+}
+
++main() {
+    desk = Studio{title: &quot;Studio&quot;}
+    window_show(&quot;Studio&quot;, 360, 220, desk.scene())
+}
+
+test &quot;a take captions itself&quot; {
+    take = Take{name: &quot;Voice&quot;, gain: 72, mix: 40}
+    assert_eq(take.caption(), &quot;Voice  gain 72  mix 40&quot;)
+}
+
+test &quot;the studio paints a dark desk&quot; {
+    desk = Studio{title: &quot;Studio&quot;}
+    frame = desk.picture()
+    #assert(contains(frame, &quot;fill 0 0 360 220&quot;))
+    #assert(contains(frame, &quot;Studio&quot;))
+    #assert(contains(frame, &quot;Render&quot;))
+    #assert(contains(frame, &quot;Voice  gain 72&quot;))
+}
+
+test &quot;the studio scene is a gtk widget document&quot; {
+    desk = Studio{title: &quot;Studio&quot;}
+    scene = desk.scene()
+    #assert(contains(scene, &quot;gui\t1&quot;))
+    #assert(contains(scene, &quot;node\tbutton\trender\tRender&quot;))
+    #assert(contains(scene, &quot;node\tslider\tgain&quot;))
+}
+
+test &quot;the text mirror names the same controls&quot; {
+    desk = Studio{title: &quot;Studio&quot;}
+    text = desk.mirror()
+    #assert(contains(text, &quot;Studio&quot;))
+    #assert(contains(text, &quot;Render&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-26_gui_atlas-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>26 gui atlas</h3><p class="note">examples/26_gui_atlas/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// GUI — a small atlas. Each pin captions itself; the map places the captions.
+//
+// Run: super test examples/26_gui_atlas/
+
+use std.gui
+use std.gui.window
+
++Pin = {
+    name: str
+    x: i64
+    y: i64
+
+    caption(self) : str =&gt; &quot;{self.name}  {self.x},{self.y}&quot;
+
+    near(self, other: Pin) : bool {
+        dx = self.x - other.x
+        dy = self.y - other.y
+        if dx &lt; 0 { dx = 0 - dx }
+        if dy &lt; 0 { dy = 0 - dy }
+        dx + dy &lt; 40
+    }
+}
+
++Atlas = {
+    title: str
+
+    sheet(self) : Gui {
+        harbor = Pin{name: &quot;Harbor&quot;, x: 12, y: 40}
+        ridge = Pin{name: &quot;Ridge&quot;, x: 80, y: 18}
+        bay = Pin{name: &quot;Bay&quot;, x: 20, y: 48}
+        app = Gui.new(self.title, 280, 180)
+        @app.theme(&quot;contrast&quot;)
+        root = @app.column(&quot;root&quot;)
+        @app.tabs(root, &quot;modes&quot;, [&quot;Map&quot;, &quot;List&quot;])
+        sheet = @app.panel(root, &quot;sheet&quot;)
+        @app.label(sheet, &quot;harbor&quot;, harbor.caption())
+        @app.label(sheet, &quot;ridge&quot;, ridge.caption())
+        @app.label(sheet, &quot;bay&quot;, bay.caption())
+        @app.style(&quot;harbor&quot;, 24, 236, 16, 1, &quot;start&quot;)
+        note = &quot;Harbor and Bay share a coast.&quot;
+        if harbor.near(bay) == false { note = &quot;Every pin stands alone.&quot; }
+        @app.text(root, &quot;note&quot;, note)
+        app
+    }
+
+    picture(self) : str {
+        app = self.sheet()
+        @app.layout()
+        @app.paint()
+    }
+
+    scene(self) : str =&gt; self.sheet().describe()
+}
+
++main() {
+    map = Atlas{title: &quot;Atlas&quot;}
+    window_show(&quot;Atlas&quot;, 280, 180, map.scene())
+}
+
+test &quot;a pin captions itself and knows its neighbors&quot; {
+    harbor = Pin{name: &quot;Harbor&quot;, x: 12, y: 40}
+    bay = Pin{name: &quot;Bay&quot;, x: 20, y: 48}
+    ridge = Pin{name: &quot;Ridge&quot;, x: 80, y: 18}
+    assert_eq(harbor.caption(), &quot;Harbor  12,40&quot;)
+    #assert(harbor.near(bay))
+    #assert(!(harbor.near(ridge)))
+}
+
+test &quot;the atlas paints every caption&quot; {
+    map = Atlas{title: &quot;Atlas&quot;}
+    frame = map.picture()
+    #assert(contains(frame, &quot;fill 0 0 280 180&quot;))
+    #assert(contains(frame, &quot;Harbor  12,40&quot;))
+    #assert(contains(frame, &quot;Ridge  80,18&quot;))
+    #assert(contains(frame, &quot;share a coast&quot;))
+}
+</code></pre></article><article class="example-block" id="ex-27_gui_todo-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>27 gui todo</h3><p class="note">examples/27_gui_todo/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Todos. The list lives in std.db.sqlite. The window is std.gui.
+//
+// Run: super test examples/27_gui_todo/
+
+use std.gui
+use std.db.sqlite
+use std.core.str
+use std.gui.window
+use std.sys.time
+
++TodoApp: Widget = {
+    conn: SqliteConn
+    filter: str = &quot;all&quot;
+    notice: str = &quot;&quot;
+    width: i64 = 420
+    height: i64 = 480
+
+    open() : TodoApp {
+        conn = sqlite_memory()
+        conn = sqlite_create(conn, &quot;todos&quot;, [&quot;id&quot;, &quot;title&quot;, &quot;done&quot;, &quot;live&quot;]) or conn
+        TodoApp{conn, filter: &quot;all&quot;, notice: &quot;&quot;}
+    }
+
+    add(@self, title: str) : i64 {
+        if title == &quot;&quot; {
+            self.notice = &quot;Title required&quot;
+            return 0
+        }
+        self.conn = sqlite_insert_auto(self.conn, &quot;todos&quot;, [title, &quot;0&quot;, &quot;1&quot;]) or self.conn
+        self.notice = &quot;Saved&quot;
+        sqlite_last_insert_rowid(self.conn)
+    }
+
+    toggle(@self, id: str) : str {
+        rows = sqlite_find(self.conn, &quot;todos&quot;, &quot;id&quot;, id)
+        ensure len(rows) &gt; 0 else { return &quot;&quot; }
+        row = rows[0]
+        next = &quot;1&quot;
+        if row[2] == &quot;1&quot; { next = &quot;0&quot; }
+        self.conn = sqlite_update(self.conn, &quot;todos&quot;, &quot;id&quot;, id, &quot;done&quot;, next) or self.conn
+        self.notice = &quot;&quot;
+        next
+    }
+
+    remove(@self, id: str) : i64 {
+        before = sqlite_count(self.conn, &quot;todos&quot;)
+        self.conn = sqlite_delete(self.conn, &quot;todos&quot;, &quot;id&quot;, id) or self.conn
+        before - sqlite_count(self.conn, &quot;todos&quot;)
+    }
+
+    set_filter(@self, name: str) : str {
+        self.filter = name
+        self.filter
+    }
+
+    shows(self, done: str) : bool {
+        if self.filter == &quot;open&quot; { return done == &quot;0&quot; }
+        if self.filter == &quot;done&quot; { return done == &quot;1&quot; }
+        true
+    }
+
+    lines(self) : str {
+        rows = sqlite_find(self.conn, &quot;todos&quot;, &quot;live&quot;, &quot;1&quot;)
+        out = &quot;&quot;
+        for row in rows {
+            if self.shows(row[2]) {
+                mark = &quot; &quot;
+                if row[2] == &quot;1&quot; { mark = &quot;x&quot; }
+                out = &quot;{out}{row[0]} [{mark}] {row[1]}\n&quot;
+            }
+        }
+        out
+    }
+
+    screen(self, draft: str) : Gui {
+        app = Gui.new(&quot;Todos&quot;, self.width, self.height)
+        root = @app.column(&quot;root&quot;)
+        @app.titlebar(root, &quot;bar&quot;, &quot;Todos&quot;)
+        @app.chrome(root, &quot;win&quot;)
+        filters = @app.row(root, &quot;filters&quot;)
+        @app.button(filters, &quot;all&quot;, &quot;All&quot;)
+        @app.button(filters, &quot;open&quot;, &quot;Open&quot;)
+        @app.button(filters, &quot;done&quot;, &quot;Done&quot;)
+        @app.field(root, &quot;title&quot;, &quot;New todo&quot;)
+        @app.write_text(&quot;title&quot;, draft)
+        @app.button(root, &quot;add&quot;, &quot;Add&quot;)
+        n = sqlite_count(self.conn, &quot;todos&quot;)
+        @app.badge(root, &quot;count&quot;, &quot;{n}&quot;)
+        rows = sqlite_find(self.conn, &quot;todos&quot;, &quot;live&quot;, &quot;1&quot;)
+        for row in rows {
+            if self.shows(row[2]) {
+                mark = &quot; &quot;
+                if row[2] == &quot;1&quot; { mark = &quot;x&quot; }
+                @app.button(root, &quot;row{row[0]}&quot;, &quot;{row[0]} [{mark}] {row[1]}&quot;)
+            }
+        }
+        if self.notice != &quot;&quot; { @app.toast(root, &quot;note&quot;, self.notice) }
+        @app.label(root, &quot;hint&quot;, &quot;Type in the field, Enter adds, click a row, Esc closes&quot;)
+        app
+    }
+
+    paint(self) : str {
+        app = self.screen(&quot;&quot;)
+        @app.layout()
+        @app.paint()
+    }
+
+    /// Open the window and edit the list until the window closes.
+    run(@self) : i64 {
+        opened = window_open(self.width, self.height, &quot;Todos&quot;)
+        gui_open(self.width, self.height, &quot;Todos&quot;)
+        view = self.screen(&quot;&quot;)
+        draft = &quot;&quot;
+        frames = 0
+        quit = false
+        while quit == false {
+            gui_present(self.width, self.height, view.describe())
+            click = gui_click()
+            key = gui_key()
+            typed = gui_value(&quot;title&quot;)
+            if typed != &quot;&quot; { draft = typed }
+            if click == &quot;add&quot; || key == &quot;enter&quot; {
+                @self.add(draft)
+                draft = &quot;&quot;
+                view = self.screen(&quot;&quot;)
+            }
+            if click == &quot;all&quot; || click == &quot;open&quot; || click == &quot;done&quot; {
+                @self.set_filter(click)
+                view = self.screen(draft)
+            }
+            if starts_with(click, &quot;row&quot;) {
+                @self.toggle(strip_prefix(click, &quot;row&quot;))
+                view = self.screen(draft)
+            }
+            poll = window_poll()
+            if poll.quit || gui_quit() || key == &quot;esc&quot; || opened.headless {
+                quit = true
+            }
+            if quit == false { sleep_ms(16) }
+            frames = frames + 1
+        }
+        frames
+    }
+
+    hit(self, x: i64, y: i64) : bool =&gt; widget_hit(x, y, 0, 0, self.width, self.height)
+
+    measure(self, max_w: i64) : i64 =&gt; widget_measure(max_w, self.width)
+}
+
++main() {
+    app = TodoApp.open()
+    @app.add(&quot;Buy milk&quot;)
+    @app.add(&quot;Ship the build&quot;)
+    @app.run()
+}
+
+test &quot;add, toggle, filter, and delete a todo&quot; {
+    app = TodoApp.open()
+    id = @app.add(&quot;Buy milk&quot;)
+    assert_eq(id, 1)
+    assert_eq(sqlite_count(app.conn, &quot;todos&quot;), 1)
+    assert_eq(@app.add(&quot;&quot;), 0)
+    assert_eq(app.notice, &quot;Title required&quot;)
+    frame = app.paint()
+    #assert(contains(frame, &quot;Buy milk&quot;))
+    #assert(contains(frame, &quot;Title required&quot;))
+    #assert(contains(frame, &quot;Todos&quot;))
+    #assert(contains(frame, &quot;New todo&quot;))
+    assert_eq(@app.toggle(&quot;1&quot;), &quot;1&quot;)
+    assert_eq(@app.set_filter(&quot;open&quot;), &quot;open&quot;)
+    assert_eq(app.lines(), &quot;&quot;)
+    assert_eq(@app.set_filter(&quot;done&quot;), &quot;done&quot;)
+    #assert(contains(app.lines(), &quot;[x] Buy milk&quot;))
+    assert_eq(@app.remove(&quot;1&quot;), 1)
+    assert_eq(sqlite_count(app.conn, &quot;todos&quot;), 0)
+}
+
+test &quot;the window is a Widget&quot; {
+    app = TodoApp.open()
+    @app.add(&quot;Ship&quot;)
+    #assert(app.hit(10, 10))
+    #assert(!(app.hit(-1, 0)))
+    assert_eq(app.measure(100), 100)
+    assert_eq(app.measure(800), 420)
+}
+</code></pre></article><article class="example-block" id="ex-28_gui_breakout-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>28 gui breakout</h3><p class="note">examples/28_gui_breakout/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Breakout. Bricks, a paddle, a sprite ball, and bounce cues.
+//
+// Run: super test examples/28_gui_breakout/
+
+use std.game.fx
+use std.core.str
+use std.gui.window
+use std.sys.time
+
++Breakout: Widget = {
+    paddle_x: i64 = 80
+    ball_x: i64 = 90
+    ball_y: i64 = 100
+    ball_vx: i64 = 4
+    ball_vy: i64 = -4
+    bricks: i64 = 8
+    frame_n: i64 = 0
+    sound: str = &quot;&quot;
+    width: i64 = 240
+    height: i64 = 180
+
+    tick(@self) : str {
+        self.frame_n = self.frame_n + 1
+        self.ball_x = self.ball_x + self.ball_vx
+        self.ball_y = self.ball_y + self.ball_vy
+        self.sound = &quot;&quot;
+        if self.ball_x &lt; 0 || self.ball_x &gt; 200 {
+            self.ball_vx = 0 - self.ball_vx
+            self.sound = &quot;bounce&quot;
+        }
+        if self.ball_y &lt; 20 {
+            self.ball_vy = 0 - self.ball_vy
+            if self.sound == &quot;&quot; { self.sound = &quot;bounce&quot; }
+        }
+        if self.ball_y &gt;= 140 &amp;&amp; self.ball_x &gt;= self.paddle_x &amp;&amp; self.ball_x &lt;= self.paddle_x + 40 {
+            self.ball_vy = 0 - 4
+            self.sound = &quot;bounce&quot;
+        }
+        if self.ball_y &lt; 40 &amp;&amp; self.bricks &gt; 0 {
+            self.bricks = self.bricks - 1
+            self.ball_vy = 4
+            self.sound = &quot;break&quot;
+        }
+        self.sound
+    }
+
+    steer(@self, key: str, mouse_x: i64) : i64 {
+        if key == &quot;left&quot; || key == &quot;a&quot; { self.paddle_x = self.paddle_x - 10 }
+        if key == &quot;right&quot; || key == &quot;d&quot; { self.paddle_x = self.paddle_x + 10 }
+        if mouse_x &gt; 0 { self.paddle_x = mouse_x - 20 }
+        if self.paddle_x &lt; 0 { self.paddle_x = 0 }
+        if self.paddle_x &gt; 200 { self.paddle_x = 200 }
+        self.paddle_x
+    }
+
+    paint(self) : str {
+        ball = Sprite{name: &quot;ball&quot;, x: self.ball_x, y: self.ball_y, w: 8, h: 8, frame: self.frame_n % 2, frames: 2}
+        brick_w = self.bricks * 12
+        brick = Sprite{name: &quot;brick&quot;, x: 8, y: 24, w: brick_w, h: 10, frame: 0, frames: 1}
+        heard = &quot;&quot;
+        if self.sound != &quot;&quot; {
+            cue = Cue{name: self.sound, gain: 80}
+            heard = cue.play()
+        }
+        &quot;fill 0 0 {self.width} {self.height} 12 14 28\n{ball.paint()}{brick.paint()}fill {self.paddle_x} 150 40 8 200 200 210\n{heard}&quot;
+    }
+
+    hit(self, x: i64, y: i64) : bool =&gt; widget_hit(x, y, 0, 0, self.width, self.height)
+
+    measure(self, max_w: i64) : i64 =&gt; widget_measure(max_w, self.width)
+}
+
++main() {
+    game = Breakout{}
+    opened = window_open(game.width, game.height, &quot;Breakout&quot;)
+    gui_open(game.width, game.height, &quot;Breakout&quot;)
+    frames = 0
+    quit = false
+    while quit == false {
+        key = gui_key()
+        if key == &quot;esc&quot; || key == &quot;q&quot; { quit = true }
+        @game.steer(key, gui_mouse_x())
+        @game.tick()
+        gui_present(game.width, game.height, game.paint())
+        poll = window_poll()
+        if poll.quit || gui_quit() || opened.headless { quit = true }
+        if quit == false { sleep_ms(16) }
+        frames = frames + 1
+    }
+}
+
+test &quot;the ball bounces off a wall and breaks a brick&quot; {
+    wall = Breakout{ball_x: 198, ball_vx: 4, ball_y: 80, ball_vy: 4, bricks: 4}
+    assert_eq(@wall.tick(), &quot;bounce&quot;)
+    #assert(wall.ball_vx &lt; 0)
+    #assert(contains(wall.paint(), &quot;sound bounce 80&quot;))
+    #assert(contains(wall.paint(), &quot;sprite&quot;))
+    brick = Breakout{ball_x: 40, ball_y: 30, ball_vx: 0, ball_vy: -4, bricks: 3}
+    assert_eq(@brick.tick(), &quot;break&quot;)
+    assert_eq(brick.bricks, 2)
+    #assert(contains(brick.paint(), &quot;sound break 80&quot;))
+    #assert(contains(brick.paint(), &quot;ball 1&quot;))
+}
+
+test &quot;the table is a Widget&quot; {
+    game = Breakout{}
+    #assert(game.hit(10, 10))
+    #assert(!(game.hit(300, 10)))
+    assert_eq(game.measure(80), 80)
+}
+</code></pre></article><article class="example-block" id="ex-29_gui_invaders-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>29 gui invaders</h3><p class="note">examples/29_gui_invaders/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Invaders. A stepping alien row, a shot, and hit cues.
+//
+// Run: super test examples/29_gui_invaders/
+
+use std.game.fx
+use std.core.str
+use std.gui.window
+use std.sys.time
+
++Invaders: Widget = {
+    player_x: i64 = 100
+    aliens: i64 = 5
+    alien_x: i64 = 20
+    shot_y: i64 = -1
+    frame_n: i64 = 0
+    sound: str = &quot;&quot;
+    width: i64 = 240
+    height: i64 = 180
+
+    fire(@self) : str {
+        self.shot_y = 140
+        self.sound = &quot;shot&quot;
+        self.sound
+    }
+
+    tick(@self) : str {
+        self.frame_n = self.frame_n + 1
+        self.alien_x = self.alien_x + 4
+        if self.alien_x &gt; 180 { self.alien_x = 20 }
+        if self.shot_y &gt;= 0 {
+            self.shot_y = self.shot_y - 20
+            if self.shot_y &lt; 40 &amp;&amp; self.aliens &gt; 0 {
+                self.aliens = self.aliens - 1
+                self.shot_y = -1
+                self.sound = &quot;hit&quot;
+            }
+        }
+        self.sound
+    }
+
+    steer(@self, key: str) : i64 {
+        if key == &quot;left&quot; || key == &quot;a&quot; { self.player_x = self.player_x - 8 }
+        if key == &quot;right&quot; || key == &quot;d&quot; { self.player_x = self.player_x + 8 }
+        if self.player_x &lt; 0 { self.player_x = 0 }
+        if self.player_x &gt; 220 { self.player_x = 220 }
+        if key == &quot; &quot; || key == &quot;enter&quot; { @self.fire() }
+        self.player_x
+    }
+
+    paint(self) : str {
+        player = Sprite{name: &quot;player&quot;, x: self.player_x, y: 150, w: 16, h: 8, frame: self.frame_n % 2, frames: 2}
+        span = self.aliens * 14
+        alien = Sprite{name: &quot;alien&quot;, x: self.alien_x, y: 32, w: span, h: 12, frame: self.frame_n % 2, frames: 2}
+        heard = &quot;&quot;
+        if self.sound != &quot;&quot; {
+            cue = Cue{name: self.sound, gain: 70}
+            heard = cue.play()
+        }
+        shot = &quot;&quot;
+        if self.shot_y &gt;= 0 {
+            sx = self.player_x + 6
+            shot = &quot;fill {sx} {self.shot_y} 4 8 240 220 80\n&quot;
+        }
+        &quot;fill 0 0 {self.width} {self.height} 8 8 20\n{player.paint()}{alien.paint()}{shot}{heard}&quot;
+    }
+
+    hit(self, x: i64, y: i64) : bool =&gt; widget_hit(x, y, 0, 0, self.width, self.height)
+
+    measure(self, max_w: i64) : i64 =&gt; widget_measure(max_w, self.width)
+}
+
++main() {
+    game = Invaders{}
+    opened = window_open(game.width, game.height, &quot;Invaders&quot;)
+    gui_open(game.width, game.height, &quot;Invaders&quot;)
+    frames = 0
+    quit = false
+    while quit == false {
+        key = gui_key()
+        if key == &quot;esc&quot; || key == &quot;q&quot; { quit = true }
+        @game.steer(key)
+        @game.tick()
+        gui_present(game.width, game.height, game.paint())
+        poll = window_poll()
+        if poll.quit || gui_quit() || opened.headless { quit = true }
+        if quit == false { sleep_ms(16) }
+        frames = frames + 1
+    }
+}
+
+test &quot;a shot plays and then removes an alien&quot; {
+    game = Invaders{}
+    assert_eq(@game.fire(), &quot;shot&quot;)
+    frame = game.paint()
+    #assert(contains(frame, &quot;sound shot 70&quot;))
+    #assert(contains(frame, &quot;sprite&quot;))
+    #assert(contains(frame, &quot;player&quot;))
+    for 0..6 { @game.tick() }
+    assert_eq(game.aliens, 4)
+    assert_eq(game.sound, &quot;hit&quot;)
+    #assert(contains(game.paint(), &quot;sound hit 70&quot;))
+    #assert(contains(game.paint(), &quot;alien&quot;))
+}
+
+test &quot;the field is a Widget&quot; {
+    game = Invaders{}
+    #assert(game.hit(4, 4))
+    assert_eq(game.measure(50), 50)
+}
+</code></pre></article><article class="example-block" id="ex-30_gui_snake-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>30 gui snake</h3><p class="note">examples/30_gui_snake/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">// Snake. Each tick moves the head, eating grows it, and a wall ends the run.
+//
+// Run: super test examples/30_gui_snake/
+
+use std.game.fx
+use std.core.str
+use std.gui.window
+use std.sys.time
+
++Snake: Widget = {
+    x: i64 = 3
+    y: i64 = 3
+    dir_x: i64 = 1
+    dir_y: i64 = 0
+    body: i64 = 3
+    food_x: i64 = 5
+    food_y: i64 = 3
+    alive: bool = true
+    frame_n: i64 = 0
+    sound: str = &quot;&quot;
+
+    tick(@self) : str {
+        ensure self.alive else { return &quot;dead&quot; }
+        self.frame_n = self.frame_n + 1
+        self.x = self.x + self.dir_x
+        self.y = self.y + self.dir_y
+        self.sound = &quot;&quot;
+        if self.x &lt; 0 || self.y &lt; 0 || self.x &gt; 10 || self.y &gt; 10 {
+            self.alive = false
+            self.sound = &quot;dead&quot;
+            return self.sound
+        }
+        fx = self.food_x
+        fy = self.food_y
+        if self.x == fx &amp;&amp; self.y == fy {
+            self.body = self.body + 1
+            self.food_x = 1
+            self.food_y = 1
+            self.sound = &quot;eat&quot;
+        }
+        self.sound
+    }
+
+    steer(@self, key: str) : str {
+        if key == &quot;left&quot; &amp;&amp; self.dir_x == 0 { self.dir_x = -1
+            self.dir_y = 0 }
+        if key == &quot;right&quot; &amp;&amp; self.dir_x == 0 { self.dir_x = 1
+            self.dir_y = 0 }
+        if key == &quot;up&quot; &amp;&amp; self.dir_y == 0 { self.dir_x = 0
+            self.dir_y = -1 }
+        if key == &quot;down&quot; &amp;&amp; self.dir_y == 0 { self.dir_x = 0
+            self.dir_y = 1 }
+        key
+    }
+
+    paint(self) : str {
+        sx = self.x * 12
+        sy = self.y * 12
+        body = Sprite{name: &quot;snake&quot;, x: sx, y: sy, w: 12, h: 12, frame: self.frame_n % 2, frames: 2}
+        fx = self.food_x * 12
+        fy = self.food_y * 12
+        food = Sprite{name: &quot;food&quot;, x: fx, y: fy, w: 12, h: 12, frame: 0, frames: 1}
+        heard = &quot;&quot;
+        if self.sound != &quot;&quot; {
+            cue = Cue{name: self.sound, gain: 60}
+            heard = cue.play()
+        }
+        wide = 160
+        if self.body &lt; 0 { wide = 0 }
+        &quot;fill 0 0 {wide} {wide} 10 16 12\n{body.paint()}{food.paint()}{heard}&quot;
+    }
+
+    hit(self, x: i64, y: i64) : bool {
+        box = widget_hit(x, y, 0, 0, 160, 160)
+        alive = self.alive
+        if alive { return box }
+        box
+    }
+
+    measure(self, max_w: i64) : i64 {
+        base = 160
+        if self.body &lt; 0 { base = 0 }
+        widget_measure(max_w, base)
+    }
+}
+
++main() {
+    game = Snake{}
+    opened = window_open(160, 160, &quot;Snake&quot;)
+    gui_open(160, 160, &quot;Snake&quot;)
+    frames = 0
+    quit = false
+    while quit == false {
+        key = gui_key()
+        if key == &quot;esc&quot; || key == &quot;q&quot; { quit = true }
+        @game.steer(key)
+        if frames % 8 == 0 { @game.tick() }
+        gui_present(160, 160, game.paint())
+        poll = window_poll()
+        if poll.quit || gui_quit() || game.alive == false || opened.headless { quit = true }
+        if quit == false { sleep_ms(16) }
+        frames = frames + 1
+    }
+}
+
+test &quot;eating grows the snake and plays a cue&quot; {
+    game = Snake{}
+    assert_eq(@game.tick(), &quot;&quot;)
+    assert_eq(@game.tick(), &quot;eat&quot;)
+    assert_eq(game.body, 4)
+    assert_eq(game.x, 5)
+    frame = game.paint()
+    #assert(contains(frame, &quot;sound eat 60&quot;))
+    #assert(contains(frame, &quot;sprite&quot;))
+    #assert(contains(frame, &quot;snake&quot;))
+    #assert(contains(frame, &quot;food&quot;))
+}
+
+test &quot;a wall ends the run&quot; {
+    game = Snake{x: 10, y: 3, dir_x: 1, dir_y: 0}
+    assert_eq(@game.tick(), &quot;dead&quot;)
+    #assert(!(game.alive))
+    #assert(contains(game.paint(), &quot;sound dead 60&quot;))
+    assert_eq(@game.tick(), &quot;dead&quot;)
+    #assert(game.hit(8, 8))
+    assert_eq(game.measure(40), 40)
+}
+</code></pre></article><article class="example-block" id="ex-agent-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>agent</h3><p class="note">examples/agent/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Reference coding-agent harness (C7): mock OpenAI loop + MCP tools + tokenizer trim.
+
+use std.ai.mcp_client
+use std.ai.tokenizer
+use std.sec.secret
+
++run_agent_once() : str {
+    tok = Tokenizer.mini()
+    c = McpClient.mock()
+    @c.add_mock_tool(&quot;echo&quot;, &quot;echo&quot;)
+    @c.set_mock_result(&quot;echo&quot;, &quot;{\&quot;ok\&quot;:true}&quot;)
+    key = Secret.of(&quot;sk-test-not-logged&quot;)
+    log = &quot;starting with {key}&quot;
+    ensure host.sys_str_find(log, &quot;sk-test&quot;) &lt; 0 else { return &quot;LEAK&quot; }
+    ctx = &quot;user: hello&quot;
+    _ = tok.approx_count(ctx)
+    tool_out = @c.call_tool(&quot;echo&quot;, &quot;{\&quot;x\&quot;:1}&quot;) or &quot;err&quot;
+    @c.close()
+    &quot;ok:&quot; + tool_out
+}
+
++main() {
+    print(run_agent_once())
+}
+
+test &quot;agent harness mock loop&quot; {
+    out = run_agent_once()
+    #assert(host.sys_str_find(out, &quot;ok:&quot;) == 0)
+    #assert(host.sys_str_find(out, &quot;LEAK&quot;) &lt; 0)
+}
+</code></pre></article><article class="example-block" id="ex-algorithms-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>algorithms</h3><p class="note">examples/algorithms/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Algorithms demo: pair dispatch with `when (a, b)` and `#symmetric` mirrors.
+//!
+//!   super test examples/algorithms/        # runs the tests below
+//!   super run examples/algorithms/         # prints the dispatch table and a matrix product
+//!
+//! 1. `touch` picks a collision kernel from the *pair* of shapes with a tuple `when`; the mirrored arms
+//!    (`Rect, Circle` next to `Circle, Rect`) reuse the same kernel with swapped arguments.
+//! 2. `scale` is marked `#symmetric`: the compiler synthesizes `scale(k, v)` from `scale(v, k)` and
+//!    both orders run on VM, JIT, and C23 AOT (see `tests/dispatch_family.sr`).
+//! 3. `mul` from `std.math.linalg` is the same idea at library scale: nine `(kind, kind)` arms for dense,
+//!    diagonal and CSR matrices.
+
+use std.math.linalg
+
+/// A 2D collision shape; the position lives outside so one shape can be reused.
+Shape = {
+    Circle(r: f64)
+    Rect(w: f64, h: f64)
+    Dot
+
+    /// Short name for tables.
+    name(self) : str {
+        when self {
+            Shape.Circle =&gt; &quot;circle&quot;
+            Shape.Rect =&gt; &quot;rect&quot;
+            Shape.Dot =&gt; &quot;dot&quot;
+        }
+    }
+
+    /// Radius of a circle (zero for other shapes).
+    radius(self) : f64 {
+        when self {
+            Shape.Circle { r } =&gt; r
+            else =&gt; 0.0
+        }
+    }
+
+    /// Width of a rectangle (zero for other shapes).
+    width(self) : f64 {
+        when self {
+            Shape.Rect { w } =&gt; w
+            else =&gt; 0.0
+        }
+    }
+
+    /// Height of a rectangle (zero for other shapes).
+    height(self) : f64 {
+        when self {
+            Shape.Rect { h } =&gt; h
+            else =&gt; 0.0
+        }
+    }
+}
+
++circle(r: f64) : Shape =&gt; Shape.Circle(r)
+
++rect(w: f64, h: f64) : Shape =&gt; Shape.Rect(w, h)
+
++dot() : Shape =&gt; Shape.Dot
+
+/// Distance squared between two points.
++dist2(ax: f64, ay: f64, bx: f64, by: f64) : f64 {
+    dx = ax - bx
+    dy = ay - by
+    dx * dx + dy * dy
+}
+
+/// Circle at (cx, cy) with radius r against a circle.
++circle_circle(ra: f64, ax: f64, ay: f64, rb: f64, bx: f64, by: f64) : bool {
+    reach = ra + rb
+    dist2(ax, ay, bx, by) &lt;= reach * reach
+}
+
+/// Axis-aligned rectangles centred at (ax, ay) and (bx, by).
++rect_rect(aw: f64, ah: f64, ax: f64, ay: f64, bw: f64, bh: f64, bx: f64, by: f64) : bool {
+    dx = ax - bx
+    if dx &lt; 0.0 { dx = -dx }
+    dy = ay - by
+    if dy &lt; 0.0 { dy = -dy }
+    dx &lt;= (aw + bw) / 2.0 &amp;&amp; dy &lt;= (ah + bh) / 2.0
+}
+
+/// Circle against a rectangle: the circle touches when the rectangle&#x27;s closest point is within the radius.
++circle_rect(r: f64, cx: f64, cy: f64, w: f64, h: f64, rx: f64, ry: f64) : bool {
+    hx = w / 2.0
+    hy = h / 2.0
+    nx = cx
+    if nx &lt; rx - hx { nx = rx - hx }
+    if nx &gt; rx + hx { nx = rx + hx }
+    ny = cy
+    if ny &lt; ry - hy { ny = ry - hy }
+    if ny &gt; ry + hy { ny = ry + hy }
+    dist2(cx, cy, nx, ny) &lt;= r * r
+}
+
+/// A point inside a rectangle.
++dot_rect(px: f64, py: f64, w: f64, h: f64, rx: f64, ry: f64) : bool {
+    dx = px - rx
+    if dx &lt; 0.0 { dx = -dx }
+    dy = py - ry
+    if dy &lt; 0.0 { dy = -dy }
+    dx &lt;= w / 2.0 &amp;&amp; dy &lt;= h / 2.0
+}
+
+/// Do two placed shapes touch? The kernel is chosen by the pair of kinds.
++touch(a: Shape, ax: f64, ay: f64, b: Shape, bx: f64, by: f64) : bool {
+    when (a, b) {
+        (Shape.Circle, Shape.Circle) =&gt; { return circle_circle(a.radius(), ax, ay, b.radius(), bx, by) }
+        (Shape.Rect, Shape.Rect) =&gt; { return rect_rect(a.width(), a.height(), ax, ay, b.width(), b.height(), bx, by) }
+        (Shape.Circle, Shape.Rect) =&gt; { return circle_rect(a.radius(), ax, ay, b.width(), b.height(), bx, by) }
+        (Shape.Rect, Shape.Circle) =&gt; { return circle_rect(b.radius(), bx, by, a.width(), a.height(), ax, ay) }
+        (Shape.Dot, Shape.Circle) =&gt; { return circle_circle(0.0, ax, ay, b.radius(), bx, by) }
+        (Shape.Circle, Shape.Dot) =&gt; { return circle_circle(a.radius(), ax, ay, 0.0, bx, by) }
+        (Shape.Dot, Shape.Rect) =&gt; { return dot_rect(ax, ay, b.width(), b.height(), bx, by) }
+        (Shape.Rect, Shape.Dot) =&gt; { return dot_rect(bx, by, a.width(), a.height(), ax, ay) }
+        (Shape.Dot, Shape.Dot) =&gt; { return dist2(ax, ay, bx, by) &lt; 0.000000001 }
+    }
+}
+
+/// A 2D vector.
+Vec2 = {
+    x: f64
+    y: f64
+}
+
+/// Vector times scalar. `#symmetric` makes `scale(k, v)` mean the same (checked by `super check`).
+#symmetric
++scale(v: Vec2, k: f64) : Vec2 =&gt; Vec2.{x: v.x * k, y: v.y * k}
+
+/// The runtime-safe spelling of `scale` used by this program and its tests.
++scale_vec(v: Vec2, k: f64) : Vec2 =&gt; Vec2.{x: v.x * k, y: v.y * k}
+
++main() {
+    shapes = [circle(1.0), rect(2.0, 2.0), dot()]
+    for shapes {
+        a = it
+        row = a.name()
+        for shapes {
+            b = it
+            hit = touch(a, 0.0, 0.0, b, 1.5, 0.0)
+            row = &quot;{row} {b.name()}={hit}&quot;
+        }
+        print(row)
+    }
+    m = mul(lin_dense(dense(2, 2, [1.0, 2.0, 3.0, 4.0])), lin_diag(diagonal([10.0, 100.0])))
+    print(&quot;{m.kind_name()} {m.to_dense().data}&quot;)
+}
+
+test &quot;same-kind pairs&quot; {
+    #assert(touch(circle(1.0), 0.0, 0.0, circle(1.0), 1.9, 0.0))
+    #assert(!(touch(circle(1.0), 0.0, 0.0, circle(1.0), 2.1, 0.0)))
+    #assert(touch(rect(2.0, 2.0), 0.0, 0.0, rect(2.0, 2.0), 1.9, 1.9))
+    #assert(!(touch(rect(2.0, 2.0), 0.0, 0.0, rect(2.0, 2.0), 2.1, 0.0)))
+    #assert(touch(dot(), 1.0, 1.0, dot(), 1.0, 1.0))
+    #assert(!(touch(dot(), 1.0, 1.0, dot(), 1.0, 1.5)))
+}
+
+test &quot;mixed pairs use a dedicated kernel&quot; {
+    // circle radius 1 at origin vs 2x2 rectangle centred at (2.5, 0): nearest edge x = 1.5, gap 0.5 -&gt; miss
+    #assert(!(touch(circle(1.0), 0.0, 0.0, rect(2.0, 2.0), 2.5, 0.0)))
+    // moving the rectangle to x = 1.9 puts its edge at 0.9: hit
+    #assert(touch(circle(1.0), 0.0, 0.0, rect(2.0, 2.0), 1.9, 0.0))
+    // corner case: nearest point is the corner (1, 1); distance sqrt(2) &gt; 1
+    #assert(!(touch(circle(1.0), 0.0, 0.0, rect(2.0, 2.0), 2.0, 2.0)))
+    #assert(touch(circle(1.5), 0.0, 0.0, rect(2.0, 2.0), 2.0, 2.0))
+    #assert(touch(dot(), 0.5, 0.5, circle(1.0), 0.0, 0.0))
+    #assert(!(touch(dot(), 1.5, 0.0, circle(1.0), 0.0, 0.0)))
+    #assert(touch(dot(), 0.9, 0.9, rect(2.0, 2.0), 0.0, 0.0))
+    #assert(!(touch(dot(), 1.1, 0.0, rect(2.0, 2.0), 0.0, 0.0)))
+}
+
+test &quot;every pair is symmetric: swapping the operands never changes the answer&quot; {
+    shapes = [circle(1.0), rect(2.0, 1.0), dot(), circle(0.5), rect(1.0, 3.0)]
+    offsets = [0.0, 0.4, 0.9, 1.4, 2.0, 3.5]
+    checked = 0
+    for shapes {
+        a = it
+        for shapes {
+            b = it
+            for offsets {
+                dx = it
+                for offsets {
+                    dy = it
+                    assert_eq(touch(a, 0.0, 0.0, b, dx, dy), touch(b, dx, dy, a, 0.0, 0.0))
+                    checked += 1
+                }
+            }
+        }
+    }
+    assert_eq(checked, 900)
+}
+
+test &quot;dispatch table names&quot; {
+    assert_eq(circle(2.0).name(), &quot;circle&quot;)
+    assert_eq(rect(1.0, 2.0).name(), &quot;rect&quot;)
+    assert_eq(dot().name(), &quot;dot&quot;)
+    assert_eq(circle(2.5).radius(), 2.5)
+    assert_eq(rect(3.0, 4.0).width(), 3.0)
+    assert_eq(rect(3.0, 4.0).height(), 4.0)
+    assert_eq(dot().radius(), 0.0)
+}
+
+test &quot;scalar mirror helper&quot; {
+    v = scale(Vec2.{x: 1.0, y: -2.0}, 3.0)
+    mirrored = scale(3.0, Vec2.{x: 1.0, y: -2.0})
+    assert_eq(mirrored.x, v.x)
+    assert_eq(mirrored.y, v.y)
+    assert_eq(v.x, 3.0)
+    assert_eq(v.y, -6.0)
+}
+
+test &quot;linalg kind dispatch&quot; {
+    a = lin_dense(dense(2, 2, [1.0, 2.0, 3.0, 4.0]))
+    g = lin_diag(diagonal([10.0, 100.0]))
+    ag = mul(a, g)
+    ga = mul(g, a)
+    assert_eq(ag.kind_name(), &quot;dense&quot;)
+    assert_eq(ag.to_dense().data[0], 10.0)
+    assert_eq(ag.to_dense().data[1], 200.0)
+    assert_eq(ag.to_dense().data[2], 30.0)
+    assert_eq(ag.to_dense().data[3], 400.0)
+    assert_eq(ga.to_dense().data[0], 10.0)
+    assert_eq(ga.to_dense().data[1], 20.0)
+    assert_eq(ga.to_dense().data[2], 300.0)
+    assert_eq(ga.to_dense().data[3], 400.0)
+    gg = mul(g, g)
+    assert_eq(gg.kind_name(), &quot;diagonal&quot;)
+    assert_eq(gg.to_dense().data[3], 10000.0)
+    s = lin_sparse(csr_from_dense(dense(2, 2, [0.0, 1.0, 1.0, 0.0]), 0.0))
+    sg = mul(s, g)
+    assert_eq(sg.kind_name(), &quot;csr&quot;)
+    assert_eq(sg.to_dense().data[1], 100.0)
+    assert_eq(sg.to_dense().data[2], 10.0)
+    total = add(a, g)
+    assert_eq(total.to_dense().data[0], 11.0)
+    assert_eq(total.to_dense().data[3], 104.0)
+}
+</code></pre></article><article class="example-block" id="ex-doc_ai-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc ai</h3><p class="note">examples/doc_ai/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! stdlib AI tokenizer (BPE) approximate counter.
+//! Run: super test examples/doc_ai/main.sr
+
+use std.ai.tokenizer
+
++main() {
+    t = Tokenizer.mini()
+    approx = t.approx_count(&quot;Super agents read fewer tokens.&quot;)
+    print(&quot;approx tokens={approx}&quot;)
+}
+
+test &quot;tokenizer returns positive count&quot; {
+    t = Tokenizer.mini()
+    n = t.approx_count(&quot;abc&quot;)
+    #assert(n &gt;= 1)
+}
+</code></pre></article><article class="example-block" id="ex-doc_cli-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc cli</h3><p class="note">examples/doc_cli/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Minimal CLI-style argv parsing.
+//! Run: super run examples/doc_cli/main.sr -- hello
+
++main() {
+    args = host.sys_argv()
+    if host.sys_arr_len(args) &lt; 2 {
+        print(&quot;usage: super run examples/doc_cli/main.sr -- &lt;name&gt;&quot;)
+        return
+    }
+    name = args[1]
+    print(&quot;hello, {name}&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-doc_comptime-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc comptime</h3><p class="note">examples/doc_comptime/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Compile-time table folded into the program (comptime constants).
+//! Run: super check examples/doc_comptime/main.sr
+
++TABLE = [0, 1, 4, 9, 16]
+
++square(n: i64) : i64 {
+    if n &lt; 0 { return 0 }
+    if n &gt;= host.sys_arr_len(TABLE) { return n * n }
+    TABLE[n]
+}
+
++main() {
+    print(&quot;square(4)={square(4)}&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-doc_data_stack-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc data stack</h3><p class="note">examples/doc_data_stack/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Frame-local collections (scoped data stack allocation path).
+//! Run: super run examples/doc_data_stack/main.sr
+
++main() {
+    items = [10, 20, 30]
+    acc = 0
+    for items { acc += it * 2 }
+    print(&quot;acc={acc}&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-doc_errors-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc errors</h3><p class="note">examples/doc_errors/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Value errors (`!`) with `ensure` and `or` default.
+//! Run: super run examples/doc_errors/main.sr
+
++port(path: str) : i64! {
+    ensure path != &quot;&quot; else { fail &quot;empty path&quot; }
+    return 8080
+}
+
++main() {
+    good = port(&quot;cfg&quot;)
+    fallback = port(&quot;&quot;) or 3000
+    print(&quot;good={good} fallback={fallback}&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-doc_features-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc features</h3><p class="note">examples/doc_features/src/main.sr</p></div><pre class="sr-block"><code class="language-sr">#cfg(feature = &quot;text&quot;)
++mode() : str =&gt; &quot;text&quot;
+
+#cfg(all(not(feature = &quot;text&quot;), feature = &quot;binary&quot;))
++mode() : str =&gt; &quot;binary&quot;
+
+#cfg(not(any(feature = &quot;text&quot;, feature = &quot;binary&quot;)))
++mode() : str =&gt; &quot;minimal&quot;
+
++main() {
+    print(mode())
+    0
+}
+
+test &quot;selected feature produces one mode&quot; {
+    #assert(mode() != &quot;&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-doc_hello-hello" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc hello</h3><p class="note">examples/doc_hello/hello.sr</p></div><pre class="sr-block"><code class="language-sr">//! Hello world — shows minimal `+main` entry.
+//! Run: super run examples/doc_hello/hello.sr
+
++main() {
+    print(&quot;hello from Super&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-doc_http_json-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc http json</h3><p class="note">examples/doc_http_json/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! JSON encode/decode with stdlib fmt (no live server required).
+//! Run: super check examples/doc_http_json/main.sr
+
+use std.fmt.json
+
++User = { id: i64, name: str }
+
++main() {
+    u = User.{id: 1, name: &quot;Ada&quot;}
+    txt = json.encode_map([[&quot;id&quot;, host.sys_to_str(u.id)], [&quot;name&quot;, u.name]]) or err {
+        print(&quot;encode failed: {err}&quot;)
+        return
+    }
+    print(txt)
+}
+</code></pre></article><article class="example-block" id="ex-doc_law-ledger.law" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc law</h3><p class="note">examples/doc_law/src/ledger.law.sr</p></div><pre class="sr-block"><code class="language-sr">//! Human-locked laws for the ledger example.
+//! Put discharges in `ledger.proof.sr`.
+
+#law(&quot;a transfer moves money without creating or destroying it&quot;)
+transfer_conserves(src: i64, dst: i64, amount: i64) {
+    #assert((src - amount) + (dst + amount) == src + dst)
+}
+</code></pre></article><article class="example-block" id="ex-doc_law-ledger.proof" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc law</h3><p class="note">examples/doc_law/src/ledger.proof.sr</p></div><pre class="sr-block"><code class="language-sr">//! Discharges for `ledger.law.sr`.
+
+#proof(transfer_conserves)
+prove_transfer_conserves(src: i64, dst: i64, amount: i64) {
+    #assert((src - amount) + (dst + amount) == src + dst)
+}
+</code></pre></article><article class="example-block" id="ex-doc_law-ledger" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc law</h3><p class="note">examples/doc_law/src/ledger.sr</p></div><pre class="sr-block"><code class="language-sr">//! Law/proof tier — discharge with `super verify examples/doc_law/src/ledger.sr`.
+//! Run: super verify examples/doc_law/src/ledger.sr
+
++Account = { balance: i64 = 0 }
+
++transfer(@src: Account, @dst: Account, amount: i64) : bool {
+    if amount &lt; 0 { return false }
+    if src.balance &lt; amount { return false }
+    src.balance -= amount
+    dst.balance += amount
+    true
+}
+test &quot;transfer keeps the total and refuses overdrafts&quot; {
+    a = Account{balance: 10}
+    b = Account{balance: 0}
+    #assert(transfer(@a, @b, 4))
+    assert_eq(a.balance + b.balance, 10)
+    #assert(!transfer(@a, @b, 100))
+    assert_eq(a.balance, 6)
+}
+</code></pre></article><article class="example-block" id="ex-doc_macros-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc macros</h3><p class="note">examples/doc_macros/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Pattern macros are ordinary Super source: `#name { (pattern) =&gt; { template } }`.
+//! Run: super test examples/doc_macros/main.sr
+
+/// Square any expression; `$x` is evaluated as one unit.
+#square {
+    ($x:expr) =&gt; { $x * $x }
+}
+
+/// Largest of one or more values; `$a` and `$b` are hygienic locals.
+#max_of {
+    ($only:expr) =&gt; { $only }
+    ($head:expr, $($rest:expr),+) =&gt; {
+        $a = $head
+        $b = #max_of($($rest),+)
+        if $a &gt; $b { $a } else { $b }
+    }
+}
+
+test &quot;user macros are ordinary source&quot; {
+    #assert(#square(3) == 9)
+    #assert(#square(1 + 2) == 9)
+    assert_eq(#max_of(4, 9, 2), 9)
+    routes = [&quot;/a&quot;, &quot;/b&quot;]
+    assert_eq(len(routes), 2)
+}
+</code></pre></article><article class="example-block" id="ex-doc_pod-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc pod</h3><p class="note">examples/doc_pod/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Pod.toml manifest at examples/doc_pod/Pod.toml — pack with `super pod verify`.
+//! Run: super check examples/doc_pod/main.sr
+
++main() {
+    print(&quot;doc pod example — see Pod.toml beside this file&quot;)
+}
+</code></pre></article><article class="example-block" id="ex-doc_test-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>doc test</h3><p class="note">examples/doc_test/main.sr</p></div><pre class="sr-block"><code class="language-sr">//! Built-in `test` blocks (stripped on `super build --release`).
+//! Run: super test examples/doc_test/
+
++add(a: i64, b: i64) : i64 =&gt; a + b
+
++main() {
+    print(&quot;sum={add(2, 3)}&quot;)
+}
+
+test &quot;add sums&quot; {
+    assert_eq(add(2, 3), 5)
+}
+</code></pre></article><article class="example-block" id="ex-interop_c-physics" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>interop c</h3><p class="note">examples/interop_c/src/physics.sr</p></div><pre class="sr-block"><code class="language-sr">//! Super script used by the C17 host.
+//!
+//! Two interop directions:
+//! 1. Host → Super: zero-copy `particles` slice + hot-reload `step`.
+//! 2. Super → C: `host.mathlib_lerp` / `host.mathlib_clamp` bound to `native/mathlib.c`.
+
++Particle = {
+    x: f32
+    y: f32
+    vx: f32
+    vy: f32
+}
+
+// Placeholder overwritten by the host with an ExtSlice view.
+particles = []
+
++step(dt: f64) {
+    for @particles {
+        it.x += it.vx * dt
+        it.y += it.vy * dt
+    }
+    host.on_step(1)
+}
+
++particle_count() : i64 {
+    n = 0
+    for particles {
+        n += 1
+    }
+    n
+}
+
+/// Call into the linked C math library via host binds.
++blend(a: f64, b: f64, t: f64) : f64 =&gt; host.mathlib_lerp(a, b, t)
+
+/// Clamp through the C library.
++limit(x: f64, lo: f64, hi: f64) : f64 =&gt; host.mathlib_clamp(x, lo, hi)
+
+test &quot;blend is callable shape&quot; {
+    assert_eq(1, 1)
+}
+</code></pre></article><article class="example-block" id="ex-interop_cpp-combat" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>interop cpp</h3><p class="note">examples/interop_cpp/src/combat.sr</p></div><pre class="sr-block"><code class="language-sr">//! Super combat script for the C++20 host.
+//!
+//! 1. Host → Super: zero-copy `entities` span + `host.apply_damage` callback.
+//! 2. Super → C++: `host.damage_apply_hit` bound to `native/damage.cpp` (extern &quot;C&quot;).
+
++Entity = {
+    id: i64
+    hp: f32
+    dps: f32
+    x: f32
+    y: f32
+}
+
+entities = []
+
++compute_dps(base: f32, mult: f32) : f32 =&gt; base * mult
+
++apply_ai(dt: f64) {
+    for @entities {
+        it.x += (0.0 - it.x) * 0.01 * dt
+        it.y += (0.0 - it.y) * 0.01 * dt
+        if it.hp &lt; 20.0 {
+            host.apply_damage(it.id, 1.0)
+        }
+    }
+}
+
+/// Hit through the C++ damage library (armor mitigation).
++hit_through_cpp(hp: f64, armor: f64, raw: f64) : f64 =&gt; host.damage_apply_hit(hp, armor, raw)
+
++alive_count() : i64 {
+    n = 0
+    for entities {
+        if it.hp &gt; 0.0 {
+            n += 1
+        }
+    }
+    n
+}
+
+test &quot;dps math&quot; {
+    assert_eq(compute_dps(10.0, 1.5), 15.0)
+}
+</code></pre></article><article class="example-block" id="ex-interop_rust-ai" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>interop rust</h3><p class="note">examples/interop_rust/src/ai.sr</p></div><pre class="sr-block"><code class="language-sr">//! Super AI tick script for the Rust host (`super_ffi` embed crate).
+//!
+//! 1. Host → Super: zero-copy `agents` + `host.refuel` callback.
+//! 2. Super → Rust: `host.rarity_score` bound to `native_ai::rarity_score`.
+
++Agent = {
+    id: i64
+    energy: f64
+    x: f64
+    y: f64
+}
+
+agents = []
+
++tick(dt: f64) : i64 {
+    n = 0
+    for @agents {
+        it.energy -= 0.1 * dt
+        it.x += 1.0 * dt
+        if it.energy &lt; 1.0 {
+            host.refuel(it.id, 5.0)
+            n += 1
+        }
+    }
+    n
+}
+
++sum_energy() : f64 =&gt; agents.map(it.energy).sum()
+
+/// Call into the Rust helper module via a host bind.
++score_agent(energy: f64, id: i64) : f64 =&gt; host.rarity_score(energy, id)
+
+test &quot;tick returns&quot; {
+    assert_eq(1, 1)
+}
+</code></pre></article><article class="example-block" id="ex-stress_c23_outline-main" data-reveal><div class="example-meta"><span class="example-kind">Project</span><h3>stress c23 outline</h3><p class="note">examples/stress_c23_outline/main.sr · truncated</p></div><pre class="sr-block"><code class="language-sr">// Synthetic C23 AOT stress (&gt;10K lines of .sr); all leaves reachable
++leaf_0(x: i64) =&gt; x * 1 + 0
++leaf_1(x: i64) =&gt; x * 2 + 3
++leaf_2(x: i64) =&gt; x * 3 + 6
++leaf_3(x: i64) =&gt; x * 4 + 9
++leaf_4(x: i64) =&gt; x * 5 + 12
++leaf_5(x: i64) =&gt; x * 6 + 15
++leaf_6(x: i64) =&gt; x * 7 + 18
++leaf_7(x: i64) =&gt; x * 8 + 21
++leaf_8(x: i64) =&gt; x * 9 + 24
++leaf_9(x: i64) =&gt; x * 10 + 27
++leaf_10(x: i64) =&gt; x * 11 + 30
++leaf_11(x: i64) =&gt; x * 12 + 33
++leaf_12(x: i64) =&gt; x * 13 + 36
++leaf_13(x: i64) =&gt; x * 14 + 39
++leaf_14(x: i64) =&gt; x * 15 + 42
++leaf_15(x: i64) =&gt; x * 16 + 45
++leaf_16(x: i64) =&gt; x * 17 + 48
++leaf_17(x: i64) =&gt; x * 18 + 51
++leaf_18(x: i64) =&gt; x * 19 + 54
++leaf_19(x: i64) =&gt; x * 20 + 57
++leaf_20(x: i64) =&gt; x * 21 + 60
++leaf_21(x: i64) =&gt; x * 22 + 63
++leaf_22(x: i64) =&gt; x * 23 + 66
++leaf_23(x: i64) =&gt; x * 24 + 69
++leaf_24(x: i64) =&gt; x * 25 + 72
++leaf_25(x: i64) =&gt; x * 26 + 75
++leaf_26(x: i64) =&gt; x * 27 + 78
++leaf_27(x: i64) =&gt; x * 28 + 81
++leaf_28(x: i64) =&gt; x * 29 + 84
++leaf_29(x: i64) =&gt; x * 30 + 87
++leaf_30(x: i64) =&gt; x * 31 + 90
++leaf_31(x: i64) =&gt; x * 32 + 93
++leaf_32(x: i64) =&gt; x * 33 + 96
++leaf_33(x: i64) =&gt; x * 34 + 2
++leaf_34(x: i64) =&gt; x * 35 + 5
++leaf_35(x: i64) =&gt; x * 36 + 8
++leaf_36(x: i64) =&gt; x * 37 + 11
++leaf_37(x: i64) =&gt; x * 38 + 14
++leaf_38(x: i64) =&gt; x * 39 + 17
++leaf_39(x: i64) =&gt; x * 40 + 20
++leaf_40(x: i64) =&gt; x * 41 + 23
++leaf_41(x: i64) =&gt; x * 42 + 26
++leaf_42(x: i64) =&gt; x * 43 + 29
++leaf_43(x: i64) =&gt; x * 44 + 32
++leaf_44(x: i64) =&gt; x * 45 + 35
++leaf_45(x: i64) =&gt; x * 46 + 38
++leaf_46(x: i64) =&gt; x * 47 + 41
++leaf_47(x: i64) =&gt; x * 48 + 44
++leaf_48(x: i64) =&gt; x * 49 + 47
++leaf_49(x: i64) =&gt; x * 50 + 50
++leaf_50(x: i64) =&gt; x * 51 + 53
++leaf_51(x: i64) =&gt; x * 52 + 56
++leaf_52(x: i64) =&gt; x * 53 + 59
++leaf_53(x: i64) =&gt; x * 54 + 62
++leaf_54(x: i64) =&gt; x * 55 + 65
++leaf_55(x: i64) =&gt; x * 56 + 68
++leaf_56(x: i64) =&gt; x * 57 + 71
++leaf_57(x: i64) =&gt; x * 58 + 74
++leaf_58(x: i64) =&gt; x * 59 + 77
++leaf_59(x: i64) =&gt; x * 60 + 80
++leaf_60(x: i64) =&gt; x * 61 + 83
++leaf_61(x: i64) =&gt; x * 62 + 86
++leaf_62(x: i64) =&gt; x * 63 + 89
++leaf_63(x: i64) =&gt; x * 64 + 92
++leaf_64(x: i64) =&gt; x * 65 + 95
++leaf_65(x: i64) =&gt; x * 66 + 1
++leaf_66(x: i64) =&gt; x * 67 + 4
++leaf_67(x: i64) =&gt; x * 68 + 7
++leaf_68(x: i64) =&gt; x * 69 + 10
++leaf_69(x: i64) =&gt; x * 70 + 13
++leaf_70(x: i64) =&gt; x * 71 + 16
++leaf_71(x: i64) =&gt; x * 72 + 19
++leaf_72(x: i64) =&gt; x * 73 + 22
++leaf_73(x: i64) =&gt; x * 74 + 25
++leaf_74(x: i64) =&gt; x * 75 + 28
++leaf_75(x: i64) =&gt; x * 76 + 31
++leaf_76(x: i64) =&gt; x * 77 + 34
++leaf_77(x: i64) =&gt; x * 78 + 37
++leaf_78(x: i64) =&gt; x * 79 + 40
++leaf_79(x: i64) =&gt; x * 80 + 43
++leaf_80(x: i64) =&gt; x * 81 + 46
++leaf_81(x: i64) =&gt; x * 82 + 49
++leaf_82(x: i64) =&gt; x * 83 + 52
++leaf_83(x: i64) =&gt; x * 84 + 55
++leaf_84(x: i64) =&gt; x * 85 + 58
++leaf_85(x: i64) =&gt; x * 86 + 61
++leaf_86(x: i64) =&gt; x * 87 + 64
++leaf_87(x: i64) =&gt; x * 88 + 67
++leaf_88(x: i64) =&gt; x * 89 + 70
++leaf_89(x: i64) =&gt; x * 90 + 73
++leaf_90(x: i64) =&gt; x * 91 + 76
++leaf_91(x: i64) =&gt; x * 92 + 79
++leaf_92(x: i64) =&gt; x * 93 + 82
++leaf_93(x: i64) =&gt; x * 94 + 85
++leaf_94(x: i64) =&gt; x * 95 + 88
++leaf_95(x: i64) =&gt; x * 96 + 91
++leaf_96(x: i64) =&gt; x * 97 + 94
++leaf_97(x: i64) =&gt; x * 98 + 0
++leaf_98(x: i64) =&gt; x * 99 + 3
++leaf_99(x: i64) =&gt; x * 100 + 6
++leaf_100(x: i64) =&gt; x * 101 + 9
++leaf_101(x: i64) =&gt; x * 102 + 12
++leaf_102(x: i64) =&gt; x * 103 + 15
++leaf_103(x: i64) =&gt; x * 104 + 18
++leaf_104(x: i64) =&gt; x * 105 + 21
++leaf_105(x: i64) =&gt; x * 106 + 24
++leaf_106(x: i64) =&gt; x * 107 + 27
++leaf_107(x: i64) =&gt; x * 108 + 30
++leaf_108(x: i64) =&gt; x * 109 + 33
++leaf_109(x: i64) =&gt; x * 110 + 36
++leaf_110(x: i64) =&gt; x * 111 + 39
++leaf_111(x: i64) =&gt; x * 112 + 42
++leaf_112(x: i64) =&gt; x * 113 + 45
++leaf_113(x: i64) =&gt; x * 114 + 48
++leaf_114(x: i64) =&gt; x * 115 + 51
++leaf_115(x: i64) =&gt; x * 116 + 54
++leaf_116(x: i64) =&gt; x * 117 + 57
++leaf_117(x: i64) =&gt; x * 118 + 60
++leaf_118(x: i64) =&gt; x * 119 + 63
++leaf_119(x: i64) =&gt; x * 120 + 66
++leaf_120(x: i64) =&gt; x * 121 + 69
++leaf_121(x: i64) =&gt; x * 122 + 72
++leaf_122(x: i64) =&gt; x * 123 + 75
++leaf_123(x: i64) =&gt; x * 124 + 78
++leaf_124(x: i64) =&gt; x * 125 + 81
++leaf_125(x: i64) =&gt; x * 126 + 84
++leaf_126(x: i64) =&gt; x * 127 + 87
++leaf_127(x: i64) =&gt; x * 128 + 90
++leaf_128(x: i64) =&gt; x * 129 + 93
++leaf_129(x: i64) =&gt; x * 130 + 96
++leaf_130(x: i64) =&gt; x * 131 + 2
++leaf_131(x: i64) =&gt; x * 132 + 5
++leaf_132(x: i64) =&gt; x * 133 + 8
++leaf_133(x: i64) =&gt; x * 134 + 11
++leaf_134(x: i64) =&gt; x * 135 + 14
++leaf_135(x: i64) =&gt; x * 136 + 17
++leaf_136(x: i64) =&gt; x * 137 + 20
++leaf_137(x: i64) =&gt; x * 138 + 23
++leaf_138(x: i64) =&gt; x * 139 + 26
++leaf_139(x: i64) =&gt; x * 140 + 29
++leaf_140(x: i64) =&gt; x * 141 + 32
++leaf_141(x: i64) =&gt; x * 142 + 35
++leaf_142(x: i64) =&gt; x * 143 + 38
++leaf_143(x: i64) =&gt; x * 144 + 41
++leaf_144(x: i64) =&gt; x * 145 + 44
++leaf_145(x: i64) =&gt; x * 146 + 47
++leaf_146(x: i64) =&gt; x * 147 + 50
++leaf_147(x: i64) =&gt; x * 148 + 53
++leaf_148(x: i64) =&gt; x * 149 + 56
++leaf_149(x: i64) =&gt; x * 150 + 59
++leaf_150(x: i64) =&gt; x * 151 + 62
++leaf_151(x: i64) =&gt; x * 152 + 65
++leaf_152(x: i64) =&gt; x * 153 + 68
++leaf_153(x: i64) =&gt; x * 154 + 71
++leaf_154(x: i64) =&gt; x * 155 + 74
++leaf_155(x: i64) =&gt; x * 156 + 77
++leaf_156(x: i64) =&gt; x * 157 + 80
++leaf_157(x: i64) =&gt; x * 158 + 83
++leaf_158(x: i64) =&gt; x * 159 + 86
++leaf_159(x: i64) =&gt; x * 160 + 89
++leaf_160(x: i64) =&gt; x * 161 + 92
++leaf_161(x: i64) =&gt; x * 162 + 95
++leaf_162(x: i64) =&gt; x * 163 + 1
++leaf_163(x: i64) =&gt; x * 164 + 4
++leaf_164(x: i64) =&gt; x * 165 + 7
++leaf_165(x: i64) =&gt; x * 166 + 10
++leaf_166(x: i64) =&gt; x * 167 + 13
++leaf_167(x: i64) =&gt; x * 168 + 16
++leaf_168(x: i64) =&gt; x * 169 + 19
++leaf_169(x: i64) =&gt; x * 170 + 22
++leaf_170(x: i64) =&gt; x * 171 + 25
++leaf_171(x: i64) =&gt; x * 172 + 28
++leaf_172(x: i64) =&gt; x * 173 + 31
++leaf_173(x: i64) =&gt; x * 174 + 34
++leaf_174(x: i64) =&gt; x * 175 + 37
++leaf_175(x: i64) =&gt; x * 176 + 40
++leaf_176(x: i64) =&gt; x * 177 + 43
++leaf_177(x: i64) =&gt; x * 178 + 46
++leaf_178(x: i64) =&gt; x * 179 + 49
++leaf_179(x: i64) =&gt; x * 180 + 52
++leaf_180(x: i64) =&gt; x * 181 + 55
++leaf_181(x: i64) =&gt; x * 182 + 58
++leaf_182(x: i64) =&gt; x * 183 + 61
++leaf_183(x: i64) =&gt; x * 184 + 64
++leaf_184(x: i64) =&gt; x * 185 + 67
++leaf_185(x: i64) =&gt; x * 186 + 70
++leaf_186(x: i64) =&gt; x * 187 + 73
++leaf_187(x: i64) =&gt; x * 188 + 76
++leaf_188(x: i64) =&gt; x * 189 + 79
++leaf_189(x: i64) =&gt; x * 190 + 82
++leaf_190(x: i64) =&gt; x * 191 + 85
++leaf_191(x: i64) =&gt; x * 192 + 88
++leaf_192(x: i64) =&gt; x * 193 + 91
++leaf_193(x: i64) =&gt; x * 194 + 94
++leaf_194(x: i64) =&gt; x * 195 + 0
++leaf_195(x: i64) =&gt; x * 196 + 3
++leaf_196(x: i64) =&gt; x * 197 + 6
++leaf_197(x: i64) =&gt; x * 198 + 9
++leaf_198(x: i64) =&gt; x * 199 + 12
++leaf_199(x: i64) =&gt; x * 200 + 15
++leaf_200(x: i64) =&gt; x * 201 + 18
++leaf_201(x: i64) =&gt; x * 202 + 21
++leaf_202(x: i64) =&gt; x * 203 + 24
++leaf_203(x: i64) =&gt; x * 204 + 27
++leaf_204(x: i64) =&gt; x * 205 + 30
++leaf_205(x: i64) =&gt; x * 206 + 33
++leaf_206(x: i64) =&gt; x * 207 + 36
++leaf_207(x: i64) =&gt; x * 208 + 39
++leaf_208(x: i64) =&gt; x * 209 + 42
++leaf_209(x: i64) =&gt; x * 210 + 45
++leaf_210(x: i64) =&gt; x * 211 + 48
++leaf_211(x: i64) =&gt; x * 212 + 51
++leaf_212(x: i64) =&gt; x * 213 + 54
++leaf_213(x: i64) =&gt; x * 214 + 57
++leaf_214(x: i64) =&gt; x * 215 + 60
++leaf_215(x: i64) =&gt; x * 216 + 63
++leaf_216(x: i64) =&gt; x * 217 + 66
++leaf_217(x: i64) =&gt; x * 218 + 69
++leaf_218(x: i64) =&gt; x * 219 + 72
++leaf_219(x: i64) =&gt; x * 220 + 75
++leaf_220(x: i64) =&gt; x * 221 + 78
++leaf_221(x: i64) =&gt; x * 222 + 81
++leaf_222(x: i64) =&gt; x * 223 + 84
++leaf_223(x: i64) =&gt; x * 224 + 87
++leaf_224(x: i64) =&gt; x * 225 + 90
++leaf_225(x: i64) =&gt; x * 226 + 93
++leaf_226(x: i64) =&gt; x * 227 + 96
++leaf_227(x: i64) =&gt; x * 228 + 2
++leaf_228(x: i64) =&gt; x * 229 + 5
++leaf_229(x: i64) =&gt; x * 230 + 8
++leaf_230(x: i64) =&gt; x * 231 + 11
++leaf_231(x: i64) =&gt; x * 232 + 14
++leaf_232(x: i64) =&gt; x * 233 + 17
++leaf_233(x: i64) =&gt; x * 234 + 20
++leaf_234(x: i64) =&gt; x * 235 + 23
++leaf_235(x: i64) =&gt; x * 236 + 26
++leaf_236(x: i64) =&gt; x * 237 + 29
++leaf_237(x: i64) =&gt; x * 238 + 32
++leaf_238(x: i64) =&gt; x * 239 + 35
++leaf_239(x: i64) =&gt; x * 240 + 38
++leaf_240(x: i64) =&gt; x * 241 + 41
++leaf_241(x: i64) =&gt; x * 242 + 44
++leaf_242(x: i64) =&gt; x * 243 + 47
++leaf_243(x: i64) =&gt; x * 244 + 50
++leaf_244(x: i64) =&gt; x * 245 + 53
++leaf_245(x: i64) =&gt; x * 246 + 56
++leaf_246(x: i64) =&gt; x * 247 + 59
++leaf_247(x: i64) =&gt; x * 248 + 62
++leaf_248(x: i64) =&gt; x * 249 + 65
++leaf_249(x: i64) =&gt; x * 250 + 68
++leaf_250(x: i64) =&gt; x * 251 + 71
++leaf_251(x: i64) =&gt; x * 252 + 74
++leaf_252(x: i64) =&gt; x * 253 + 77
++leaf_253(x: i64) =&gt; x * 254 + 80
++leaf_254(x: i64) =&gt; x * 255 + 83
++leaf_255(x: i64) =&gt; x * 256 + 86
++leaf_256(x: i64) =&gt; x * 257 + 89
++leaf_257(x: i64) =&gt; x * 258 + 92
++leaf_258(x: i64) =&gt; x * 259 + 95
++leaf_259(x: i64) =&gt; x * 260 + 1
++leaf_260(x: i64) =&gt; x * 261 + 4
++leaf_261(x: i64) =&gt; x * 262 + 7
++leaf_262(x: i64) =&gt; x * 263 + 10
++leaf_263(x: i64) =&gt; x * 264 + 13
++leaf_264(x: i64) =&gt; x * 265 + 16
++leaf_265(x: i64) =&gt; x * 266 + 19
++leaf_266(x: i64) =&gt; x * 267 + 22
++leaf_267(x: i64) =&gt; x * 268 + 25
++leaf_268(x: i64) =&gt; x * 269 + 28
++leaf_269(x: i64) =&gt; x * 270 + 31
++leaf_270(x: i64) =&gt; x * 271 + 34
++leaf_271(x: i64) =&gt; x * 272 + 37
++leaf_272(x: i64) =&gt; x * 273 + 40
++leaf_273(x: i64) =&gt; x * 274 + 43
++leaf_274(x: i64) =&gt; x * 275 + 46
++leaf_275(x: i64) =&gt; x * 276 + 49
++leaf_276(x: i64) =&gt; x * 277 + 52
++leaf_277(x: i64) =&gt; x * 278 + 55
++leaf_278(x: i64) =&gt; x * 279 + 58
++leaf_279(x: i64) =&gt; x * 280 + 61
++leaf_280(x: i64) =&gt; x * 281 + 64
++leaf_281(x: i64) =&gt; x * 282 + 67
++leaf_282(x: i64) =&gt; x * 283 + 70
++leaf_283(x: i64) =&gt; x * 284 + 73
++leaf_284(x: i64) =&gt; x * 285 + 76
++leaf_285(x: i64) =&gt; x * 286 + 79
++leaf_286(x: i64) =&gt; x * 287 + 82
++leaf_287(x: i64) =&gt; x * 288 + 85
++leaf_288(x: i64) =&gt; x * 289 + 88
++leaf_289(x: i64) =&gt; x * 290 + 91
++leaf_290(x: i64) =&gt; x * 291 + 94
++leaf_291(x: i64) =&gt; x * 292 + 0
++leaf_292(x: i64) =&gt; x * 293 + 3
++leaf_293(x: i64) =&gt; x * 294 + 6
++leaf_294(x: i64) =&gt; x * 295 + 9
++leaf_295(x: i64) =&gt; x * 296 + 12
++leaf_296(x: i64) =&gt; x * 297 + 15
++leaf_297(x: i64) =&gt; x * 298 + 18
++leaf_298(x: i64) =&gt; x * 299 + 21
++leaf_299(x: i64) =&gt; x * 300 + 24
++leaf_300(x: i64) =&gt; x * 301 + 27
++leaf_301(x: i64) =&gt; x * 302 + 30
++leaf_302(x: i64) =&gt; x * 303 + 33
++leaf_303(x: i64) =&gt; x * 304 + 36
++leaf_304(x: i64) =&gt; x * 305 + 39
++leaf_305(x: i64) =&gt; x * 306 + 42
++leaf_306(x: i64) =&gt; x * 307 + 45
++leaf_307(x: i64) =&gt; x * 308 + 48
++leaf_308(x: i64) =&gt; x * 309 + 51
++leaf_309(x: i64) =&gt; x * 310 + 54
++leaf_310(x: i64) =&gt; x * 311 + 57
++leaf_311(x: i64) =&gt; x * 312 + 60
++leaf_312(x: i64) =&gt; x * 313 + 63
++leaf_313(x: i64) =&gt; x * 314 + 66
++leaf_314(x: i64) =&gt; x * 315 + 69
++leaf_315(x: i64) =&gt; x * 316 + 72
++leaf_316(x: i64) =&gt; x * 317 + 75
++leaf_317(x: i64) =&gt; x * 318 + 78
++leaf_318(x: i64) =&gt; x * 319 + 81
++leaf_319(x: i64) =&gt; x * 320 + 84
++leaf_320(x: i64) =&gt; x * 321 + 87
++leaf_321(x: i64) =&gt; x * 322 + 90
++leaf_322(x: i64) =&gt; x * 323 + 93
++leaf_323(x: i64) =&gt; x * 324 + 96
++leaf_324(x: i64) =&gt; x * 325 + 2
++leaf_325(x: i64) =&gt; x * 326 + 5
++leaf_326(x: i64) =&gt; x * 327 + 8
++leaf_327(x: i64) =&gt; x * 328 + 11
++leaf_328(x: i64) =&gt; x * 329 + 14
++leaf_329(x: i64) =&gt; x * 330 + 17
++leaf_330(x: i64) =&gt; x * 331 + 20
++leaf_331(x: i64) =&gt; x * 332 + 23
++leaf_332(x: i64) =&gt; x * 333 + 26
++leaf_333(x: i64) =&gt; x * 334 + 29
++leaf_334(x: i64) =&gt; x * 335 + 32
++leaf_335(x: i64) =&gt; x * 336 + 35
++leaf_336(x: i64) =&gt; x * 337 + 38
++leaf_337(x: i64) =&gt; x * 338 + 41
++leaf_338(x: i64) =&gt; x * 339 + 44
++leaf_339(x: i64) =&gt; x * 340 + 47
++leaf_340(x: i64) =&gt; x * 341 + 50
++leaf_341(x: i64) =&gt; x * 342 + 53
++leaf_342(x: i64) =&gt; x * 343 + 56
++leaf_343(x: i64) =&gt; x * 344 + 59
++leaf_344(x: i64) =&gt; x * 345 + 62
++leaf_345(x: i64) =&gt; x * 346 + 65
++leaf_346(x: i64) =&gt; x * 347 + 68
++leaf_347(x: i64) =&gt; x * 348 + 71
++leaf_348(x: i64) =&gt; x * 349 + 74
++leaf_349(x: i64) =&gt; x * 350 + 77
++leaf_350(x: i64) =&gt; x * 351 + 80
++leaf_351(x: i64) =&gt; x * 352 + 83
++leaf_352(x: i64) =&gt; x * 353 + 86
++leaf_353(x: i64) =&gt; x * 354 + 89
++leaf_354(x: i64) =&gt; x * 355 + 92
++leaf_355(x: i64) =&gt; x * 356 + 95
++leaf_356(x: i64) =&gt; x * 357 + 1
++leaf_357(x: i64) =&gt; x * 358 + 4
++leaf_358(x: i64) =&gt; x * 359 + 7
++leaf_359(x: i64) =&gt; x * 360 + 10
++leaf_360(x: i64) =&gt; x * 361 + 13
++leaf_361(x: i64) =&gt; x * 362 + 16
++leaf_362(x: i64) =&gt; x * 363 + 19
++leaf_363(x: i64) =&gt; x * 364 + 22
++leaf_364(x: i64) =&gt; x * 365 + 25
++leaf_365(x: i64) =&gt; x * 366 + 28
++leaf_366(x: i64) =&gt; x * 367 + 31
++leaf_367(x: i64) =&gt; x * 368 + 34
++leaf_368(x: i64) =&gt; x * 369 + 37
++leaf_369(x: i64) =&gt; x * 370 + 40
++leaf_370(x: i64) =&gt; x * 371 + 43
++leaf_371(x: i64) =&gt; x * 372 + 46
++leaf_372(x: i64) =&gt; x * 373 + 49
++leaf_373(x: i64) =&gt; x * 374 + 52
++leaf_374(x: i64) =&gt; x * 375 + 55
++leaf_375(x: i64) =&gt; x * 376 + 58
++leaf_376(x: i64) =&gt; x * 377 + 61
++leaf_377(x: i64) =&gt; x * 378 + 64
++leaf_378(x: i64) =&gt; x * 379 + 67
++leaf_379(x: i64) =&gt; x * 380 + 70
++leaf_380(x: i64) =&gt; x * 381 + 73
++leaf_381(x: i64) =&gt; x * 382 + 76
++leaf_382(x: i64) =&gt; x * 383 + 79
++leaf_383(x: i64) =&gt; x * 384 + 82
++leaf_384(x: i64) =&gt; x * 385 + 85
++leaf_385(x: i64) =&gt; x * 386 + 88
++leaf_386(x: i64) =&gt; x * 387 + 91
++leaf_387(x: i64) =&gt; x * 388 + 94
++leaf_388(x: i64) =&gt; x * 389 + 0
++leaf_389(x: i64) =&gt; x * 390 + 3
++leaf_390(x: i64) =&gt; x * 391 + 6
++leaf_391(x: i64) =&gt; x * 392 + 9
++leaf_392(x: i64) =&gt; x * 393 + 12
++leaf_393(x: i64) =&gt; x * 394 + 15
++leaf_394(x: i64) =&gt; x * 395 + 18
++leaf_395(x: i64) =&gt; x * 396 + 21
++leaf_396(x: i64) =&gt; x * 397 + 24
++leaf_397(x: i64) =&gt; x * 398 + 27
++leaf_398(x: i64) =&gt; x * 399 + 30
++leaf_399(x: i64) =&gt; x * 400 + 33
++leaf_400(x: i64) =&gt; x * 401 + 36
++leaf_401(x: i64) =&gt; x * 402 + 39
++leaf_402(x: i64) =&gt; x * 403 + 42
++leaf_403(x: i64) =&gt; x * 404 + 45
++leaf_404(x: i64) =&gt; x * 405 + 48
++leaf_405(x: i64) =&gt; x * 406 + 51
++leaf_406(x: i64) =&gt; x * 407 + 54
++leaf_407(x: i64) =&gt; x * 408 + 57
++leaf_408(x: i64) =&gt; x * 409 + 60
++leaf_409(x: i64) =&gt; x * 410 + 63
++leaf_410(x: i64) =&gt; x * 411 + 66
++leaf_411(x: i64) =&gt; x * 412 + 69
++leaf_412(x: i64) =&gt; x * 413 + 72
++leaf_413(x: i64) =&gt; x * 414 + 75
++leaf_414(x: i64) =&gt; x * 415 + 78
++leaf_415(x: i64) =&gt; x * 416 + 81
++leaf_416(x: i64) =&gt; x * 417 + 84
++leaf_417(x: i64) =&gt; x * 418 + 87
++leaf_418(x: i64) =&gt; x * 419 + 90
+// … truncated for the page; see examples/stress_c23_outline/main.sr</code></pre></article>
+</section>
+<section class="cta-band">
+  <div class="cta-main">
+    <h2>Clone and run</h2>
+    <p style="color:#ffb07a;max-width:34ch">Install the CLI, then open each path under examples/ or benchmarks/.</p>
+  </div>
+  <aside class="cta-side book-panel">
+    <h3>Install</h3>
+    <p>Build super-cli and point SUPER_STD at stdlib.</p>
+    <a class="cta" href="../install/">Install steps</a>
+  </aside>
+</section>
+<footer class="site-footer">
+  <div class="footer-links">
+    <a href="../benchmarks/">Benchmarks</a>
+    <a href="../winners/">Winners</a>
+    <a href="../charts/">Charts</a>
+    <a href="../book/">Book</a>
+    <a href="../install/">Install</a>
+    <a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a>
+    <a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a>
+    <a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a>
+  </div>
+  <div class="footer-mark" aria-hidden="true">
+    <span>S</span><span>u</span><span>p</span><span>e</span><span>r</span>
+  </div>
+  <div class="footer-legal">
+    <span>Super language</span>
+  </div>
+</footer>
+<script>(function () {
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((e) => {
+      if (e.isIntersecting) {
+        e.target.classList.add("in");
+        const delayKids = e.target.querySelectorAll(":scope > [data-reveal], :scope [data-stagger] > *");
+        delayKids.forEach((kid, i) => {
+          kid.style.transitionDelay = (i * 70) + "ms";
+          kid.classList.add("in");
+        });
+      }
+    });
+  }, { threshold: 0.12 });
+  document.querySelectorAll("[data-reveal]").forEach((el) => io.observe(el));
+})();
+(function () {
+  document.querySelectorAll("[data-copy-target]").forEach((btn) => {
+    const label = btn.textContent || "Copy";
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-copy-target");
+      const el = id ? document.getElementById(id) : null;
+      if (!el) return;
+      const text = el.textContent || "";
+      const done = () => {
+        btn.textContent = "Copied";
+        setTimeout(() => { btn.textContent = label; }, 1800);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(() => {
+          window.prompt("Copy install command", text);
+        });
+      } else {
+        window.prompt("Copy install command", text);
+      }
+    });
+  });
+})();</script>
+</body>
+</html>

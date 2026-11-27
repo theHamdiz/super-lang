@@ -1,0 +1,600 @@
+//! std.game.ecs — sparse-set entity component system
+//!
+//! Import with:
+//!   use std.game.ecs
+//!
+//! Entities are generational i64 handles (index + generation * 1048576), so a stale
+//! handle to a recycled slot is rejected by `alive`. Component stores are sparse
+//! sets keyed by component name: dense parallel arrays (`eids`, `vals`) give O(1)
+//! add / get / remove (swap-remove) and cache-friendly iteration.
+//!
+//!   w = World.new()
+//!   e = @w.spawn()
+//!   @w.add(e, "Pos", .{x: 1.0, y: 2.0})
+//!   @w.add(e, "Vel", .{vx: 0.5, vy: 0.0})
+//!   for w.query(["Pos", "Vel"]) {
+//!       pos = w.get(it, "Pos")
+//!       ...
+//!       @w.add(it, "Pos", moved)           // add on an existing component overwrites
+//!   }
+//!
+//! Also included: world-level resources (`res_set` / `res_get`) and named event
+//! queues (`emit` / `drain`). Component values may be any Super value. `get` yields
+//! `none` when the component is absent, so `w.get(e, "Hp") or default` works.
+
+use std.core.collections
+use std.core.str
+
+/// `ECS_STRIDE` is `1048576`.
++ECS_STRIDE = 1048576
+
+/// One component store (sparse set).
++Store = {
+    /// Name on `Store` (`str`).
+    name: str
+    /// Eids on `Store`. Defaults to `[]`.
+    eids: _ = []
+    /// Vals on `Store`. Defaults to `[]`.
+    vals: _ = []
+    /// Sparse on `Store`. Defaults to `[]`.
+    sparse: _ = []
+
+    /// Create a fresh `Store`.
+    new(name: str) : Store => Store.{name, eids: [], vals: [], sparse: []}
+
+    /// Dense slot of `idx`, or -1.
+    slot(self, idx: i64) : i64 {
+        ensure idx < len(self.sparse) else { return -1 }
+        self.sparse[idx]
+    }
+
+    /// Occupied on this `Store` (`idx`).
+    occupied(self, idx: i64) : bool {
+        self.slot(idx) >= 0
+    }
+
+    /// Dense len on this `Store`. Returns `i64`.
+    dense_len(self) : i64 {
+        len(self.eids)
+    }
+
+    /// Insert or overwrite the value for entity index `idx`.
+    put(self, idx: i64, v: _) : Store {
+        out = self
+        at = out.slot(idx)
+        if at >= 0 {
+            out.vals = arr_set(out.vals, at, v)
+            out
+        } else {
+            have = len(out.sparse)
+            if idx >= have {
+                grow = idx + 1 - have
+                for 0..grow { out.sparse = arr_push(out.sparse, -1) }
+            }
+            out.sparse = arr_set(out.sparse, idx, len(out.eids))
+            out.eids = arr_push(out.eids, idx)
+            out.vals = arr_push(out.vals, v)
+            out
+        }
+    }
+
+    /// Drop on this `Store` (`idx`). Returns `Store`.
+    drop(self, idx: i64) : Store {
+        at = self.slot(idx)
+        ensure at >= 0 else { return self }
+        out = self
+        last = len(out.eids) - 1
+        if at != last {
+            moved = out.eids[last]
+            out.eids = arr_set(out.eids, at, moved)
+            out.vals = arr_set(out.vals, at, out.vals[last])
+            out.sparse = arr_set(out.sparse, moved, at)
+        }
+        out.eids = out.eids[0..last]
+        out.vals = out.vals[0..last]
+        out.sparse = arr_set(out.sparse, idx, -1)
+        out
+    }
+}
+
+/// `World` is the entity store: generations, component columns, resources, and events.
++World = {
+    /// Generation of each entity slot. A stale id fails the generation check. Defaults to `[]`.
+    gens: _ = []
+    /// True for slots that currently hold an entity. Defaults to `[]`.
+    alive: _ = []
+    /// Recycled entity indices. Defaults to `[]`.
+    free: _ = []
+    /// How many entities are alive. Defaults to `0`.
+    live: i64 = 0
+    /// Names on `World`. Defaults to `[]`.
+    names: _ = []
+    /// Stores on `World`. Defaults to `[]`.
+    stores: _ = []
+    /// Name heads on `World`. Defaults to `[]`.
+    name_heads: _ = []
+    /// Name next on `World`. Defaults to `[]`.
+    name_next: _ = []
+    /// Res keys on `World`. Defaults to `[]`.
+    res_keys: _ = []
+    /// Res vals on `World`. Defaults to `[]`.
+    res_vals: _ = []
+    /// Ev names on `World`. Defaults to `[]`.
+    ev_names: _ = []
+    /// Ev queues on `World`. Defaults to `[]`.
+    ev_queues: _ = []
+
+    /// Create a fresh `World`.
+    new() : World => World.{gens: [], alive: [], free: [], live: 0, names: [], stores: [], name_heads: arr_new(64, -1), name_next: [], res_keys: [], res_vals: [], ev_names: [], ev_queues: []}
+
+    /// Id of a new entity. Recycles a free slot when one exists.
+    spawn(@self) : i64 {
+        nfree = len(self.free)
+        if nfree > 0 {
+            idx = self.free[nfree - 1]
+            self.free = self.free[0..(nfree - 1)]
+            self.alive = arr_set(self.alive, idx, 1)
+            self.live = self.live + 1
+            idx + self.gens[idx] * ECS_STRIDE
+        } else {
+            idx = len(self.gens)
+            self.gens = arr_push(self.gens, 0)
+            self.alive = arr_push(self.alive, 1)
+            self.live = self.live + 1
+            idx
+        }
+    }
+
+    /// True when `e` still names a live entity (index and generation both match).
+    is_alive(self, e: i64) : bool {
+        ensure e >= 0 else { return false }
+        idx = e % ECS_STRIDE
+        ensure idx < len(self.gens) else { return false }
+        ensure self.alive[idx] == 1 else { return false }
+        self.gens[idx] == e / ECS_STRIDE
+    }
+
+    /// How many entities are alive.
+    count(self) : i64 => self.live
+
+    /// Destroy an entity and every component it owns. Returns false for stale handles.
+    despawn(@self, e: i64) : bool {
+        ensure self.is_alive(e) else { return false }
+        idx = e % ECS_STRIDE
+        n = len(self.stores)
+        for 0..n {
+            k = it
+            st = self.stores[k]
+            if Store.occupied(st, idx) {
+                self.stores = arr_set(self.stores, k, Store.drop(st, idx))
+            }
+        }
+        self.alive = arr_set(self.alive, idx, 0)
+        self.gens = arr_set(self.gens, idx, self.gens[idx] + 1)
+        self.free = arr_push(self.free, idx)
+        self.live = self.live - 1
+        true
+    }
+
+    /// Store id on this `World` (`name`). Returns `i64`.
+    store_id(self, name: str) : i64 {
+        at = self.name_heads[ecs_name_hash(name) & 63]
+        for 0..len(self.names) {
+            ensure at >= 0 else { return -1 }
+            if self.names[at] == name { return at }
+            at = self.name_next[at]
+        }
+        -1
+    }
+
+    /// Attach (or overwrite) component `name` on a live entity. Returns false if dead.
+    add(@self, e: i64, name: str, v: _) : bool {
+        ensure self.is_alive(e) else { return false }
+        k = self.store_id(name)
+        if k < 0 {
+            bucket = ecs_name_hash(name) & 63
+            k = len(self.stores)
+            self.names = arr_push(self.names, name)
+            self.stores = arr_push(self.stores, Store.new(name))
+            self.name_next = arr_push(self.name_next, self.name_heads[bucket])
+            self.name_heads = arr_set(self.name_heads, bucket, k)
+        }
+        st = self.stores[k]
+        self.stores = arr_set(self.stores, k, Store.put(st, e % ECS_STRIDE, v))
+        true
+    }
+
+    /// Has on this `World` (`e`, `name`).
+    has(self, e: i64, name: str) : bool {
+        ensure self.is_alive(e) else { return false }
+        k = self.store_id(name)
+        ensure k >= 0 else { return false }
+        Store.occupied(self.stores[k], e % ECS_STRIDE)
+    }
+
+    /// Component value or `none`.
+    get(self, e: i64, name: str) {
+        ensure self.is_alive(e) else { return none }
+        k = self.store_id(name)
+        ensure k >= 0 else { return none }
+        st = self.stores[k]
+        at = Store.slot(st, e % ECS_STRIDE)
+        ensure at >= 0 else { return none }
+        st.vals[at]
+    }
+
+    /// Remove on this `World` (`e`, `name`).
+    remove(@self, e: i64, name: str) : bool {
+        ensure self.has(e, name) else { return false }
+        k = self.store_id(name)
+        st = self.stores[k]
+        self.stores = arr_set(self.stores, k, Store.drop(st, e % ECS_STRIDE))
+        true
+    }
+
+    /// Number of entities carrying `name`.
+    count_of(self, name: str) : i64 {
+        k = self.store_id(name)
+        ensure k >= 0 else { return 0 }
+        Store.dense_len(self.stores[k])
+    }
+
+    /// Handles of every entity that has all of `with` and none of `without`, in the dense
+    /// order of the smallest `with` store (iteration is driven by the rarest component).
+    query_without(self, with: _, without: _) : _ {
+        nw = len(with)
+        ensure nw > 0 else { return [] }
+        ids = []
+        for with {
+            k = self.store_id(it)
+            ensure k >= 0 else { return [] }
+            ids = arr_push(ids, k)
+        }
+        driver = ids[0]
+        for ids {
+            if Store.dense_len(self.stores[it]) < Store.dense_len(self.stores[driver]) { driver = it }
+        }
+        ex = []
+        for without {
+            k = self.store_id(it)
+            if k >= 0 { ex = arr_push(ex, k) }
+        }
+        out = []
+        eids = self.stores[driver].eids
+        for eids {
+            idx = it
+            ok = true
+            for ids {
+                if Store.occupied(self.stores[it], idx) == false { ok = false }
+            }
+            for ex {
+                if Store.occupied(self.stores[it], idx) { ok = false }
+            }
+            if ok { out = arr_push(out, idx + self.gens[idx] * ECS_STRIDE) }
+        }
+        out
+    }
+
+    /// Same as `query_without` on this `World`.
+    query(self, with: _) : _ => self.query_without(with, [])
+
+    /// Res set on this `World` (`key`, `v`).
+    res_set(@self, key: str, v: _) : bool {
+        pos = -1
+        ks = self.res_keys
+        for ks {
+            if pos < 0 && it == key { pos = index }
+        }
+        if pos >= 0 {
+            self.res_vals = arr_set(self.res_vals, pos, v)
+            true
+        } else {
+            self.res_keys = arr_push(self.res_keys, key)
+            self.res_vals = arr_push(self.res_vals, v)
+            true
+        }
+    }
+
+    /// Res get on this `World` (`key`).
+    res_get(self, key: str) {
+        pos = -1
+        ks = self.res_keys
+        for ks {
+            if pos < 0 && it == key { pos = index }
+        }
+        ensure pos >= 0 else { return none }
+        self.res_vals[pos]
+    }
+
+    /// Ev id on this `World` (`name`). Returns `i64`.
+    ev_id(self, name: str) : i64 {
+        pos = -1
+        ns = self.ev_names
+        for ns {
+            if pos < 0 && it == name { pos = index }
+        }
+        pos
+    }
+
+    /// Queue an event payload on channel `name`.
+    emit(@self, name: str, payload: _) : i64 {
+        k = self.ev_id(name)
+        if k < 0 {
+            self.ev_names = arr_push(self.ev_names, name)
+            self.ev_queues = arr_push(self.ev_queues, [])
+            k = len(self.ev_names) - 1
+        }
+        self.ev_queues = arr_set(self.ev_queues, k, arr_push(self.ev_queues[k], payload))
+        len(self.ev_queues[k])
+    }
+
+    /// Pending on this `World` (`name`). Returns `i64`.
+    pending(self, name: str) : i64 {
+        k = self.ev_id(name)
+        ensure k >= 0 else { return 0 }
+        len(self.ev_queues[k])
+    }
+
+    /// Take (and clear) every queued payload, oldest first.
+    drain(@self, name: str) : _ {
+        k = self.ev_id(name)
+        ensure k >= 0 else { return [] }
+        out = self.ev_queues[k]
+        self.ev_queues = arr_set(self.ev_queues, k, [])
+        out
+    }
+}
+
+/// Ecs index (`e`). Returns `i64`.
++ecs_index(e: i64) : i64 => e % ECS_STRIDE
+/// Ecs gen (`e`). Returns `i64`.
++ecs_gen(e: i64) : i64 => e / ECS_STRIDE
+
+/// Ecs name hash (`name`). Returns `i64`.
++ecs_name_hash(name: str) : i64 {
+    h = 2166136261
+    for 0..byte_len(name) {
+        h = ((h ^ ord(name[it])) * 16777619) & 2147483647
+    }
+    h
+}
+
+// --- tests ----------------------------------------------------------------------------------------------
+
+/// Test that component names use the hash index.
+test "component names use the hash index" {
+    w = World.new()
+    bucket = ecs_name_hash("Pos") & 63
+    assert_eq(w.name_heads[bucket], -1)
+    e = @w.spawn()
+    #assert(@w.add(e, "Pos", 1))
+    assert_eq(w.name_heads[bucket], 0)
+    assert_eq(w.store_id("Pos"), 0)
+}
+
+/// Test that add get has and overwrite.
+test "add get has and overwrite" {
+    w = World.new()
+    e = @w.spawn()
+    #assert(!(w.has(e, "Pos")))
+    #assert(@w.add(e, "Pos", .{x: 1.0, y: 2.0}))
+    #assert(w.has(e, "Pos"))
+    p = w.get(e, "Pos")
+    assert_eq(p.x, 1.0)
+    assert_eq(p.y, 2.0)
+    @w.add(e, "Pos", .{x: 5.0, y: 6.0})
+    q = w.get(e, "Pos")
+    assert_eq(q.x, 5.0)
+    assert_eq(q.y, 6.0)
+    assert_eq(w.count_of("Pos"), 1)
+    assert_eq(w.get(e, "Vel") or "none", "none")
+    assert_eq(w.count_of("Vel"), 0)
+}
+
+/// Test that spawn hands out sequential handles.
+test "spawn hands out sequential handles" {
+    w = World.new()
+    a = @w.spawn()
+    b = @w.spawn()
+    c = @w.spawn()
+    assert_eq(a, 0)
+    assert_eq(b, 1)
+    assert_eq(c, 2)
+    assert_eq(w.count(), 3)
+    #assert(w.is_alive(b))
+    #assert(!(w.is_alive(3)))
+    #assert(!(w.is_alive(-1)))
+}
+
+/// Test that despawn bumps the generation and recycles the slot.
+test "despawn bumps the generation and recycles the slot" {
+    w = World.new()
+    a = @w.spawn()
+    b = @w.spawn()
+    #assert(@w.despawn(a))
+    #assert(!(w.is_alive(a)))
+    assert_eq(w.count(), 1)
+    #assert(!(@w.despawn(a)))
+    c = @w.spawn()
+    assert_eq(ecs_index(c), 0)
+    assert_eq(ecs_gen(c), 1)
+    assert_eq(c, 1048576)
+    #assert(w.is_alive(c))
+    #assert(!(w.is_alive(a)))
+    #assert(w.is_alive(b))
+    assert_eq(w.count(), 2)
+}
+
+/// Test that stale handles cannot touch the new occupant.
+test "stale handles cannot touch the new occupant" {
+    w = World.new()
+    a = @w.spawn()
+    @w.despawn(a)
+    b = @w.spawn()
+    #assert(!(@w.add(a, "Hp", 5)))
+    #assert(!(w.has(a, "Hp")))
+    #assert(@w.add(b, "Hp", 9))
+    assert_eq(w.get(b, "Hp"), 9)
+    assert_eq(w.get(a, "Hp") or -1, -1)
+    #assert(!(@w.despawn(a)))
+    #assert(w.is_alive(b))
+}
+
+/// Test that remove swaps the tail into the hole without corrupting lookups.
+test "remove swaps the tail into the hole without corrupting lookups" {
+    w = World.new()
+    a = @w.spawn()
+    b = @w.spawn()
+    c = @w.spawn()
+    @w.add(a, "N", 10)
+    @w.add(b, "N", 20)
+    @w.add(c, "N", 30)
+    #assert(@w.remove(a, "N"))
+    assert_eq(w.count_of("N"), 2)
+    #assert(!(w.has(a, "N")))
+    assert_eq(w.get(b, "N"), 20)
+    assert_eq(w.get(c, "N"), 30)
+    #assert(!(@w.remove(a, "N")))
+    #assert(@w.remove(c, "N"))
+    assert_eq(w.get(b, "N"), 20)
+    #assert(@w.remove(b, "N"))
+    assert_eq(w.count_of("N"), 0)
+    @w.add(b, "N", 99)
+    assert_eq(w.get(b, "N"), 99)
+}
+
+/// Test that despawn strips every component.
+test "despawn strips every component" {
+    w = World.new()
+    a = @w.spawn()
+    b = @w.spawn()
+    @w.add(a, "Pos", 1)
+    @w.add(a, "Vel", 2)
+    @w.add(b, "Pos", 3)
+    @w.add(b, "Vel", 4)
+    @w.despawn(a)
+    assert_eq(w.count_of("Pos"), 1)
+    assert_eq(w.count_of("Vel"), 1)
+    assert_eq(w.get(b, "Pos"), 3)
+    assert_eq(w.get(b, "Vel"), 4)
+    c = @w.spawn()
+    #assert(!(w.has(c, "Pos")))
+    #assert(!(w.has(c, "Vel")))
+}
+
+/// Test that query intersects component sets.
+test "query intersects component sets" {
+    w = World.new()
+    ids = []
+    for 0..6 { ids = ids + [@w.spawn()] }
+    for 0..6 { @w.add(ids[it], "Pos", it) }
+    @w.add(ids[1], "Vel", 1)
+    @w.add(ids[3], "Vel", 3)
+    @w.add(ids[4], "Vel", 4)
+    both = w.query(["Pos", "Vel"])
+    assert_eq(len(both), 3)
+    sum = 0
+    for both { sum += w.get(it, "Pos") }
+    assert_eq(sum, 8)
+    assert_eq(len(w.query(["Pos"])), 6)
+    assert_eq(len(w.query(["Pos", "Nope"])), 0)
+    assert_eq(len(w.query([])), 0)
+}
+
+/// Test that query without excludes tagged entities.
+test "query without excludes tagged entities" {
+    w = World.new()
+    a = @w.spawn()
+    b = @w.spawn()
+    c = @w.spawn()
+    @w.add(a, "Enemy", true)
+    @w.add(b, "Enemy", true)
+    @w.add(c, "Enemy", true)
+    @w.add(b, "Dead", true)
+    live = w.query_without(["Enemy"], ["Dead"])
+    assert_eq(len(live), 2)
+    assert_eq(live[0], a)
+    assert_eq(live[1], c)
+    assert_eq(len(w.query_without(["Enemy"], ["Missing"])), 3)
+}
+
+/// Test that a movement system integrates positions in place.
+test "a movement system integrates positions in place" {
+    w = World.new()
+    for 0..5 {
+        e = @w.spawn()
+        @w.add(e, "Pos", .{x: it * 1.0, y: 0.0})
+        @w.add(e, "Vel", .{vx: 2.0, vy: 1.0})
+    }
+    for 0..10 {
+        for w.query(["Pos", "Vel"]) {
+            p = w.get(it, "Pos")
+            v = w.get(it, "Vel")
+            @w.add(it, "Pos", .{x: p.x + v.vx * 0.5, y: p.y + v.vy * 0.5})
+        }
+    }
+    p0 = w.get(0, "Pos")
+    p4 = w.get(4, "Pos")
+    assert_eq(p0.x, 10.0)
+    assert_eq(p0.y, 5.0)
+    assert_eq(p4.x, 14.0)
+    assert_eq(p4.y, 5.0)
+}
+
+/// Test that resources are overwritten by key.
+test "resources are overwritten by key" {
+    w = World.new()
+    assert_eq(w.res_get("score") or -1, -1)
+    @w.res_set("score", 10)
+    @w.res_set("level", 2)
+    assert_eq(w.res_get("score"), 10)
+    @w.res_set("score", 25)
+    assert_eq(w.res_get("score"), 25)
+    assert_eq(w.res_get("level"), 2)
+    assert_eq(len(w.res_keys), 2)
+}
+
+/// Test that events queue in order and drain once.
+test "events queue in order and drain once" {
+    w = World.new()
+    assert_eq(w.pending("hit"), 0)
+    assert_eq(len(@w.drain("hit")), 0)
+    assert_eq(@w.emit("hit", 5), 1)
+    assert_eq(@w.emit("hit", 7), 2)
+    @w.emit("spawn", "boss")
+    assert_eq(w.pending("hit"), 2)
+    got = @w.drain("hit")
+    assert_eq(len(got), 2)
+    assert_eq(got[0], 5)
+    assert_eq(got[1], 7)
+    assert_eq(w.pending("hit"), 0)
+    assert_eq(w.pending("spawn"), 1)
+    assert_eq(len(@w.drain("hit")), 0)
+}
+
+/// Test that churn keeps the world consistent.
+test "churn keeps the world consistent" {
+    w = World.new()
+    live = []
+    for 0..60 {
+        e = @w.spawn()
+        @w.add(e, "Id", it)
+        live = live + [e]
+    }
+    for 0..60 {
+        if it % 3 == 0 { @w.despawn(live[it]) }
+    }
+    assert_eq(w.count(), 40)
+    assert_eq(w.count_of("Id"), 40)
+    total = 0
+    for w.query(["Id"]) { total += w.get(it, "Id") }
+    assert_eq(total, 1770 - 570)
+    for 0..20 {
+        e = @w.spawn()
+        @w.add(e, "Id", 1000)
+    }
+    assert_eq(w.count(), 60)
+    assert_eq(w.count_of("Id"), 60)
+    #assert(!(w.is_alive(live[0])))
+    #assert(w.is_alive(live[1]))
+}

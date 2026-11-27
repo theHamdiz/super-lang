@@ -1,0 +1,23 @@
+# Local build / regenerate artifacts — sources and frozen data stay tracked.
+.work/
+.taste-skill/
+__pycache__/
+**/__pycache__/
+www
+results/
+run_final.log
+report.html
+report.pdf
+*.superb
+**/*.superb
+site_assets/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.check.c
+**/*.check.c
+target/
+**/target/
+benchmarks/.baseline_pre_syntax.json

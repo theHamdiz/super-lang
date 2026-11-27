@@ -1,0 +1,109 @@
+// Invaders. A stepping alien row, a shot, and hit cues.
+//
+// Run: super test examples/29_gui_invaders/
+
+use std.game.fx
+use std.core.str
+use std.gui.window
+use std.sys.time
+
++Invaders: Widget = {
+    player_x: i64 = 100
+    aliens: i64 = 5
+    alien_x: i64 = 20
+    shot_y: i64 = -1
+    frame_n: i64 = 0
+    sound: str = ""
+    width: i64 = 240
+    height: i64 = 180
+
+    fire(@self) : str {
+        self.shot_y = 140
+        self.sound = "shot"
+        self.sound
+    }
+
+    tick(@self) : str {
+        self.frame_n = self.frame_n + 1
+        self.alien_x = self.alien_x + 4
+        if self.alien_x > 180 { self.alien_x = 20 }
+        if self.shot_y >= 0 {
+            self.shot_y = self.shot_y - 20
+            if self.shot_y < 40 && self.aliens > 0 {
+                self.aliens = self.aliens - 1
+                self.shot_y = -1
+                self.sound = "hit"
+            }
+        }
+        self.sound
+    }
+
+    steer(@self, key: str) : i64 {
+        if key == "left" || key == "a" { self.player_x = self.player_x - 8 }
+        if key == "right" || key == "d" { self.player_x = self.player_x + 8 }
+        if self.player_x < 0 { self.player_x = 0 }
+        if self.player_x > 220 { self.player_x = 220 }
+        if key == " " || key == "enter" { @self.fire() }
+        self.player_x
+    }
+
+    paint(self) : str {
+        player = Sprite{name: "player", x: self.player_x, y: 150, w: 16, h: 8, frame: self.frame_n % 2, frames: 2}
+        span = self.aliens * 14
+        alien = Sprite{name: "alien", x: self.alien_x, y: 32, w: span, h: 12, frame: self.frame_n % 2, frames: 2}
+        heard = ""
+        if self.sound != "" {
+            cue = Cue{name: self.sound, gain: 70}
+            heard = cue.play()
+        }
+        shot = ""
+        if self.shot_y >= 0 {
+            sx = self.player_x + 6
+            shot = "fill {sx} {self.shot_y} 4 8 240 220 80\n"
+        }
+        "fill 0 0 {self.width} {self.height} 8 8 20\n{player.paint()}{alien.paint()}{shot}{heard}"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, 0, 0, self.width, self.height)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.width)
+}
+
++main() {
+    game = Invaders{}
+    opened = window_open(game.width, game.height, "Invaders")
+    gui_open(game.width, game.height, "Invaders")
+    frames = 0
+    quit = false
+    while quit == false {
+        key = gui_key()
+        if key == "esc" || key == "q" { quit = true }
+        @game.steer(key)
+        @game.tick()
+        gui_present(game.width, game.height, game.paint())
+        poll = window_poll()
+        if poll.quit || gui_quit() || opened.headless { quit = true }
+        if quit == false { sleep_ms(16) }
+        frames = frames + 1
+    }
+}
+
+test "a shot plays and then removes an alien" {
+    game = Invaders{}
+    assert_eq(@game.fire(), "shot")
+    frame = game.paint()
+    #assert(contains(frame, "sound shot 70"))
+    #assert(contains(frame, "sprite"))
+    #assert(contains(frame, "player"))
+    for 0..6 { @game.tick() }
+    assert_eq(game.aliens, 4)
+    assert_eq(game.sound, "hit")
+    #assert(contains(game.paint(), "sound hit 70"))
+    #assert(contains(game.paint(), "alien"))
+}
+
+test "the field is a Widget" {
+    game = Invaders{}
+    #assert(game.hit(4, 4))
+    assert_eq(game.measure(50), 50)
+}

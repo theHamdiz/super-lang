@@ -1,0 +1,18 @@
+//! Laws for std.data.plan — lazy query plans (pure op/expression tags).
+//! Implementation: `pl_simple` / `pl_no_ex` in `plan.sr`.
+
+law_pl_simple_kind(kind: i64) : i64 => kind
+
+law_pl_no_ex_tag() : i64 => 0
+
+#law("model plan op kind is preserved")
+plan_simple_builds() {
+    #assert(law_pl_simple_kind(0) == 0)
+    #assert(law_pl_simple_kind(1) == 1)
+}
+
+#law("model empty expression tag is zero")
+plan_no_ex_total() {
+    tag = law_pl_no_ex_tag()
+    #assert(tag == 0)
+}

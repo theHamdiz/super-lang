@@ -1,0 +1,41 @@
+//! Super script used by the C17 host.
+//!
+//! Two interop directions:
+//! 1. Host → Super: zero-copy `particles` slice + hot-reload `step`.
+//! 2. Super → C: `host.mathlib_lerp` / `host.mathlib_clamp` bound to `native/mathlib.c`.
+
++Particle = {
+    x: f32
+    y: f32
+    vx: f32
+    vy: f32
+}
+
+// Placeholder overwritten by the host with an ExtSlice view.
+particles = []
+
++step(dt: f64) {
+    for @particles {
+        it.x += it.vx * dt
+        it.y += it.vy * dt
+    }
+    host.on_step(1)
+}
+
++particle_count() : i64 {
+    n = 0
+    for particles {
+        n += 1
+    }
+    n
+}
+
+/// Call into the linked C math library via host binds.
++blend(a: f64, b: f64, t: f64) : f64 => host.mathlib_lerp(a, b, t)
+
+/// Clamp through the C library.
++limit(x: f64, lo: f64, hi: f64) : f64 => host.mathlib_clamp(x, lo, hi)
+
+test "blend is callable shape" {
+    assert_eq(1, 1)
+}

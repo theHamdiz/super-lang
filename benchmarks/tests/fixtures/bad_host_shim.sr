@@ -1,0 +1,7 @@
+//! Intentional LAW-BENCH-001 violation fixture (under benchmarks/tests/ — not gated by suite scan).
+use host
+
++main() {
+    cs = host.sys_lake20_run()
+    print("CHECKSUM={cs}")
+}

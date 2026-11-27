@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/super-core",
+    "crates/super-frontend",
+    "crates/super-runtime",
+    "crates/super-host",
+    "crates/super-ffi",
+    "crates/super-lsp",
+    "crates/super-mcp",
+    "crates/super-cli",
+]
+default-members = ["crates/super-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Super Contributors"]
+repository = "https://github.com/theHamdiz/super-lang"
+
+[workspace.dependencies]
+super-core = { path = "crates/super-core" }
+super-frontend = { path = "crates/super-frontend" }
+super-runtime = { path = "crates/super-runtime" }
+super-host = { path = "crates/super-host" }
+super-ffi = { path = "crates/super-ffi" }
+super-lsp = { path = "crates/super-lsp" }
+super-mcp = { path = "crates/super-mcp" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+clap = { version = "4.6.8", features = ["derive"] }
+clap_complete = "4.6.0"
+toml = "0.9.8"
+semver = "1.0.27"
+
+# Fail the build on any rustc warning across the workspace.
+[workspace.lints.rust]
+warnings = "deny"
+
+# `cargo build --release` / `make build` — speed. Thin LTO, one codegen unit.
+# Unwind is required for the panic-safe C ABI (`catch_unwind` in super-ffi).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+overflow-checks = false
+
+# `cargo build --profile size` / `make PROFILE=size build` — smallest binary.
+[profile.size]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# `cargo build --profile fast` / `make PROFILE=fast build` — same peak as release.
+[profile.fast]
+inherits = "release"
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "symbols"

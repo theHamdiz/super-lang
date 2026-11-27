@@ -1,0 +1,99 @@
+//! std.sys.signal — OS signal notify for graceful shutdown
+//!
+//! Import with:
+//!   use std.sys.signal
+//!
+//!   stop = Notify.arm([SIGINT, SIGTERM]) or err { return }
+//!   // poll stop.fd() alongside a listen socket, or:
+//!   signo = stop.recv() or err { return }
+//!   @stop.close()
+//!
+//! Handlers write the signo into a self-pipe. The read end is pollable and
+//! works the same under the VM and C23 AOT (no fiber scheduler required).
+
+/// POSIX `SIGINT` (Ctrl-C).
++SIGINT = 2
+/// POSIX `SIGTERM` (service manager stop).
++SIGTERM = 15
+
+/// Channel-like stop handle backed by a self-pipe.
++Notify = {
+    /// Read end of the notify pipe (for `sys_net_poll2` / epoll).
+    pipe_fd: i64 = -1
+    /// True after a successful `arm`.
+    armed: bool = false
+
+    /// Arm handlers for `sigs` (defaults to SIGINT+SIGTERM when empty).
+    arm(sigs: _) : Notify! {
+        fd = host.sys_signal_arm(sigs) or err {
+            fail "signal: arm failed: {err}"
+            return
+        }
+        Notify.{pipe_fd: fd, armed: true}
+    }
+
+    /// Arm the usual graceful-stop pair.
+    graceful() : Notify! => Notify.arm([SIGINT, SIGTERM])
+
+    /// Pollable file descriptor.
+    fd(self) : i64 => self.pipe_fd
+
+    /// True when at least one signal has been delivered.
+    signaled(self) : bool {
+        ensure self.armed else { return false }
+        host.sys_signal_signaled()
+    }
+
+    /// Last delivered signo (0 if none).
+    last(self) : i64 {
+        ensure self.armed else { return 0 }
+        host.sys_signal_last()
+    }
+
+    /// Block until a signal arrives; returns the signo.
+    recv(self) : i64! {
+        ensure self.armed else {
+            fail "signal: not armed"
+            return
+        }
+        host.sys_signal_recv() or err {
+            fail "signal: recv failed: {err}"
+            return
+        }
+    }
+
+    /// Test helper: push `signo` without raising a real OS signal.
+    inject(self, signo: i64) : bool! {
+        ensure self.armed else {
+            fail "signal: not armed"
+            return
+        }
+        host.sys_signal_inject(signo) or err {
+            fail "signal: inject failed: {err}"
+            return
+        }
+        true
+    }
+
+    /// Tear down handlers and the pipe.
+    close(@self) : bool {
+        ensure self.armed else { return false }
+        self.armed = false
+        self.pipe_fd = -1
+        host.sys_signal_close()
+    }
+}
+
+test "notify arm inject signaled close" {
+    stop = Notify.graceful() or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(stop.fd() >= 0)
+    #assert(!(stop.signaled()))
+    #assert(stop.inject(SIGTERM) or false)
+    #assert(stop.signaled())
+    #assert(stop.fd() >= 0)
+    #assert(@stop.close())
+    #assert(!(@stop.close()))
+}

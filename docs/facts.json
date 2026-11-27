@@ -1,0 +1,85 @@
+{
+  "version": "0.1.0",
+  "generated_at": "2026-11-27T21:47:39+00:00",
+  "stdlib_sr_files": 179,
+  "stdlib_modules": 127,
+  "modules_with_laws": 40,
+  "modules_with_proofs": 11,
+  "laws_total": 102,
+  "platforms": [
+    {
+      "platform": "Linux x86_64 glibc",
+      "tier": "1",
+      "pal": "epoll + io_uring",
+      "aot_sockets": "supported (C23)",
+      "jit": "native + VM fallback",
+      "archive_suffix": "x86_64-unknown-linux-gnu.tar.gz"
+    },
+    {
+      "platform": "Linux ARM64 glibc",
+      "tier": "1",
+      "pal": "epoll + io_uring",
+      "aot_sockets": "supported (C23)",
+      "jit": "native + VM fallback",
+      "archive_suffix": "aarch64-unknown-linux-gnu.tar.gz"
+    },
+    {
+      "platform": "Linux x86_64 musl",
+      "tier": "1",
+      "pal": "epoll + io_uring",
+      "aot_sockets": "supported (C23)",
+      "jit": "native + VM fallback",
+      "archive_suffix": "x86_64-unknown-linux-musl.tar.gz"
+    },
+    {
+      "platform": "macOS x86_64",
+      "tier": "1",
+      "pal": "kqueue",
+      "aot_sockets": "supported (C23)",
+      "jit": "native + VM fallback",
+      "archive_suffix": "x86_64-apple-darwin.tar.gz"
+    },
+    {
+      "platform": "macOS ARM64",
+      "tier": "1",
+      "pal": "kqueue",
+      "aot_sockets": "supported (C23)",
+      "jit": "native + VM fallback",
+      "archive_suffix": "aarch64-apple-darwin.tar.gz"
+    },
+    {
+      "platform": "Windows x86_64",
+      "tier": "1",
+      "pal": "Rust host WSAPoll (VM)",
+      "aot_sockets": "Winsock2 (WSAPoll).",
+      "jit": "native + VM fallback",
+      "archive_suffix": "x86_64-pc-windows-gnu.zip"
+    },
+    {
+      "platform": "FreeBSD x86_64",
+      "tier": "2",
+      "pal": "kqueue",
+      "aot_sockets": "supported (C23)",
+      "jit": "native + VM fallback",
+      "archive_suffix": "x86_64-unknown-freebsd.tar.gz"
+    }
+  ],
+  "platform_tier1_count": 6,
+  "platform_tier2_count": 1,
+  "law_mutation_score_pct": 92.9,
+  "repro_targets": {
+    "x86_64-unknown-linux-gnu": "PASS:86f5608570a55332\u2026",
+    "x86_64-unknown-linux-musl": "PASS:6dcdeb01febcc285\u2026"
+  },
+  "soak_memory": {
+    "dir": "benchmarks-memory/",
+    "tracked": false,
+    "note": "local/CI workspace; gitignored \u2014 see docs/SOAK_GATE.md"
+  },
+  "alloc_probe_per_request": {
+    "allocs": 0,
+    "frees": 0,
+    "note": "malloc counter; conn arena bump not free()"
+  },
+  "windows_aot_sockets": "Winsock2 (WSAPoll) in 0.1.0"
+}

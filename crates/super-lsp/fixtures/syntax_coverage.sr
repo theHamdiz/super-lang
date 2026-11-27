@@ -1,0 +1,189 @@
+//! Syntax coverage fixture for LSP — every major Super surface in one module.
+/*! Keep this file parse-clean; LSP tests assert zero E0001 diagnostics. */
+
+use std.net.http
+
+/// Multi-binding with per-name export and a private name.
++tasks, +next_id, owner = [], 1, "Ahmad"
+
+/// Typed multi-binding.
++width: i64, height: i64 = 8, 4
+
+#N = 4
+#TABLE = #for i in 0..4 { i }
+
+#if true {
+    #FLAG = 1
+} else {
+    #FLAG = 0
+}
+
+#{
+    #INNER = 2
+}
+
++Widget = trait {
+    draw(self) : i64
+}
+
++Pos: Widget = {
+    x: f64 = 0.0
+    y: f64 = 0.0
+    -secret: i64 = 0
+    draw(_self) : i64 => 1
+}
+
+Status = {
+    Pending
+    Paid(amount: f64)
+    Failed(reason: str)
+
+    amount_or(self, fallback: f64) : f64 {
+        when self {
+            Status.Paid { amount } => amount
+            else => fallback
+        }
+    }
+}
+
+state world = Pos.{x: 0.0, y: 0.0}
+
+rewrite "double" (x: i64) {
+    x + x => x * 2
+}
+
+#inline
+#simd
++hot(x: f64) : f64 => x * 2.0
+
+#get("/tasks")
++handle_list(req: Request) : Response {
+    _ = req
+    http.ok("[]")
+}
+
++add_tax(amount: f64) => amount * 1.14
+
++read_port(path: str) : i64! {
+    ensure path != "" else { fail "Empty path" }
+    return 8080
+}
+
++maybe_user(id: i64) : i64? => if id == 1 { 1 } else { none }
+
++branchy(n: i64) : i64 {
+    when n {
+        n > 10 => 1
+        n > 0 => 2
+        else => 0
+    }
+}
+
++mutate(@p: Pos) {
+    p.x += 1.0
+}
+
++pipeline(xs) : i64 {
+    xs.keep(it >= 0).map(it * 2).sum()
+}
+
++loops(n: i64) : i64 {
+    total = 0
+    for i in 0..n {
+        continue if i == 1
+        total += i
+        break if i > 5
+    }
+    scores = [1, 2, 3]
+    for @scores {
+        it += 1
+    }
+    par j in 0..2 {
+        _ = j
+    }
+    while total < 0 {
+        total += 1
+    }
+    loop {
+        break
+    }
+    total
+}
+
++opts_and_errs(path: str) : i64 {
+    u = maybe_user(1) or 0
+    p = read_port(path) or 3000
+    p2 = read_port("") or err {
+        _ = err
+        return 0
+    }
+    u + p + p2
+}
+
++destructure_demo() : i64 {
+    t = Pos.{x: 1.0, y: 2.0}
+    {x, y} = t
+    a, b = 1, 2
+    _ = x
+    _ = y
+    a + b
+}
+
++macros_surface(flag: bool) : i64 {
+    #assert(flag)
+    x = #dbg(1)
+    if !flag {
+        #todo
+    }
+    if false {
+        #unimplemented
+        #unreachable
+        panic "never"
+    }
+    x
+}
+
++sugar(xs) {
+    mid = xs[1..3]
+    doubled = xs.map(it * 2)
+    ports = {http: 80, https: 443}
+    host = "localhost"
+    port = 8080
+    cfg = {host, port}
+    _ = ports
+    _ = cfg
+    _ = mid
+    doubled
+}
+
++main() {
+    _ = tasks
+    _ = next_id
+    _ = owner
+    _ = width
+    _ = height
+    _ = #N
+    _ = #FLAG
+    _ = #INNER
+    _ = #TABLE
+    _ = world
+    _ = hot(1.0)
+    _ = add_tax(10.0)
+    _ = branchy(3)
+    _ = pipeline([1, -1, 2])
+    _ = loops(4)
+    _ = opts_and_errs("cfg")
+    _ = destructure_demo()
+    _ = macros_surface(true)
+    _ = sugar([1, 2, 3, 4])
+    s = Status.Paid(3.5)
+    _ = s.amount_or(0.0)
+    p = Pos.{}
+    mutate(@p)
+}
+
+test "coverage smoke" {
+    assert_eq(next_id, 1)
+    assert_eq(owner, "Ahmad")
+    assert_eq(width, 8)
+}

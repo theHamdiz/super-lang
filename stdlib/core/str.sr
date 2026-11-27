@@ -1,0 +1,1014 @@
+//! std.core.str — string utilities (pure Super, no host calls required)
+//!
+//! Import with:
+//!   use std.core.str
+//!
+//! Then:  "  hi ".trim()   s.split(",")   s.replace("a", "b")   "42".to_i64()
+//!
+//! Positions are -based character indices. `find*` returns -1 when absent.
+//! Everything here is written against `s[i]` (one character) and `s[lo..hi]`
+//! (slice), so a runtime needs no string intrinsics beyond those two.
+
+/// `ALPHA_LOWER` is `"abcdefghijklmnopqrstuvwxyz"`.
++ALPHA_LOWER = "abcdefghijklmnopqrstuvwxyz"
+/// `ALPHA_UPPER` is `"ABCDEFGHIJKLMNOPQRSTUVWXYZ"`.
++ALPHA_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+/// `DIGITS` is `"0123456789"`.
++DIGITS = "0123456789"
+/// `NL` is `"\n"`.
++NL = "\n"
+
+/// Number of Unicode scalar values (code points). Use `len` for UTF-8 bytes.
++char_count(s: str) : i64 => host.sys_str_len(s)
+
+/// O(1) host length in UTF-8 bytes / code units (prefer in ASCII/HTTP/JSON hot paths).
++byte_len(s: str) : i64 => host.sys_byte_len(s)
+/// Unicode code point of the first character of `ch`.
++ord(ch: str) : i64 => host.sys_ord(ch)
+/// One-character string for code point `b`.
+#inline
++chr(b: i64) : str => host.sys_chr(b)
+/// Byte at index `i` (O(1) code unit), or -1 when `i` is out of range.
+/// Prefer this over `ord(s[i])` in ASCII/HTTP/JSON scanners — no UTF-8 seek.
++byte_at(s: str, i: i64) : i64 => host.sys_byte_at(s, i)
+/// UTF-8 substring of byte range `[lo, hi)` (clamped). Pairs with `byte_at` / `byte_len` spans.
++byte_slice(s: str, lo: i64, hi: i64) : str => host.sys_byte_slice(s, lo, hi)
+/// First byte index of `needle` in `s` at/after `start`, or -1 (ASCII/HTTP/JSON wire scans).
++byte_find_from(s: str, needle: str, start: i64) : i64 => host.sys_byte_find(s, needle, start)
+/// First byte index of `needle` in `s`, or -1.
++byte_find(s: str, needle: str) : i64 => byte_find_from(s, needle, 0)
+/// True when `needle` occurs at byte index `pos` (no allocation; prefer over `starts_with(s[pos..])`).
++byte_match_at(s: str, needle: str, pos: i64) : bool => host.sys_byte_match_at(s, needle, pos)
+/// True when the byte range `s[lo..hi)` equals `t` (no slice allocation; routers / parsers).
++byte_eq_range(s: str, lo: i64, hi: i64, t: str) : bool => host.sys_byte_eq_range(s, lo, hi, t)
+/// True when `needle` occurs at character index `pos`.
++match_at(s: str, needle: str, pos: i64) : bool => host.sys_str_match_at(s, needle, pos)
+/// `s` with one ASCII/Latin-1 byte (`code & 0xff`) appended. Prefer over `s + chr(code)` in builders —
+/// AOT grows the owned buffer in place (no 1-char temp string).
+#inline
++push_ascii(s: str, code: i64) : str => host.sys_str_push_ascii(s, code)
+
+/// First byte index of `needle` in `s[start..limit)`, or -1.
++byte_find_limit(s: str, needle: str, start: i64, limit: i64) : i64 => host.sys_byte_find_limit(s, needle, start, limit)
+/// First byte index of `needle` in `s[0..limit)`, or -1.
++byte_find_to(s: str, needle: str, limit: i64) : i64 => byte_find_limit(s, needle, 0, limit)
+/// True when byte ranges `a[alo..ahi)` and `b[blo..bhi)` are equal.
++byte_eq_ranges(a: str, alo: i64, ahi: i64, b: str, blo: i64, bhi: i64) : bool => host.sys_byte_eq_ranges(a, alo, ahi, b, blo, bhi)
+
+/// Growable / fixed-capacity string builder (host `sys_sb_*`). Prefer over `out = out + …` loops.
++StrBuilder = {
+    h: i64 = 0
+
+    lit(@self, s: str) { host.sys_sb_lit(self.h, s) }
+    ascii(@self, code: i64) { host.sys_sb_ascii(self.h, code) }
+    dec(@self, v: i64) { host.sys_sb_i64(self.h, v) }
+    #inline
+    lit_dec(@self, key: str, v: i64) {
+        host.sys_sb_lit(self.h, key)
+        host.sys_sb_i64(self.h, v)
+    }
+    #inline
+    json_i(@self, key: str, v: i64) {
+        host.sys_sb_lit(self.h, ",\"")
+        host.sys_sb_lit(self.h, key)
+        host.sys_sb_lit(self.h, "\":")
+        host.sys_sb_i64(self.h, v)
+    }
+    #inline
+    json_i0(@self, key: str, v: i64) {
+        host.sys_sb_lit(self.h, "{\"")
+        host.sys_sb_lit(self.h, key)
+        host.sys_sb_lit(self.h, "\":")
+        host.sys_sb_i64(self.h, v)
+    }
+    set(@self, i: i64, code: i64) { host.sys_sb_set(self.h, i, code) }
+    len(self) : i64 => host.sys_sb_len(self.h)
+    clear(@self) { host.sys_sb_clear(self.h) }
+    cat(@self, other: StrBuilder) { host.sys_sb_cat(self.h, other.h) }
+    text(self) : str => host.sys_sb_cstr(self.h)
+    finish(@self) : str => host.sys_sb_finish(self.h)
+}
+
+/// Heap-backed builder with initial capacity `cap`.
++str_builder(cap: i64) : StrBuilder => StrBuilder.{h: host.sys_sb_new(cap)}
+/// Stack/fixed builder with capacity `cap` (bench / hot wire paths).
++str_builder_fixed(cap: i64) : StrBuilder => StrBuilder.{h: host.sys_sb_stack(cap)}
+/// IEEE CRC-32 of a StrBuilder's live bytes (no `text()` / strlen).
++crc32_sb(sb: StrBuilder) : i64 => host.sys_crc32_sb(sb.h)
+
+/// Parse `s[lo..hi)` as an unsigned decimal, or -1 when empty/non-digit/too long.
++parse_uint_range(s: str, lo: i64, hi: i64) : i64 {
+    n = hi - lo
+    if n <= 0 || n > 15 { return -1 }
+    acc = 0
+    i = lo
+    while i < hi {
+        d = byte_at(s, i) - 48
+        if d < 0 || d > 9 { return -1 }
+        acc = acc * 10 + d
+        i += 1
+    }
+    acc
+}
+
+/// Advance `p[0]` past non-digits in `s` up to `limit`.
++skip_nondigits_at(@p, s: str, limit: i64) {
+    while p[0] < limit {
+        d = byte_at(s, p[0]) - 48
+        if d >= 0 && d <= 9 { return }
+        p[0] = p[0] + 1
+    }
+}
+
+/// Parse an unsigned run at `p[0]` and advance; returns -1 when no digits (CSV null fields).
++scan_uint_at(@p, s: str) : i64 {
+    v = 0
+    n = byte_len(s)
+    have = 0
+    while p[0] < n {
+        d = byte_at(s, p[0]) - 48
+        if d < 0 || d > 9 {
+            if have == 0 { return -1 }
+            return v
+        }
+        have = 1
+        v = v * 10 + d
+        p[0] = p[0] + 1
+    }
+    if have == 0 { return -1 }
+    v
+}
+
+/// Append `n` random lowercase ASCII letters (receiver must provide `draw(26)`).
+#inline
++letters_into(@rng, n: i64, @sb: StrBuilder) {
+    for 0..n {
+        code = 97 + @rng.draw(26)
+        @sb.ascii(code)
+    }
+}
+
+/// Decimal id `1..99999` into `sb`, or `"abc"` when `draw(50) == 0`.
+#inline
++id_into(@rng, @sb: StrBuilder) {
+    bad = @rng.draw(50)
+    id = 1 + @rng.draw(99999)
+    if bad == 0 {
+        @sb.lit("abc")
+    } else {
+        @sb.dec(id)
+    }
+}
+
+#inline
++sb_json_key_sp(@sb: StrBuilder, key: str, sp: str) {
+    @sb.ascii(34)
+    @sb.lit(key)
+    @sb.lit("\":")
+    @sb.lit(sp)
+}
+
+#inline
++sb_json_quote_cat(@sb: StrBuilder, inner: StrBuilder) {
+    @sb.ascii(34)
+    @sb.cat(inner)
+    @sb.ascii(34)
+}
+
+#inline
++sb_json_int_sp(@sb: StrBuilder, key: str, sp: str, v: i64) {
+    sb_json_key_sp(@sb, key, sp)
+    @sb.dec(v)
+}
+
+#inline
++sb_pad2(@sb: StrBuilder, v: i64) {
+    @sb.dec(v / 10)
+    @sb.dec(v % 10)
+}
+
++sb_http_frame(@dst: StrBuilder, head: str, body: StrBuilder) {
+    @dst.clear()
+    @dst.lit(head)
+    @dst.lit_dec("\r\nContent-Length: ", byte_len(body))
+    @dst.lit("\r\n\r\n")
+    @dst.cat(body)
+}
+
+/// Digits immediately after the first `needle` in `line`, or -1.
++extract_uint_after(line: str, needle: str) : i64 {
+    at = find_from(line, needle, 0)
+    if at < 0 { return 0 - 1 }
+    i = at + needle.len
+    n = byte_len(line)
+    if i >= n { return 0 - 1 }
+    d0 = byte_at(line, i) - 48
+    if d0 < 0 || d0 > 9 { return 0 - 1 }
+    v = 0
+    while i < n {
+        d = byte_at(line, i) - 48
+        if d < 0 || d > 9 { return v }
+        v = v * 10 + d
+        i += 1
+    }
+    v
+}
+
+/// `YYYY-MM-DD HH:MM:SS level svc-NN user=UID` log line prefix (clears `sb` first).
++sb_log_prefix(
+    @sb: StrBuilder,
+    year: str,
+    mo: i64,
+    dd: i64,
+    hh: i64,
+    mi: i64,
+    ss: i64,
+    level: str,
+    svc: i64,
+    uid: i64
+) {
+    @sb.clear()
+    @sb.lit(year)
+    @sb.ascii(45)
+    sb_pad2(@sb, mo)
+    @sb.ascii(45)
+    sb_pad2(@sb, dd)
+    @sb.ascii(32)
+    sb_pad2(@sb, hh)
+    @sb.ascii(58)
+    sb_pad2(@sb, mi)
+    @sb.ascii(58)
+    sb_pad2(@sb, ss)
+    @sb.ascii(32)
+    @sb.lit(level)
+    @sb.lit(" svc-")
+    sb_pad2(@sb, svc)
+    @sb.lit(" user=")
+    @sb.dec(uid)
+}
+
+/// `GET /v1/product/{id}?region={r}` path scan starting at byte 16.
++http_scan_product_region(req: str) : _ {
+    q = [16]
+    pp = scan_uint_at(@q, req)
+    q[0] += 8
+    rr = scan_uint_at(@q, req)
+    .{pp, rr, at: q[0]}
+}
+
++sb_json_product_forecast(
+    @bw: StrBuilder,
+    product: i64,
+    region: i64,
+    orders: i64,
+    revenue: i64,
+    region_revenue: i64,
+    forecast: i64,
+    root_hex: str
+) {
+    @bw.json_i0("product", product)
+    @bw.json_i("region", region)
+    @bw.json_i("orders", orders)
+    @bw.json_i("revenue", revenue)
+    @bw.json_i("region_revenue", region_revenue)
+    @bw.json_i("forecast", forecast)
+    @bw.lit(",\"root\":\"")
+    @bw.lit(root_hex)
+    @bw.lit("\"}")
+}
+
++JSON_LB = "{"
++JSON_RB = "}"
+
+/// Spaced JSON order body into `body` (optional `sku`; `v` fuzzes omit/malform).
++order_body_into(@rng, v: i64, sp: str, @body: StrBuilder, @scratch: StrBuilder) {
+    user = 1 + @rng.draw(9999)
+    qty = 1 + @rng.draw(100)
+    if v == 0 { qty = 0 }
+    if v == 3 { user = 10000 }
+    @body.lit(JSON_LB)
+    sb_json_int_sp(@body, "user", sp, user)
+    @body.lit(",")
+    @body.lit(sp)
+    sb_json_int_sp(@body, "qty", sp, qty)
+    @scratch.clear()
+    letters_into(@rng, 4, @scratch)
+    if v != 1 {
+        @body.lit(",")
+        @body.lit(sp)
+        sb_json_key_sp(@body, "sku", sp)
+        sb_json_quote_cat(@body, @scratch)
+    }
+    if v != 2 { @body.lit(JSON_RB) }
+}
+
+/// Spaced JSON update body (`qty` + `note`; `v` fuzzes omit/malform).
++update_body_into(@rng, v: i64, sp: str, @body: StrBuilder) {
+    qty = 1 + @rng.draw(100)
+    nl = 3 + @rng.draw(5)
+    if v == 0 { qty = 101 }
+    @body.lit(JSON_LB)
+    if v != 1 {
+        sb_json_int_sp(@body, "qty", sp, qty)
+        @body.lit(",")
+        @body.lit(sp)
+    }
+    sb_json_key_sp(@body, "note", sp)
+    @body.ascii(34)
+    letters_into(@rng, nl, @body)
+    @body.ascii(34)
+    if v != 2 { @body.lit(JSON_RB) }
+}
+
+/// Spaced JSON login body (`user`/`pass`; `v` fuzzes omit/malform).
++login_body_into(@rng, v: i64, sp: str, @body: StrBuilder, @scratch: StrBuilder, @pass: StrBuilder) {
+    ul = 4 + @rng.draw(6)
+    @scratch.clear()
+    letters_into(@rng, ul, @scratch)
+    pl = 6 + @rng.draw(7)
+    @pass.clear()
+    letters_into(@rng, pl, @pass)
+    if v == 0 { @pass.clear() }
+    @body.lit(JSON_LB)
+    if v != 1 {
+        sb_json_key_sp(@body, "user", sp)
+        sb_json_quote_cat(@body, @scratch)
+        @body.lit(",")
+        @body.lit(sp)
+    }
+    sb_json_key_sp(@body, "pass", sp)
+    sb_json_quote_cat(@body, @pass)
+    @body.lit(JSON_RB)
+    if v == 2 { @body.ascii(120) }
+}
+
+/// Parse `s` as a signed integer, or fail.
++parse_int(s: str) : i64! => to_i64(s)
+
+/// True when `s` is `""`.
++is_empty(s: str) : bool => s == ""
+
+/// True when `c` is a space, tab, newline, or carriage return.
++is_space(c: str) : bool => c == " " || c == "\t" || c == "\n" || c == "\r"
+
+// --- searching ---------------------------------------------------------
+
+/// Index of the first `needle` in `s` at or after `start`, or -1 when it is absent.
++find_from(s: str, needle: str, start: i64) : i64 => host.sys_str_find(s, needle, start)
+
+/// Index of the first `needle` in `s`, or -1 when it is absent.
++find(s: str, needle: str) : i64 => find_from(s, needle, 0)
+
+/// Index of the last `needle` in `s`, or -1 when it is absent.
++find_last(s: str, needle: str) : i64 {
+    ensure needle != "" else { return -1 }
+    pos = -1
+    at = find_from(s, needle, 0)
+    while at >= 0 {
+        pos = at
+        at = find_from(s, needle, at + 1)
+    }
+    pos
+}
+
+/// Index of the first character `ch` in `s`, or -1.
++find_byte(s: str, ch: str) : i64 => find(s, ch)
+
+/// Index of character `ch` in `s` at or after `start`, or -1.
++find_byte_from(s: str, ch: str, start: i64) : i64 => find_from(s, ch, start)
+
+/// True when `needle` occurs in `s`.
++contains(s: str, needle: str) : bool => find(s, needle) >= 0
+
+/// True when `s` begins with `prefix`.
++starts_with(s: str, prefix: str) : bool => host.sys_str_match_at(s, prefix, 0)
+
+/// True when `s` ends with `suffix`.
++ends_with(s: str, suffix: str) : bool {
+    d = char_count(s) - char_count(suffix)
+    d >= 0 && host.sys_str_match_at(s, suffix, d)
+}
+
+/// Number of non-overlapping occurrences of `needle` in `s`.
++count(s: str, needle: str) : i64 {
+    m = char_count(needle)
+    ensure m > 0 else { return 0 }
+    total = 0
+    at = find_from(s, needle, 0)
+    while at >= 0 {
+        total += 1
+        at = find_from(s, needle, at + m)
+    }
+    total
+}
+
+// --- slicing / trimming ------------------------------------------------
+
+/// Slice of `s` from index `start`, at most `size` characters, clamped to the string.
++substr(s: str, start: i64, size: i64) : str {
+    lo = start
+    if lo < 0 { lo = 0 }
+    ensure size > 0 else { return "" }
+    // slicing clamps the end to the length (a wrapped `lo + size` reads as past it)
+    s[lo..lo + size]
+}
+
+/// Index of the first non-space character in `s`, or the length when `s` is blank.
++first_non_space(s: str) : i64 {
+    n = char_count(s)
+    pos = n
+    for 0..n {
+        if pos == n && !is_space(s[it]) { pos = it }
+    }
+    pos
+}
+
+/// `s` with leading spaces, tabs, and newlines removed.
++trim_start(s: str) : str {
+    n = char_count(s)
+    s[first_non_space(s)..n]
+}
+
+/// `s` with trailing spaces, tabs, and newlines removed.
++trim_end(s: str) : str {
+    n = char_count(s)
+    cut = 0
+    for 0..n {
+        if !is_space(s[it]) { cut = it + 1 }
+    }
+    s[0..cut]
+}
+
+/// `s` with leading and trailing whitespace removed.
++trim(s: str) : str => trim_end(trim_start(s))
+
+/// `s` without a leading `prefix`. Returns `s` unchanged when the prefix is absent.
++strip_prefix(s: str, prefix: str) : str {
+    ensure starts_with(s, prefix) else { return s }
+    s[char_count(prefix)..char_count(s)]
+}
+
+/// `s` without a trailing `suffix`. Returns `s` unchanged when the suffix is absent.
++strip_suffix(s: str, suffix: str) : str {
+    ensure ends_with(s, suffix) else { return s }
+    s[0..(char_count(s) - char_count(suffix))]
+}
+
+// --- transforms --------------------------------------------------------
+
+/// `s` with each ASCII letter passed through the case map.
++map_alpha(s: str, from: str, to: str) : str {
+    out = ""
+    for 0..char_count(s) {
+        c = s[it]
+        k = find(from, c)
+        if k >= 0 {
+            m = to[k]
+            out = "{out}{m}"
+        } else {
+            out = "{out}{c}"
+        }
+    }
+    out
+}
+
+/// ASCII uppercase copy of `s`.
++to_upper(s: str) : str => map_alpha(s, ALPHA_LOWER, ALPHA_UPPER)
+/// ASCII lowercase copy of `s`.
++to_lower(s: str) : str => map_alpha(s, ALPHA_UPPER, ALPHA_LOWER)
+
+/// `s` with its characters in reverse order.
++reverse(s: str) : str {
+    out = ""
+    n = char_count(s)
+    for 0..n {
+        c = s[n - 1 - it]
+        out = "{out}{c}"
+    }
+    out
+}
+
+/// `s` repeated `times` times. Zero or fewer copies is empty.
++repeat(s: str, times: i64) : str {
+    out = ""
+    for 0..times { out = "{out}{s}" }
+    out
+}
+
+/// `s` padded on the left with `fill` until it is at least `width` characters.
++pad_left(s: str, width: i64, fill: str) : str {
+    out = s
+    for 0..(width - char_count(s)) { out = "{fill}{out}" }
+    out
+}
+
+/// `s` padded on the right with `fill` until it is at least `width` characters.
++pad_right(s: str, width: i64, fill: str) : str {
+    out = s
+    for 0..(width - char_count(s)) { out = "{out}{fill}" }
+    out
+}
+
+/// `Cut` is a split of a string into the head before a separator and the tail after it.
++Cut = {
+    /// Head on `Cut` (`str`). Defaults to `""`.
+    head: str = ""
+    /// Tail on `Cut` (`str`). Defaults to `""`.
+    tail: str = ""
+    /// Found on `Cut` (`bool`). Defaults to `false`.
+    found: bool = false
+}
+
+/// Split once on the first `sep` (Go strings.Cut). Named `str_cut` to avoid clashing with locals in `std.net.http`.
++str_cut(s: str, sep: str) : Cut {
+    pos = find(s, sep)
+    if pos < 0 { return Cut.{head: s, tail: "", found: false} }
+    Cut.{head: s[0..pos], tail: s[(pos + char_count(sep))..char_count(s)], found: true}
+}
+
+/// `s` with the first `from` replaced by `to`.
++replace_once(s: str, from: str, to: str) : str {
+    pos = find(s, from)
+    if pos < 0 { return s }
+    m = char_count(from)
+    s[0..pos] + to + s[(pos + m)..char_count(s)]
+}
+
+/// `s` with every non-overlapping `from` replaced by `to`.
++replace(s: str, from: str, to: str) : str {
+    m = char_count(from)
+    ensure m > 0 else { return s }
+    out = ""
+    at = 0
+    hit = find_from(s, from, 0)
+    while hit >= 0 {
+        out = out + s[at..hit] + to
+        at = hit + m
+        hit = find_from(s, from, at)
+    }
+    out + s[at..char_count(s)]
+}
+
+// --- split / join / lines ----------------------------------------------
+
+/// How many pieces `s` splits into on `sep`.
++split_count(s: str, sep: str) : i64 => count(s, sep) + 1
+
+/// The `n`-th piece of `s` split on `sep`.
++split_nth(s: str, sep: str, n: i64) : str {
+    lp = char_count(sep)
+    ensure lp > 0 else { return s }
+    ensure n >= 0 else { return "" }
+    start = 0
+    for 0..n {
+        hit = find_from(s, sep, start)
+        if hit < 0 { return "" }
+        start = hit + lp
+    }
+    end = find_from(s, sep, start)
+    if end < 0 { end = char_count(s) }
+    s[start..end]
+}
+
+/// List of pieces of `s` split on `sep`.
++split(s: str, sep: str) {
+    parts = []
+    lp = char_count(sep)
+    start = 0
+    hit = if lp > 0 { find_from(s, sep, 0) } else { -1 }
+    while hit >= 0 {
+        parts = host.sys_arr_push(parts, s[start..hit])
+        start = hit + lp
+        hit = find_from(s, sep, start)
+    }
+    parts = host.sys_arr_push(parts, s[start..char_count(s)])
+    parts
+}
+
+/// Split on ASCII whitespace runs (Go strings.Fields).
++fields(s: str) {
+    parts = []
+    n = char_count(s)
+    start = -1
+    for 0..(n + 1) {
+        at_end = it == n
+        ws = false
+        if !at_end { ws = is_space(s[it]) }
+        if !ws && start < 0 { start = it }
+        if (ws || at_end) && start >= 0 {
+            if it > start {
+                parts = host.sys_arr_push(parts, s[start..it])
+            }
+            start = -1
+        }
+    }
+    parts
+}
+
+/// Pieces of `parts` concatenated with `sep` between them.
++join(parts: _, sep: str) : str {
+    out = ""
+    for parts {
+        if index > 0 { out = "{out}{sep}" }
+        out = "{out}{it}"
+    }
+    out
+}
+
+/// Lines of `s`, split on newlines. A trailing newline does not add an empty line.
++lines(s: str) {
+    parts = []
+    for split(s, NL) {
+        parts = host.sys_arr_push(parts, strip_suffix(it, "\r"))
+    }
+    parts
+}
+
+// --- character classes & compare ---------------------------------------
+
+/// True when `c` is a single ASCII digit.
++is_digit(c: str) : bool => find(DIGITS, c) >= 0
+
+/// True when `c` is a single ASCII lowercase letter.
++is_ascii_lower(c: str) : bool => find(ALPHA_LOWER, c) >= 0
+
+/// True when `c` is a single ASCII uppercase letter.
++is_ascii_upper(c: str) : bool => find(ALPHA_UPPER, c) >= 0
+
+/// True when `c` is a single ASCII letter.
++is_ascii_alpha(c: str) : bool => is_ascii_lower(c) || is_ascii_upper(c)
+
+/// True when `c` is a single ASCII letter or digit.
++is_ascii_alnum(c: str) : bool => is_ascii_alpha(c) || is_digit(c)
+
+/// Lexicographic string compare: -1, 0, +1 (byte order via host ord).
++compare(s: str, t: str) : i64 {
+    ns = byte_len(s)
+    nt = byte_len(t)
+    n = ns
+    if nt < n { n = nt }
+    for 0..n {
+        a = ord(s[it])
+        b = ord(t[it])
+        if a < b { return -1 }
+        if a > b { return 1 }
+    }
+    if ns < nt { return -1 }
+    if ns > nt { return 1 }
+    0
+}
+
+/// `s` cut to at most `max` characters.
++truncate(s: str, max: i64) : str {
+    n = char_count(s)
+    if n <= max { return s }
+    s[0..max]
+}
+
+/// The shared prefix of `a` and `b`.
++common_prefix(a: str, b: str) : str {
+    n = byte_len(a)
+    m = byte_len(b)
+    cap = n
+    if m < cap { cap = m }
+    k = 0
+    for 0..cap {
+        if ord(a[it]) == ord(b[it]) { k = it + 1 }
+    }
+    a[0..k]
+}
+
+// --- parsing -----------------------------------------------------------
+
+/// Parse `s` as a signed integer, or fail.
++to_i64(s: str) : i64! {
+    t = trim(s)
+    n = char_count(t)
+    ensure n > 0 else {
+        fail "empty integer"
+        return
+    }
+    sign = 1
+    from = 0
+    if t[0] == "-" {
+        sign = -1
+        from = 1
+    }
+    if t[0] == "+" { from = 1 }
+    ensure from < n else {
+        fail "integer has no digits"
+        return
+    }
+    acc = 0
+    bad = false
+    for from..n {
+        d = find(DIGITS, t[it])
+        if d < 0 { bad = true }
+        acc = acc * 10 + d
+    }
+    ensure !bad else {
+        fail "invalid integer"
+        return
+    }
+    sign * acc
+}
+
+/// Parse `s` as a floating-point number, or fail.
++to_f64(s: str) : f64! {
+    t = trim(s)
+    n = char_count(t)
+    ensure n > 0 else {
+        fail "empty float"
+        return
+    }
+    neg = t[0] == "-"
+    from = 0
+    if t[0] == "-" || t[0] == "+" { from = 1 }
+    ensure from < n else {
+        fail "float has no digits"
+        return
+    }
+    whole = 0.0
+    frac = 0.0
+    scale = 1.0
+    seen_dot = false
+    bad = false
+    for from..n {
+        c = t[it]
+        d = find(DIGITS, c)
+        if c == "." && !seen_dot {
+            seen_dot = true
+        } else {
+            if d < 0 { bad = true }
+            if seen_dot {
+                scale = scale / 10.0
+                frac += d * scale
+            } else {
+                whole = whole * 10.0 + d
+            }
+        }
+    }
+    ensure !bad else {
+        fail "invalid float"
+        return
+    }
+    v = whole + frac
+    if neg { v = 0.0 - v }
+    v
+}
+
+/// Parse `s` as a boolean (`true` / `false`, case-insensitive), or fail.
++to_bool(s: str) : bool! {
+    t = to_lower(trim(s))
+    if t == "true" || t == "1" || t == "yes" || t == "on" { return true }
+    if t == "false" || t == "0" || t == "no" || t == "off" { return false }
+    fail "invalid bool"
+    return
+}
+
+// --- tests -------------------------------------------------------------
+
+/// Test that len handles empty, short and long strings.
+test "len handles empty, short and long strings" {
+    assert_eq(char_count(""), 0)
+    assert_eq(char_count("a"), 1)
+    assert_eq(char_count("hello"), 5)
+    assert_eq(char_count("hello world, this is super"), 26)
+}
+
+/// Test that find / contains / starts_with / ends_with.
+test "find / contains / starts_with / ends_with" {
+    assert_eq(find("hello", "l"), 2)
+    assert_eq(find("hello", "lo"), 3)
+    assert_eq(find("hello", "z"), -1)
+    assert_eq(find_from("abcabc", "b", 2), 4)
+    assert_eq(find_from("abcabc", "abc", 0), 0)
+    assert_eq(find_from("abcabc", "abc", 1), 3)
+    assert_eq(find_from("abcabc", "abc", 4), -1)
+    assert_eq(find_from("aab", "ab", 0), 1)
+    assert_eq(find_from("abc", "bcd", 0), -1)
+    assert_eq(find_from("abc", "c", 9), -1)
+    assert_eq(find_from("a\r\nb\r\n", "\r\n", 3), 4)
+    assert_eq(find_from("abc", "", 2), 2)
+    #assert(contains("super lang", "lang"))
+    #assert(!(contains("super lang", "go")))
+    #assert(starts_with("super.toml", "super"))
+    #assert(!(starts_with("sy", "super")))
+    #assert(ends_with("main.sr", ".sr"))
+    #assert(!(ends_with("r", ".sr")))
+}
+
+/// Test that count counts non-overlapping matches.
+test "count counts non-overlapping matches" {
+    assert_eq(count("a,b,c,d", ","), 3)
+    assert_eq(count("aaaa", "aa"), 2)
+    assert_eq(count("abc", "x"), 0)
+}
+
+/// Test that trim family.
+test "trim family" {
+    assert_eq(trim("  hi  "), "hi")
+    assert_eq(trim_start("  hi  "), "hi  ")
+    assert_eq(trim_end("  hi  "), "  hi")
+    assert_eq(trim("   "), "")
+    assert_eq(trim("x"), "x")
+}
+
+/// Test that substr / strip.
+test "substr / strip" {
+    assert_eq(substr("abcdef", 1, 3), "bcd")
+    assert_eq(substr("abc", 2, 10), "c")
+    assert_eq(substr("abc", 5, 2), "")
+    assert_eq(strip_prefix("--flag", "--"), "flag")
+    assert_eq(strip_suffix("a.sr", ".sr"), "a")
+    assert_eq(strip_prefix("flag", "--"), "flag")
+}
+
+/// Test that case mapping and reverse.
+test "case mapping and reverse" {
+    assert_eq(to_upper("Super-2026"), "SUPER-2026")
+    assert_eq(to_lower("Super-2026"), "super-2026")
+    assert_eq(reverse("abc"), "cba")
+}
+
+/// Test that repeat and padding.
+test "repeat and padding" {
+    assert_eq(repeat("ab", 3), "ababab")
+    assert_eq(pad_left("7", 3, "0"), "007")
+    assert_eq(pad_right("7", 3, "."), "7..")
+    assert_eq(pad_left("1234", 3, "0"), "1234")
+}
+
+/// Test that replace replaces every occurrence.
+test "replace replaces every occurrence" {
+    assert_eq(replace("a-b-c", "-", "+"), "a+b+c")
+    assert_eq(replace("aaa", "aa", "b"), "ba")
+    assert_eq(replace("abc", "", "x"), "abc")
+    assert_eq(replace("hello", "l", ""), "heo")
+}
+
+/// Test that split_nth / split_count.
+test "split_nth / split_count" {
+    assert_eq(split_count("a,b,c", ","), 3)
+    assert_eq(split_nth("a,b,c", ",", 0), "a")
+    assert_eq(split_nth("a,b,c", ",", 1), "b")
+    assert_eq(split_nth("a,b,c", ",", 2), "c")
+    assert_eq(split_nth("a,,c", ",", 1), "")
+    assert_eq(split_nth("key=value", "=", 1), "value")
+}
+
+/// Test that join over literal arrays.
+test "join over literal arrays" {
+    assert_eq(join(["a", "b", "c"], "-"), "a-b-c")
+    assert_eq(join(["solo"], ","), "solo")
+}
+
+/// Test that to_i64 parses signs and rejects garbage.
+test "to_i64 parses signs and rejects garbage" {
+    assert_eq(to_i64("42") or 0, 42)
+    assert_eq(to_i64("  -17 ") or 0, -17)
+    assert_eq(to_i64("+8") or 0, 8)
+    assert_eq(to_i64("12x") or 999, 999)
+    assert_eq(to_i64("") or 999, 999)
+    assert_eq(to_i64("-") or 999, 999)
+    assert_eq(to_i64("abc") or -1, -1)
+}
+
+/// Test that to_f64 parses fractions.
+test "to_f64 parses fractions" {
+    assert_eq(to_f64("3.5") or 0.0, 3.5)
+    assert_eq(to_f64("-0.25") or 0.0, 0.0 - 0.25)
+    assert_eq(to_f64("10") or 0.0, 10.0)
+    assert_eq(to_f64("1.x") or 9.0, 9.0)
+}
+
+/// Test that to_bool accepts common spellings.
+test "to_bool accepts common spellings" {
+    #assert(to_bool("true") or false)
+    #assert(to_bool(" YES ") or false)
+    #assert(!(to_bool("0") or true))
+    #assert(to_bool("maybe") or true)
+}
+
+/// Test that byte_len ord chr byte_at primitives.
+test "byte_len ord chr byte_at primitives" {
+    assert_eq(byte_len(""), 0)
+    assert_eq(byte_len("hello"), 5)
+    assert_eq(ord("A"), 65)
+    assert_eq(ord(""), -1)
+    assert_eq(chr(97), "a")
+    assert_eq(chr(122), "z")
+    assert_eq(byte_at("abc", 0), 97)
+    assert_eq(byte_at("abc", 2), 99)
+    assert_eq(byte_at("abc", 3), -1)
+    assert_eq(chr(ord("Q")), "Q")
+    // "é" is 2 UTF-8 bytes; byte_slice peels the code units without UTF-8 seek.
+    assert_eq(byte_len("aéb"), 4)
+    assert_eq(byte_slice("aéb", 1, 3), "é")
+    assert_eq(byte_slice("aéb", 0, 1), "a")
+    assert_eq(byte_slice("aéb", 3, 4), "b")
+    assert_eq(byte_slice("aéb", 10, 20), "")
+    assert_eq(byte_find("ab\r\ncd\r\n", "\r\n"), 2)
+    assert_eq(byte_find_from("ab\r\ncd\r\n", "\r\n", 3), 6)
+    assert_eq(byte_find("abc", "z"), -1)
+    #assert(byte_match_at("GET /x", "GET ", 0))
+    #assert(!(byte_match_at("GET /x", "POST ", 0)))
+    #assert(byte_match_at("ab\r\n", "\r\n", 2))
+    #assert(match_at("file.json", ".json", 4))
+    #assert(byte_eq_range("/users/42", 1, 6, "users"))
+    #assert(!(byte_eq_range("/users/42", 1, 6, "user")))
+    #assert(byte_eq_range("/users/42", 7, 9, "42"))
+    assert_eq(push_ascii("", 65), "A")
+    assert_eq(push_ascii("xy", 122), "xyz")
+}
+
+/// Test that parse_int wraps to_i64.
+test "parse_int wraps to_i64" {
+    assert_eq(parse_int("123") or -1, 123)
+    assert_eq(parse_int("-9") or 0, -9)
+    assert_eq(parse_int("nope") or -1, -1)
+    assert_eq(parse_int("") or -1, -1)
+}
+
+/// Empty CSV fields must yield -1 (peer parse_int parity for lakehouse bench).
+test "scan_uint_at returns -1 on empty field" {
+    line = "7,,3\n"
+    p = [0]
+    assert_eq(scan_uint_at(@p, line), 7)
+    p[0] += 1
+    assert_eq(scan_uint_at(@p, line), -1)
+    p[0] += 1
+    assert_eq(scan_uint_at(@p, line), 3)
+}
+
+/// Test that find_last cut fields.
+test "find_last cut fields" {
+    assert_eq(find_last("abcabc", "bc"), 4)
+    assert_eq(find_last("abc", "z"), -1)
+    c = str_cut("a=b=c", "=")
+    assert_eq(c.head, "a")
+    assert_eq(c.tail, "b=c")
+    #assert(c.found)
+    miss = str_cut("plain", "=")
+    #assert(!(miss.found))
+    assert_eq(replace_once("foo.foo", "foo", "bar"), "bar.foo")
+    f = fields("  a\tb  c ")
+    assert_eq(host.sys_arr_len(f), 3)
+    assert_eq(f[0], "a")
+    assert_eq(f[2], "c")
+}
+
+/// Test that char classes and compare.
+test "char classes and compare" {
+    #assert(is_digit("7"))
+    #assert(!(is_digit("x")))
+    #assert(is_ascii_alpha("K"))
+    #assert(!(is_ascii_alnum("_")))
+    assert_eq(compare("abc", "abd"), -1)
+    assert_eq(compare("abd", "abc"), 1)
+    assert_eq(compare("ab", "abc"), -1)
+    assert_eq(truncate("hello", 3), "hel")
+    assert_eq(truncate("hi", 5), "hi")
+    assert_eq(common_prefix("foobar", "foobaz"), "fooba")
+}
+
+/// Test that search, length and slicing count Unicode scalars, not bytes.
+test "unicode-aware search and slicing" {
+    s = "héllo wörld"
+    assert_eq(char_count(s), 11)
+    assert_eq(find(s, "wö"), 6)
+    assert_eq(find_from(s, "l", 3), 3)
+    assert_eq(find_from(s, "l", 4), 9)
+    assert_eq(find_from(s, "l", -5), 2)
+    assert_eq(find_from(s, "", 4), 4)
+    #assert(starts_with(s, "hé"))
+    #assert(ends_with(s, "örld"))
+    #assert(!(ends_with("ö", "wörld")))
+    assert_eq(substr(s, 6, 3), "wör")
+    assert_eq(substr(s, -2, 2), "hé")
+    assert_eq(substr(s, 3, 0), "")
+    assert_eq(substr(s, 9, 9223372036854775807), "ld")
+    assert_eq(s[7], "ö")
+    assert_eq(count("ééé", "é"), 3)
+    assert_eq(replace("aéaé", "é", "!"), "a!a!")
+}
+
+/// Test that find_last sees overlapping matches and split keeps empty edges.
+test "find_last overlap and split edges" {
+    assert_eq(find_last("aaaa", "aa"), 2)
+    assert_eq(count("aaaa", "aa"), 2)
+    p = split(",a,,b,", ",")
+    assert_eq(host.sys_arr_len(p), 5)
+    assert_eq(p[0], "")
+    assert_eq(p[3], "b")
+    assert_eq(p[4], "")
+    whole = split("abc", "")
+    assert_eq(host.sys_arr_len(whole), 1)
+    assert_eq(whole[0], "abc")
+    l = lines("x\r\ny\n")
+    assert_eq(host.sys_arr_len(l), 3)
+    assert_eq(l[0], "x")
+    assert_eq(l[1], "y")
+    assert_eq(split_nth("a,b", ",", 5), "")
+    assert_eq(split_nth("a,b", ",", -1), "")
+}

@@ -1,0 +1,118 @@
+//! std.net.sse — Server-Sent Events (HTML living standard) framing
+//!
+//! Import with:
+//!   use std.net.sse
+//!
+//!   wire = sse_event("message", "hello", "42", 0)
+//!   ev = sse_parse_block("event: message\ndata: hello\nid: 42\n\n")
+
+use std.core.str
+use std.core.collections
+
+/// `SseEvent` is one Server-Sent Event (event name, data, id, retry).
++SseEvent = {
+    /// Event on `SseEvent` (`str`). Defaults to `"message"`.
+    event: str = "message"
+    /// Data on `SseEvent` (`str`). Defaults to `""`.
+    data: str = ""
+    /// Id on `SseEvent` (`str`). Defaults to `""`.
+    id: str = ""
+    /// Retry ms on `SseEvent` (`i64`). Defaults to `0`.
+    retry_ms: i64 = 0
+}
+
+/// Response headers that start a Server-Sent Events stream.
++sse_headers() : str => "Content-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n"
+
+/// Sse event (`event`, `data`, `id`, `retry_ms`). Returns `str`.
++sse_event(event: str, data: str, id: str, retry_ms: i64) : str {
+    out = ""
+    if event != "" { out = out + "event: " + event + "\n" }
+    start = 0
+    n = byte_len(data)
+    for 0..(n + 1) {
+        if it == n || data[it] == "\n" {
+            out = out + "data: " + data[start..it] + "\n"
+            start = it + 1
+        }
+    }
+    if id != "" { out = out + "id: " + id + "\n" }
+    if retry_ms > 0 { out = out + "retry: {retry_ms}\n" }
+    out + "\n"
+}
+
+/// Sse comment (`text`). Returns `str`.
++sse_comment(text: str) : str => ": " + text + "\n\n"
+
+/// Sse parse block (`block`). Returns `SseEvent`.
++sse_parse_block(block: str) : SseEvent {
+    event = "message"
+    data_acc = ""
+    id = ""
+    retry_ms = 0
+    start = 0
+    n = byte_len(block)
+    for 0..(n + 1) {
+        if it == n || block[it] == "\n" {
+            line = block[start..it]
+            start = it + 1
+            if line != "" {
+                if sse_starts(line, "event:") {
+                    event = sse_trim(line[6..byte_len(line)])
+                }
+                if sse_starts(line, "data:") {
+                    piece = sse_trim(line[5..byte_len(line)])
+                    if data_acc == "" { data_acc = piece } else { data_acc = data_acc + "\n" + piece }
+                }
+                if sse_starts(line, "id:") {
+                    id = sse_trim(line[3..byte_len(line)])
+                }
+                if sse_starts(line, "retry:") {
+                    retry_ms = sse_parse_i64(sse_trim(line[6..byte_len(line)])) or 0
+                }
+            }
+        }
+    }
+    SseEvent.{event, data: data_acc, id, retry_ms}
+}
+
+/// Sse starts (`s`, `p`).
++sse_starts(s: str, p: str) : bool {
+    pn = byte_len(p)
+    ensure byte_len(s) >= pn else { return false }
+    s[0..pn] == p
+}
+
+/// Sse trim (`s`). Returns `str`.
++sse_trim(s: str) : str {
+    n = byte_len(s)
+    ensure n > 0 else { return s }
+    if s[0] == " " { return s[1..n] }
+    s
+}
+
+/// Sse parse i64 (`s`). Returns `i64`, or fails.
++sse_parse_i64(s: str) : i64! {
+    n = byte_len(s)
+    ensure n > 0 else { fail "empty" }
+    acc = 0
+    for 0..n {
+        d = ord(s[it]) - 48
+        ensure d >= 0 && d <= 9 else { fail "digit" }
+        acc = acc * 10 + d
+    }
+    acc
+}
+
+/// Test that frame and parse.
+test "frame and parse" {
+    wire = sse_event("tick", "hello\nworld", "7", 3000)
+    #assert(sse_starts(wire, "event:"))
+    ev = sse_parse_block(wire)
+    assert_eq(ev.event, "tick")
+    assert_eq(ev.id, "7")
+    assert_eq(ev.retry_ms, 3000)
+    assert_eq(ev.data, "hello\nworld")
+    #assert(sse_starts(sse_headers(), "Content-Type:"))
+    #assert(sse_starts(sse_comment("keepalive"), ":"))
+}

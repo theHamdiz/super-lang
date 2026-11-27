@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://thehamdiz.github.io/super-lang/sitemap.xml

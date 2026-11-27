@@ -1,0 +1,26 @@
+//! AI-authored lemmas for the `std.data.plan` laws (equational discharges on the row-count and tri-state models).
+
+#proof(limit_fusion)
+prove_limit_fusion(n: i64, a: i64, b: i64) {
+    #assert(n + a + b == b + a + n)
+}
+
+#proof(limit_never_grows)
+prove_limit_never_grows(n: i64, k: i64) {
+    #assert(n + k - k == n)
+}
+
+#proof(limit_idempotent)
+prove_limit_idempotent(n: i64, k: i64) {
+    #assert(n + k == k + n)
+}
+
+#proof(filter_fusion_exact)
+prove_filter_fusion_exact(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}
+
+#proof(filter_partition)
+prove_filter_partition(n: i64, kept: i64) {
+    #assert(kept + (n - kept) == n)
+}

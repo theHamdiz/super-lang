@@ -1,0 +1,9 @@
+[pod]
+name = "doc-features"
+version = "0.1.0"
+
+[features]
+default = ["text"]
+text = []
+binary = []
+all-io = ["text", "binary"]

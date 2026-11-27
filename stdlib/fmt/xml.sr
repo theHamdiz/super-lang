@@ -1,0 +1,1355 @@
+//! std.fmt.xml — XML pull parser and element builder
+//!
+//! Import with:
+//!   use std.fmt.xml
+//!
+//! `XmlReader` is a pull parser: each `pull()` returns one token (start tag with its
+//! attributes, end tag, text, CDATA, comment, processing instruction, doctype, end of file).
+//! It checks well-formedness as it goes: matching end tags, unique quoted attributes, entity
+//! references, a single root element, and a nesting limit.
+//!
+//!   r = XmlReader.new("<a id=\"1\">hi <b/></a>")
+//!   t = @r.pull() or XmlToken.eof()           // start tag "a", t.attr("id") == "1"
+//!
+//! A self-closing tag yields a start token immediately followed by its end token, so
+//! consumers always see balanced pairs. `XmlWriter` builds documents with escaping,
+//! optional pretty-printing, and well-formedness checks reported by `finish()`:
+//!
+//!   w = XmlWriter.new(0)
+//!   @w.open("user")
+//!   @w.attr("id", "7")
+//!   @w.text("Amina & co")
+//!   @w.close()
+//!   w.finish() or "?"                        // <user id="7">Amina &amp; co</user>
+//!
+//! Not supported: namespaces resolution (prefixes are kept as part of names), external
+//! entities, DTD validation (a DOCTYPE is returned verbatim), and non-UTF-8 encodings.
+
+/// Token kind: end of input.
++XML_EOF = 0
+/// Token kind: start tag (`name`, attributes).
++XML_START = 1
+/// Token kind: end tag (`name`).
++XML_END = 2
+/// Token kind: character data with entities decoded (`text`).
++XML_TEXT = 3
+/// Token kind: `<![CDATA[...]]>` section (`text`, verbatim).
++XML_CDATA = 4
+/// Token kind: `<!--...-->` comment (`text`).
++XML_COMMENT = 5
+/// Token kind: processing instruction or XML declaration (`name` = target, `text` = data).
++XML_PI = 6
+/// Token kind: `<!DOCTYPE ...>` (`text` = everything between `<!DOCTYPE` and `>`).
++XML_DOCTYPE = 7
+/// Deepest element nesting the reader accepts.
++XML_MAX_DEPTH = 256
+
+// --- escaping -------------------------------------------------------------------------------
+
+/// `s` with `&`, `<` and `>` replaced by entity references.
++xml_escape_text(s: str) : str {
+    out = ""
+    for 0..host.sys_str_len(s) {
+        c = s[it]
+        if c == "&" {
+            out = out + "&amp;"
+        } else {
+            if c == "<" {
+                out = out + "&lt;"
+            } else {
+                if c == ">" {
+                    out = out + "&gt;"
+                } else {
+                    out = out + c
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `s` escaped for use inside a double-quoted attribute value.
++xml_escape_attr(s: str) : str {
+    out = ""
+    for 0..host.sys_str_len(s) {
+        c = s[it]
+        if c == "&" {
+            out = out + "&amp;"
+        } else {
+            if c == "<" {
+                out = out + "&lt;"
+            } else {
+                if c == ">" {
+                    out = out + "&gt;"
+                } else {
+                    if c == "\"" {
+                        out = out + "&quot;"
+                    } else {
+                        if c == "'" {
+                            out = out + "&apos;"
+                        } else {
+                            if c == "\n" {
+                                out = out + "&#10;"
+                            } else {
+                                if c == "\t" {
+                                    out = out + "&#9;"
+                                } else {
+                                    if c == "\r" {
+                                        out = out + "&#13;"
+                                    } else {
+                                        out = out + c
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Value of the digit `c` in `base` (10 or 16), or -1.
++xml_digit(c: str, base: i64) : i64 {
+    code = host.sys_ord(c)
+    if code >= 48 {
+        if code <= 57 { return code - 48 }
+    }
+    if base == 16 {
+        if code >= 97 {
+            if code <= 102 { return code - 87 }
+        }
+        if code >= 65 {
+            if code <= 70 { return code - 55 }
+        }
+    }
+    -1
+}
+
+/// `s` with entity and character references decoded, or fail on an unknown or malformed one.
++xml_unescape(s: str) : str! {
+    n = host.sys_str_len(s)
+    out = ""
+    i = 0
+    while i < n {
+        c = s[i]
+        if c != "&" {
+            out = out + c
+            i += 1
+        } else {
+            j = i + 1
+            while j < n {
+                if s[j] == ";" { break }
+                if j - i > 10 { break }
+                j += 1
+            }
+            ensure j < n else {
+                fail "xml: unterminated entity reference"
+                return
+            }
+            ensure s[j] == ";" else {
+                fail "xml: unterminated entity reference"
+                return
+            }
+            name = s[(i + 1)..j]
+            piece = ""
+            if name == "lt" { piece = "<" }
+            if name == "gt" { piece = ">" }
+            if name == "amp" { piece = "&" }
+            if name == "quot" { piece = "\"" }
+            if name == "apos" { piece = "'" }
+            if piece == "" {
+                ensure host.sys_str_len(name) >= 2 else {
+                    fail "xml: unknown entity &{name};"
+                    return
+                }
+                ensure name[0] == "#" else {
+                    fail "xml: unknown entity &{name};"
+                    return
+                }
+                base = 10
+                start = 1
+                if name[1] == "x" {
+                    base = 16
+                    start = 2
+                }
+                ensure start < host.sys_str_len(name) else {
+                    fail "xml: empty character reference"
+                    return
+                }
+                v = 0
+                bad = false
+                for start..host.sys_str_len(name) {
+                    d = xml_digit(name[it], base)
+                    if d < 0 { bad = true } else { v = v * base + d }
+                }
+                ensure !bad else {
+                    fail "xml: malformed character reference &{name};"
+                    return
+                }
+                ensure xml_char_ok(v) else {
+                    fail "xml: character reference out of range &{name};"
+                    return
+                }
+                piece = host.sys_chr(v)
+            }
+            out = out + piece
+            i = j + 1
+        }
+    }
+    out
+}
+
+/// True when `v` is a legal XML 1.0 character (tab, newline, return, or U+0020 and up minus
+/// surrogates, U+FFFE and U+FFFF).
++xml_char_ok(v: i64) : bool {
+    if v == 9 { return true }
+    if v == 10 { return true }
+    if v == 13 { return true }
+    if v < 32 { return false }
+    if v >= 55296 {
+        if v <= 57343 { return false }
+    }
+    if v == 65534 { return false }
+    if v == 65535 { return false }
+    v <= 1114111
+}
+
+// --- names ----------------------------------------------------------------------------------
+
+/// True when `c` may start an XML name (letter, `_`, `:` or any non-ASCII character).
++xml_name_start(c: str) : bool {
+    code = host.sys_ord(c)
+    if code >= 128 { return true }
+    if code == 95 { return true }
+    if code == 58 { return true }
+    if code >= 65 {
+        if code <= 90 { return true }
+    }
+    if code >= 97 {
+        if code <= 122 { return true }
+    }
+    false
+}
+
+/// True when `c` may continue an XML name.
++xml_name_char(c: str) : bool {
+    if xml_name_start(c) { return true }
+    code = host.sys_ord(c)
+    if code == 45 { return true }
+    if code == 46 { return true }
+    if code >= 48 {
+        if code <= 57 { return true }
+    }
+    false
+}
+
+/// True when `name` is a valid element or attribute name.
++xml_valid_name(name: str) : bool {
+    n = host.sys_str_len(name)
+    if n == 0 { return false }
+    if !xml_name_start(name[0]) { return false }
+    ok = true
+    for 1..n {
+        if !xml_name_char(name[it]) { ok = false }
+    }
+    ok
+}
+
+/// Index just past the name starting at `i` in `s` (== `i` when there is none).
++xml_name_end(s: str, i: i64, n: i64) : i64 {
+    p = i
+    if p < n {
+        if xml_name_start(s[p]) {
+            p += 1
+            while p < n {
+                if xml_name_char(s[p]) { p += 1 } else { break }
+            }
+        }
+    }
+    p
+}
+
+/// True for the XML whitespace characters.
++xml_is_ws(c: str) : bool {
+    if c == " " { return true }
+    if c == "\n" { return true }
+    if c == "\t" { return true }
+    c == "\r"
+}
+
+/// Index of the first non-whitespace character of `s` at or after `i`.
++xml_skip_ws(s: str, i: i64, n: i64) : i64 {
+    p = i
+    while p < n {
+        if xml_is_ws(s[p]) { p += 1 } else { break }
+    }
+    p
+}
+
+/// Index of the first occurrence of `needle` in `s` at or after `from`, or -1.
++xml_find(s: str, needle: str, from: i64) : i64 {
+    n = host.sys_str_len(s)
+    k = host.sys_str_len(needle)
+    if k == 0 { return from }
+    first = needle[0]
+    found = -1
+    p = from
+    while p + k <= n {
+        if s[p] == first {
+            if s[p..(p + k)] == needle {
+                found = p
+                break
+            }
+        }
+        p += 1
+    }
+    found
+}
+
+/// One-based line number of offset `pos` in `s`.
++xml_line_at(s: str, pos: i64) : i64 {
+    line = 1
+    limit = pos
+    n = host.sys_str_len(s)
+    if limit > n { limit = n }
+    for 0..limit {
+        if s[it] == "\n" { line += 1 }
+    }
+    line
+}
+
+// --- reader ---------------------------------------------------------------------------------
+
+/// One parsed token. Which fields are meaningful depends on `kind`.
++XmlToken = {
+    /// One of the `XML_*` kinds. Defaults to `0`.
+    kind: i64 = 0
+    /// Element name (start/end) or PI target. Defaults to `""`.
+    name: str = ""
+    /// Text, CDATA, comment, PI data or doctype body. Defaults to `""`.
+    text: str = ""
+    /// Attribute names of a start tag, in source order. Defaults to `[]`.
+    attr_names: _ = []
+    /// Decoded attribute values, parallel to `attr_names`. Defaults to `[]`.
+    attr_vals: _ = []
+
+    /// The end-of-input token.
+    eof() : XmlToken => XmlToken.{kind: 0, name: "", text: "", attr_names: [], attr_vals: []}
+
+    /// Number of attributes on a start tag.
+    attr_count(self) : i64 => host.sys_arr_len(self.attr_names)
+
+    /// Value of attribute `key`, or fail when it is absent.
+    attr(self, key: str) : str! {
+        found = -1
+        for 0..host.sys_arr_len(self.attr_names) {
+            if self.attr_names[it] == key { found = it }
+        }
+        ensure found >= 0 else {
+            fail "xml: no attribute {key}"
+            return
+        }
+        self.attr_vals[found]
+    }
+
+    /// True when attribute `key` is present.
+    has_attr(self, key: str) : bool {
+        found = false
+        for self.attr_names {
+            if it == key { found = true }
+        }
+        found
+    }
+}
+
+/// Pull parser over an XML string.
++XmlReader = {
+    /// Source text. Defaults to `""`.
+    src: str = ""
+    /// Offset of the next unread character. Defaults to `0`.
+    pos: i64 = 0
+    /// Length of `src` in characters. Defaults to `0`.
+    size: i64 = 0
+    /// Names of the currently open elements. Defaults to `[]`.
+    stack: _ = []
+    /// True once the root element has been closed. Defaults to `false`.
+    root_done: bool = false
+    /// True when the root element has been opened. Defaults to `false`.
+    root_seen: bool = false
+    /// True when a self-closing tag's end token is still owed. Defaults to `false`.
+    owe_end: bool = false
+    /// Name for the owed end token. Defaults to `""`.
+    owe_name: str = ""
+
+    /// Reader at the start of `src`.
+    new(src: str) : XmlReader {
+        XmlReader.{src, pos: 0, size: host.sys_str_len(src), stack: [], root_done: false, root_seen: false, owe_end: false, owe_name: ""}
+    }
+
+    /// Current nesting depth (open elements).
+    depth(self) : i64 => host.sys_arr_len(self.stack)
+
+    /// Error text `xml: line N: msg` for the current position.
+    msg(self, text: str) : str {
+        ln = xml_line_at(self.src, self.pos)
+        "xml: line {ln}: {text}"
+    }
+
+    /// Read the next token, or fail on malformed input. At the end of a well-formed document
+    /// every further call returns the `XML_EOF` token.
+    pull(@self) : XmlToken! {
+        if self.owe_end {
+            self.owe_end = false
+            name = self.owe_name
+            return XmlToken.{kind: 2, name, text: "", attr_names: [], attr_vals: []}
+        }
+        if self.depth() == 0 { self.pos = xml_skip_ws(self.src, self.pos, self.size) }
+        if self.pos >= self.size {
+            if self.depth() > 0 {
+                top = self.stack[self.depth() - 1]
+                m = self.msg("unclosed element <{top}>")
+                fail "{m}"
+                return
+            }
+            if !self.root_seen {
+                m = self.msg("no root element")
+                fail "{m}"
+                return
+            }
+            return XmlToken.eof()
+        }
+        c = self.src[self.pos]
+        if c != "<" { return @self.pull_text() }
+        nxt = ""
+        if self.pos + 1 < self.size { nxt = self.src[self.pos + 1] }
+        if nxt == "/" { return @self.pull_end() }
+        if nxt == "?" { return @self.pull_pi() }
+        if nxt == "!" { return @self.pull_bang() }
+        @self.pull_start()
+    }
+
+    /// Character data up to the next `<`.
+    pull_text(@self) : XmlToken! {
+        if self.depth() == 0 {
+            m = self.msg("text outside the root element")
+            fail "{m}"
+            return
+        }
+        start = self.pos
+        p = start
+        while p < self.size {
+            if self.src[p] == "<" { break }
+            p += 1
+        }
+        raw = self.src[start..p]
+        self.pos = p
+        ensure xml_find(raw, "]]>", 0) < 0 else {
+            m = self.msg("']]>' is not allowed in character data")
+            fail "{m}"
+            return
+        }
+        text = xml_unescape(raw) or err {
+            m = self.msg("{err}")
+            fail "{m}"
+        }
+        XmlToken.{kind: 3, name: "", text, attr_names: [], attr_vals: []}
+    }
+
+    /// `</name>`.
+    pull_end(@self) : XmlToken! {
+        p = self.pos + 2
+        e = xml_name_end(self.src, p, self.size)
+        ensure e > p else {
+            m = self.msg("expected an element name after '</'")
+            fail "{m}"
+            return
+        }
+        name = self.src[p..e]
+        q = xml_skip_ws(self.src, e, self.size)
+        ensure q < self.size else {
+            self.pos = q
+            m = self.msg("unterminated end tag </{name}")
+            fail "{m}"
+            return
+        }
+        ensure self.src[q] == ">" else {
+            self.pos = q
+            m = self.msg("expected '>' in end tag </{name}")
+            fail "{m}"
+            return
+        }
+        ensure self.depth() > 0 else {
+            m = self.msg("unexpected end tag </{name}>")
+            fail "{m}"
+            return
+        }
+        top = self.stack[self.depth() - 1]
+        ensure top == name else {
+            m = self.msg("end tag </{name}> does not match <{top}>")
+            fail "{m}"
+            return
+        }
+        self.stack = host.sys_arr_pop(self.stack)
+        self.pos = q + 1
+        if self.depth() == 0 { self.root_done = true }
+        XmlToken.{kind: 2, name, text: "", attr_names: [], attr_vals: []}
+    }
+
+    /// `<?target data?>` (the XML declaration is a PI named `xml`).
+    pull_pi(@self) : XmlToken! {
+        p = self.pos + 2
+        e = xml_name_end(self.src, p, self.size)
+        ensure e > p else {
+            m = self.msg("expected a target after '<?'")
+            fail "{m}"
+            return
+        }
+        target = self.src[p..e]
+        close = xml_find(self.src, "?>", e)
+        ensure close >= 0 else {
+            m = self.msg("unterminated processing instruction")
+            fail "{m}"
+            return
+        }
+        start = xml_skip_ws(self.src, e, close)
+        data = self.src[start..close]
+        self.pos = close + 2
+        XmlToken.{kind: 6, name: target, text: data, attr_names: [], attr_vals: []}
+    }
+
+    /// `<!-- -->`, `<![CDATA[ ]]>` and `<!DOCTYPE >`.
+    pull_bang(@self) : XmlToken! {
+        p = self.pos
+        if self.size - p >= 4 {
+            if self.src[p..(p + 4)] == "<!--" {
+                close = xml_find(self.src, "-->", p + 4)
+                ensure close >= 0 else {
+                    m = self.msg("unterminated comment")
+                    fail "{m}"
+                    return
+                }
+                body = self.src[(p + 4)..close]
+                self.pos = close + 3
+                return XmlToken.{kind: 5, name: "", text: body, attr_names: [], attr_vals: []}
+            }
+        }
+        if self.size - p >= 9 {
+            if self.src[p..(p + 9)] == "<![CDATA[" {
+                ensure self.depth() > 0 else {
+                    m = self.msg("CDATA outside the root element")
+                    fail "{m}"
+                    return
+                }
+                close = xml_find(self.src, "]]>", p + 9)
+                ensure close >= 0 else {
+                    m = self.msg("unterminated CDATA section")
+                    fail "{m}"
+                    return
+                }
+                body = self.src[(p + 9)..close]
+                self.pos = close + 3
+                return XmlToken.{kind: 4, name: "", text: body, attr_names: [], attr_vals: []}
+            }
+        }
+        if self.size - p >= 9 {
+            if self.src[p..(p + 9)] == "<!DOCTYPE" {
+                ensure !self.root_seen else {
+                    m = self.msg("DOCTYPE after the root element")
+                    fail "{m}"
+                    return
+                }
+                q = p + 9
+                brackets = 0
+                found = -1
+                while q < self.size {
+                    ch = self.src[q]
+                    if ch == "[" { brackets += 1 }
+                    if ch == "]" { brackets -= 1 }
+                    if ch == ">" {
+                        if brackets <= 0 {
+                            found = q
+                            break
+                        }
+                    }
+                    q += 1
+                }
+                ensure found >= 0 else {
+                    m = self.msg("unterminated DOCTYPE")
+                    fail "{m}"
+                    return
+                }
+                body = xml_trim(self.src[(p + 9)..found])
+                self.pos = found + 1
+                return XmlToken.{kind: 7, name: "", text: body, attr_names: [], attr_vals: []}
+            }
+        }
+        m = self.msg("unsupported markup declaration")
+        fail "{m}"
+        return
+    }
+
+    /// `<name attr="v" ...>` or `<name .../>`.
+    pull_start(@self) : XmlToken! {
+        ensure !self.root_done else {
+            m = self.msg("content after the root element")
+            fail "{m}"
+            return
+        }
+        ensure self.depth() < 256 else {
+            m = self.msg("elements nested deeper than 256")
+            fail "{m}"
+            return
+        }
+        p = self.pos + 1
+        e = xml_name_end(self.src, p, self.size)
+        ensure e > p else {
+            m = self.msg("expected an element name after '<'")
+            fail "{m}"
+            return
+        }
+        name = self.src[p..e]
+        names = []
+        vals = []
+        q = e
+        empty = false
+        finished = false
+        while !finished {
+            gap = xml_skip_ws(self.src, q, self.size)
+            ensure gap < self.size else {
+                self.pos = gap
+                m = self.msg("unterminated start tag <{name}")
+                fail "{m}"
+                return
+            }
+            ch = self.src[gap]
+            if ch == ">" {
+                q = gap + 1
+                finished = true
+            } else {
+                if ch == "/" {
+                    ensure gap + 1 < self.size else {
+                        self.pos = gap
+                        m = self.msg("unterminated start tag <{name}")
+                        fail "{m}"
+                        return
+                    }
+                    ensure self.src[gap + 1] == ">" else {
+                        self.pos = gap
+                        m = self.msg("expected '>' after '/' in <{name}")
+                        fail "{m}"
+                        return
+                    }
+                    q = gap + 2
+                    empty = true
+                    finished = true
+                } else {
+                    ensure gap > q else {
+                        self.pos = gap
+                        m = self.msg("expected whitespace between attributes of <{name}>")
+                        fail "{m}"
+                        return
+                    }
+                    ae = xml_name_end(self.src, gap, self.size)
+                    ensure ae > gap else {
+                        self.pos = gap
+                        m = self.msg("malformed attribute in <{name}>")
+                        fail "{m}"
+                        return
+                    }
+                    aname = self.src[gap..ae]
+                    eq = xml_skip_ws(self.src, ae, self.size)
+                    ensure eq < self.size else {
+                        self.pos = eq
+                        m = self.msg("unterminated start tag <{name}")
+                        fail "{m}"
+                        return
+                    }
+                    ensure self.src[eq] == "=" else {
+                        self.pos = eq
+                        m = self.msg("attribute {aname} has no value")
+                        fail "{m}"
+                        return
+                    }
+                    vs = xml_skip_ws(self.src, eq + 1, self.size)
+                    ensure vs < self.size else {
+                        self.pos = vs
+                        m = self.msg("unterminated start tag <{name}")
+                        fail "{m}"
+                        return
+                    }
+                    quote = self.src[vs]
+                    if quote != "\"" {
+                        ensure quote == "'" else {
+                            self.pos = vs
+                            m = self.msg("attribute {aname} value must be quoted")
+                            fail "{m}"
+                            return
+                        }
+                    }
+                    ve = xml_find(self.src, quote, vs + 1)
+                    ensure ve >= 0 else {
+                        self.pos = vs
+                        m = self.msg("unterminated attribute value")
+                        fail "{m}"
+                        return
+                    }
+                    raw = self.src[(vs + 1)..ve]
+                    ensure xml_find(raw, "<", 0) < 0 else {
+                        self.pos = vs
+                        m = self.msg("'<' is not allowed in attribute values")
+                        fail "{m}"
+                        return
+                    }
+                    dup = false
+                    for names {
+                        if it == aname { dup = true }
+                    }
+                    ensure !dup else {
+                        self.pos = gap
+                        m = self.msg("duplicate attribute {aname}")
+                        fail "{m}"
+                        return
+                    }
+                    value = xml_unescape(raw) or err {
+                        self.pos = vs
+                        m = self.msg("{err}")
+                        fail "{m}"
+                    }
+                    names = host.sys_arr_push(names, aname)
+                    vals = host.sys_arr_push(vals, value)
+                    q = ve + 1
+                }
+            }
+        }
+        self.pos = q
+        self.root_seen = true
+        if empty {
+            self.owe_end = true
+            self.owe_name = name
+            if self.depth() == 0 { self.root_done = true }
+        } else {
+            self.stack = host.sys_arr_push(self.stack, name)
+        }
+        XmlToken.{kind: 1, name, text: "", attr_names: names, attr_vals: vals}
+    }
+}
+
+/// `s` without leading and trailing whitespace.
++xml_trim(s: str) : str {
+    n = host.sys_str_len(s)
+    lo = xml_skip_ws(s, 0, n)
+    hi = n
+    while hi > lo {
+        if xml_is_ws(s[hi - 1]) { hi -= 1 } else { break }
+    }
+    if lo >= hi { return "" }
+    s[lo..hi]
+}
+
+/// Compact description of every token: `<a id=1>`, `</a>`, `T:text`, `C:cdata`, `#:comment`,
+/// `?:target data`, `!:doctype`, separated by `|`. Fails on malformed XML.
++xml_summary(src: str) : str! {
+    r = XmlReader.new(src)
+    out = ""
+    going = true
+    while going {
+        t = @r.pull() or err { fail "{err}" }
+        piece = ""
+        if t.kind == 0 { going = false }
+        if t.kind == 1 {
+            piece = "<{t.name}"
+            for 0..t.attr_count() { piece = "{piece} {t.attr_names[it]}={t.attr_vals[it]}" }
+            piece = "{piece}>"
+        }
+        if t.kind == 2 { piece = "</{t.name}>" }
+        if t.kind == 3 { piece = "T:{t.text}" }
+        if t.kind == 4 { piece = "C:{t.text}" }
+        if t.kind == 5 { piece = "#:{t.text}" }
+        if t.kind == 6 { piece = "?:{t.name} {t.text}" }
+        if t.kind == 7 { piece = "!:{t.text}" }
+        if going {
+            if out == "" { out = piece } else { out = "{out}|{piece}" }
+        }
+    }
+    out
+}
+
+/// Text content of the first element named `tag` (decoded text and CDATA, nested elements
+/// included), or fail when there is none.
++xml_text_of(src: str, tag: str) : str! {
+    r = XmlReader.new(src)
+    out = ""
+    inside = 0
+    found = false
+    going = true
+    while going {
+        t = @r.pull() or err { fail "{err}" }
+        if t.kind == 0 { going = false }
+        if t.kind == 1 {
+            if inside > 0 {
+                inside += 1
+            } else {
+                if !found {
+                    if t.name == tag {
+                        inside = 1
+                        found = true
+                    }
+                }
+            }
+        }
+        if t.kind == 2 {
+            if inside > 0 {
+                inside -= 1
+                if inside == 0 { going = false }
+            }
+        }
+        if inside > 0 {
+            if t.kind == 3 { out = "{out}{t.text}" }
+            if t.kind == 4 { out = "{out}{t.text}" }
+        }
+    }
+    ensure found else {
+        fail "xml: no element {tag}"
+        return
+    }
+    out
+}
+
+/// Value of attribute `attr` on the first element named `tag`, or fail.
++xml_attr_of(src: str, tag: str, attr: str) : str! {
+    r = XmlReader.new(src)
+    result = ""
+    found = false
+    going = true
+    while going {
+        t = @r.pull() or err { fail "{err}" }
+        if t.kind == 0 { going = false }
+        if t.kind == 1 {
+            if t.name == tag {
+                if t.has_attr(attr) {
+                    result = t.attr(attr) or ""
+                    found = true
+                    going = false
+                }
+            }
+        }
+    }
+    ensure found else {
+        fail "xml: no attribute {attr} on <{tag}>"
+        return
+    }
+    result
+}
+
+/// How many elements named `tag` appear in `src` (fails on malformed XML).
++xml_count(src: str, tag: str) : i64! {
+    r = XmlReader.new(src)
+    n = 0
+    going = true
+    while going {
+        t = @r.pull() or err { fail "{err}" }
+        if t.kind == 0 { going = false }
+        if t.kind == 1 {
+            if t.name == tag { n += 1 }
+        }
+    }
+    n
+}
+
+// --- builder --------------------------------------------------------------------------------
+
+/// Builds an XML document with escaping and well-formedness checks. Methods never panic: the
+/// first mistake is recorded and `finish()` reports it.
++XmlWriter = {
+    /// Output so far. Defaults to `""`.
+    out: str = ""
+    /// Spaces per nesting level, or 0 for compact output. Defaults to `0`.
+    indent: i64 = 0
+    /// Names of the open elements. Defaults to `[]`.
+    stack: _ = []
+    /// Per open element: 1 once it has a child element. Defaults to `[]`.
+    kids: _ = []
+    /// Per open element: 1 once it has text (suppresses pretty-printing inside it). Defaults to `[]`.
+    texts: _ = []
+    /// True while the last start tag has not been closed with `>` yet. Defaults to `false`.
+    open_tag: bool = false
+    /// True once the root element has been closed. Defaults to `false`.
+    root_closed: bool = false
+    /// First error recorded, or empty. Defaults to `""`.
+    problem: str = ""
+
+    /// Writer producing compact output (`indent` 0) or `indent` spaces per level.
+    new(indent: i64) : XmlWriter {
+        n = indent
+        if n < 0 { n = 0 }
+        XmlWriter.{out: "", indent: n, stack: [], kids: [], texts: [], open_tag: false, root_closed: false, problem: ""}
+    }
+
+    /// Number of open elements.
+    depth(self) : i64 => host.sys_arr_len(self.stack)
+
+    /// Record `msg` as the first error.
+    fail_with(@self, msg: str) {
+        if self.problem == "" { self.problem = msg }
+    }
+
+    /// Terminate a pending start tag with `>`.
+    seal(@self) {
+        if self.open_tag {
+            self.out = "{self.out}>"
+            self.open_tag = false
+        }
+    }
+
+    /// Start a new line plus indentation for nesting level `level` (pretty mode only).
+    newline(@self, level: i64) {
+        if self.indent > 0 {
+            pad = ""
+            for 0..(level * self.indent) { pad = "{pad} " }
+            self.out = "{self.out}\n{pad}"
+        }
+    }
+
+    /// Write `<?xml version="1.0" encoding="UTF-8"?>` (only valid before the root element).
+    declaration(@self) {
+        if self.problem != "" { return }
+        if self.out != "" {
+            @self.fail_with("xml: declaration must come first")
+            return
+        }
+        self.out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    }
+
+    /// Open element `name`.
+    open(@self, name: str) {
+        if self.problem != "" { return }
+        if !xml_valid_name(name) {
+            @self.fail_with("xml: invalid element name '{name}'")
+            return
+        }
+        if self.root_closed {
+            @self.fail_with("xml: second root element <{name}>")
+            return
+        }
+        @self.seal()
+        d = self.depth()
+        if d > 0 {
+            if self.texts[d - 1] == 0 { @self.newline(d) }
+            self.kids = host.sys_arr_set(self.kids, d - 1, 1)
+        } else {
+            if self.out != "" { @self.newline(0) }
+        }
+        self.out = "{self.out}<{name}"
+        self.open_tag = true
+        self.stack = host.sys_arr_push(self.stack, name)
+        self.kids = host.sys_arr_push(self.kids, 0)
+        self.texts = host.sys_arr_push(self.texts, 0)
+    }
+
+    /// Add attribute `key="value"` to the element just opened.
+    attr(@self, key: str, value: str) {
+        if self.problem != "" { return }
+        if !self.open_tag {
+            @self.fail_with("xml: attribute '{key}' outside a start tag")
+            return
+        }
+        if !xml_valid_name(key) {
+            @self.fail_with("xml: invalid attribute name '{key}'")
+            return
+        }
+        marker = " {key}=\""
+        tag_start = xml_last_tag_start(self.out)
+        if xml_find(self.out[tag_start..host.sys_str_len(self.out)], marker, 0) >= 0 {
+            @self.fail_with("xml: duplicate attribute '{key}'")
+            return
+        }
+        escaped = xml_escape_attr(value)
+        self.out = "{self.out} {key}=\"{escaped}\""
+    }
+
+    /// Add escaped character data to the current element.
+    text(@self, s: str) {
+        if self.problem != "" { return }
+        d = self.depth()
+        if d == 0 {
+            @self.fail_with("xml: text outside the root element")
+            return
+        }
+        @self.seal()
+        self.texts = host.sys_arr_set(self.texts, d - 1, 1)
+        self.out = "{self.out}{xml_escape_text(s)}"
+    }
+
+    /// Add a CDATA section to the current element (`]]>` inside is split safely).
+    cdata(@self, s: str) {
+        if self.problem != "" { return }
+        d = self.depth()
+        if d == 0 {
+            @self.fail_with("xml: CDATA outside the root element")
+            return
+        }
+        @self.seal()
+        self.texts = host.sys_arr_set(self.texts, d - 1, 1)
+        safe = xml_split_cdata(s)
+        self.out = "{self.out}<![CDATA[{safe}]]>"
+    }
+
+    /// Add a comment (the text must not contain `--`).
+    comment(@self, s: str) {
+        if self.problem != "" { return }
+        if xml_find(s, "--", 0) >= 0 {
+            @self.fail_with("xml: comment may not contain '--'")
+            return
+        }
+        @self.seal()
+        d = self.depth()
+        if d > 0 {
+            if self.texts[d - 1] == 0 { @self.newline(d) }
+        } else {
+            if self.out != "" { @self.newline(0) }
+        }
+        self.out = "{self.out}<!--{s}-->"
+    }
+
+    /// Close the innermost open element (`<a/>` when it is still empty).
+    close(@self) {
+        if self.problem != "" { return }
+        d = self.depth()
+        if d == 0 {
+            @self.fail_with("xml: close without a matching open")
+            return
+        }
+        name = self.stack[d - 1]
+        if self.open_tag {
+            self.out = "{self.out}/>"
+            self.open_tag = false
+        } else {
+            if self.kids[d - 1] == 1 {
+                if self.texts[d - 1] == 0 { @self.newline(d - 1) }
+            }
+            self.out = "{self.out}</{name}>"
+        }
+        self.stack = host.sys_arr_pop(self.stack)
+        self.kids = host.sys_arr_pop(self.kids)
+        self.texts = host.sys_arr_pop(self.texts)
+        if d == 1 { self.root_closed = true }
+    }
+
+    /// Convenience: `<name>text</name>` as a child of the current element.
+    leaf(@self, name: str, s: str) {
+        @self.open(name)
+        @self.text(s)
+        @self.close()
+    }
+
+    /// The finished document, or fail with the first recorded error / unclosed elements.
+    finish(self) : str! {
+        ensure self.problem == "" else {
+            fail "{self.problem}"
+            return
+        }
+        ensure self.depth() == 0 else {
+            top = self.stack[self.depth() - 1]
+            fail "xml: unclosed element <{top}>"
+            return
+        }
+        ensure self.root_closed else {
+            fail "xml: no root element"
+            return
+        }
+        self.out
+    }
+}
+
+/// Offset of the last `<` in `s` (start of the most recent tag), or 0.
++xml_last_tag_start(s: str) : i64 {
+    n = host.sys_str_len(s)
+    found = 0
+    for 0..n {
+        if s[n - 1 - it] == "<" {
+            if found == 0 { found = n - 1 - it }
+        }
+    }
+    found
+}
+
+/// `s` made safe for a CDATA body: every `]]>` becomes `]]]]><![CDATA[>`.
++xml_split_cdata(s: str) : str {
+    out = ""
+    n = host.sys_str_len(s)
+    i = 0
+    while i < n {
+        if i + 3 <= n {
+            if s[i..(i + 3)] == "]]>" {
+                out = "{out}]]]]><![CDATA[>"
+                i += 3
+                continue
+            }
+        }
+        c = s[i]
+        out = "{out}{c}"
+        i += 1
+    }
+    out
+}
+
+/// `<name attr="..">text</name>` in one call (`text` empty gives a self-closing tag).
++xml_element(name: str, attr_names: _, attr_vals: _, text: str) : str! {
+    w = XmlWriter.new(0)
+    @w.open(name)
+    for attr_names { @w.attr(it, attr_vals[index]) }
+    if text != "" { @w.text(text) }
+    @w.close()
+    w.finish()
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+/// Test that escaping and unescaping are inverse for the five predefined entities.
+test "xml escape and unescape" {
+    assert_eq(xml_escape_text("a < b & c > d"), "a &lt; b &amp; c &gt; d")
+    assert_eq(xml_escape_attr("say \"hi\" & 'bye'"), "say &quot;hi&quot; &amp; &apos;bye&apos;")
+    assert_eq(xml_escape_attr("a\nb\tc"), "a&#10;b&#9;c")
+    assert_eq(xml_unescape("&lt;&gt;&amp;&quot;&apos;") or "?", "<>&\"'")
+    assert_eq(xml_unescape("&#65;&#x42;&#x1F600;") or "?", "AB😀")
+    assert_eq(xml_unescape("plain") or "?", "plain")
+    assert_eq(xml_unescape("&nope;") or "err", "err")
+    assert_eq(xml_unescape("&amp") or "err", "err")
+    assert_eq(xml_unescape("&#;") or "err", "err")
+    assert_eq(xml_unescape("&#xZZ;") or "err", "err")
+    assert_eq(xml_unescape("&#0;") or "err", "err")
+    assert_eq(xml_unescape("&#55296;") or "err", "err")
+    raw = "<tag attr=\"v\">&</tag>"
+    assert_eq(xml_unescape(xml_escape_attr(raw)) or "?", raw)
+}
+
+/// Test name validation helpers.
+test "xml names" {
+    #assert(xml_valid_name("a"))
+    #assert(xml_valid_name("_x-1.y"))
+    #assert(xml_valid_name("ns:tag"))
+    #assert(xml_valid_name("é"))
+    #assert(!(xml_valid_name("")))
+    #assert(!(xml_valid_name("1a")))
+    #assert(!(xml_valid_name("-a")))
+    #assert(!(xml_valid_name("a b")))
+    assert_eq(xml_name_end("abc def", 0, 7), 3)
+    assert_eq(xml_name_end("  x", 0, 3), 0)
+    assert_eq(xml_find("hello world", "wor", 0), 6)
+    assert_eq(xml_find("hello", "xyz", 0), -1)
+    assert_eq(xml_line_at("a\nb\nc", 4), 3)
+}
+
+/// Test a document with every token kind.
+test "xml pull parser tokens" {
+    src = "<?xml version=\"1.0\"?>\n<!DOCTYPE note [<!ENTITY x \"y\">]>\n<!-- hi -->\n<note id=\"7\" lang='en'>\n  <to>Amina &amp; co</to>\n  <![CDATA[<raw> & text]]>\n  <br/>\n</note>\n"
+    got = xml_summary(src) or "ERR"
+    want = "?:xml version=\"1.0\"|!:note [<!ENTITY x \"y\">]|#: hi |<note id=7 lang=en>|T:\n  |<to>|T:Amina & co|</to>|T:\n  |C:<raw> & text|T:\n  |<br>|</br>|T:\n|</note>"
+    assert_eq(got, want)
+}
+
+/// Test attribute access on start tokens.
+test "xml token attributes" {
+    r = XmlReader.new("<a x=\"1\" y = '2&amp;3' z=\"\"/>")
+    t = @r.pull() or XmlToken.eof()
+    assert_eq(t.kind, 1)
+    assert_eq(t.name, "a")
+    assert_eq(t.attr_count(), 3)
+    assert_eq(t.attr("x") or "?", "1")
+    assert_eq(t.attr("y") or "?", "2&3")
+    assert_eq(t.attr("z") or "?", "")
+    assert_eq(t.attr("w") or "none", "none")
+    #assert(t.has_attr("y"))
+    #assert(!(t.has_attr("w")))
+    e = @r.pull() or XmlToken.eof()
+    assert_eq(e.kind, 2)
+    assert_eq(e.name, "a")
+    end = @r.pull() or XmlToken.eof()
+    assert_eq(end.kind, 0)
+    again = @r.pull() or XmlToken.eof()
+    assert_eq(again.kind, 0)
+    assert_eq(r.depth(), 0)
+}
+
+/// Test nesting depth and mixed content.
+test "xml mixed content and nesting" {
+    r = XmlReader.new("<a>one<b>two<c/></b>three</a>")
+    kinds = []
+    depths = []
+    going = true
+    while going {
+        t = @r.pull() or XmlToken.eof()
+        kinds = host.sys_arr_push(kinds, t.kind)
+        depths = host.sys_arr_push(depths, r.depth())
+        if t.kind == 0 { going = false }
+    }
+    assert_eq(kinds[0], 1)
+    assert_eq(kinds[1], 3)
+    assert_eq(host.sys_arr_len(kinds), 10)
+    assert_eq(depths[0], 1)
+    assert_eq(depths[4], 2)
+    assert_eq(depths[6], 1)
+    assert_eq(depths[8], 0)
+    assert_eq(xml_summary("<a>one<b>two<c/></b>three</a>") or "ERR", "<a>|T:one|<b>|T:two|<c>|</c>|</b>|T:three|</a>")
+}
+
+/// Test the query helpers.
+test "xml query helpers" {
+    src = "<lib><book id=\"1\"><t>Dune</t></book><book id=\"2\"><t>Emma <![CDATA[& Co]]></t></book></lib>"
+    assert_eq(xml_count(src, "book") or -1, 2)
+    assert_eq(xml_count(src, "none") or -1, 0)
+    assert_eq(xml_text_of(src, "t") or "?", "Dune")
+    assert_eq(xml_text_of(src, "lib") or "?", "DuneEmma & Co")
+    assert_eq(xml_text_of(src, "zzz") or "none", "none")
+    assert_eq(xml_attr_of(src, "book", "id") or "?", "1")
+    assert_eq(xml_attr_of(src, "book", "x") or "none", "none")
+    assert_eq(xml_attr_of(src, "t", "id") or "none", "none")
+}
+
+/// Test that malformed documents fail with line numbers.
+test "xml parser errors" {
+    assert_eq(xml_summary("") or "err", "err")
+    assert_eq(xml_summary("<a>") or "unclosed", "unclosed")
+    assert_eq(xml_summary("<a></b>") or "mismatch", "mismatch")
+    assert_eq(xml_summary("</a>") or "stray", "stray")
+    assert_eq(xml_summary("<a/><b/>") or "two roots", "two roots")
+    assert_eq(xml_summary("text") or "text", "text")
+    assert_eq(xml_summary("<a x=1/>") or "unquoted", "unquoted")
+    assert_eq(xml_summary("<a x=\"1\" x=\"2\"/>") or "dup", "dup")
+    assert_eq(xml_summary("<a x=\"1\"y=\"2\"/>") or "nospace", "nospace")
+    assert_eq(xml_summary("<a x/>") or "novalue", "novalue")
+    assert_eq(xml_summary("<a x=\"<\"/>") or "lt", "lt")
+    assert_eq(xml_summary("<a>&bogus;</a>") or "entity", "entity")
+    assert_eq(xml_summary("<a><!-- open</a>") or "comment", "comment")
+    assert_eq(xml_summary("<a><![CDATA[open</a>") or "cdata", "cdata")
+    assert_eq(xml_summary("<a>x]]>y</a>") or "cdata end", "cdata end")
+    assert_eq(xml_summary("<a") or "partial", "partial")
+    assert_eq(xml_summary("<?pi") or "pi", "pi")
+    assert_eq(xml_summary("<a/>trailing") or "trail", "trail")
+    bad = xml_summary("<a>\n<b>\n</c></a>") or err { "{err}" }
+    assert_eq(bad, "xml: line 3: end tag </c> does not match <b>")
+}
+
+/// Test the nesting limit.
+test "xml depth limit" {
+    open = ""
+    close = ""
+    for 0..257 {
+        open = "{open}<a>"
+        close = "{close}</a>"
+    }
+    assert_eq(xml_summary("{open}{close}") or "too deep", "too deep")
+    ok_open = ""
+    ok_close = ""
+    for 0..100 {
+        ok_open = "{ok_open}<a>"
+        ok_close = "{ok_close}</a>"
+    }
+    assert_eq(xml_count("{ok_open}{ok_close}", "a") or -1, 100)
+}
+
+/// Test compact building with escaping.
+test "xml writer compact" {
+    w = XmlWriter.new(0)
+    @w.declaration()
+    @w.open("user")
+    @w.attr("id", "7")
+    @w.attr("note", "a \"q\" & <b>")
+    @w.leaf("name", "Amina & co")
+    @w.open("empty")
+    @w.close()
+    @w.cdata("raw <x> ]]> end")
+    @w.comment(" done ")
+    @w.close()
+    want = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><user id=\"7\" note=\"a &quot;q&quot; &amp; &lt;b&gt;\"><name>Amina &amp; co</name><empty/><![CDATA[raw <x> ]]]]><![CDATA[> end]]><!-- done --></user>"
+    assert_eq(w.finish() or "ERR", want)
+    summary = xml_summary(w.finish() or "") or "ERR"
+    assert_eq(summary, "?:xml version=\"1.0\" encoding=\"UTF-8\"|<user id=7 note=a \"q\" & <b>>|<name>|T:Amina & co|</name>|<empty>|</empty>|C:raw <x> ]]|C:> end|#: done |</user>")
+}
+
+/// Test pretty-printed building (children indented, text elements stay inline).
+test "xml writer pretty" {
+    w = XmlWriter.new(2)
+    @w.open("root")
+    @w.open("item")
+    @w.attr("k", "v")
+    @w.text("one")
+    @w.close()
+    @w.open("group")
+    @w.leaf("a", "1")
+    @w.open("b")
+    @w.close()
+    @w.close()
+    @w.close()
+    want = "<root>\n  <item k=\"v\">one</item>\n  <group>\n    <a>1</a>\n    <b/>\n  </group>\n</root>"
+    assert_eq(w.finish() or "ERR", want)
+}
+
+/// Test that builder mistakes surface in finish().
+test "xml writer errors" {
+    bad_name = XmlWriter.new(0)
+    @bad_name.open("1bad")
+    assert_eq(bad_name.finish() or "err", "err")
+    unclosed = XmlWriter.new(0)
+    @unclosed.open("a")
+    assert_eq(unclosed.finish() or "err", "err")
+    empty = XmlWriter.new(0)
+    assert_eq(empty.finish() or "err", "err")
+    two = XmlWriter.new(0)
+    @two.open("a")
+    @two.close()
+    @two.open("b")
+    assert_eq(two.finish() or "err", "err")
+    late_attr = XmlWriter.new(0)
+    @late_attr.open("a")
+    @late_attr.text("x")
+    @late_attr.attr("k", "v")
+    assert_eq(late_attr.finish() or "err", "err")
+    dup = XmlWriter.new(0)
+    @dup.open("a")
+    @dup.attr("k", "1")
+    @dup.attr("k", "2")
+    assert_eq(dup.finish() or "err", "err")
+    stray = XmlWriter.new(0)
+    @stray.close()
+    assert_eq(stray.finish() or "err", "err")
+    top_text = XmlWriter.new(0)
+    @top_text.text("x")
+    assert_eq(top_text.finish() or "err", "err")
+    bad_comment = XmlWriter.new(0)
+    @bad_comment.open("a")
+    @bad_comment.comment("a--b")
+    assert_eq(bad_comment.finish() or "err", "err")
+    first_err = XmlWriter.new(0)
+    @first_err.open("")
+    @first_err.open("ok")
+    assert_eq(first_err.finish() or "e", "e")
+    msg = first_err.finish() or err { "{err}" }
+    assert_eq(msg, "xml: invalid element name ''")
+}
+
+/// Test that built documents re-parse to the same tokens.
+test "xml build then parse roundtrip" {
+    w = XmlWriter.new(0)
+    @w.open("order")
+    @w.attr("id", "42")
+    @w.open("line")
+    @w.attr("sku", "A&B")
+    @w.text("2 < 3")
+    @w.close()
+    @w.leaf("note", "say \"hi\"")
+    @w.close()
+    doc = w.finish() or "ERR"
+    assert_eq(xml_attr_of(doc, "order", "id") or "?", "42")
+    assert_eq(xml_attr_of(doc, "line", "sku") or "?", "A&B")
+    assert_eq(xml_text_of(doc, "line") or "?", "2 < 3")
+    assert_eq(xml_text_of(doc, "note") or "?", "say \"hi\"")
+    assert_eq(xml_count(doc, "line") or -1, 1)
+    one = xml_element("p", ["a", "b"], ["1", "x&y"], "text") or "ERR"
+    assert_eq(one, "<p a=\"1\" b=\"x&amp;y\">text</p>")
+    solo = xml_element("br", [], [], "") or "ERR"
+    assert_eq(solo, "<br/>")
+    assert_eq(xml_element("1x", [], [], "") or "err", "err")
+}

@@ -1,0 +1,71 @@
+//! std.sys.sync — mutex and once helpers (Go sync subset)
+//!
+//! Import with:
+//!   use std.sys.sync
+//!
+//! Cross-fiber counters use module-local `shared` cells (see tests); `SpinMutex` covers
+//! single-fiber critical sections without heap allocation.
+
+/// `SpinMutex` is a spin lock around one slot.
++SpinMutex = {
+    /// Slot on `SpinMutex` (`i64`). Defaults to `0`.
+    slot: i64 = 0
+
+    /// Create a fresh `SpinMutex`.
+    new() : SpinMutex => SpinMutex.{slot: 0}
+
+    /// Try lock on this `SpinMutex`.
+    try_lock(@self) : bool {
+        if self.slot == 0 {
+            self.slot = 1
+            return true
+        }
+        false
+    }
+
+    /// Unlock on this `SpinMutex`.
+    unlock(@self) {
+        self.slot = 0
+    }
+}
+
+/// `Once` runs a function a single time.
++Once = {
+    /// Done on `Once` (`i64`). Defaults to `0`.
+    done: i64 = 0
+
+    /// Create a fresh `Once`.
+    new() : Once => Once.{done: 0}
+
+    /// Call on this `Once`.
+    call(@self) : bool {
+        if self.done != 0 { return false }
+        self.done = 1
+        true
+    }
+}
+
+/// Test that spin mutex.
+test "spin mutex" {
+    m = SpinMutex.new()
+    #assert(@m.try_lock())
+    #assert(!(@m.try_lock()))
+    @m.unlock()
+    #assert(@m.try_lock())
+    @m.unlock()
+}
+
+/// Test that once.
+test "once" {
+    o = Once.new()
+    #assert(@o.call())
+    #assert(!(@o.call()))
+    #assert(!(@o.call()))
+}
+
+/// Test that shared counter pattern for atomics.
+test "shared counter pattern for atomics" {
+    hits = shared 0
+    @hits += 3
+    assert_eq(hits.load(), 3)
+}

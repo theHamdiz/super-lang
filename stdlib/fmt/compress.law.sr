@@ -1,0 +1,14 @@
+//! Laws for std.fmt.compress — real-body (`compress_xor32` / `compress_u32`).
+//! Adler/CRC string walks need host strlen (docs/LAWS_STATUS.md).
+//! AI agents must not edit this file; put discharges in `compress.proof.sr`.
+
+#law("compress_xor32 self-inverse on literals")
+compress_xor32_model() {
+    #assert(compress_xor32(compress_xor32(7, 3), 3) == 7)
+    #assert(compress_xor32(0, 0) == 0)
+}
+
+#law("compress_u32 masks above 32 bits")
+compress_u32_mask() {
+    #assert(compress_u32(4294967297) == 1)
+}

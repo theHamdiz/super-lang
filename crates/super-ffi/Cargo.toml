@@ -1,0 +1,22 @@
+[package]
+name = "super-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-boilerplate host FFI for embedding Super (Rust + C ABI + C++20)"
+
+[dependencies]
+super-core.workspace = true
+super-frontend.workspace = true
+super-runtime.workspace = true
+
+[lib]
+# `super` is a Rust keyword — cdylib/staticlib ship as libsuper_ffi.*
+name = "super_ffi"
+path = "src/lib.rs"
+# rlib + staticlib only: cdylib needs host libs (e.g. -lexecinfo) that cross
+# FreeBSD/musl linkers do not provide on GitHub runners.
+crate-type = ["rlib", "staticlib"]
+
+[lints]
+workspace = true

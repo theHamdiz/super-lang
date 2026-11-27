@@ -1,0 +1,8 @@
+//! Clean Super algo fixture — must pass LAW-BENCH-001.
+use std.core.collections
+
++main() {
+    s = 0
+    for [1, 2, 3, 4] { s += it }
+    print("CHECKSUM={s}")
+}

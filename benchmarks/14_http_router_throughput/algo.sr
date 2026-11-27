@@ -1,0 +1,242 @@
+// 14_http_router_throughput — 30k simulated HTTP requests: build wire text → parse request line and
+// headers → radix route match → HMAC-SHA256 bearer token → JSON body validation → status checksum.
+// Emit uses stdlib StrBuilder. Lookup / token verify / header scan use range APIs (LAW-BENCH-001).
+use std.core.str
+use std.sec.sha2
+use std.core.collections
+use std.net.radix
+
++NREQ = 30000
++NOW = 1700000000
++MAXNODES = 64
+
+// Routes 1..7 and 10 need a bearer token.
+AUTH = [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1]
+
+Wire = {
+    method: i64 = 0
+    has_body: bool = false
+    kind: i64 = 0
+    a: i64 = 0
+    b: i64 = 0
+}
+
+pick_endpoint(@rng: LcgGlibc, a: i64) : Wire {
+    if a < 5 { return Wire.{kind: 0} }
+    if a < 15 { return Wire.{kind: 1} }
+    if a < 35 { return Wire.{kind: 2} }
+    if a < 45 { return Wire.{kind: 3} }
+    if a < 55 { return Wire.{method: POST, has_body: true, kind: 4} }
+    if a < 65 { return Wire.{kind: 5} }
+    if a < 70 { return Wire.{method: PUT, has_body: true, kind: 6} }
+    if a < 75 { return Wire.{method: DELETE, kind: 7} }
+    if a < 85 { return Wire.{kind: 8, a: @rng.draw(10), b: @rng.draw(100)} }
+    if a < 90 { return Wire.{method: POST, has_body: true, kind: 9} }
+    if a < 95 { return Wire.{kind: 10} }
+    if a < 98 { return Wire.{kind: 11} }
+    Wire.{method: DELETE, kind: 12}
+}
+
+emit_path(@rng: LcgGlibc, w: Wire, @path: StrBuilder) {
+    @path.clear()
+    when w.kind {
+        0 => @path.lit("/health")
+        1 => @path.lit("/users")
+        2 => {
+            @path.lit("/users/")
+            id_into(@rng, @path)
+        }
+        3 => {
+            @path.lit("/users/")
+            id_into(@rng, @path)
+            @path.lit("/orders")
+        }
+        4 => @path.lit("/orders")
+        5 => {
+            @path.lit("/orders/")
+            id_into(@rng, @path)
+        }
+        6 => {
+            @path.lit("/orders/")
+            id_into(@rng, @path)
+        }
+        7 => {
+            @path.lit("/orders/")
+            id_into(@rng, @path)
+        }
+        8 => {
+            @path.lit("/static/a")
+            @path.dec(w.a)
+            @path.lit("/f")
+            @path.dec(w.b)
+            @path.lit(".js")
+        }
+        9 => @path.lit("/auth/login")
+        10 => {
+            @path.lit("/v1/items/")
+            id_into(@rng, @path)
+            @path.lit("/tags/t")
+            tag = @rng.draw(50)
+            @path.dec(tag)
+        }
+        11 => {
+            @path.lit("/nope/")
+            id_into(@rng, @path)
+        }
+        else => @path.lit("/users")
+    }
+}
+
+build_request(
+    @rng: LcgGlibc,
+    key,
+    @path: StrBuilder,
+    @wire: StrBuilder,
+    @tok: StrBuilder,
+    @body: StrBuilder,
+    @scratch: StrBuilder,
+    @pass: StrBuilder
+) : str {
+    a = @rng.draw(100)
+    w = pick_endpoint(@rng, a)
+    emit_path(@rng, w, @path)
+    t = @rng.draw(20)
+    uid = 1 + @rng.draw(9999)
+    ex = @rng.draw(1000)
+    has_token = t >= 2
+    if has_token {
+        exp = if t == 4 { NOW - 1 - ex } else { NOW + 1000 + ex }
+        @tok.clear()
+        @tok.dec(uid)
+        @tok.ascii(46)
+        @tok.dec(exp)
+        claims_n = tok.len()
+        @tok.ascii(46)
+        if t < 4 {
+            sha2_hmac_sig8_forged_into_range(tok.h, key, tok.text(), 0, claims_n)
+        } else {
+            sha2_hmac_sig8_into_range(tok.h, key, tok.text(), 0, claims_n)
+        }
+    }
+    @body.clear()
+    if w.has_body {
+        v = @rng.draw(10)
+        sp = if @rng.draw(2) == 1 { " " } else { "" }
+        if a < 55 {
+            order_body_into(@rng, v, sp, @body, @scratch)
+        } else {
+            if a < 70 {
+                update_body_into(@rng, v, sp, @body)
+            } else {
+                login_body_into(@rng, v, sp, @body, @scratch, @pass)
+            }
+        }
+    }
+    @wire.clear()
+    @wire.lit(method_lit(w.method))
+    @wire.cat(path)
+    @wire.lit(" HTTP/1.1\r\nHost: api.local\r\n")
+    if has_token {
+        @wire.lit("Authorization: Bearer ")
+        @wire.cat(tok)
+        @wire.lit("\r\n")
+    }
+    if w.has_body {
+        @wire.lit("Content-Length: ")
+        @wire.dec(body.len())
+        @wire.lit("\r\n")
+    }
+    @wire.lit("\r\n")
+    if w.has_body { @wire.cat(body) }
+    wire.text()
+}
+
+router() : RadixRouter {
+    r = radix_new(MAXNODES)
+    @r.add("/health", GET, 0)
+    @r.add("/users", GET, 1)
+    @r.add("/users/:id", GET, 2)
+    @r.add("/users/:id/orders", GET, 3)
+    @r.add("/orders", POST, 4)
+    @r.add("/orders/:id", GET, 5)
+    @r.add("/orders/:id", PUT, 6)
+    @r.add("/orders/:id", DELETE, 7)
+    @r.add("/static/*path", GET, 8)
+    @r.add("/auth/login", POST, 9)
+    @r.add("/v1/items/:id/tags/:tag", GET, 10)
+    r
+}
+
+Outcome = {
+    status: i64 = 0
+    pid: i64 = 0
+}
+
+handle(req: str, n: i64, rt: RadixRouter, key) : Outcome {
+    method = request_method(req)
+    ensure method >= 0 else { return Outcome.{status: 400} }
+    po = byte_find(req, " ") + 1
+    pe = byte_find_from(req, " ", po)
+    p = byte_find(req, "\r\n") + 2
+    tok_lo, tok_hi, clen = -1, -1, -1
+    while p < n && !byte_match_at(req, "\r\n", p) {
+        le = byte_find_from(req, "\r\n", p)
+        if byte_match_at(req, "Authorization: Bearer ", p) {
+            tok_lo = p + 22
+            tok_hi = le
+        } else {
+            if byte_match_at(req, "Content-Length: ", p) {
+                clen = parse_uint_range(req, p + 16, le)
+            }
+        }
+        p = le + 2
+    }
+    body_lo = p + 2
+    ensure clen < 0 || clen == n - body_lo else { return Outcome.{status: 400} }
+    m = rt.lookup_range(req, po, pe, method)
+    ensure m.status == 0 else { return Outcome.{status: m.status} }
+    rid, pid = m.rid, m.pid
+    if AUTH[rid] == 1 {
+        uid = if tok_lo >= 0 { bearer_uid_range(req, tok_lo, tok_hi, key, NOW) } else { -1 }
+        ensure uid >= 0 else { return Outcome.{status: 401, pid} }
+        ensure !((rid == 6 || rid == 7) && uid % 13 == 0) else { return Outcome.{status: 403, pid} }
+    }
+    ensure !m.bad_id else { return Outcome.{status: 400, pid} }
+    if rid == 4 || rid == 6 || rid == 9 {
+        ensure body_valid_range(rid, req, body_lo, n - body_lo) else { return Outcome.{status: 400, pid} }
+    }
+    Outcome.{status: route_status(rid, pid), pid}
+}
+
+route_status(rid: i64, pid: i64) : i64 {
+    when rid {
+        2 => if pid > 90000 { 404 } else { 200 }
+        4 => 201
+        5 => if pid % 7 == 0 { 404 } else { 200 }
+        7 => 204
+        else => 200
+    }
+}
+
++main() {
+    key, rt, rng = sha2_fill_key32(), router(), LcgGlibc.{s: 140014}
+    path = str_builder_fixed(128)
+    wire = str_builder_fixed(512)
+    tok = str_builder_fixed(64)
+    body = str_builder_fixed(256)
+    scratch = str_builder_fixed(32)
+    pass = str_builder_fixed(32)
+    cs, sum_pid, ok2xx = 0, 0, 0
+    by_status = [0; 600]
+    for i in 0..NREQ {
+        req = build_request(@rng, key, @path, @wire, @tok, @body, @scratch, @pass)
+        o = handle(req, wire.len(), rt, key)
+        by_status[o.status] += 1
+        cs += o.status * (i % 97 + 1)
+        sum_pid += o.pid
+        ok2xx += 1 if o.status < 300
+    }
+    mix = (0..600).map(by_status[it] * (it % 53 + 1) * (it / 100 + 1)).sum()
+    cs += sum_pid + 5 * ok2xx + 7 * mix
+    print("CHECKSUM={cs}")
+}

@@ -1,0 +1,25 @@
+//! Pattern macros are ordinary Super source: `#name { (pattern) => { template } }`.
+//! Run: super test examples/doc_macros/main.sr
+
+/// Square any expression; `$x` is evaluated as one unit.
+#square {
+    ($x:expr) => { $x * $x }
+}
+
+/// Largest of one or more values; `$a` and `$b` are hygienic locals.
+#max_of {
+    ($only:expr) => { $only }
+    ($head:expr, $($rest:expr),+) => {
+        $a = $head
+        $b = #max_of($($rest),+)
+        if $a > $b { $a } else { $b }
+    }
+}
+
+test "user macros are ordinary source" {
+    #assert(#square(3) == 9)
+    #assert(#square(1 + 2) == 9)
+    assert_eq(#max_of(4, 9, 2), 9)
+    routes = ["/a", "/b"]
+    assert_eq(len(routes), 2)
+}

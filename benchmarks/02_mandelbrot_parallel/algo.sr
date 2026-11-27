@@ -1,0 +1,27 @@
+// 02_mandelbrot_parallel - 1024x1024 maxiter 128 (OpenMP row parallel + reduction)
++W = 1024
++H = 1024
++MAXIT = 128
+
++main() {
+    cs = 0
+    par y in 0..H {
+        cy = (y * 1.0 / H) * 2.0 - 1.0
+        local = 0
+        for x in 0..W {
+            cx = (x * 1.0 / W) * 3.5 - 2.5
+            zx, zy, iter = 0.0, 0.0, 0
+            for 0..MAXIT {
+                zx2 = zx * zx
+                zy2 = zy * zy
+                break if zx2 + zy2 > 4.0
+                zy = 2.0 * zx * zy + cy
+                zx = zx2 - zy2 + cx
+                iter += 1
+            }
+            local += iter
+        }
+        cs += local
+    }
+    print("CHECKSUM={cs}")
+}

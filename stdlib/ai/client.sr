@@ -1,0 +1,539 @@
+//! std.ai.client — shared HTTP client for generative AI providers
+//!
+//! Import with:
+//!   use std.ai.client
+//!
+//! Providers (openai, claude, gemini, …) build on `AiClient`. Live calls use
+//! `std.net.http.Client`. Offline tests use `push_mock` so `super test` never
+//! needs network credentials. Every method on `+AiClient` is public (type export).
+
+use std.core.str
+use std.core.collections
+use std.fmt.json
+use std.net.http
+use std.sec.vault
+
+/// Modality tags.
++AI_TEXT = "text"
++AI_CHAT = "chat"
++AI_IMAGE = "image"
++AI_AUDIO = "audio"
++AI_VIDEO = "video"
++AI_EMBED = "embed"
++AI_TTS = "tts"
++AI_STT = "stt"
+
+/// Auth header style for the provider wire format.
++AI_AUTH_BEARER = "bearer"
++AI_AUTH_X_API_KEY = "x-api-key"
++AI_AUTH_XI_API_KEY = "xi-api-key"
++AI_AUTH_QUERY = "query"
++AI_AUTH_ARK = "ark"
+
+/// One chat / completion message.
++AiMessage = {
+    role: str = "user"
+    content: str = ""
+    /// Optional name (OpenAI tool/function messages).
+    name: str = ""
+}
+
+/// One tool / function definition (JSON Schema parameters as a JSON object string).
++AiTool = {
+    name: str = ""
+    description: str = ""
+    parameters_json: str = "{}"
+}
+
+/// Unified request across providers.
++AiRequest = {
+    model: str = ""
+    modality: str = "chat"
+    messages: _ = []
+    prompt: str = ""
+    system: str = ""
+    temperature: f64 = 0.7
+    max_tokens: i64 = 1024
+    top_p: f64 = 1.0
+    stream: bool = false
+    /// Tool definitions (`AiTool` array). Empty = none.
+    tools: _ = []
+    /// Extra provider JSON object fragment (no surrounding braces) or empty.
+    extra_json: str = ""
+    /// Image/audio/video URL or data URI when relevant.
+    media_url: str = ""
+    /// Voice / size / quality hints.
+    voice: str = ""
+    size: str = "1024x1024"
+    /// Seconds for audio/video.
+    duration_s: i64 = 0
+    /// Stop sequences (string array).
+    stop: _ = []
+}
+
+/// Unified response.
++AiResponse = {
+    ok: bool = false
+    provider: str = ""
+    model: str = ""
+    modality: str = ""
+    text: str = ""
+    json: str = ""
+    status: i64 = 0
+    error: str = ""
+    usage_in: i64 = 0
+    usage_out: i64 = 0
+    /// Finish reason when the provider reports one (`stop`, `length`, `tool_calls`, …).
+    finish: str = ""
+    /// Embedding vector when modality is embed (f64 array); empty otherwise.
+    embedding: _ = []
+    /// Tool-call JSON array fragment when present.
+    tool_calls: str = ""
+    /// Binary / base64 payload for TTS/image when decoded as text is unsuitable.
+    media_b64: str = ""
+}
+
+/// Transport + auth + mock queue shared by every provider facade.
++AiClient = {
+    provider: str = ""
+    base_url: str = ""
+    api_key: str = ""
+    /// `AI_AUTH_*` style.
+    auth: str = "bearer"
+    /// Extra static headers: flat [name, value, …].
+    extra_headers: _ = []
+    /// HTTP timeout in milliseconds.
+    timeout_ms: i64 = 120000
+    /// When true, `request` returns fixtures instead of HTTP.
+    offline: bool = true
+    /// Last raw request body (for tests / debugging).
+    last_body: str = ""
+    /// Last URL.
+    last_url: str = ""
+    /// Last response status (live or mocked).
+    last_status: i64 = 0
+    /// Mock queue of JSON (or raw) response bodies.
+    mocks: _ = []
+
+    /// Construct a client. Defaults to offline so tests never hit the network.
+    new(provider: str, base_url: str, api_key: str) : AiClient {
+        AiClient.{
+            provider,
+            base_url,
+            api_key,
+            auth: AI_AUTH_BEARER,
+            extra_headers: [],
+            timeout_ms: 120000,
+            offline: true,
+            last_body: "",
+            last_url: "",
+            last_status: 0,
+            mocks: []
+        }
+    }
+
+    /// Construct with an explicit auth style.
+    with_auth(provider: str, base_url: str, api_key: str, auth: str) : AiClient {
+        c = AiClient.new(provider, base_url, api_key)
+        c.auth = auth
+        c
+    }
+
+    /// Load API key from a vault KV path.
+    from_vault(provider: str, base_url: str, v: Vault, token: str, mount: str, path: str, key: str) : AiClient {
+        k = v.get(token, mount, path, key, 0) or ""
+        AiClient.new(provider, base_url, k)
+    }
+
+    /// Switch offline / live. Live uses `std.net.http.Client`.
+    set_offline(@self, on: bool) : bool {
+        self.offline = on
+        on
+    }
+
+    /// Override HTTP timeout.
+    set_timeout(@self, ms: i64) : i64 {
+        self.timeout_ms = ms
+        ms
+    }
+
+    /// Set auth style (`AI_AUTH_*`).
+    set_auth(@self, style: str) : str {
+        self.auth = style
+        style
+    }
+
+    /// Replace extra headers (flat name/value pairs).
+    set_headers(@self, headers: _) : i64 {
+        self.extra_headers = headers
+        len(headers)
+    }
+
+    /// Push a mock body for the next offline `request`.
+    push_mock(@self, body: str) : i64 {
+        self.mocks = arr_push(self.mocks, body)
+        len(self.mocks)
+    }
+
+    /// Pop the next mock body, or `""`.
+    take_mock(@self) : str {
+        n = len(self.mocks)
+        ensure n > 0 else { return "" }
+        body = self.mocks[0]
+        rest = []
+        for 1..n { rest = arr_push(rest, self.mocks[it]) }
+        self.mocks = rest
+        body
+    }
+
+    /// Build OpenAI-compatible chat/completions JSON (also DeepSeek / OpenRouter).
+    chat_body(_self, req: AiRequest) : str {
+        msgs = "["
+        ms = req.messages
+        if req.system != "" {
+            msgs = msgs + "{\"role\":\"system\",\"content\":" + ai_json_str(req.system) + "}"
+            if len(ms) > 0 { msgs = msgs + "," }
+        }
+        for ms {
+            if index > 0 { msgs = msgs + "," }
+            msgs = msgs + "{\"role\":\"" + it.role + "\",\"content\":" + ai_json_str(it.content) + "}"
+        }
+        msgs = msgs + "]"
+        body = "{\"model\":" + ai_json_str(req.model) + ",\"messages\":" + msgs
+        body = body + ",\"temperature\":" + "{req.temperature}"
+        body = body + ",\"max_tokens\":" + "{req.max_tokens}"
+        body = body + ",\"top_p\":" + "{req.top_p}"
+        if req.stream { body = body + ",\"stream\":true" }
+        tools = req.tools
+        if len(tools) > 0 {
+            body = body + ",\"tools\":["
+            for tools {
+                if index > 0 { body = body + "," }
+                body = body + "{\"type\":\"function\",\"function\":{\"name\":" + ai_json_str(it.name)
+                body = body + ",\"description\":" + ai_json_str(it.description)
+                body = body + ",\"parameters\":" + it.parameters_json + "}}"
+            }
+            body = body + "]"
+        }
+        stops = req.stop
+        if len(stops) > 0 {
+            body = body + ",\"stop\":["
+            for stops {
+                if index > 0 { body = body + "," }
+                body = body + ai_json_str(it)
+            }
+            body = body + "]"
+        }
+        if req.extra_json != "" { body = body + "," + req.extra_json }
+        body + "}"
+    }
+
+    /// Auth + content-type headers for an outbound call.
+    auth_headers(self) : _ {
+        hs = ["Content-Type", HTTP_JSON, "Accept", HTTP_JSON]
+        if self.auth == AI_AUTH_BEARER && self.api_key != "" {
+            hs = arr_push(hs, "Authorization")
+            hs = arr_push(hs, "Bearer " + self.api_key)
+        }
+        if self.auth == AI_AUTH_X_API_KEY && self.api_key != "" {
+            hs = arr_push(hs, "x-api-key")
+            hs = arr_push(hs, self.api_key)
+        }
+        if self.auth == AI_AUTH_XI_API_KEY && self.api_key != "" {
+            hs = arr_push(hs, "xi-api-key")
+            hs = arr_push(hs, self.api_key)
+        }
+        if self.auth == AI_AUTH_ARK && self.api_key != "" {
+            hs = arr_push(hs, "Authorization")
+            hs = arr_push(hs, "Bearer " + self.api_key)
+        }
+        eh = self.extra_headers
+        for eh {
+            hs = arr_push(hs, it)
+        }
+        hs
+    }
+
+    /// Resolve URL; for `AI_AUTH_QUERY` appends `?key=` / `&key=`.
+    resolve_url(self, path: str) : str {
+        url = self.base_url + path
+        if self.auth == AI_AUTH_QUERY && self.api_key != "" {
+            sep = "?"
+            if contains(url, "?") { sep = "&" }
+            return url + sep + "key=" + self.api_key
+        }
+        url
+    }
+
+    /// Perform POST `path` with `body`. Offline pops a mock; live uses HTTP.
+    request(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        self.last_url = self.resolve_url(path)
+        self.last_body = body
+        if self.offline {
+            raw = @self.take_mock()
+            if raw == "" {
+                raw = "{\"ok\":true,\"text\":\"offline-" + self.provider + "\",\"model\":" + ai_json_str(req.model) + "}"
+            }
+            self.last_status = 200
+            return ai_parse_response(self.provider, req, 200, raw)
+        }
+        ensure self.api_key != "" else {
+            self.last_status = 0
+            return AiResponse.{
+                ok: false, provider: self.provider, model: req.model, modality: req.modality,
+                text: "", json: "", status: 0, error: "ai: missing api_key", usage_in: 0, usage_out: 0,
+                finish: "", embedding: [], tool_calls: "", media_b64: ""
+            }
+        }
+        http = Client.new()
+        http.timeout_ms = self.timeout_ms
+        hs = self.auth_headers()
+        res = @http.fetch("POST", self.last_url, hs, body) or err {
+            self.last_status = 0
+            @http.close_idle()
+            return AiResponse.{
+                ok: false, provider: self.provider, model: req.model, modality: req.modality,
+                text: "", json: "", status: 0, error: "ai: http failed: {err}", usage_in: 0, usage_out: 0,
+                finish: "", embedding: [], tool_calls: "", media_b64: ""
+            }
+        }
+        @http.close_idle()
+        self.last_status = res.status
+        ai_parse_response(self.provider, req, res.status, res.body)
+    }
+
+    /// Back-compat alias used by older provider wrappers.
+    complete(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        @self.request(path, req, body)
+    }
+}
+
+/// Escape `s` as a JSON string literal (including quotes).
++ai_json_str(s: str) : str {
+    out = "\""
+    n = byte_len(s)
+    for 0..n {
+        c = s[it]
+        if c == "\\" { out = out + "\\\\" }
+        if c == "\"" { out = out + "\\\"" }
+        if c == "\n" { out = out + "\\n" }
+        if c == "\r" { out = out + "\\r" }
+        if c == "\t" { out = out + "\\t" }
+        if c != "\\" && c != "\"" && c != "\n" && c != "\r" && c != "\t" { out = out + c }
+    }
+    out + "\""
+}
+
+/// Message helpers.
++ai_msg(role: str, content: str) : AiMessage => AiMessage.{role, content, name: ""}
++ai_user(content: str) : AiMessage => ai_msg("user", content)
++ai_system(content: str) : AiMessage => ai_msg("system", content)
++ai_assistant(content: str) : AiMessage => ai_msg("assistant", content)
+
+/// Build a default chat request.
++ai_chat_req(model: str, messages: _, max_tokens: i64) : AiRequest {
+    AiRequest.{
+        model, modality: AI_CHAT, messages, prompt: "", system: "", temperature: 0.7,
+        max_tokens, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+        voice: "", size: "", duration_s: 0, stop: []
+    }
+}
+
+/// Extract a JSON string field value (first `"key":"..."` occurrence).
++ai_field(raw: str, key: str) : str {
+    needle = "\"" + key + "\":\""
+    at = find(raw, needle)
+    ensure at >= 0 else { return "" }
+    start = at + byte_len(needle)
+    end = start
+    n = byte_len(raw)
+    esc = false
+    for start..n {
+        c = raw[it]
+        if esc {
+            esc = false
+            continue
+        }
+        if c == "\\" {
+            esc = true
+            continue
+        }
+        if c == "\"" {
+            end = it
+            break
+        }
+    }
+    ensure end > start else { return "" }
+    raw[start..end]
+}
+
+/// Extract nested `choices[0].message.content`.
++ai_openai_text(raw: str) : str {
+    t = json_get_path(raw, "choices.0.message.content") or ""
+    if t != "" { return ai_unquote(t) }
+    t = json_get_path(raw, "choices.0.text") or ""
+    if t != "" { return ai_unquote(t) }
+    t = ai_field(raw, "content")
+    if t != "" { return t }
+    ai_field(raw, "text")
+}
+
+/// Anthropic Messages API: `content[0].text`.
++ai_claude_text(raw: str) : str {
+    t = json_get_path(raw, "content.0.text") or ""
+    if t != "" { return ai_unquote(t) }
+    t = ai_field(raw, "text")
+    if t != "" { return t }
+    ai_field(raw, "content")
+}
+
+/// Gemini: `candidates[0].content.parts[0].text`.
++ai_gemini_text(raw: str) : str {
+    t = json_get_path(raw, "candidates.0.content.parts.0.text") or ""
+    if t != "" { return ai_unquote(t) }
+    t = ai_field(raw, "text")
+    if t != "" { return t }
+    ai_field(raw, "content")
+}
+
+/// Strip surrounding JSON quotes when `json_get_path` returns a raw string token.
++ai_unquote(s: str) : str {
+    n = byte_len(s)
+    ensure n >= 2 else { return s }
+    if s[0] == "\"" && s[n - 1] == "\"" { return s[1..(n - 1)] }
+    s
+}
+
+/// Parse provider JSON into `AiResponse`.
++ai_parse_response(provider: str, req: AiRequest, status: i64, raw: str) : AiResponse {
+    is_ok = status >= 200 && status < 300
+    if status == 0 { is_ok = true }
+    out_text = ""
+    if provider == "claude" {
+        out_text = ai_claude_text(raw)
+    }
+    if provider == "gemini" {
+        out_text = ai_gemini_text(raw)
+    }
+    if provider != "claude" && provider != "gemini" {
+        out_text = ai_openai_text(raw)
+    }
+    if out_text == "" { out_text = ai_field(raw, "text") }
+    if out_text == "" && req.modality == AI_STT { out_text = ai_field(raw, "transcript") }
+    errmsg = ""
+    if !is_ok || (status >= 400) {
+        is_ok = false
+        errmsg = ai_field(raw, "message")
+        if errmsg == "" { errmsg = ai_field(raw, "error") }
+        if errmsg == "" { errmsg = "ai: http {status}" }
+    }
+    u_in = json_get_int(raw, "prompt_tokens") or 0
+    if u_in == 0 {
+        u_in = ai_usage_int(raw, "prompt_tokens")
+    }
+    u_out = json_get_int(raw, "completion_tokens") or 0
+    if u_out == 0 { u_out = ai_usage_int(raw, "completion_tokens") }
+    if u_in == 0 { u_in = ai_usage_int(raw, "input_tokens") }
+    if u_out == 0 { u_out = ai_usage_int(raw, "output_tokens") }
+    finish_why = ai_field(raw, "finish_reason")
+    if finish_why == "" { finish_why = ai_field(raw, "stop_reason") }
+    media = ai_field(raw, "b64_json")
+    if media == "" { media = ai_field(raw, "url") }
+    tools_json = ""
+    tc_at = find(raw, "\"tool_calls\"")
+    if tc_at >= 0 { tools_json = raw[tc_at..byte_len(raw)] }
+    AiResponse.{
+        ok: is_ok,
+        provider,
+        model: req.model,
+        modality: req.modality,
+        text: out_text,
+        json: raw,
+        status,
+        error: errmsg,
+        usage_in: u_in,
+        usage_out: u_out,
+        finish: finish_why,
+        embedding: [],
+        tool_calls: tools_json,
+        media_b64: media
+    }
+}
+
+/// Find an integer near `"key":N` inside a usage object.
++ai_usage_int(raw: str, key: str) : i64 {
+    needle = "\"" + key + "\":"
+    at = find(raw, needle)
+    ensure at >= 0 else { return 0 }
+    start = at + byte_len(needle)
+    n = byte_len(raw)
+    end = start
+    for start..n {
+        c = raw[it]
+        if c >= "0" && c <= "9" {
+            end = it + 1
+            continue
+        }
+        break
+    }
+    ensure end > start else { return 0 }
+    to_i64(raw[start..end]) or 0
+}
+
+/// Prefer `"text"` / `"content"`; else whole body (legacy helper).
++ai_extract_text(raw: str) : str {
+    t = ai_field(raw, "text")
+    if t != "" { return t }
+    t = ai_field(raw, "content")
+    if t != "" { return t }
+    raw
+}
+
+test "chat body encodes messages and system" {
+    c = AiClient.new("test", "https://example.com", "k")
+    req = ai_chat_req("m", [ai_user("hi")], 16)
+    req.system = "s"
+    req.temperature = 0.2
+    body = c.chat_body(req)
+    #assert(contains(body, "\"role\":\"system\""))
+    #assert(contains(body, "\"role\":\"user\""))
+    #assert(contains(body, "hi"))
+}
+
+test "offline request uses mock queue and openai parse" {
+    c = AiClient.new("openai", "https://example.com", "k")
+    @c.push_mock("{\"choices\":[{\"message\":{\"content\":\"hello-mock\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}")
+    req = ai_chat_req("m", [ai_user("x")], 8)
+    res = @c.request("/v1/chat", req, "{}")
+    #assert(res.ok)
+    assert_eq(res.text, "hello-mock")
+    assert_eq(res.status, 200)
+    assert_eq(res.usage_in, 3)
+    assert_eq(res.usage_out, 2)
+}
+
+test "claude and gemini text extractors" {
+    assert_eq(ai_claude_text("{\"content\":[{\"type\":\"text\",\"text\":\"ok-c\"}]}"), "ok-c")
+    assert_eq(ai_gemini_text("{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok-g\"}]}}]}"), "ok-g")
+}
+
+test "json string escapes quotes" {
+    #assert(contains(ai_json_str("a\"b"), "\\\""))
+}
+
+test "missing api key fails live path" {
+    c = AiClient.new("openai", "https://example.com", "")
+    @c.set_offline(false)
+    req = ai_chat_req("m", [ai_user("x")], 8)
+    res = @c.request("/v1/chat", req, "{}")
+    #assert(!(res.ok))
+    #assert(contains(res.error, "api_key"))
+}
+
+test "auth headers include bearer" {
+    c = AiClient.new("openai", "https://api.openai.com", "sk-test")
+    hs = c.auth_headers()
+    joined = ""
+    for hs { joined = joined + it + "|" }
+    #assert(contains(joined, "Bearer sk-test"))
+}

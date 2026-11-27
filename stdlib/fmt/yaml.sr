@@ -1,0 +1,1648 @@
+//! std.fmt.yaml — YAML 1.2 subset: block maps, block lists, flow collections, scalars
+//!
+//! Import with:
+//!   use std.fmt.yaml
+//!
+//! `YamlDoc` is a flat node arena (no recursive types): every node has a kind, an optional
+//! key, a scalar value and linked children. Parse once, then query by dotted path where
+//! numeric segments index lists:
+//!
+//!   doc = YamlDoc.parse("server:\n  host: localhost\n  ports:\n    - 80\n    - 443\n") or YamlDoc.new()
+//!   host = doc.get_str("server.host") or "?"          // "localhost"
+//!   https = doc.get_int("server.ports.1") or 0        // 443
+//!
+//! Supported: nested block mappings and sequences (a sequence may sit at the same indent as
+//! its key), sequences of mappings, `"double"` and `'single'` quoted scalars with escapes,
+//! plain scalars, `null`/`~`, flow sequences `[a, b]` and flow mappings, literal `|` and
+//! folded `>` block scalars (clip and `-` strip), `#` comments, and a leading `---`.
+//! Not supported (reported or ignored by design): anchors/aliases, tags, multi-document
+//! streams past the first document, multi-line plain scalars, complex `?` keys, tab indents.
+//!
+//! Emit with `doc.to_yaml()`, build programmatically with `put_*` / `push_*`, or serialize a
+//! flat string map with `yaml_stringify_map`. Parse -> emit -> parse is lossless.
+
+/// `YAML_LB` is `"{"`.
++YAML_LB = "{"
+/// `YAML_RB` is `"}"`.
++YAML_RB = "}"
+/// Node kind: plain scalar (number, bool or unquoted text).
++YAML_PLAIN = 0
+/// Node kind: string scalar (was quoted or a block scalar; never reinterpreted as a number).
++YAML_STRING = 1
+/// Node kind: null scalar.
++YAML_NULL = 2
+/// Node kind: mapping.
++YAML_MAP = 3
+/// Node kind: sequence.
++YAML_SEQ = 4
+
+// --- character and string helpers ---------------------------------------------------------
+
+/// Character count of `s`.
++yaml_len(s: str) : i64 => host.sys_str_len(s)
+
+/// True for a space or tab.
++yaml_is_ws(c: str) : bool {
+    if c == " " { return true }
+    c == "\t"
+}
+
+/// Number of leading spaces of `s`.
++yaml_leading_spaces(s: str) : i64 {
+    n = yaml_len(s)
+    k = 0
+    while k < n {
+        if s[k] == " " { k += 1 } else { break }
+    }
+    k
+}
+
+/// `n` spaces.
++yaml_spaces(n: i64) : str {
+    out = ""
+    for 0..n { out = "{out} " }
+    out
+}
+
+/// `s` without surrounding spaces and tabs.
++yaml_trim(s: str) : str {
+    n = yaml_len(s)
+    lo = 0
+    while lo < n {
+        if yaml_is_ws(s[lo]) { lo += 1 } else { break }
+    }
+    hi = n
+    while hi > lo {
+        if yaml_is_ws(s[hi - 1]) { hi -= 1 } else { break }
+    }
+    if lo >= hi { return "" }
+    s[lo..hi]
+}
+
+/// `s` with ASCII letters lower-cased.
++yaml_lower(s: str) : str {
+    out = ""
+    n = yaml_len(s)
+    for 0..n {
+        code = host.sys_ord(s[it])
+        if code >= 65 {
+            if code <= 90 { code += 32 }
+        }
+        ch = host.sys_chr(code)
+        out = "{out}{ch}"
+    }
+    out
+}
+
+/// True for the characters 0-9.
++yaml_is_digit(c: str) : bool {
+    code = host.sys_ord(c)
+    if code < 48 { return false }
+    code <= 57
+}
+
+/// Value of the hex digit `c`, or -1.
++yaml_hex_val(c: str) : i64 {
+    code = host.sys_ord(c)
+    if code >= 48 {
+        if code <= 57 { return code - 48 }
+    }
+    if code >= 97 {
+        if code <= 102 { return code - 87 }
+    }
+    if code >= 65 {
+        if code <= 70 { return code - 55 }
+    }
+    -1
+}
+
+/// Lines of `text` split on `\n` (a `\r` is dropped).
++yaml_split_lines(text: str) : _ {
+    out = []
+    cur = ""
+    n = yaml_len(text)
+    for 0..n {
+        c = text[it]
+        if c == "\n" {
+            out = host.sys_arr_push(out, cur)
+            cur = ""
+        } else {
+            if c != "\r" { cur = "{cur}{c}" }
+        }
+    }
+    host.sys_arr_push(out, cur)
+}
+
+/// `path` split on `.` into segments (an empty path has no segments).
++yaml_split_path(path: str) : _ {
+    out = []
+    if path == "" { return out }
+    cur = ""
+    n = yaml_len(path)
+    for 0..n {
+        c = path[it]
+        if c == "." {
+            out = host.sys_arr_push(out, cur)
+            cur = ""
+        } else {
+            cur = "{cur}{c}"
+        }
+    }
+    host.sys_arr_push(out, cur)
+}
+
+// --- scalar classification ------------------------------------------------------------------
+
+/// True when a plain `s` can be read as a base-10 integer (`-12`, `+7`, `0042`).
++yaml_int_ok(s: str) : bool {
+    n = yaml_len(s)
+    if n == 0 { return false }
+    pos = 0
+    if s[0] == "-" { pos = 1 }
+    if s[0] == "+" { pos = 1 }
+    if pos >= n { return false }
+    if n - pos > 18 { return false }
+    ok = true
+    for pos..n {
+        if !yaml_is_digit(s[it]) { ok = false }
+    }
+    ok
+}
+
+/// Integer value of `s`, or fail.
++yaml_to_int(s: str) : i64! {
+    ensure yaml_int_ok(s) else {
+        fail "yaml: not an integer"
+        return
+    }
+    n = yaml_len(s)
+    pos = 0
+    neg = false
+    if s[0] == "-" {
+        neg = true
+        pos = 1
+    }
+    if s[0] == "+" { pos = 1 }
+    v = 0
+    for pos..n { v = v * 10 + (host.sys_ord(s[it]) - 48) }
+    if neg { v = -v }
+    v
+}
+
+/// Index just past the run of digits starting at `i`.
++yaml_digits_end(s: str, i: i64, n: i64) : i64 {
+    p = i
+    while p < n {
+        if yaml_is_digit(s[p]) { p += 1 } else { break }
+    }
+    p
+}
+
+/// True when `s` looks like a YAML float (`1.5`, `.5`, `2e10`, `-3.0e-2`, `.inf`, `.nan`).
++yaml_float_ok(s: str) : bool {
+    low = yaml_lower(s)
+    if low == ".inf" { return true }
+    if low == "-.inf" { return true }
+    if low == "+.inf" { return true }
+    if low == ".nan" { return true }
+    n = yaml_len(s)
+    p = 0
+    if n > 0 {
+        if s[0] == "-" { p = 1 }
+        if s[0] == "+" { p = 1 }
+    }
+    a = yaml_digits_end(s, p, n)
+    digits = a - p
+    seen_dot = false
+    seen_exp = false
+    if a < n {
+        if s[a] == "." {
+            seen_dot = true
+            b = yaml_digits_end(s, a + 1, n)
+            digits += b - a - 1
+            a = b
+        }
+    }
+    if digits == 0 { return false }
+    if a < n {
+        if s[a] == "e" { seen_exp = true }
+        if s[a] == "E" { seen_exp = true }
+    }
+    if seen_exp {
+        q = a + 1
+        if q < n {
+            if s[q] == "-" { q += 1 } else { if s[q] == "+" { q += 1 } }
+        }
+        e = yaml_digits_end(s, q, n)
+        if e == q { return false }
+        a = e
+    }
+    if a != n { return false }
+    if seen_dot { return true }
+    seen_exp
+}
+
+/// True for the YAML null spellings (`~`, `null`, `Null`, `NULL`) and the empty string.
++yaml_is_null_word(s: str) : bool {
+    if s == "" { return true }
+    if s == "~" { return true }
+    low = yaml_lower(s)
+    low == "null"
+}
+
+/// True for YAML 1.2 booleans (`true`, `false` in any of the three standard cases).
++yaml_is_bool_word(s: str) : bool {
+    if s == "true" { return true }
+    if s == "false" { return true }
+    if s == "True" { return true }
+    if s == "False" { return true }
+    if s == "TRUE" { return true }
+    s == "FALSE"
+}
+
+/// True when a plain scalar `s` would be read back as null, a bool, a number or a YAML 1.1
+/// boolean spelling, so a *string* with that text must be quoted.
++yaml_looks_special(s: str) : bool {
+    if yaml_is_null_word(s) { return true }
+    if yaml_is_bool_word(s) { return true }
+    if yaml_int_ok(s) { return true }
+    if yaml_float_ok(s) { return true }
+    low = yaml_lower(s)
+    words = ["yes", "no", "on", "off", "y", "n"]
+    hit = false
+    for words {
+        if low == it { hit = true }
+    }
+    hit
+}
+
+/// True when `s` can be written as an unquoted scalar without changing its structure.
++yaml_plain_ok(s: str) : bool {
+    n = yaml_len(s)
+    if n == 0 { return false }
+    if yaml_is_ws(s[0]) { return false }
+    if yaml_is_ws(s[n - 1]) { return false }
+    first = s[0]
+    specials = "-?:,[]{}#&*!|>'\"%@`"
+    for 0..yaml_len(specials) {
+        if specials[it] == first { return false }
+    }
+    ok = true
+    for 0..n {
+        c = s[it]
+        if host.sys_ord(c) < 32 { ok = false }
+        if c == ":" {
+            if it + 1 >= n { ok = false } else { if yaml_is_ws(s[it + 1]) { ok = false } }
+        }
+        if c == "#" {
+            if it > 0 {
+                if yaml_is_ws(s[it - 1]) { ok = false }
+            }
+        }
+    }
+    ok
+}
+
+/// `s` as a double-quoted YAML scalar.
++yaml_quote(s: str) : str {
+    out = "\""
+    n = yaml_len(s)
+    for 0..n {
+        c = s[it]
+        code = host.sys_ord(c)
+        piece = c
+        if c == "\"" { piece = "\\\"" }
+        if c == "\\" { piece = "\\\\" }
+        if c == "\n" { piece = "\\n" }
+        if c == "\t" { piece = "\\t" }
+        if c == "\r" { piece = "\\r" }
+        if code < 32 {
+            if c != "\n" {
+                if c != "\t" {
+                    if c != "\r" {
+                        hex = "0123456789abcdef"
+                        piece = "\\x{hex[code / 16]}{hex[code % 16]}"
+                    }
+                }
+            }
+        }
+        out = "{out}{piece}"
+    }
+    "{out}\""
+}
+
+/// Emit `val` as a scalar of `kind`: nulls as `null`, strings quoted only when ambiguous,
+/// plain scalars verbatim unless that would break the structure.
++yaml_emit_scalar(kind: i64, val: str) : str {
+    if kind == 2 { return "null" }
+    if !yaml_plain_ok(val) { return yaml_quote(val) }
+    if kind == 1 {
+        if yaml_looks_special(val) { return yaml_quote(val) }
+    }
+    val
+}
+
+/// Emit a mapping key (quoted only when needed).
++yaml_emit_key(key: str) : str {
+    if yaml_plain_ok(key) { return key }
+    yaml_quote(key)
+}
+
+// --- quoted scalars ---------------------------------------------------------------------------
+
+/// Index of the quote closing the one at `start`, or -1 when unterminated.
++yaml_quoted_end(s: str, start: i64) : i64 {
+    n = yaml_len(s)
+    q = s[start]
+    i = start + 1
+    found = -1
+    while i < n {
+        c = s[i]
+        if q == "\"" {
+            if c == "\\" {
+                i += 2
+            } else {
+                if c == "\"" {
+                    found = i
+                    break
+                }
+                i += 1
+            }
+        } else {
+            if c == "'" {
+                if i + 1 < n {
+                    if s[i + 1] == "'" {
+                        i += 2
+                    } else {
+                        found = i
+                        break
+                    }
+                } else {
+                    found = i
+                    break
+                }
+            } else {
+                i += 1
+            }
+        }
+    }
+    found
+}
+
+/// Decoded text of the quoted scalar from `start` (opening quote) to `end` (closing quote).
++yaml_unquote(s: str, start: i64, end: i64) : str {
+    q = s[start]
+    out = ""
+    i = start + 1
+    while i < end {
+        c = s[i]
+        if q == "'" {
+            out = "{out}{c}"
+            if c == "'" { i += 1 }
+            i += 1
+        } else {
+            if c != "\\" {
+                out = "{out}{c}"
+                i += 1
+            } else {
+                e = s[i + 1]
+                piece = e
+                width = 2
+                if e == "n" { piece = "\n" }
+                if e == "t" { piece = "\t" }
+                if e == "r" { piece = "\r" }
+                if e == "0" { piece = host.sys_chr(0) }
+                if e == "x" {
+                    if i + 3 < end {
+                        hi = yaml_hex_val(s[i + 2])
+                        lo = yaml_hex_val(s[i + 3])
+                        if hi >= 0 {
+                            if lo >= 0 {
+                                piece = host.sys_chr(hi * 16 + lo)
+                                width = 4
+                            }
+                        }
+                    }
+                }
+                if e == "u" {
+                    if i + 5 < end {
+                        v = 0
+                        good = true
+                        for 2..6 {
+                            h = yaml_hex_val(s[i + it])
+                            if h < 0 { good = false } else { v = v * 16 + h }
+                        }
+                        if good {
+                            piece = host.sys_chr(v)
+                            width = 6
+                        }
+                    }
+                }
+                out = "{out}{piece}"
+                i += width
+            }
+        }
+    }
+    out
+}
+
+/// True when a quote at `c` (after `prev`) can open a quoted scalar.
++yaml_opens_quote(c: str, prev: str) : bool {
+    if c != "\"" {
+        if c != "'" { return false }
+    }
+    if yaml_is_ws(prev) { return true }
+    if prev == "[" { return true }
+    if prev == "{" { return true }
+    prev == ","
+}
+
+/// Quote-aware scan of one line. Mode 0 finds the start of a `#` comment, mode 1 the colon
+/// separating a key from its value. Returns the index or -1.
++yaml_scan(line: str, mode: i64) : i64 {
+    n = yaml_len(line)
+    quote = ""
+    prev = " "
+    skip = 0
+    esc = false
+    found = -1
+    for 0..n {
+        c = line[it]
+        if found < 0 {
+            if skip > 0 {
+                skip -= 1
+            } else {
+                if quote == "" {
+                    if mode == 0 {
+                        if c == "#" {
+                            if yaml_is_ws(prev) { found = it }
+                        }
+                    } else {
+                        if c == ":" {
+                            nxt = " "
+                            if it + 1 < n { nxt = line[it + 1] }
+                            if yaml_is_ws(nxt) { found = it }
+                        }
+                    }
+                    if found < 0 {
+                        if yaml_opens_quote(c, prev) { quote = c }
+                    }
+                } else {
+                    if quote == "\"" {
+                        if esc {
+                            esc = false
+                        } else {
+                            if c == "\\" {
+                                esc = true
+                            } else {
+                                if c == "\"" { quote = "" }
+                            }
+                        }
+                    } else {
+                        if c == "'" {
+                            if it + 1 < n {
+                                if line[it + 1] == "'" { skip = 1 } else { quote = "" }
+                            } else {
+                                quote = ""
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        prev = c
+    }
+    found
+}
+
+/// `line` without a trailing `#` comment.
++yaml_strip_comment(line: str) : str {
+    cut = yaml_scan(line, 0)
+    if cut < 0 { return line }
+    line[0..cut]
+}
+
+/// True for a sequence entry: `-` alone or `- ` followed by anything.
++yaml_is_seq_start(text: str) : bool {
+    n = yaml_len(text)
+    if n == 0 { return false }
+    if text[0] != "-" { return false }
+    if n == 1 { return true }
+    yaml_is_ws(text[1])
+}
+
+/// Key text of `raw` (the part before the colon): trimmed, unquoted.
++yaml_key(raw: str) : str {
+    t = yaml_trim(raw)
+    n = yaml_len(t)
+    if n >= 2 {
+        if t[0] == "\"" {
+            e = yaml_quoted_end(t, 0)
+            if e == n - 1 { return yaml_unquote(t, 0, e) }
+        }
+        if t[0] == "'" {
+            e = yaml_quoted_end(t, 0)
+            if e == n - 1 { return yaml_unquote(t, 0, e) }
+        }
+    }
+    t
+}
+
+// --- the document --------------------------------------------------------------------------------
+
+/// A parsed or built YAML document: a flat arena of nodes. Node 0 is the root.
++YamlDoc = {
+    /// Kind of each node (`YAML_PLAIN` .. `YAML_SEQ`). Defaults to `[]`.
+    kinds: _ = []
+    /// Mapping key of each node (empty for sequence items and the root). Defaults to `[]`.
+    keys: _ = []
+    /// Scalar text of each node (empty for containers). Defaults to `[]`.
+    vals: _ = []
+    /// First child of each node, or -1. Defaults to `[]`.
+    firsts: _ = []
+    /// Last child of each node, or -1. Defaults to `[]`.
+    lasts: _ = []
+    /// Next sibling of each node, or -1. Defaults to `[]`.
+    nexts: _ = []
+    /// Parse scratch: the source lines (cleared once parsing finishes).
+    src_lines: _ = []
+    /// Parse scratch: index of the current line.
+    src_pos: i64 = 0
+    /// First parse error message, or empty.
+    err: str = ""
+
+    /// Empty document whose root is an empty mapping, ready for `put_*` calls.
+    new() : YamlDoc {
+        d = YamlDoc.{}
+        @d.add(3, "", "", -1)
+        d
+    }
+
+    /// Parse `text`, or fail with a `yaml: line N: ...` message.
+    parse(text: str) : YamlDoc! {
+        d = YamlDoc.{}
+        @d.load(text)
+        ensure d.err == "" else {
+            fail "{d.err}"
+            return
+        }
+        d.src_lines = []
+        d
+    }
+
+    /// Append a node and link it under `parent` (-1 for the root). Returns its id.
+    add(@self, kind: i64, key: str, val: str, parent: i64) : i64 {
+        id = host.sys_arr_len(self.kinds)
+        self.kinds = host.sys_arr_push(self.kinds, kind)
+        self.keys = host.sys_arr_push(self.keys, key)
+        self.vals = host.sys_arr_push(self.vals, val)
+        self.firsts = host.sys_arr_push(self.firsts, -1)
+        self.lasts = host.sys_arr_push(self.lasts, -1)
+        self.nexts = host.sys_arr_push(self.nexts, -1)
+        if parent >= 0 {
+            last = self.lasts[parent]
+            if last < 0 {
+                self.firsts = host.sys_arr_set(self.firsts, parent, id)
+            } else {
+                self.nexts = host.sys_arr_set(self.nexts, last, id)
+            }
+            self.lasts = host.sys_arr_set(self.lasts, parent, id)
+        }
+        id
+    }
+
+    // ---- building ----
+
+    /// Add a string child `key: v` to mapping `parent`. Returns the node id.
+    put_str(@self, parent: i64, key: str, v: str) : i64 => @self.add(1, key, v, parent)
+    /// Add an integer child `key: n` to mapping `parent`.
+    put_int(@self, parent: i64, key: str, n: i64) : i64 => @self.add(0, key, "{n}", parent)
+    /// Add a boolean child `key: b` to mapping `parent`.
+    put_bool(@self, parent: i64, key: str, b: bool) : i64 {
+        text = "false"
+        if b { text = "true" }
+        @self.add(0, key, text, parent)
+    }
+    /// Add a null child `key: null` to mapping `parent`.
+    put_null(@self, parent: i64, key: str) : i64 => @self.add(2, key, "", parent)
+    /// Add an empty mapping child under `key`; returns its id for further `put_*` calls.
+    put_map(@self, parent: i64, key: str) : i64 => @self.add(3, key, "", parent)
+    /// Add an empty sequence child under `key`; returns its id for further `push_*` calls.
+    put_seq(@self, parent: i64, key: str) : i64 => @self.add(4, key, "", parent)
+    /// Append a string item to sequence `parent`.
+    push_str(@self, parent: i64, v: str) : i64 => @self.add(1, "", v, parent)
+    /// Append an integer item to sequence `parent`.
+    push_int(@self, parent: i64, n: i64) : i64 => @self.add(0, "", "{n}", parent)
+    /// Append an empty mapping item to sequence `parent`; returns its id.
+    push_map(@self, parent: i64) : i64 => @self.add(3, "", "", parent)
+
+    // ---- querying ----
+
+    /// Number of nodes in the document.
+    size(self) : i64 => host.sys_arr_len(self.kinds)
+
+    /// Child of node `id` named `key`, or -1.
+    child(self, id: i64, key: str) : i64 {
+        if id < 0 { return -1 }
+        if self.kinds[id] != 3 { return -1 }
+        c = self.firsts[id]
+        found = -1
+        while c >= 0 {
+            if self.keys[c] == key {
+                found = c
+                break
+            }
+            c = self.nexts[c]
+        }
+        found
+    }
+
+    /// The `i`-th child of node `id`, or -1.
+    at(self, id: i64, i: i64) : i64 {
+        if id < 0 { return -1 }
+        if i < 0 { return -1 }
+        c = self.firsts[id]
+        for 0..i {
+            if c >= 0 { c = self.nexts[c] }
+        }
+        c
+    }
+
+    /// Node id for the dotted `path` (`""` is the root), or -1 when absent.
+    find(self, path: str) : i64 {
+        if host.sys_arr_len(self.kinds) == 0 { return -1 }
+        node = 0
+        for yaml_split_path(path) {
+            if node >= 0 {
+                if self.kinds[node] == 3 {
+                    node = self.child(node, it)
+                } else {
+                    if self.kinds[node] == 4 {
+                        idx = yaml_to_int(it) or -1
+                        node = self.at(node, idx)
+                    } else {
+                        node = -1
+                    }
+                }
+            }
+        }
+        node
+    }
+
+    /// Kind of the node at `path`, or -1 when absent.
+    kind_at(self, path: str) : i64 {
+        id = self.find(path)
+        if id < 0 { return -1 }
+        self.kinds[id]
+    }
+
+    /// True when `path` exists.
+    has(self, path: str) : bool => self.find(path) >= 0
+
+    /// True when `path` exists and is null.
+    is_null(self, path: str) : bool => self.kind_at(path) == 2
+
+    /// Number of children of the container at `path` (0 for scalars or a missing path).
+    count(self, path: str) : i64 {
+        id = self.find(path)
+        if id < 0 { return 0 }
+        n = 0
+        c = self.firsts[id]
+        while c >= 0 {
+            n += 1
+            c = self.nexts[c]
+        }
+        n
+    }
+
+    /// Keys of the mapping at `path`, in document order.
+    keys_at(self, path: str) : _ {
+        out = []
+        id = self.find(path)
+        if id < 0 { return out }
+        if self.kinds[id] != 3 { return out }
+        c = self.firsts[id]
+        while c >= 0 {
+            out = host.sys_arr_push(out, self.keys[c])
+            c = self.nexts[c]
+        }
+        out
+    }
+
+    /// Scalar texts of the sequence at `path` (container items are skipped).
+    strs_at(self, path: str) : _ {
+        out = []
+        id = self.find(path)
+        if id < 0 { return out }
+        c = self.firsts[id]
+        while c >= 0 {
+            k = self.kinds[c]
+            if k < 3 { out = host.sys_arr_push(out, self.vals[c]) }
+            c = self.nexts[c]
+        }
+        out
+    }
+
+    /// Scalar text at `path` (a null reads as the empty string), or fail.
+    get_str(self, path: str) : str! {
+        id = self.find(path)
+        ensure id >= 0 else {
+            fail "yaml: no such path {path}"
+            return
+        }
+        ensure self.kinds[id] < 3 else {
+            fail "yaml: {path} is not a scalar"
+            return
+        }
+        self.vals[id]
+    }
+
+    /// Integer at `path`, or fail.
+    get_int(self, path: str) : i64! {
+        text = self.get_str(path) or err { fail "{err}" }
+        id = self.find(path)
+        ensure self.kinds[id] == 0 else {
+            fail "yaml: {path} is not an integer"
+            return
+        }
+        yaml_to_int(text) or err { fail "yaml: {path} is not an integer" }
+    }
+
+    /// Boolean at `path` (`true` / `false`), or fail.
+    get_bool(self, path: str) : bool! {
+        text = self.get_str(path) or err { fail "{err}" }
+        id = self.find(path)
+        ensure self.kinds[id] == 0 else {
+            fail "yaml: {path} is not a boolean"
+            return
+        }
+        ensure yaml_is_bool_word(text) else {
+            fail "yaml: {path} is not a boolean"
+            return
+        }
+        yaml_lower(text) == "true"
+    }
+
+    // ---- emitting ----
+
+    /// True when node `id` is a non-empty container (written as an indented block).
+    is_block(self, id: i64) : bool {
+        if self.kinds[id] < 3 { return false }
+        self.firsts[id] >= 0
+    }
+
+    /// One-line form of a scalar or empty container.
+    inline_text(self, id: i64) : str {
+        k = self.kinds[id]
+        if k == 3 { return "{YAML_LB}{YAML_RB}" }
+        if k == 4 { return "[]" }
+        yaml_emit_scalar(k, self.vals[id])
+    }
+
+    /// Block text of node `id` with every line indented by at least `indent` spaces.
+    emit(self, id: i64, indent: i64) : str {
+        k = self.kinds[id]
+        pad = yaml_spaces(indent)
+        out = ""
+        if k == 3 {
+            c = self.firsts[id]
+            while c >= 0 {
+                name = yaml_emit_key(self.keys[c])
+                if self.is_block(c) {
+                    sub = self.emit(c, indent + 2)
+                    out = "{out}{pad}{name}:\n{sub}"
+                } else {
+                    text = self.inline_text(c)
+                    out = "{out}{pad}{name}: {text}\n"
+                }
+                c = self.nexts[c]
+            }
+            return out
+        }
+        if k == 4 {
+            c = self.firsts[id]
+            while c >= 0 {
+                if self.is_block(c) {
+                    sub = self.emit(c, indent + 2)
+                    body = sub[(indent + 2)..yaml_len(sub)]
+                    out = "{out}{pad}- {body}"
+                } else {
+                    text = self.inline_text(c)
+                    out = "{out}{pad}- {text}\n"
+                }
+                c = self.nexts[c]
+            }
+            return out
+        }
+        text = self.inline_text(id)
+        "{pad}{text}\n"
+    }
+
+    /// The whole document as block YAML (an empty document is `null`).
+    to_yaml(self) : str {
+        if host.sys_arr_len(self.kinds) == 0 { return "null\n" }
+        if !self.is_block(0) {
+            text = self.inline_text(0)
+            return "{text}\n"
+        }
+        self.emit(0, 0)
+    }
+
+    // ---- parsing (scratch state lives in the `-` fields) ----
+
+    /// Record the first error, attributed to the zero-based line index `ln`.
+    fail_at(@self, ln: i64, msg: str) {
+        if self.err == "" {
+            shown = ln + 1
+            self.err = "yaml: line {shown}: {msg}"
+        }
+    }
+
+    /// Text of line `i` without indentation or comment.
+    line_text(self, i: i64) : str => yaml_trim(yaml_strip_comment(self.src_lines[i]))
+
+    /// Indentation (leading spaces) of line `i`.
+    line_indent(self, i: i64) : i64 => yaml_leading_spaces(self.src_lines[i])
+
+    /// Advance past blank, comment-only and `---` lines.
+    skip_blank(@self) {
+        n = host.sys_arr_len(self.src_lines)
+        going = true
+        while going {
+            if self.src_pos >= n {
+                going = false
+            } else {
+                raw = self.src_lines[self.src_pos]
+                t = yaml_trim(yaml_strip_comment(raw))
+                if t == "" {
+                    self.src_pos += 1
+                } else {
+                    if raw == "---" { self.src_pos += 1 } else { going = false }
+                }
+            }
+        }
+    }
+
+    /// Split `text` into lines, find the single document and parse it.
+    load(@self, text: str) {
+        raw = yaml_split_lines(text)
+        n = host.sys_arr_len(raw)
+        started = false
+        end = n
+        for 0..n {
+            line = raw[it]
+            t = yaml_trim(yaml_strip_comment(line))
+            marker = false
+            if line == "---" { marker = true }
+            if line == "..." { marker = true }
+            if yaml_len(line) > 3 {
+                if line[0..4] == "--- " { marker = true }
+                if line[0..4] == "... " { marker = true }
+            }
+            if marker {
+                if started {
+                    if end == n { end = it }
+                }
+            } else {
+                if t != "" { started = true }
+            }
+            if self.err == "" {
+                lead = yaml_leading_spaces(line)
+                if lead < yaml_len(line) {
+                    if line[lead] == "\t" { @self.fail_at(it, "tab character in indentation") }
+                }
+            }
+        }
+        kept = []
+        for 0..end { kept = host.sys_arr_push(kept, raw[it]) }
+        self.src_lines = kept
+        self.src_pos = 0
+        @self.skip_blank()
+        if self.err != "" { return }
+        if self.src_pos >= host.sys_arr_len(self.src_lines) {
+            @self.add(2, "", "", -1)
+            return
+        }
+        ci = self.line_indent(self.src_pos)
+        @self.block(ci, -1, "")
+        @self.skip_blank()
+        if self.src_pos < host.sys_arr_len(self.src_lines) {
+            @self.fail_at(self.src_pos, "unexpected content")
+        }
+    }
+
+    /// Parse the node whose first line is the current line, indented exactly `indent`.
+    block(@self, indent: i64, parent: i64, key: str) : i64 {
+        cur = self.src_pos
+        text = self.line_text(cur)
+        if yaml_is_seq_start(text) {
+            id = @self.add(4, key, "", parent)
+            @self.parse_seq(indent, id)
+            return id
+        }
+        first = text[0]
+        if first != "[" {
+            if first != YAML_LB {
+                colon = yaml_scan(text, 1)
+                if colon >= 0 {
+                    id = @self.add(3, key, "", parent)
+                    @self.parse_map(indent, id)
+                    return id
+                }
+            }
+        }
+        self.src_pos += 1
+        @self.value(text, indent - 1, parent, key, cur)
+    }
+
+    /// True when the current line is an entry at exactly `indent`. Returns false at the end
+    /// of the block; a deeper line is an error (and also returns false).
+    next_entry(@self, indent: i64, want_seq: bool) : bool {
+        @self.skip_blank()
+        if self.src_pos >= host.sys_arr_len(self.src_lines) { return false }
+        ci = self.line_indent(self.src_pos)
+        if ci < indent { return false }
+        if ci > indent {
+            @self.fail_at(self.src_pos, "unexpected indentation")
+            return false
+        }
+        is_seq = yaml_is_seq_start(self.line_text(self.src_pos))
+        if is_seq != want_seq {
+            if !want_seq { @self.fail_at(self.src_pos, "unexpected sequence item in mapping") }
+            return false
+        }
+        true
+    }
+
+    /// Parse `key: value` entries at `indent` into mapping `node`.
+    parse_map(@self, indent: i64, node: i64) {
+        going = true
+        while going {
+            if @self.next_entry(indent, false) {
+                @self.map_entry(indent, node)
+            } else {
+                going = false
+            }
+            if self.err != "" { going = false }
+        }
+    }
+
+    /// Parse one `key: value` line (the current line) into mapping `node`.
+    map_entry(@self, indent: i64, node: i64) {
+        cur = self.src_pos
+        text = self.line_text(cur)
+        colon = yaml_scan(text, 1)
+        if colon < 0 {
+            @self.fail_at(cur, "expected 'key: value'")
+            return
+        }
+        key = yaml_key(text[0..colon])
+        rest = yaml_trim(text[(colon + 1)..yaml_len(text)])
+        self.src_pos += 1
+        if self.child(node, key) >= 0 {
+            @self.fail_at(cur, "duplicate key '{key}'")
+            return
+        }
+        if rest == "" {
+            @self.child_or_null(indent, node, key)
+        } else {
+            @self.value(rest, indent, node, key, cur)
+        }
+    }
+
+    /// The value after `key:` (or `-`) with nothing on the line: a deeper block, a sequence at
+    /// the same indent (mappings only), or null.
+    child_or_null(@self, indent: i64, parent: i64, key: str) {
+        @self.skip_blank()
+        made = false
+        if self.src_pos < host.sys_arr_len(self.src_lines) {
+            ci = self.line_indent(self.src_pos)
+            if ci > indent {
+                @self.block(ci, parent, key)
+                made = true
+            } else {
+                if ci == indent {
+                    if self.kinds[parent] == 3 {
+                        if yaml_is_seq_start(self.line_text(self.src_pos)) {
+                            @self.block(ci, parent, key)
+                            made = true
+                        }
+                    }
+                }
+            }
+        }
+        if !made { @self.add(2, key, "", parent) }
+    }
+
+    /// Parse `- item` entries at `indent` into sequence `node`.
+    parse_seq(@self, indent: i64, node: i64) {
+        going = true
+        while going {
+            if @self.next_entry(indent, true) {
+                @self.seq_item(indent, node)
+            } else {
+                going = false
+            }
+            if self.err != "" { going = false }
+        }
+    }
+
+    /// Parse one `- ...` line (the current line) into sequence `node`.
+    seq_item(@self, indent: i64, node: i64) {
+        cur = self.src_pos
+        text = self.line_text(cur)
+        tail_text = text[1..yaml_len(text)]
+        rest = yaml_trim(tail_text)
+        self.src_pos += 1
+        if rest == "" {
+            @self.child_or_null(indent, node, "")
+            return
+        }
+        nested = yaml_is_seq_start(rest)
+        if !nested {
+            c0 = rest[0]
+            if c0 != "[" {
+                if c0 != YAML_LB {
+                    if yaml_scan(rest, 1) >= 0 { nested = true }
+                }
+            }
+        }
+        if nested {
+            off = 1 + yaml_leading_spaces(tail_text)
+            inner = indent + off
+            self.src_lines = host.sys_arr_set(self.src_lines, cur, "{yaml_spaces(inner)}{rest}")
+            self.src_pos = cur
+            @self.block(inner, node, "")
+            return
+        }
+        @self.value(rest, indent, node, "", cur)
+    }
+
+    /// Parse the inline value `rest` into a new child of `parent`. Returns the node id.
+    value(@self, rest: str, indent: i64, parent: i64, key: str, ln: i64) : i64 {
+        n = yaml_len(rest)
+        c = rest[0]
+        if c == "|" { return @self.block_scalar(rest, indent, parent, key) }
+        if c == ">" { return @self.block_scalar(rest, indent, parent, key) }
+        if c == "[" { return @self.flow_value(rest, parent, key, ln) }
+        if c == YAML_LB { return @self.flow_value(rest, parent, key, ln) }
+        if c == "\"" {
+            e = yaml_quoted_end(rest, 0)
+            if e < 0 {
+                @self.fail_at(ln, "unterminated quoted scalar")
+                return -1
+            }
+            if e != n - 1 {
+                @self.fail_at(ln, "unexpected text after quoted scalar")
+                return -1
+            }
+            return @self.add(1, key, yaml_unquote(rest, 0, e), parent)
+        }
+        if c == "'" {
+            e = yaml_quoted_end(rest, 0)
+            if e < 0 {
+                @self.fail_at(ln, "unterminated quoted scalar")
+                return -1
+            }
+            if e != n - 1 {
+                @self.fail_at(ln, "unexpected text after quoted scalar")
+                return -1
+            }
+            return @self.add(1, key, yaml_unquote(rest, 0, e), parent)
+        }
+        if yaml_is_null_word(rest) { return @self.add(2, key, "", parent) }
+        @self.add(0, key, rest, parent)
+    }
+
+    /// Parse the flow collection in `rest` and check nothing follows it.
+    flow_value(@self, rest: str, parent: i64, key: str, ln: i64) : i64 {
+        start = host.sys_arr_len(self.kinds)
+        e = @self.flow(rest, 0, parent, key, ln)
+        if self.err != "" { return -1 }
+        n = yaml_len(rest)
+        tail = yaml_trim(rest[e..n])
+        if tail != "" { @self.fail_at(ln, "unexpected text after flow collection") }
+        start
+    }
+
+    /// Parse one flow node (`[..]`, `{..}` or a scalar) of `s` starting at `pos`. Returns the
+    /// index just past it.
+    flow(@self, s: str, pos: i64, parent: i64, key: str, ln: i64) : i64 {
+        n = yaml_len(s)
+        p = pos
+        while p < n {
+            if yaml_is_ws(s[p]) { p += 1 } else { break }
+        }
+        if p >= n {
+            @self.fail_at(ln, "unexpected end of flow collection")
+            return n
+        }
+        c = s[p]
+        if c == "[" {
+            id = @self.add(4, key, "", parent)
+            p += 1
+            done = false
+            while !done {
+                while p < n {
+                    if yaml_is_ws(s[p]) { p += 1 } else { break }
+                }
+                if p >= n {
+                    @self.fail_at(ln, "unterminated flow sequence")
+                    done = true
+                } else {
+                    if s[p] == "]" {
+                        p += 1
+                        done = true
+                    } else {
+                        p = @self.flow(s, p, id, "", ln)
+                        if self.err != "" {
+                            done = true
+                        } else {
+                            while p < n {
+                                if yaml_is_ws(s[p]) { p += 1 } else { break }
+                            }
+                            if p < n {
+                                if s[p] == "," { p += 1 }
+                            }
+                        }
+                    }
+                }
+            }
+            return p
+        }
+        if c == YAML_LB {
+            id = @self.add(3, key, "", parent)
+            p += 1
+            done = false
+            while !done {
+                while p < n {
+                    if yaml_is_ws(s[p]) { p += 1 } else { break }
+                }
+                if p >= n {
+                    @self.fail_at(ln, "unterminated flow mapping")
+                    done = true
+                } else {
+                    if s[p] == YAML_RB {
+                        p += 1
+                        done = true
+                    } else {
+                        name = ""
+                        if s[p] == "\"" {
+                            e = yaml_quoted_end(s, p)
+                            if e < 0 {
+                                @self.fail_at(ln, "unterminated quoted key")
+                                done = true
+                            } else {
+                                name = yaml_unquote(s, p, e)
+                                p = e + 1
+                            }
+                        } else {
+                            q = p
+                            while q < n {
+                                if s[q] == ":" { break }
+                                if s[q] == "," { break }
+                                if s[q] == YAML_RB { break }
+                                q += 1
+                            }
+                            name = yaml_trim(s[p..q])
+                            p = q
+                        }
+                        if !done {
+                            while p < n {
+                                if yaml_is_ws(s[p]) { p += 1 } else { break }
+                            }
+                            if self.child(id, name) >= 0 {
+                                @self.fail_at(ln, "duplicate key '{name}'")
+                                done = true
+                            } else {
+                                if p < n {
+                                    if s[p] == ":" {
+                                        p = @self.flow(s, p + 1, id, name, ln)
+                                    } else {
+                                        @self.add(2, name, "", id)
+                                    }
+                                } else {
+                                    @self.fail_at(ln, "unterminated flow mapping")
+                                    done = true
+                                }
+                                if self.err != "" { done = true }
+                                if !done {
+                                    while p < n {
+                                        if yaml_is_ws(s[p]) { p += 1 } else { break }
+                                    }
+                                    if p < n {
+                                        if s[p] == "," { p += 1 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return p
+        }
+        if c == "\"" {
+            e = yaml_quoted_end(s, p)
+            if e < 0 {
+                @self.fail_at(ln, "unterminated quoted scalar")
+                return n
+            }
+            @self.add(1, key, yaml_unquote(s, p, e), parent)
+            return e + 1
+        }
+        if c == "'" {
+            e = yaml_quoted_end(s, p)
+            if e < 0 {
+                @self.fail_at(ln, "unterminated quoted scalar")
+                return n
+            }
+            @self.add(1, key, yaml_unquote(s, p, e), parent)
+            return e + 1
+        }
+        q = p
+        while q < n {
+            if s[q] == "," { break }
+            if s[q] == "]" { break }
+            if s[q] == YAML_RB { break }
+            q += 1
+        }
+        raw = yaml_trim(s[p..q])
+        if yaml_is_null_word(raw) {
+            @self.add(2, key, "", parent)
+        } else {
+            @self.add(0, key, raw, parent)
+        }
+        q
+    }
+
+    /// Read a `|` or `>` block scalar whose lines are indented deeper than `indent`.
+    block_scalar(@self, header: str, indent: i64, parent: i64, key: str) : i64 {
+        folded = header[0] == ">"
+        strip = false
+        for 1..yaml_len(header) {
+            if header[it] == "-" { strip = true }
+        }
+        n = host.sys_arr_len(self.src_lines)
+        j = self.src_pos
+        block_indent = -1
+        picked = []
+        collecting = true
+        while collecting {
+            if j >= n {
+                collecting = false
+            } else {
+                ln = self.src_lines[j]
+                if yaml_trim(ln) == "" {
+                    picked = host.sys_arr_push(picked, "")
+                    j += 1
+                } else {
+                    li = yaml_leading_spaces(ln)
+                    if li <= indent {
+                        collecting = false
+                    } else {
+                        if block_indent < 0 { block_indent = li }
+                        if li < block_indent {
+                            collecting = false
+                        } else {
+                            picked = host.sys_arr_push(picked, ln[block_indent..yaml_len(ln)])
+                            j += 1
+                        }
+                    }
+                }
+            }
+        }
+        while host.sys_arr_len(picked) > 0 {
+            if picked[host.sys_arr_len(picked) - 1] == "" {
+                trimmed = []
+                for 0..(host.sys_arr_len(picked) - 1) { trimmed = host.sys_arr_push(trimmed, picked[it]) }
+                picked = trimmed
+                j = j
+            } else {
+                break
+            }
+        }
+        self.src_pos = j
+        text = ""
+        if folded {
+            after_text = false
+            for picked {
+                if it == "" {
+                    text = "{text}\n"
+                    after_text = false
+                } else {
+                    if after_text { text = "{text} " }
+                    text = "{text}{it}"
+                    after_text = true
+                }
+            }
+        } else {
+            for picked {
+                if index > 0 { text = "{text}\n" }
+                text = "{text}{it}"
+            }
+        }
+        if host.sys_arr_len(picked) > 0 {
+            if !strip { text = "{text}\n" }
+        }
+        @self.add(1, key, text, parent)
+    }
+}
+
+// --- stringify helpers -------------------------------------------------------------------------
+
+/// Block YAML for the flat string map given as parallel arrays `keys` and `vals`.
++yaml_stringify_map(keys: _, vals: _) : str {
+    d = YamlDoc.new()
+    for keys { @d.put_str(0, it, vals[index]) }
+    d.to_yaml()
+}
+
+/// Block YAML for the list of strings `items`.
++yaml_stringify_list(items: _) : str {
+    d = YamlDoc.{}
+    @d.add(4, "", "", -1)
+    for items { @d.push_str(0, it) }
+    d.to_yaml()
+}
+
+// --- tests ---------------------------------------------------------------------------------------
+
+/// Test that a simple map parses and its scalar kinds are typed.
+test "yaml parses a simple map" {
+    src = "name: Amina\nage: 30\nactive: true\nratio: 0.5\nnote: \"hello: world\"\nnothing: ~\nblank:\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.get_str("name") or "?", "Amina")
+    assert_eq(d.get_int("age") or -1, 30)
+    #assert(d.get_bool("active") or false)
+    assert_eq(d.get_str("ratio") or "?", "0.5")
+    assert_eq(d.get_str("note") or "?", "hello: world")
+    #assert(d.is_null("nothing"))
+    #assert(d.is_null("blank"))
+    assert_eq(d.count(""), 7)
+    assert_eq(d.kind_at("age"), 0)
+    assert_eq(d.kind_at("note"), 1)
+    assert_eq(d.kind_at("missing"), -1)
+    #assert(d.has("name"))
+    #assert(!(d.has("nope")))
+    ks = d.keys_at("")
+    assert_eq(ks[0], "name")
+    assert_eq(ks[6], "blank")
+}
+
+/// Test that typed getters fail on the wrong shape.
+test "yaml getters reject wrong types" {
+    d = YamlDoc.parse("name: Amina\nage: 30\nlist:\n  - 1\n") or YamlDoc.new()
+    assert_eq(d.get_int("name") or -7, -7)
+    #assert(d.get_bool("age") or true)
+    assert_eq(d.get_str("list") or "container", "container")
+    assert_eq(d.get_str("gone") or "gone", "gone")
+    assert_eq(d.get_int("list.0") or -7, 1)
+    assert_eq(d.get_int("list.5") or -7, -7)
+}
+
+/// Test nested maps and lists with dotted paths.
+test "yaml nested maps and lists" {
+    src = "server:\n  host: localhost\n  ports:\n    - 80\n    - 443\n  tls:\n    enabled: false\nowner: Amina\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.get_str("server.host") or "?", "localhost")
+    assert_eq(d.get_int("server.ports.0") or -1, 80)
+    assert_eq(d.get_int("server.ports.1") or -1, 443)
+    #assert(!(d.get_bool("server.tls.enabled") or true))
+    assert_eq(d.get_str("owner") or "?", "Amina")
+    assert_eq(d.count("server.ports"), 2)
+    assert_eq(d.count("server"), 3)
+    ps = d.strs_at("server.ports")
+    assert_eq(ps[0], "80")
+    assert_eq(ps[1], "443")
+}
+
+/// Test sequences of mappings, including a sequence at its key's indent.
+test "yaml sequences of mappings" {
+    src = "items:\n  - name: a\n    qty: 1\n  - name: b\n    qty: 2\ntags:\n- x\n- y\nlast: end\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.get_str("items.0.name") or "?", "a")
+    assert_eq(d.get_int("items.1.qty") or -1, 2)
+    assert_eq(d.count("items"), 2)
+    assert_eq(d.count("items.0"), 2)
+    assert_eq(d.get_str("tags.1") or "?", "y")
+    assert_eq(d.get_str("last") or "?", "end")
+}
+
+/// Test a top-level list, nested lists and the bare `-` form.
+test "yaml top level lists" {
+    d = YamlDoc.parse("- 1\n- two\n- - a\n  - b\n-\n  k: v\n") or YamlDoc.new()
+    assert_eq(d.kind_at(""), 4)
+    assert_eq(d.count(""), 4)
+    assert_eq(d.get_int("0") or -1, 1)
+    assert_eq(d.get_str("1") or "?", "two")
+    assert_eq(d.get_str("2.1") or "?", "b")
+    assert_eq(d.get_str("3.k") or "?", "v")
+}
+
+/// Test flow sequences and mappings.
+test "yaml flow collections" {
+    src = "nums: [1, 2, 3]\nempty: []\npoint: {YAML_LB}x: 1, y: \"two\"{YAML_RB}\nnested: [[1, 2], {YAML_LB}k: v{YAML_RB}]\nnone: {YAML_LB}{YAML_RB}\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.count("nums"), 3)
+    assert_eq(d.get_int("nums.2") or -1, 3)
+    assert_eq(d.count("empty"), 0)
+    assert_eq(d.kind_at("empty"), 4)
+    assert_eq(d.get_int("point.x") or -1, 1)
+    assert_eq(d.get_str("point.y") or "?", "two")
+    assert_eq(d.get_int("nested.0.1") or -1, 2)
+    assert_eq(d.get_str("nested.1.k") or "?", "v")
+    assert_eq(d.kind_at("none"), 3)
+    assert_eq(d.count("none"), 0)
+}
+
+/// Test quoted scalar escapes.
+test "yaml quoted scalars" {
+    src = "a: \"tab\\there\"\nb: 'it''s'\nc: \"line\\nbreak\"\nd: \"\\u00e9\\x41\"\ne: \"# not a comment\"\nf: '123'\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.get_str("a") or "?", "tab\there")
+    assert_eq(d.get_str("b") or "?", "it's")
+    assert_eq(d.get_str("c") or "?", "line\nbreak")
+    assert_eq(d.get_str("d") or "?", "éA")
+    assert_eq(d.get_str("e") or "?", "# not a comment")
+    assert_eq(d.get_str("f") or "?", "123")
+    assert_eq(d.kind_at("f"), 1)
+    assert_eq(d.get_int("f") or -9, -9)
+}
+
+/// Test comments, the document marker and quoted keys.
+test "yaml comments markers and quoted keys" {
+    src = "# header\n---\nname: x # trailing\n\"odd key\": 1\n'it''s': 2\nurl: http://example.com/a#frag\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.get_str("name") or "?", "x")
+    assert_eq(d.get_int("odd key") or -1, 1)
+    assert_eq(d.get_int("it's") or -1, 2)
+    assert_eq(d.get_str("url") or "?", "http://example.com/a#frag")
+    two = YamlDoc.parse("a: 1\n---\nb: 2\n") or YamlDoc.new()
+    #assert(two.has("a"))
+    #assert(!(two.has("b")))
+}
+
+/// Test literal and folded block scalars.
+test "yaml block scalars" {
+    src = "lit: |\n  line one\n  line two\nfold: >\n  folded\n  text\n\n  para\nstrip: |-\n  bare\nafter: 1\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.get_str("lit") or "?", "line one\nline two\n")
+    assert_eq(d.get_str("fold") or "?", "folded text\npara\n")
+    assert_eq(d.get_str("strip") or "?", "bare")
+    assert_eq(d.get_int("after") or -1, 1)
+}
+
+/// Test that malformed documents fail with a line number.
+test "yaml errors report line numbers" {
+    bad_tab = YamlDoc.parse("a:\n\tb: 1\n") or err { "{err}" }
+    assert_eq(bad_tab, "yaml: line 2: tab character in indentation")
+    dup = YamlDoc.parse("a: 1\nb: 2\na: 3\n") or err { "{err}" }
+    assert_eq(dup, "yaml: line 3: duplicate key 'a'")
+    indent = YamlDoc.parse("a: 1\n   b: 2\n") or err { "{err}" }
+    assert_eq(indent, "yaml: line 2: unexpected indentation")
+    quote = YamlDoc.parse("a: \"open\n") or err { "{err}" }
+    assert_eq(quote, "yaml: line 1: unterminated quoted scalar")
+    nocolon = YamlDoc.parse("a: 1\nplain words\n") or err { "{err}" }
+    assert_eq(nocolon, "yaml: line 2: expected 'key: value'")
+    flow = YamlDoc.parse("a: [1, 2\n") or err { "{err}" }
+    assert_eq(flow, "yaml: line 1: unterminated flow sequence")
+    trailing = YamlDoc.parse("a: \"x\" y\n") or err { "{err}" }
+    assert_eq(trailing, "yaml: line 1: unexpected text after quoted scalar")
+    seq_in_map = YamlDoc.parse("a: 1\n- b\n") or err { "{err}" }
+    assert_eq(seq_in_map, "yaml: line 2: unexpected sequence item in mapping")
+}
+
+/// Test that empty and scalar-only documents parse.
+test "yaml empty and scalar documents" {
+    e = YamlDoc.parse("") or YamlDoc.new()
+    assert_eq(e.kind_at(""), 2)
+    c = YamlDoc.parse("# only a comment\n\n") or YamlDoc.new()
+    assert_eq(c.kind_at(""), 2)
+    s = YamlDoc.parse("hello\n") or YamlDoc.new()
+    assert_eq(s.get_str("") or "?", "hello")
+    n = YamlDoc.parse("42\n") or YamlDoc.new()
+    assert_eq(n.get_int("") or -1, 42)
+}
+
+/// Test exact emitted text for a nested document.
+test "yaml emits block text" {
+    src = "server:\n  host: localhost\n  ports:\n    - 80\n    - 443\nitems:\n  - name: a\n    qty: 1\n  - name: b\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    assert_eq(d.to_yaml(), src)
+}
+
+/// Test that parse -> emit -> parse is lossless across feature combinations.
+test "yaml roundtrip" {
+    src = "a: 1\nb: \"two words\"\nc:\n  - x\n  - y: 1\n    z:\n      - 1\n      - 2\n  - - n\n    - m\nd: [1, 2]\ne: ~\nf: '007'\ng: \"yes\"\nh: |\n  l1\n  l2\n"
+    d = YamlDoc.parse(src) or YamlDoc.new()
+    out1 = d.to_yaml()
+    d2 = YamlDoc.parse(out1) or YamlDoc.new()
+    out2 = d2.to_yaml()
+    assert_eq(out1, out2)
+    assert_eq(d2.get_str("f") or "?", "007")
+    assert_eq(d2.kind_at("f"), 1)
+    assert_eq(d2.get_str("g") or "?", "yes")
+    assert_eq(d2.kind_at("g"), 1)
+    assert_eq(d2.get_int("d.1") or -1, 2)
+    assert_eq(d2.get_int("c.1.z.1") or -1, 2)
+    assert_eq(d2.get_str("c.2.1") or "?", "m")
+    assert_eq(d2.get_str("h") or "?", "l1\nl2\n")
+    #assert(d2.is_null("e"))
+    assert_eq(d2.size(), d.size())
+}
+
+/// Test building a document and emitting it.
+test "yaml builder emits valid yaml" {
+    d = YamlDoc.new()
+    @d.put_str(0, "name", "Amina")
+    @d.put_int(0, "age", 30)
+    @d.put_bool(0, "admin", true)
+    @d.put_null(0, "spouse")
+    db = @d.put_map(0, "db")
+    @d.put_str(db, "host", "localhost")
+    @d.put_int(db, "port", 5432)
+    tags = @d.put_seq(0, "tags")
+    @d.push_str(tags, "a")
+    @d.push_str(tags, "b c")
+    @d.push_int(tags, 7)
+    row = @d.push_map(tags)
+    @d.put_int(row, "id", 1)
+    @d.put_map(0, "empty_map")
+    @d.put_seq(0, "empty_list")
+    want = "name: Amina\nage: 30\nadmin: true\nspouse: null\ndb:\n  host: localhost\n  port: 5432\ntags:\n  - a\n  - b c\n  - 7\n  - id: 1\nempty_map: {YAML_LB}{YAML_RB}\nempty_list: []\n"
+    assert_eq(d.to_yaml(), want)
+    back = YamlDoc.parse(d.to_yaml()) or YamlDoc.new()
+    assert_eq(back.get_str("name") or "?", "Amina")
+    assert_eq(back.get_int("tags.3.id") or -1, 1)
+    assert_eq(back.count("empty_map"), 0)
+    assert_eq(back.kind_at("empty_list"), 4)
+}
+
+/// Test stringify of flat maps and lists, including values that need quoting.
+test "yaml stringify map and list roundtrip" {
+    keys = ["plain", "num", "flag", "empty", "colon", "hash", "lead", "multi", "quote", "sp ace"]
+    vals = ["value", "123", "true", "", "a: b", "x #y", " pad", "l1\nl2", "say \"hi\"", "v"]
+    text = yaml_stringify_map(keys, vals)
+    d = YamlDoc.parse(text) or YamlDoc.new()
+    assert_eq(d.count(""), 10)
+    for keys {
+        assert_eq(d.get_str(it) or "MISSING", vals[index])
+    }
+    assert_eq(d.kind_at("num"), 1)
+    assert_eq(d.kind_at("flag"), 1)
+    assert_eq(d.kind_at("plain"), 0)
+    lines = yaml_stringify_list(["a", "b: c", "7", "-"])
+    l = YamlDoc.parse(lines) or YamlDoc.new()
+    assert_eq(l.count(""), 4)
+    assert_eq(l.get_str("0") or "?", "a")
+    assert_eq(l.get_str("1") or "?", "b: c")
+    assert_eq(l.get_str("2") or "?", "7")
+    assert_eq(l.get_str("3") or "?", "-")
+    assert_eq(yaml_stringify_map([], []), "{YAML_LB}{YAML_RB}\n")
+}
+
+/// Test scalar classification helpers.
+test "yaml scalar classification" {
+    #assert(yaml_int_ok("42"))
+    #assert(yaml_int_ok("-7"))
+    #assert(!(yaml_int_ok("4.2")))
+    #assert(!(yaml_int_ok("")))
+    #assert(!(yaml_int_ok("-")))
+    #assert(yaml_float_ok("1.5"))
+    #assert(yaml_float_ok(".5"))
+    #assert(yaml_float_ok("2e10"))
+    #assert(yaml_float_ok("-3.0e-2"))
+    #assert(yaml_float_ok(".inf"))
+    #assert(!(yaml_float_ok("1.2.3")))
+    #assert(!(yaml_float_ok("e5")))
+    #assert(!(yaml_float_ok("12")))
+    #assert(yaml_is_null_word("~"))
+    #assert(yaml_is_null_word("Null"))
+    #assert(!(yaml_is_null_word("nil")))
+    #assert(yaml_is_bool_word("True"))
+    #assert(!(yaml_is_bool_word("yes")))
+    #assert(yaml_looks_special("yes"))
+    #assert(!(yaml_looks_special("hello")))
+    assert_eq(yaml_to_int("+12") or -1, 12)
+    assert_eq(yaml_to_int("x") or -1, -1)
+}
+
+/// Test quote-aware scanning helpers.
+test "yaml scan helpers" {
+    assert_eq(yaml_strip_comment("a: b # c"), "a: b ")
+    assert_eq(yaml_strip_comment("a: \"b # c\""), "a: \"b # c\"")
+    assert_eq(yaml_strip_comment("a: it's # c"), "a: it's ")
+    assert_eq(yaml_strip_comment("# whole"), "")
+    assert_eq(yaml_scan("key: value", 1), 3)
+    assert_eq(yaml_scan("\"a: b\": c", 1), 6)
+    assert_eq(yaml_scan("http://x", 1), -1)
+    assert_eq(yaml_scan("trailing:", 1), 8)
+    #assert(yaml_is_seq_start("- a"))
+    #assert(yaml_is_seq_start("-"))
+    #assert(!(yaml_is_seq_start("-a")))
+    assert_eq(yaml_trim("  x \t"), "x")
+    assert_eq(yaml_quoted_end("\"a\\\"b\" tail", 0), 5)
+    assert_eq(yaml_quoted_end("'it''s' x", 0), 6)
+    assert_eq(yaml_quoted_end("\"open", 0), -1)
+    assert_eq(yaml_quote("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"")
+}

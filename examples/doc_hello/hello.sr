@@ -1,0 +1,6 @@
+//! Hello world — shows minimal `+main` entry.
+//! Run: super run examples/doc_hello/hello.sr
+
++main() {
+    print("hello from Super")
+}

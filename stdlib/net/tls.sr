@@ -1,0 +1,2023 @@
+//! std.net.tls — TLS 1.3 record framing, hello/extension builders and an offline handshake model
+//!
+//! Import with:
+//!   use std.net.tls
+//!
+//! Three layers, all pure functions over byte arrays (i64 values 0..255):
+//!
+//!  1. Record layer — `tls_record_encode`, `tls_record_at`, `tls_fragment`, TLS 1.3 inner
+//!     plaintext (`tls_inner_encode` / `tls_inner_decode`), alerts.
+//!  2. Handshake builders — SNI and ALPN extensions (`tls_sni_extension`,
+//!     `tls_alpn_extension`, `tls_alpn_select`), `ClientHello` / `ServerHello` build and
+//!     parse, and `tls_pem_strip` for certificate files.
+//!  3. `TlsConn` — a client or server handshake state machine that two instances can run
+//!     against each other with no network:
+//!
+//!       c = TlsConn.client("example.com", ["h2", "http/1.1"], "seed-a")
+//!       s = TlsConn.server(["h2"], cert_bytes, "seed-b")
+//!       flight = @c.start()
+//!       reply = @s.feed(flight) or []        // ServerHello + encrypted flight
+//!       fin = @c.feed(reply) or []           // client Finished; c.connected()
+//!       @s.feed(fin)                         // s.connected()
+//!       wire = @c.send_app(bytes) or []      // protected application data
+//!
+//! The record protection here is a *framing model*, NOT real cryptography: a SHA-256 based
+//! keystream and a 16-byte HMAC-SHA-256 tag stand in for an AEAD so sequence numbers, tag
+//! checks, inner content types and key switching can be exercised offline. Do not use it to
+//! protect real traffic; terminate production TLS with a vetted implementation.
+
+use std.core.bytes
+use std.sec.hash
+use std.sec.encoding
+
+/// Record content type: change_cipher_spec (middlebox compatibility only).
++TLS_CCS = 20
+/// Record content type: alert.
++TLS_ALERT = 21
+/// Record content type: handshake.
++TLS_HANDSHAKE = 22
+/// Record content type: application_data (also the outer type of every protected record).
++TLS_APPDATA = 23
+/// Largest plaintext carried by one record.
++TLS_MAX_PLAINTEXT = 16384
+/// Largest record body (plaintext + inner type + padding + 255 bytes of expansion).
++TLS_MAX_BODY = 16640
+/// Legacy record version 0x0303 written in every TLS 1.3 record.
++TLS_LEGACY_VERSION = 771
+
+/// Handshake type: ClientHello.
++TLS_HS_CLIENT_HELLO = 1
+/// Handshake type: ServerHello.
++TLS_HS_SERVER_HELLO = 2
+/// Handshake type: EncryptedExtensions.
++TLS_HS_ENCRYPTED_EXTENSIONS = 8
+/// Handshake type: Certificate.
++TLS_HS_CERTIFICATE = 11
+/// Handshake type: CertificateVerify.
++TLS_HS_CERTIFICATE_VERIFY = 15
+/// Handshake type: Finished.
++TLS_HS_FINISHED = 20
+
+/// Extension type: server_name.
++TLS_EXT_SNI = 0
+/// Extension type: supported_groups.
++TLS_EXT_GROUPS = 10
+/// Extension type: signature_algorithms.
++TLS_EXT_SIGALGS = 13
+/// Extension type: application_layer_protocol_negotiation.
++TLS_EXT_ALPN = 16
+/// Extension type: supported_versions.
++TLS_EXT_VERSIONS = 43
+/// Extension type: key_share.
++TLS_EXT_KEY_SHARE = 51
+/// Cipher suite TLS_AES_128_GCM_SHA256.
++TLS_AES_128_GCM_SHA256 = 4865
+
+/// Handshake state: client has not sent its hello yet.
++TLS_ST_START = 0
+/// Handshake state: client waits for the ServerHello.
++TLS_ST_WAIT_SH = 1
+/// Handshake state: client waits for EncryptedExtensions.
++TLS_ST_WAIT_EE = 2
+/// Handshake state: client waits for the server Certificate.
++TLS_ST_WAIT_CERT = 3
+/// Handshake state: client waits for CertificateVerify.
++TLS_ST_WAIT_CV = 4
+/// Handshake state: client waits for the server Finished.
++TLS_ST_WAIT_FINISHED = 5
+/// Handshake state: both sides are protecting application data.
++TLS_ST_CONNECTED = 6
+/// Handshake state: a close_notify was exchanged.
++TLS_ST_CLOSED = 7
+/// Handshake state: the handshake or a record failed; see `alert`.
++TLS_ST_FAILED = 8
+/// Handshake state: server waits for the ClientHello.
++TLS_ST_WAIT_CH = 9
+/// Handshake state: server waits for the client Finished.
++TLS_ST_WAIT_CLIENT_FINISHED = 10
+
+// --- byte builders ------------------------------------------------------------------------
+
+/// Concatenation of the byte arrays in `parts`.
++tls_cat(parts: _) : _ {
+    out = []
+    for parts {
+        chunk = it
+        for chunk { out = host.sys_arr_push(out, it) }
+    }
+    out
+}
+
+/// Big-endian 16-bit encoding of `v`.
++tls_u16(v: i64) : _ => [(v / 256) % 256, v % 256]
+
+/// Big-endian 24-bit encoding of `v`.
++tls_u24(v: i64) : _ => [(v / 65536) % 256, (v / 256) % 256, v % 256]
+
+/// `data` preceded by its one-byte length.
++tls_vec8(data: _) : _ => tls_cat([[host.sys_arr_len(data)], data])
+
+/// `data` preceded by its two-byte length.
++tls_vec16(data: _) : _ => tls_cat([tls_u16(host.sys_arr_len(data)), data])
+
+/// `data` preceded by its three-byte length.
++tls_vec24(data: _) : _ => tls_cat([tls_u24(host.sys_arr_len(data)), data])
+
+/// Bytes `lo..hi` of `data`.
++tls_slice(data: _, lo: i64, hi: i64) : _ {
+    out = []
+    for lo..hi { out = host.sys_arr_push(out, data[it]) }
+    out
+}
+
+/// Lowercase hex of `data`.
++tls_hex(data: _) : str {
+    digits = "0123456789abcdef"
+    out = ""
+    for data { out = "{out}{digits[it / 16]}{digits[it % 16]}" }
+    out
+}
+
+/// Value of the hex digit `c`, or -1.
++tls_hex_val(c: str) : i64 {
+    code = host.sys_ord(c)
+    if code >= 48 {
+        if code <= 57 { return code - 48 }
+    }
+    if code >= 97 {
+        if code <= 102 { return code - 87 }
+    }
+    if code >= 65 {
+        if code <= 70 { return code - 55 }
+    }
+    -1
+}
+
+/// Bytes of the hex string `hex` (an odd trailing digit is ignored).
++tls_unhex(hex: str) : _ {
+    out = []
+    n = host.sys_str_len(hex) / 2
+    for 0..n {
+        hi = tls_hex_val(hex[it * 2])
+        lo = tls_hex_val(hex[it * 2 + 1])
+        out = host.sys_arr_push(out, hi * 16 + lo)
+    }
+    out
+}
+
+/// Hex of `n` fresh random bytes (the production source of hello randoms and key shares).
++tls_random_hex(n: i64) : str => host.sys_hex_encode(host.sys_rand_bytes(n))
+
+/// 32 deterministic bytes derived from `seed` and `label` (offline tests and replays).
++tls_derive32(seed: str, label: str) : _ => tls_unhex(sha256_hex("{seed}|{label}"))
+
+// --- record layer -------------------------------------------------------------------------
+
+/// One parsed record: outer content type, legacy version and body bytes.
++TlsRecord = {
+    /// Content type (20..23). Defaults to `0`.
+    ctype: i64 = 0
+    /// Legacy version field. Defaults to `0`.
+    version: i64 = 0
+    /// Record body (plaintext, or ciphertext for protected records). Defaults to `[]`.
+    body: _ = []
+}
+
+/// Five-byte record header for a body of `len` bytes.
++tls_record_header(ctype: i64, len: i64) : _ => [ctype, 3, 3, (len / 256) % 256, len % 256]
+
+/// One record carrying `payload` as a plaintext record, or fail when it is too large.
++tls_record_encode(ctype: i64, payload: _) : _! {
+    ensure ctype >= 20 else {
+        fail "tls: invalid content type {ctype}"
+        return
+    }
+    ensure ctype <= 23 else {
+        fail "tls: invalid content type {ctype}"
+        return
+    }
+    n = host.sys_arr_len(payload)
+    ensure n <= 16384 else {
+        fail "tls: record_overflow ({n} > 16384)"
+        return
+    }
+    tls_cat([tls_record_header(ctype, n), payload])
+}
+
+/// `payload` split into as many plaintext records as needed (nothing for an empty payload).
++tls_fragment(ctype: i64, payload: _) : _ {
+    out = []
+    n = host.sys_arr_len(payload)
+    pos = 0
+    while pos < n {
+        end = pos + 16384
+        if end > n { end = n }
+        rec = tls_record_encode(ctype, tls_slice(payload, pos, end)) or []
+        out = tls_cat([out, rec])
+        pos = end
+    }
+    out
+}
+
+/// Total bytes of the record starting at `pos`: -1 while fewer than 5 header bytes exist.
++tls_record_need(data: _, pos: i64) : i64 {
+    n = host.sys_arr_len(data)
+    if pos + 5 > n { return -1 }
+    5 + data[pos + 3] * 256 + data[pos + 4]
+}
+
+/// Parse the record at `pos`; fails on an invalid header or while the record is incomplete.
++tls_record_at(data: _, pos: i64) : TlsRecord! {
+    need = tls_record_need(data, pos)
+    ensure need >= 0 else {
+        fail "tls: incomplete record header"
+        return
+    }
+    ctype = data[pos]
+    ensure ctype >= 20 else {
+        fail "tls: unexpected_message (content type {ctype})"
+        return
+    }
+    ensure ctype <= 23 else {
+        fail "tls: unexpected_message (content type {ctype})"
+        return
+    }
+    ensure data[pos + 1] == 3 else {
+        fail "tls: protocol_version (record version major {data[pos + 1]})"
+        return
+    }
+    body_len = need - 5
+    ensure body_len <= 16640 else {
+        fail "tls: record_overflow ({body_len} > 16640)"
+        return
+    }
+    ensure pos + need <= host.sys_arr_len(data) else {
+        fail "tls: incomplete record body"
+        return
+    }
+    version = data[pos + 1] * 256 + data[pos + 2]
+    TlsRecord.{ctype, version, body: tls_slice(data, pos + 5, pos + need)}
+}
+
+/// Every complete record in `data` (a trailing partial record is left unparsed).
++tls_parse_records(data: _) : _ {
+    out = []
+    pos = 0
+    going = true
+    while going {
+        need = tls_record_need(data, pos)
+        if need < 0 {
+            going = false
+        } else {
+            if pos + need > host.sys_arr_len(data) {
+                going = false
+            } else {
+                rec = tls_record_at(data, pos) or TlsRecord.{}
+                if rec.ctype == 0 {
+                    going = false
+                } else {
+                    out = host.sys_arr_push(out, rec)
+                    pos += need
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Decrypted TLS 1.3 record content: the real content type and the data.
++TlsInner = {
+    /// Real content type revealed after decryption. Defaults to `0`.
+    ctype: i64 = 0
+    /// Content bytes. Defaults to `[]`.
+    content: _ = []
+}
+
+/// TLS 1.3 `TLSInnerPlaintext`: `content`, then the real type, then `pad` zero bytes.
++tls_inner_encode(content: _, ctype: i64, pad: i64) : _ {
+    out = tls_cat([content, [ctype]])
+    for 0..pad { out = host.sys_arr_push(out, 0) }
+    out
+}
+
+/// Split inner plaintext into content and type (the last non-zero byte), or fail when it is all
+/// padding.
++tls_inner_decode(inner: _) : TlsInner! {
+    n = host.sys_arr_len(inner)
+    last = -1
+    for 0..n {
+        if last < 0 {
+            if inner[n - 1 - it] != 0 { last = n - 1 - it }
+        }
+    }
+    ensure last >= 0 else {
+        fail "tls: unexpected_message (inner plaintext has no content type)"
+        return
+    }
+    TlsInner.{ctype: inner[last], content: tls_slice(inner, 0, last)}
+}
+
+// --- alerts -------------------------------------------------------------------------------
+
+/// Alert description: close_notify.
++TLS_ALERT_CLOSE_NOTIFY = 0
+/// Alert description: unexpected_message.
++TLS_ALERT_UNEXPECTED_MESSAGE = 10
+/// Alert description: bad_record_mac.
++TLS_ALERT_BAD_RECORD_MAC = 20
+/// Alert description: handshake_failure.
++TLS_ALERT_HANDSHAKE_FAILURE = 40
+/// Alert description: bad_certificate.
++TLS_ALERT_BAD_CERTIFICATE = 42
+/// Alert description: illegal_parameter.
++TLS_ALERT_ILLEGAL_PARAMETER = 47
+/// Alert description: decode_error.
++TLS_ALERT_DECODE_ERROR = 50
+/// Alert description: decrypt_error.
++TLS_ALERT_DECRYPT_ERROR = 51
+/// Alert description: protocol_version.
++TLS_ALERT_PROTOCOL_VERSION = 70
+/// Alert description: internal_error.
++TLS_ALERT_INTERNAL_ERROR = 80
+/// Alert description: missing_extension.
++TLS_ALERT_MISSING_EXTENSION = 109
+/// Alert description: no_application_protocol.
++TLS_ALERT_NO_APPLICATION_PROTOCOL = 120
+
+/// Two-byte alert body: severity (1 warning, 2 fatal) and description.
++tls_alert_body(level: i64, desc: i64) : _ => [level, desc]
+
+/// Plaintext alert record. `close_notify` is a warning, everything else is fatal.
++tls_alert_record(desc: i64) : _ {
+    level = 2
+    if desc == 0 { level = 1 }
+    tls_cat([tls_record_header(21, 2), tls_alert_body(level, desc)])
+}
+
+/// RFC name of alert `desc` (`alert_<n>` for unknown values).
++tls_alert_name(desc: i64) : str {
+    if desc == 0 { return "close_notify" }
+    if desc == 10 { return "unexpected_message" }
+    if desc == 20 { return "bad_record_mac" }
+    if desc == 22 { return "record_overflow" }
+    if desc == 40 { return "handshake_failure" }
+    if desc == 42 { return "bad_certificate" }
+    if desc == 47 { return "illegal_parameter" }
+    if desc == 50 { return "decode_error" }
+    if desc == 51 { return "decrypt_error" }
+    if desc == 70 { return "protocol_version" }
+    if desc == 80 { return "internal_error" }
+    if desc == 109 { return "missing_extension" }
+    if desc == 120 { return "no_application_protocol" }
+    "alert_{desc}"
+}
+
+// --- record protection (framing model, not real crypto) -----------------------------------
+
+/// `n` keystream bytes for (`key`, `seq`): SHA-256 blocks of `key|seq|counter`.
++tls_keystream(key: str, seq: i64, n: i64) : _ {
+    out = []
+    block = 0
+    while host.sys_arr_len(out) < n {
+        chunk = tls_unhex(sha256_hex("{key}|{seq}|{block}"))
+        for chunk { out = host.sys_arr_push(out, it) }
+        block += 1
+    }
+    tls_slice(out, 0, n)
+}
+
+/// 16-byte authentication tag over the ciphertext `ct`, its header and the sequence number.
++tls_tag(key: str, seq: i64, ct: _) : _ {
+    aad = tls_record_header(23, host.sys_arr_len(ct) + 16)
+    mac = hmac_sha256_hex(key, "{seq}|{tls_hex(aad)}|{tls_hex(ct)}")
+    tls_unhex(mac[0..32])
+}
+
+/// Protect `inner` (TLS 1.3 inner plaintext): ciphertext followed by the 16-byte tag.
++tls_seal(key: str, seq: i64, inner: _) : _ {
+    stream = tls_keystream(key, seq, host.sys_arr_len(inner))
+    ct = []
+    for 0..host.sys_arr_len(inner) { ct = host.sys_arr_push(ct, (inner[it] ^ stream[it]) & 255) }
+    tls_cat([ct, tls_tag(key, seq, ct)])
+}
+
+/// Verify and decrypt a protected record body, or fail with `bad_record_mac`.
++tls_open(key: str, seq: i64, body: _) : _! {
+    n = host.sys_arr_len(body)
+    ensure n >= 17 else {
+        fail "tls: bad_record_mac (record shorter than the tag)"
+        return
+    }
+    ct = tls_slice(body, 0, n - 16)
+    tag = tls_slice(body, n - 16, n)
+    want = tls_tag(key, seq, ct)
+    diff = 0
+    for 0..16 { diff = diff | (tag[it] ^ want[it]) }
+    ensure diff == 0 else {
+        fail "tls: bad_record_mac (tag mismatch)"
+        return
+    }
+    stream = tls_keystream(key, seq, n - 16)
+    out = []
+    for 0..(n - 16) { out = host.sys_arr_push(out, (ct[it] ^ stream[it]) & 255) }
+    out
+}
+
+/// A complete protected record (outer type 23) carrying `content` of real type `ctype`.
++tls_protect(key: str, seq: i64, ctype: i64, content: _) : _ {
+    body = tls_seal(key, seq, tls_inner_encode(content, ctype, 0))
+    tls_cat([tls_record_header(23, host.sys_arr_len(body)), body])
+}
+
+// --- extensions ---------------------------------------------------------------------------
+
+/// A generic extension: type, then the length-prefixed `data`.
++tls_extension(ext_type: i64, data: _) : _ => tls_cat([tls_u16(ext_type), tls_vec16(data)])
+
+/// True when `host` is usable as an SNI name: 1..255 ASCII letters, digits, `-`, `_` and
+/// dots, with no empty labels, not ending in a dot, and not an IPv4 literal.
++tls_valid_sni(host_name: str) : bool {
+    n = host.sys_str_len(host_name)
+    if n == 0 { return false }
+    if n > 255 { return false }
+    ok = true
+    all_numeric = true
+    prev = "."
+    for 0..n {
+        c = host_name[it]
+        code = host.sys_ord(c)
+        good = false
+        if code >= 48 {
+            if code <= 57 { good = true }
+        }
+        if code >= 65 {
+            if code <= 90 { good = true }
+        }
+        if code >= 97 {
+            if code <= 122 { good = true }
+        }
+        if c == "-" { good = true }
+        if c == "_" { good = true }
+        if c == "." {
+            good = true
+            if prev == "." { ok = false }
+        } else {
+            if c != "-" {
+                if code < 48 { all_numeric = false }
+                if code > 57 { all_numeric = false }
+            } else {
+                all_numeric = false
+            }
+        }
+        if !good { ok = false }
+        prev = c
+    }
+    if prev == "." { ok = false }
+    if all_numeric { ok = false }
+    ok
+}
+
+/// The server_name extension for `host_name`, or fail when it is not a valid DNS name.
++tls_sni_extension(host_name: str) : _! {
+    ensure tls_valid_sni(host_name) else {
+        fail "tls: invalid server name"
+        return
+    }
+    name = host.sys_str_to_bytes(host_name)
+    entry = tls_cat([[0], tls_vec16(name)])
+    tls_extension(0, tls_vec16(entry))
+}
+
+/// Host name inside server_name extension data, or fail.
++tls_parse_sni(data: _) : str! {
+    r = ByteReader.from(data)
+    list_len = @r.read_u16_be() or err { fail "tls: decode_error (sni list)" }
+    ensure list_len == r.remaining() else {
+        fail "tls: decode_error (sni list length)"
+        return
+    }
+    kind = @r.read_u8() or err { fail "tls: decode_error (sni type)" }
+    ensure kind == 0 else {
+        fail "tls: decode_error (sni name type)"
+        return
+    }
+    name_len = @r.read_u16_be() or err { fail "tls: decode_error (sni name)" }
+    ensure name_len > 0 else {
+        fail "tls: decode_error (empty sni name)"
+        return
+    }
+    raw = @r.read_n(name_len) or err { fail "tls: decode_error (sni name bytes)" }
+    host.sys_bytes_to_str(raw)
+}
+
+/// The ALPN extension offering `protos` in preference order, or fail on an empty list or an
+/// empty / over-long protocol name.
++tls_alpn_extension(protos: _) : _! {
+    ensure host.sys_arr_len(protos) > 0 else {
+        fail "tls: empty ALPN list"
+        return
+    }
+    list = []
+    for protos {
+        raw = host.sys_str_to_bytes(it)
+        n = host.sys_arr_len(raw)
+        if n >= 1 {
+            if n <= 255 { list = tls_cat([list, tls_vec8(raw)]) }
+        }
+    }
+    ensure host.sys_arr_len(list) > 0 else {
+        fail "tls: invalid ALPN protocol name"
+        return
+    }
+    ensure host.sys_arr_len(list) < 65536 else {
+        fail "tls: ALPN list too long"
+        return
+    }
+    tls_extension(16, tls_vec16(list))
+}
+
+/// Protocol names inside ALPN extension data, or fail.
++tls_parse_alpn(data: _) : _! {
+    r = ByteReader.from(data)
+    list_len = @r.read_u16_be() or err { fail "tls: decode_error (alpn list)" }
+    ensure list_len == r.remaining() else {
+        fail "tls: decode_error (alpn list length)"
+        return
+    }
+    out = []
+    bad = false
+    while r.remaining() > 0 {
+        n = @r.read_u8() or 0
+        raw = @r.read_n(n) or []
+        if n == 0 { bad = true }
+        if host.sys_arr_len(raw) != n { bad = true }
+        out = host.sys_arr_push(out, host.sys_bytes_to_str(raw))
+        if bad { break }
+    }
+    ensure !bad else {
+        fail "tls: decode_error (alpn entry)"
+        return
+    }
+    ensure host.sys_arr_len(out) > 0 else {
+        fail "tls: decode_error (empty alpn list)"
+        return
+    }
+    out
+}
+
+/// The protocol a server picks: the first of `server_prefs` that the client also offered,
+/// or the empty string when there is no overlap.
++tls_alpn_select(client: _, server_prefs: _) : str {
+    pick = ""
+    for server_prefs {
+        want = it
+        if pick == "" {
+            for client {
+                if it == want { pick = want }
+            }
+        }
+    }
+    pick
+}
+
+/// supported_versions extension: the client form lists TLS 1.3 only.
++tls_versions_extension(client_form: bool) : _ {
+    if client_form { return tls_extension(43, [2, 3, 4]) }
+    tls_extension(43, [3, 4])
+}
+
+/// supported_groups extension offering x25519.
++tls_groups_extension() : _ => tls_extension(10, tls_vec16([0, 29]))
+
+/// signature_algorithms extension offering rsa_pss_rsae_sha256 and ecdsa_secp256r1_sha256.
++tls_sigalgs_extension() : _ => tls_extension(13, tls_vec16([8, 4, 4, 3]))
+
+/// key_share extension carrying one x25519 share (client: a list of one entry; server: the entry).
++tls_key_share_extension(share: _, client_form: bool) : _ {
+    entry = tls_cat([tls_u16(29), tls_vec16(share)])
+    if client_form { return tls_extension(51, tls_vec16(entry)) }
+    tls_extension(51, entry)
+}
+
+/// Everything a hello message announced.
++TlsHello = {
+    /// ClientHello legacy_version / ServerHello legacy_version. Defaults to `0`.
+    legacy: i64 = 0
+    /// The 32 random bytes. Defaults to `[]`.
+    random: _ = []
+    /// Legacy session id bytes. Defaults to `[]`.
+    session_id: _ = []
+    /// Offered cipher suites (client) or the one chosen (server, single element). Defaults to `[]`.
+    ciphers: _ = []
+    /// Server name, or empty. Defaults to `""`.
+    sni: str = ""
+    /// ALPN names (client offer or the server's single choice). Defaults to `[]`.
+    alpn: _ = []
+    /// supported_versions entries. Defaults to `[]`.
+    versions: _ = []
+    /// First key_share entry's public bytes. Defaults to `[]`.
+    key_share: _ = []
+}
+
+/// Fold the extension block `exts` into `hello`; `client` selects the client/server wire forms.
++tls_parse_exts(exts: _, client: bool, hello: TlsHello) : TlsHello! {
+    r = ByteReader.from(exts)
+    h = hello
+    seen = []
+    while r.remaining() > 0 {
+        ty = @r.read_u16_be() or err { fail "tls: decode_error (extension type)" }
+        n = @r.read_u16_be() or err { fail "tls: decode_error (extension length)" }
+        data = @r.read_n(n) or err { fail "tls: decode_error (extension truncated)" }
+        dup = false
+        for seen {
+            if it == ty { dup = true }
+        }
+        ensure !dup else {
+            fail "tls: illegal_parameter (duplicate extension {ty})"
+            return
+        }
+        seen = host.sys_arr_push(seen, ty)
+        if ty == 0 { h.sni = tls_parse_sni(data) or err { fail "{err}" } }
+        if ty == 16 { h.alpn = tls_parse_alpn(data) or err { fail "{err}" } }
+        if ty == 43 {
+            vr = ByteReader.from(data)
+            if client {
+                vl = @vr.read_u8() or err { fail "tls: decode_error (versions)" }
+                ensure vl == vr.remaining() else {
+                    fail "tls: decode_error (versions length)"
+                    return
+                }
+            }
+            vs = []
+            while vr.remaining() > 1 {
+                v = @vr.read_u16_be() or 0
+                vs = host.sys_arr_push(vs, v)
+            }
+            ensure vr.remaining() == 0 else {
+                fail "tls: decode_error (versions odd length)"
+                return
+            }
+            h.versions = vs
+        }
+        if ty == 51 {
+            kr = ByteReader.from(data)
+            if client {
+                kl = @kr.read_u16_be() or err { fail "tls: decode_error (key_share)" }
+                ensure kl == kr.remaining() else {
+                    fail "tls: decode_error (key_share length)"
+                    return
+                }
+            }
+            if kr.remaining() > 0 {
+                group = @kr.read_u16_be() or err { fail "tls: decode_error (key_share group)" }
+                sl = @kr.read_u16_be() or err { fail "tls: decode_error (key_share length)" }
+                share = @kr.read_n(sl) or err { fail "tls: decode_error (key_share bytes)" }
+                if group == 29 { h.key_share = share }
+            }
+        }
+    }
+    h
+}
+
+// --- hello messages -----------------------------------------------------------------------
+
+/// A handshake message: type, three-byte length, body.
++tls_hs_msg(htype: i64, body: _) : _ => tls_cat([[htype], tls_vec24(body)])
+
+/// One parsed handshake message.
++TlsHs = {
+    /// Handshake type. Defaults to `0`.
+    htype: i64 = 0
+    /// Body bytes. Defaults to `[]`.
+    body: _ = []
+    /// The complete message including its four-byte header (for the transcript). Defaults to `[]`.
+    raw: _ = []
+}
+
+/// Split `data` into complete handshake messages, or fail on a truncated one.
++tls_hs_parse_all(data: _) : _! {
+    out = []
+    r = ByteReader.from(data)
+    while r.remaining() > 0 {
+        ht = @r.read_u8() or err { fail "tls: decode_error (handshake header)" }
+        hi = @r.read_u8() or err { fail "tls: decode_error (handshake header)" }
+        mid = @r.read_u8() or err { fail "tls: decode_error (handshake header)" }
+        lo = @r.read_u8() or err { fail "tls: decode_error (handshake header)" }
+        n = hi * 65536 + mid * 256 + lo
+        body = @r.read_n(n) or err { fail "tls: decode_error (handshake body truncated)" }
+        out = host.sys_arr_push(out, TlsHs.{htype: ht, body, raw: tls_hs_msg(ht, body)})
+    }
+    out
+}
+
+/// ClientHello handshake message offering TLS 1.3, `sni` (skipped when empty), `alpn` (skipped
+/// when empty), an x25519 `key_share` of 32 bytes and the legacy `session_id` to echo.
++tls_client_hello(sni: str, alpn: _, random: _, key_share: _, session_id: _) : _! {
+    ensure host.sys_arr_len(session_id) <= 32 else {
+        fail "tls: session id longer than 32 bytes"
+        return
+    }
+    ensure host.sys_arr_len(random) == 32 else {
+        fail "tls: random must be 32 bytes"
+        return
+    }
+    ensure host.sys_arr_len(key_share) == 32 else {
+        fail "tls: key share must be 32 bytes"
+        return
+    }
+    exts = []
+    if sni != "" {
+        sx = tls_sni_extension(sni) or err { fail "{err}" }
+        exts = tls_cat([exts, sx])
+    }
+    exts = tls_cat([exts, tls_versions_extension(true), tls_groups_extension(), tls_sigalgs_extension()])
+    if host.sys_arr_len(alpn) > 0 {
+        ax = tls_alpn_extension(alpn) or err { fail "{err}" }
+        exts = tls_cat([exts, ax])
+    }
+    exts = tls_cat([exts, tls_key_share_extension(key_share, true)])
+    suites = [19, 1, 19, 2, 19, 3]
+    body = tls_cat([tls_u16(771), random, tls_vec8(session_id), tls_vec16(suites), tls_vec8([0]), tls_vec16(exts)])
+    tls_hs_msg(1, body)
+}
+
+/// Parse a ClientHello body (without the handshake header), or fail.
++tls_parse_client_hello(body: _) : TlsHello! {
+    r = ByteReader.from(body)
+    legacy = @r.read_u16_be() or err { fail "tls: decode_error (client version)" }
+    random = @r.read_n(32) or err { fail "tls: decode_error (client random)" }
+    sid_len = @r.read_u8() or err { fail "tls: decode_error (session id)" }
+    ensure sid_len <= 32 else {
+        fail "tls: illegal_parameter (session id too long)"
+        return
+    }
+    sid = @r.read_n(sid_len) or err { fail "tls: decode_error (session id bytes)" }
+    cs_len = @r.read_u16_be() or err { fail "tls: decode_error (cipher suites)" }
+    ensure cs_len >= 2 else {
+        fail "tls: decode_error (no cipher suites)"
+        return
+    }
+    ensure cs_len % 2 == 0 else {
+        fail "tls: decode_error (odd cipher suite length)"
+        return
+    }
+    cs_raw = @r.read_n(cs_len) or err { fail "tls: decode_error (cipher suite bytes)" }
+    suites = []
+    for 0..(cs_len / 2) { suites = host.sys_arr_push(suites, cs_raw[it * 2] * 256 + cs_raw[it * 2 + 1]) }
+    comp_len = @r.read_u8() or err { fail "tls: decode_error (compression)" }
+    comp = @r.read_n(comp_len) or err { fail "tls: decode_error (compression bytes)" }
+    ensure comp_len == 1 else {
+        fail "tls: illegal_parameter (compression must be null)"
+        return
+    }
+    ensure comp[0] == 0 else {
+        fail "tls: illegal_parameter (compression must be null)"
+        return
+    }
+    ext_len = @r.read_u16_be() or err { fail "tls: missing_extension (no extensions)" }
+    exts = @r.read_n(ext_len) or err { fail "tls: decode_error (extensions truncated)" }
+    ensure r.remaining() == 0 else {
+        fail "tls: decode_error (trailing bytes after extensions)"
+        return
+    }
+    base = TlsHello.{legacy, random, session_id: sid, ciphers: suites}
+    tls_parse_exts(exts, true, base) or err { fail "{err}" }
+}
+
+/// ServerHello handshake message echoing `session_id`, choosing `cipher` and sending the
+/// x25519 `key_share`.
++tls_server_hello(random: _, session_id: _, cipher: i64, key_share: _) : _! {
+    ensure host.sys_arr_len(random) == 32 else {
+        fail "tls: random must be 32 bytes"
+        return
+    }
+    ensure host.sys_arr_len(key_share) == 32 else {
+        fail "tls: key share must be 32 bytes"
+        return
+    }
+    exts = tls_cat([tls_versions_extension(false), tls_key_share_extension(key_share, false)])
+    body = tls_cat([tls_u16(771), random, tls_vec8(session_id), tls_u16(cipher), [0], tls_vec16(exts)])
+    tls_hs_msg(2, body)
+}
+
+/// Parse a ServerHello body (without the handshake header), or fail.
++tls_parse_server_hello(body: _) : TlsHello! {
+    r = ByteReader.from(body)
+    legacy = @r.read_u16_be() or err { fail "tls: decode_error (server version)" }
+    random = @r.read_n(32) or err { fail "tls: decode_error (server random)" }
+    sid_len = @r.read_u8() or err { fail "tls: decode_error (session id)" }
+    sid = @r.read_n(sid_len) or err { fail "tls: decode_error (session id bytes)" }
+    cipher = @r.read_u16_be() or err { fail "tls: decode_error (cipher suite)" }
+    comp = @r.read_u8() or err { fail "tls: decode_error (compression)" }
+    ensure comp == 0 else {
+        fail "tls: illegal_parameter (compression must be null)"
+        return
+    }
+    ext_len = @r.read_u16_be() or err { fail "tls: missing_extension (no extensions)" }
+    exts = @r.read_n(ext_len) or err { fail "tls: decode_error (extensions truncated)" }
+    ensure r.remaining() == 0 else {
+        fail "tls: decode_error (trailing bytes after extensions)"
+        return
+    }
+    base = TlsHello.{legacy, random, session_id: sid, ciphers: [cipher]}
+    tls_parse_exts(exts, false, base) or err { fail "{err}" }
+}
+
+/// EncryptedExtensions body announcing the negotiated ALPN protocol (none when empty).
++tls_encrypted_extensions(alpn: str) : _! {
+    exts = []
+    if alpn != "" {
+        ax = tls_alpn_extension([alpn]) or err { fail "{err}" }
+        exts = ax
+    }
+    tls_hs_msg(8, tls_vec16(exts))
+}
+
+/// ALPN protocol announced in an EncryptedExtensions body (empty when absent), or fail.
++tls_parse_encrypted_extensions(body: _) : str! {
+    r = ByteReader.from(body)
+    n = @r.read_u16_be() or err { fail "tls: decode_error (extensions)" }
+    ensure n == r.remaining() else {
+        fail "tls: decode_error (extensions length)"
+        return
+    }
+    raw = @r.read_n(n) or err { fail "tls: decode_error (extensions bytes)" }
+    h = tls_parse_exts(raw, false, TlsHello.{}) or err { fail "{err}" }
+    if host.sys_arr_len(h.alpn) == 1 { return h.alpn[0] }
+    ""
+}
+
+// --- PEM ----------------------------------------------------------------------------------
+
+/// A PEM block: its label (`CERTIFICATE`) and the base64 body with line breaks removed.
++TlsPem = {
+    /// Text between `-----BEGIN ` and `-----`. Defaults to `""`.
+    label: str = ""
+    /// Base64 payload, whitespace removed. Defaults to `""`.
+    body: str = ""
+}
+
+/// Index of the first occurrence of `needle` in `s` at or after `from`, or -1.
++tls_find(s: str, needle: str, from: i64) : i64 {
+    n = host.sys_str_len(s)
+    k = host.sys_str_len(needle)
+    found = -1
+    p = from
+    while p + k <= n {
+        if s[p..(p + k)] == needle {
+            found = p
+            break
+        }
+        p += 1
+    }
+    found
+}
+
+/// True for characters allowed in a base64 body.
++tls_is_b64(c: str) : bool {
+    code = host.sys_ord(c)
+    if code >= 48 {
+        if code <= 57 { return true }
+    }
+    if code >= 65 {
+        if code <= 90 { return true }
+    }
+    if code >= 97 {
+        if code <= 122 { return true }
+    }
+    if c == "+" { return true }
+    if c == "/" { return true }
+    if c == "-" { return true }
+    if c == "_" { return true }
+    c == "="
+}
+
+/// Strip the first PEM block of `text` down to its label and one-line base64 body; RFC 1421
+/// header lines (`Proc-Type: ...`) are dropped. Fails on a missing or mismatched boundary.
++tls_pem_strip(text: str) : TlsPem! {
+    begin = tls_find(text, "-----BEGIN ", 0)
+    ensure begin >= 0 else {
+        fail "tls: pem: no BEGIN boundary"
+        return
+    }
+    label_start = begin + 11
+    label_end = tls_find(text, "-----", label_start)
+    ensure label_end >= 0 else {
+        fail "tls: pem: unterminated BEGIN boundary"
+        return
+    }
+    label = text[label_start..label_end]
+    body_start = label_end + 5
+    end_marker = "-----END {label}-----"
+    end = tls_find(text, end_marker, body_start)
+    ensure end >= 0 else {
+        fail "tls: pem: no matching END boundary for {label}"
+        return
+    }
+    raw = text[body_start..end]
+    out = ""
+    line = ""
+    bad = false
+    n = host.sys_str_len(raw)
+    for 0..(n + 1) {
+        c = "\n"
+        if it < n { c = raw[it] }
+        if c == "\n" {
+            if tls_find(line, ":", 0) < 0 { out = "{out}{line}" }
+            line = ""
+        } else {
+            if c != "\r" {
+                if c != " " {
+                    if c != "\t" {
+                        line = "{line}{c}"
+                    }
+                }
+            }
+        }
+    }
+    for 0..host.sys_str_len(out) {
+        if !tls_is_b64(out[it]) { bad = true }
+    }
+    ensure !bad else {
+        fail "tls: pem: invalid base64 character"
+        return
+    }
+    TlsPem.{label, body: out}
+}
+
+/// DER bytes of the first PEM block of `text`, or fail.
++tls_pem_decode(text: str) : _! {
+    p = tls_pem_strip(text) or err { fail "{err}" }
+    base64_decode_bytes(p.body) or err { fail "tls: pem: {err}" }
+}
+
+// --- handshake state machine ----------------------------------------------------------------
+
+/// One end of an offline TLS 1.3 handshake. Create with `TlsConn.client` / `TlsConn.server`,
+/// shuttle the returned byte arrays between two instances, then exchange application data.
++TlsConn = {
+    /// 0 for a client, 1 for a server. Defaults to `0`.
+    role: i64 = 0
+    /// One of the `TLS_ST_*` states. Defaults to `0`.
+    phase: i64 = 0
+    /// Server name sent (client) or received (server). Defaults to `""`.
+    sni: str = ""
+    /// ALPN protocols offered (client) or preferred (server). Defaults to `[]`.
+    alpn_offer: _ = []
+    /// Negotiated ALPN protocol, or empty. Defaults to `""`.
+    alpn: str = ""
+    /// Seed that makes random values and key shares deterministic; empty draws fresh ones. Defaults to `""`.
+    seed: str = ""
+    /// Server certificate bytes (sent by a server, received by a client). Defaults to `[]`.
+    cert: _ = []
+    /// Our hello random. Defaults to `[]`.
+    my_random: _ = []
+    /// Our x25519 key share. Defaults to `[]`.
+    my_share: _ = []
+    /// Client's key share (server side). Defaults to `[]`.
+    peer_share: _ = []
+    /// Client's random (server side). Defaults to `[]`.
+    peer_random: _ = []
+    /// Echoed legacy session id. Defaults to `[]`.
+    session_id: _ = []
+    /// Hex transcript of handshake messages so far. Defaults to `""`.
+    transcript: str = ""
+    /// Handshake secret. Defaults to `""`.
+    secret: str = ""
+    /// Transcript hash at the server Finished. Defaults to `""`.
+    th_sf: str = ""
+    /// Key protecting records we send (empty before the keys exist). Defaults to `""`.
+    send_key: str = ""
+    /// Key protecting records we receive. Defaults to `""`.
+    recv_key: str = ""
+    /// Sequence number of the next record we send. Defaults to `0`.
+    send_seq: i64 = 0
+    /// Sequence number of the next record we expect. Defaults to `0`.
+    recv_seq: i64 = 0
+    /// Received bytes not yet forming a complete record. Defaults to `[]`.
+    inbuf: _ = []
+    /// Application data received so far. Defaults to `[]`.
+    app_in: _ = []
+    /// Last alert description sent or received (-1 for none). Defaults to `-1`.
+    alert: i64 = -1
+
+    /// Client that will send `sni` (skipped when empty) and offer `alpn` (skipped when empty).
+    /// A non-empty `seed` makes the handshake deterministic.
+    client(sni: str, alpn: _, seed: str) : TlsConn {
+        TlsConn.{role: 0, phase: 0, sni, alpn_offer: alpn, alpn: "", seed, cert: [], my_random: [], my_share: [], peer_share: [], peer_random: [], session_id: [], transcript: "", secret: "", th_sf: "", send_key: "", recv_key: "", send_seq: 0, recv_seq: 0, inbuf: [], app_in: [], alert: -1}
+    }
+
+    /// Server that prefers the ALPN protocols `prefs` and presents the certificate bytes `cert`.
+    server(prefs: _, cert: _, seed: str) : TlsConn {
+        TlsConn.{role: 1, phase: 9, sni: "", alpn_offer: prefs, alpn: "", seed, cert, my_random: [], my_share: [], peer_share: [], peer_random: [], session_id: [], transcript: "", secret: "", th_sf: "", send_key: "", recv_key: "", send_seq: 0, recv_seq: 0, inbuf: [], app_in: [], alert: -1}
+    }
+
+    /// True once both sides protect application data.
+    connected(self) : bool => self.phase == 6
+
+    /// True after a close_notify was exchanged.
+    closed(self) : bool => self.phase == 7
+
+    /// True after a fatal error.
+    failed(self) : bool => self.phase == 8
+
+    /// Plaintext alert record for the last fatal error (empty when there was none).
+    alert_record(self) : _ {
+        if self.alert < 0 { return [] }
+        tls_alert_record(self.alert)
+    }
+
+    /// Record `desc`, mark the connection failed, and return the error text `tls: <name>: why`.
+    abort(@self, desc: i64, why: str) : str {
+        self.alert = desc
+        self.phase = 8
+        name = tls_alert_name(desc)
+        "tls: {name}: {why}"
+    }
+
+    /// 32 random bytes for `label`: derived from the seed when set, else fresh.
+    draw(self, label: str) : _ {
+        if self.seed == "" { return tls_unhex(tls_random_hex(32)) }
+        tls_derive32(self.seed, label)
+    }
+
+    /// Current transcript hash.
+    th(self) : str => sha256_hex(self.transcript)
+
+    /// Append a handshake message to the transcript.
+    absorb(@self, raw: _) {
+        self.transcript = "{self.transcript}{tls_hex(raw)}"
+    }
+
+    /// Protect `content` of real type `ctype` with the send key and advance the send sequence.
+    protect(@self, ctype: i64, content: _) : _ {
+        rec = tls_protect(self.send_key, self.send_seq, ctype, content)
+        self.send_seq += 1
+        rec
+    }
+
+    /// Begin the handshake (client only): the ClientHello record.
+    start(@self) : _ {
+        if self.role != 0 { return [] }
+        if self.phase != 0 { return [] }
+        self.my_random = self.draw("client random")
+        self.my_share = self.draw("client key share")
+        self.session_id = self.draw("session id")
+        hello = tls_client_hello(self.sni, self.alpn_offer, self.my_random, self.my_share, self.session_id) or []
+        if host.sys_arr_len(hello) == 0 {
+            @self.abort(80, "could not build ClientHello")
+            return []
+        }
+        @self.absorb(hello)
+        self.phase = 1
+        tls_record_encode(22, hello) or []
+    }
+
+    /// Derive handshake traffic keys from the two key shares and randoms.
+    derive_handshake(@self, client_random: _, server_random: _, client_share: _, server_share: _) {
+        self.secret = sha256_hex("{tls_hex(client_random)}|{tls_hex(server_random)}|{tls_hex(client_share)}|{tls_hex(server_share)}")
+    }
+
+    /// HMAC-derived key `label` under the handshake secret.
+    key_for(self, label: str) : str => hmac_sha256_hex(self.secret, label)
+
+    /// Feed bytes received from the peer; returns the bytes to send back (possibly empty).
+    /// Incomplete records are buffered. Protocol violations fail with `tls: <alert>: ...`,
+    /// leave the connection in `TLS_ST_FAILED`, and set `alert`.
+    feed(@self, data: _) : _! {
+        ensure self.phase != 8 else {
+            fail "tls: connection already failed"
+            return
+        }
+        self.inbuf = tls_cat([self.inbuf, data])
+        out = []
+        going = true
+        while going {
+            need = tls_record_need(self.inbuf, 0)
+            if need < 0 {
+                going = false
+            } else {
+                waiting = false
+                if need > host.sys_arr_len(self.inbuf) {
+                    // Oversized records fail immediately instead of waiting for their body.
+                    if need <= 16645 { waiting = true }
+                }
+                if waiting {
+                    going = false
+                } else {
+                    rec = tls_record_at(self.inbuf, 0) or err {
+                        etext = "{err}"
+                        code = 10
+                        if tls_find(etext, "record_overflow", 0) >= 0 { code = 22 }
+                        if tls_find(etext, "protocol_version", 0) >= 0 { code = 70 }
+                        m = @self.abort(code, etext)
+                        fail "{m}"
+                    }
+                    self.inbuf = tls_slice(self.inbuf, need, host.sys_arr_len(self.inbuf))
+                    reply = @self.on_record(rec) or err { fail "{err}" }
+                    out = tls_cat([out, reply])
+                    if self.phase == 8 { going = false }
+                    if self.phase == 7 { going = false }
+                }
+            }
+        }
+        out
+    }
+
+    /// Handle one complete record.
+    on_record(@self, rec: TlsRecord) : _! {
+        if rec.ctype == 20 {
+            if self.phase == 6 {
+                m = @self.abort(10, "change_cipher_spec after the handshake")
+                fail "{m}"
+                return
+            }
+            return []
+        }
+        if rec.ctype == 21 {
+            ensure self.send_key == "" else {
+                m = @self.abort(10, "plaintext alert after keys were established")
+                fail "{m}"
+                return
+            }
+            ensure host.sys_arr_len(rec.body) == 2 else {
+                m = @self.abort(50, "alert must be 2 bytes")
+                fail "{m}"
+                return
+            }
+            return @self.on_alert(rec.body[1])
+        }
+        if rec.ctype == 22 {
+            ensure self.recv_key == "" else {
+                m = @self.abort(10, "plaintext handshake record after keys were established")
+                fail "{m}"
+                return
+            }
+            return @self.on_handshake(rec.body)
+        }
+        ensure self.recv_key != "" else {
+            m = @self.abort(10, "protected record before keys were established")
+            fail "{m}"
+            return
+        }
+        plain = tls_open(self.recv_key, self.recv_seq, rec.body) or err {
+            m = @self.abort(20, "{err}")
+            fail "{m}"
+        }
+        self.recv_seq += 1
+        inner = tls_inner_decode(plain) or err {
+            m = @self.abort(10, "{err}")
+            fail "{m}"
+        }
+        if inner.ctype == 21 {
+            ensure host.sys_arr_len(inner.content) == 2 else {
+                m = @self.abort(50, "alert must be 2 bytes")
+                fail "{m}"
+                return
+            }
+            return @self.on_alert(inner.content[1])
+        }
+        if inner.ctype == 22 { return @self.on_handshake(inner.content) }
+        if inner.ctype == 23 {
+            ensure self.phase == 6 else {
+                m = @self.abort(10, "application data before the handshake finished")
+                fail "{m}"
+                return
+            }
+            self.app_in = tls_cat([self.app_in, inner.content])
+            return []
+        }
+        m = @self.abort(10, "unexpected inner content type {inner.ctype}")
+        fail "{m}"
+        return
+    }
+
+    /// Handle a received alert: close_notify closes cleanly, anything else fails the connection.
+    on_alert(@self, desc: i64) : _! {
+        self.alert = desc
+        if desc == 0 {
+            self.phase = 7
+            return []
+        }
+        self.phase = 8
+        name = tls_alert_name(desc)
+        fail "tls: peer sent {name}"
+        return
+    }
+
+    /// Process every handshake message in `content` for this role and state.
+    on_handshake(@self, content: _) : _! {
+        msgs = tls_hs_parse_all(content) or err {
+            m = @self.abort(50, "{err}")
+            fail "{m}"
+        }
+        ensure host.sys_arr_len(msgs) > 0 else {
+            m = @self.abort(50, "empty handshake record")
+            fail "{m}"
+            return
+        }
+        out = []
+        i = 0
+        while i < host.sys_arr_len(msgs) {
+            reply = []
+            if self.role == 0 {
+                reply = @self.client_msg(msgs[i]) or err { fail "{err}" }
+            } else {
+                reply = @self.server_msg(msgs[i]) or err { fail "{err}" }
+            }
+            out = tls_cat([out, reply])
+            i += 1
+        }
+        out
+    }
+
+    /// Server: react to one handshake message.
+    server_msg(@self, msg: TlsHs) : _! {
+        if self.phase == 9 {
+            ensure msg.htype == 1 else {
+                m = @self.abort(10, "expected ClientHello, got handshake type {msg.htype}")
+                fail "{m}"
+                return
+            }
+            hello = tls_parse_client_hello(msg.body) or err {
+                etext = "{err}"
+                code = 50
+                if tls_find(etext, "illegal_parameter", 0) >= 0 { code = 47 }
+                if tls_find(etext, "missing_extension", 0) >= 0 { code = 109 }
+                m = @self.abort(code, etext)
+                fail "{m}"
+            }
+            has13 = false
+            for hello.versions {
+                if it == 772 { has13 = true }
+            }
+            ensure has13 else {
+                m = @self.abort(70, "client does not offer TLS 1.3")
+                fail "{m}"
+                return
+            }
+            ensure host.sys_arr_len(hello.key_share) == 32 else {
+                m = @self.abort(109, "no x25519 key_share")
+                fail "{m}"
+                return
+            }
+            offers_suite = false
+            for hello.ciphers {
+                if it == 4865 { offers_suite = true }
+            }
+            ensure offers_suite else {
+                m = @self.abort(40, "no common cipher suite")
+                fail "{m}"
+                return
+            }
+            chosen = ""
+            if host.sys_arr_len(hello.alpn) > 0 {
+                if host.sys_arr_len(self.alpn_offer) > 0 {
+                    chosen = tls_alpn_select(hello.alpn, self.alpn_offer)
+                    ensure chosen != "" else {
+                        m = @self.abort(120, "no common application protocol")
+                        fail "{m}"
+                        return
+                    }
+                }
+            }
+            self.alpn = chosen
+            self.sni = hello.sni
+            self.peer_random = hello.random
+            self.peer_share = hello.key_share
+            self.session_id = hello.session_id
+            @self.absorb(msg.raw)
+            self.my_random = self.draw("server random")
+            self.my_share = self.draw("server key share")
+            sh = tls_server_hello(self.my_random, self.session_id, 4865, self.my_share) or err {
+                m = @self.abort(80, "{err}")
+                fail "{m}"
+            }
+            @self.absorb(sh)
+            @self.derive_handshake(self.peer_random, self.my_random, self.peer_share, self.my_share)
+            s_hs = self.key_for("s hs traffic")
+            c_hs = self.key_for("c hs traffic")
+            out = tls_record_encode(22, sh) or []
+            self.send_key = s_hs
+            self.recv_key = c_hs
+            self.send_seq = 0
+            self.recv_seq = 0
+            ee = tls_encrypted_extensions(self.alpn) or []
+            @self.absorb(ee)
+            out = tls_cat([out, @self.protect(22, ee)])
+            cert_entry = tls_cat([tls_vec24(self.cert), tls_u16(0)])
+            cert_msg = tls_hs_msg(11, tls_cat([[0], tls_vec24(cert_entry)]))
+            @self.absorb(cert_msg)
+            out = tls_cat([out, @self.protect(22, cert_msg)])
+            sig = tls_unhex(hmac_sha256_hex(self.secret, "cert verify {self.th()}"))
+            cv = tls_hs_msg(15, tls_cat([tls_u16(2052), tls_vec16(sig)]))
+            @self.absorb(cv)
+            out = tls_cat([out, @self.protect(22, cv)])
+            fin_data = tls_finished_data(s_hs, self.th())
+            fin = tls_hs_msg(20, fin_data)
+            @self.absorb(fin)
+            self.th_sf = self.th()
+            out = tls_cat([out, @self.protect(22, fin)])
+            self.phase = 10
+            return out
+        }
+        if self.phase == 10 {
+            ensure msg.htype == 20 else {
+                m = @self.abort(10, "expected client Finished, got handshake type {msg.htype}")
+                fail "{m}"
+                return
+            }
+            c_hs = self.key_for("c hs traffic")
+            want = tls_finished_data(c_hs, self.th_sf)
+            ensure tls_same(msg.body, want) else {
+                m = @self.abort(51, "client Finished does not verify")
+                fail "{m}"
+                return
+            }
+            @self.absorb(msg.raw)
+            self.send_key = self.key_for("s ap traffic {self.th_sf}")
+            self.recv_key = self.key_for("c ap traffic {self.th_sf}")
+            self.send_seq = 0
+            self.recv_seq = 0
+            self.phase = 6
+            return []
+        }
+        m = @self.abort(10, "unexpected handshake message type {msg.htype}")
+        fail "{m}"
+        return
+    }
+
+    /// Client: react to one handshake message.
+    client_msg(@self, msg: TlsHs) : _! {
+        if self.phase == 1 {
+            ensure msg.htype == 2 else {
+                m = @self.abort(10, "expected ServerHello, got handshake type {msg.htype}")
+                fail "{m}"
+                return
+            }
+            hello = tls_parse_server_hello(msg.body) or err {
+                m = @self.abort(50, "{err}")
+                fail "{m}"
+            }
+            ensure host.sys_arr_len(hello.versions) == 1 else {
+                m = @self.abort(70, "ServerHello lacks supported_versions")
+                fail "{m}"
+                return
+            }
+            ensure hello.versions[0] == 772 else {
+                m = @self.abort(70, "server did not select TLS 1.3")
+                fail "{m}"
+                return
+            }
+            ensure hello.ciphers[0] == 4865 else {
+                m = @self.abort(47, "server chose a cipher suite we did not offer")
+                fail "{m}"
+                return
+            }
+            ensure host.sys_arr_len(hello.key_share) == 32 else {
+                m = @self.abort(109, "ServerHello lacks an x25519 key_share")
+                fail "{m}"
+                return
+            }
+            ensure tls_same(hello.session_id, self.session_id) else {
+                m = @self.abort(47, "session id was not echoed")
+                fail "{m}"
+                return
+            }
+            @self.absorb(msg.raw)
+            @self.derive_handshake(self.my_random, hello.random, self.my_share, hello.key_share)
+            self.recv_key = self.key_for("s hs traffic")
+            self.send_key = self.key_for("c hs traffic")
+            self.recv_seq = 0
+            self.send_seq = 0
+            self.phase = 2
+            return []
+        }
+        if self.phase == 2 {
+            ensure msg.htype == 8 else {
+                m = @self.abort(10, "expected EncryptedExtensions, got handshake type {msg.htype}")
+                fail "{m}"
+                return
+            }
+            chosen = tls_parse_encrypted_extensions(msg.body) or err {
+                m = @self.abort(50, "{err}")
+                fail "{m}"
+            }
+            if chosen != "" {
+                offered = false
+                for self.alpn_offer {
+                    if it == chosen { offered = true }
+                }
+                ensure offered else {
+                    m = @self.abort(120, "server selected an ALPN protocol we did not offer")
+                    fail "{m}"
+                    return
+                }
+            }
+            self.alpn = chosen
+            @self.absorb(msg.raw)
+            self.phase = 3
+            return []
+        }
+        if self.phase == 3 {
+            ensure msg.htype == 11 else {
+                m = @self.abort(10, "expected Certificate, got handshake type {msg.htype}")
+                fail "{m}"
+                return
+            }
+            r = ByteReader.from(msg.body)
+            ctx = @r.read_u8() or 255
+            list_hi = @r.read_u8() or 0
+            list_mid = @r.read_u8() or 0
+            list_lo = @r.read_u8() or 0
+            list_len = list_hi * 65536 + list_mid * 256 + list_lo
+            ensure ctx == 0 else {
+                m = @self.abort(50, "bad certificate_request_context")
+                fail "{m}"
+                return
+            }
+            ensure list_len == r.remaining() else {
+                m = @self.abort(50, "bad certificate list length")
+                fail "{m}"
+                return
+            }
+            c_hi = @r.read_u8() or 0
+            c_mid = @r.read_u8() or 0
+            c_lo = @r.read_u8() or 0
+            c_len = c_hi * 65536 + c_mid * 256 + c_lo
+            der = @r.read_n(c_len) or err {
+                m = @self.abort(50, "certificate entry truncated")
+                fail "{m}"
+            }
+            ensure host.sys_arr_len(der) > 0 else {
+                m = @self.abort(42, "empty certificate")
+                fail "{m}"
+                return
+            }
+            self.cert = der
+            @self.absorb(msg.raw)
+            self.phase = 4
+            return []
+        }
+        if self.phase == 4 {
+            ensure msg.htype == 15 else {
+                m = @self.abort(10, "expected CertificateVerify, got handshake type {msg.htype}")
+                fail "{m}"
+                return
+            }
+            r = ByteReader.from(msg.body)
+            alg = @r.read_u16_be() or 0
+            sig_len = @r.read_u16_be() or 0
+            sig = @r.read_n(sig_len) or []
+            ensure alg == 2052 else {
+                m = @self.abort(47, "unsupported signature algorithm")
+                fail "{m}"
+                return
+            }
+            want = tls_unhex(hmac_sha256_hex(self.secret, "cert verify {self.th()}"))
+            ensure tls_same(sig, want) else {
+                m = @self.abort(51, "CertificateVerify does not verify")
+                fail "{m}"
+                return
+            }
+            @self.absorb(msg.raw)
+            self.phase = 5
+            return []
+        }
+        if self.phase == 5 {
+            ensure msg.htype == 20 else {
+                m = @self.abort(10, "expected Finished, got handshake type {msg.htype}")
+                fail "{m}"
+                return
+            }
+            s_hs = self.key_for("s hs traffic")
+            want = tls_finished_data(s_hs, self.th())
+            ensure tls_same(msg.body, want) else {
+                m = @self.abort(51, "server Finished does not verify")
+                fail "{m}"
+                return
+            }
+            @self.absorb(msg.raw)
+            self.th_sf = self.th()
+            c_hs = self.key_for("c hs traffic")
+            fin = tls_hs_msg(20, tls_finished_data(c_hs, self.th_sf))
+            out = @self.protect(22, fin)
+            self.send_key = self.key_for("c ap traffic {self.th_sf}")
+            self.recv_key = self.key_for("s ap traffic {self.th_sf}")
+            self.send_seq = 0
+            self.recv_seq = 0
+            self.phase = 6
+            return out
+        }
+        m = @self.abort(10, "unexpected handshake message type {msg.htype}")
+        fail "{m}"
+        return
+    }
+
+    /// Protect application data (fragmenting at 16383 bytes per record). Fails before the
+    /// handshake completes.
+    send_app(@self, data: _) : _! {
+        ensure self.phase == 6 else {
+            fail "tls: handshake not complete"
+            return
+        }
+        out = []
+        n = host.sys_arr_len(data)
+        pos = 0
+        while pos < n {
+            end = pos + 16383
+            if end > n { end = n }
+            out = tls_cat([out, @self.protect(23, tls_slice(data, pos, end))])
+            pos = end
+        }
+        out
+    }
+
+    /// Take the application data received so far and clear the buffer.
+    take_app(@self) : _ {
+        got = self.app_in
+        self.app_in = []
+        got
+    }
+
+    /// Send a protected close_notify and move to the closed state.
+    close(@self) : _ {
+        if self.phase != 6 { return [] }
+        rec = @self.protect(21, [1, 0])
+        self.alert = 0
+        self.phase = 7
+        rec
+    }
+}
+
+/// Finished verify_data for `base_key` over the transcript hash `th`.
++tls_finished_data(base_key: str, th: str) : _ {
+    fin_key = hmac_sha256_hex(base_key, "finished")
+    tls_unhex(hmac_sha256_hex(fin_key, th))
+}
+
+/// True when the byte arrays `a` and `b` are identical.
++tls_same(a: _, b: _) : bool {
+    if host.sys_arr_len(a) != host.sys_arr_len(b) { return false }
+    diff = 0
+    for 0..host.sys_arr_len(a) { diff = diff | (a[it] ^ b[it]) }
+    diff == 0
+}
+
+// --- tests --------------------------------------------------------------------------------
+
+/// Test the small integer and vector builders.
+test "tls byte builders" {
+    assert_eq(tls_u16(258)[0], 1)
+    assert_eq(tls_u16(258)[1], 2)
+    assert_eq(tls_u24(65793)[0], 1)
+    assert_eq(tls_u24(65793)[1], 1)
+    assert_eq(tls_u24(65793)[2], 1)
+    #assert(tls_same(tls_vec8([9, 8]), [2, 9, 8]))
+    #assert(tls_same(tls_vec16([7]), [0, 1, 7]))
+    #assert(tls_same(tls_vec24([5, 6]), [0, 0, 2, 5, 6]))
+    #assert(tls_same(tls_cat([[1], [], [2, 3]]), [1, 2, 3]))
+    assert_eq(tls_hex([0, 15, 255]), "000fff")
+    #assert(tls_same(tls_unhex("000fFF"), [0, 15, 255]))
+    assert_eq(host.sys_arr_len(tls_derive32("s", "l")), 32)
+    #assert(tls_same(tls_derive32("s", "l"), tls_derive32("s", "l")))
+    #assert(!(tls_same(tls_derive32("s", "l"), tls_derive32("s", "m"))))
+    assert_eq(host.sys_arr_len(tls_unhex(tls_random_hex(32))), 32)
+    #assert(tls_same(tls_slice([1, 2, 3, 4], 1, 3), [2, 3]))
+}
+
+/// Test record encode, parse and incomplete handling.
+test "tls record framing" {
+    rec = tls_record_encode(22, [1, 2, 3]) or []
+    #assert(tls_same(rec, [22, 3, 3, 0, 3, 1, 2, 3]))
+    assert_eq(tls_record_need(rec, 0), 8)
+    assert_eq(tls_record_need([22, 3], 0), -1)
+    parsed = tls_record_at(rec, 0) or TlsRecord.{}
+    assert_eq(parsed.ctype, 22)
+    assert_eq(parsed.version, 771)
+    #assert(tls_same(parsed.body, [1, 2, 3]))
+    assert_eq(tls_record_encode(19, []) or [99], [99])
+    assert_eq(tls_record_encode(24, []) or [99], [99])
+    big = host.sys_arr_new(16385, 7)
+    assert_eq(host.sys_arr_len(tls_record_encode(23, big) or []), 0)
+    ok = host.sys_arr_new(16384, 7)
+    assert_eq(host.sys_arr_len(tls_record_encode(23, ok) or []), 16389)
+    two = tls_cat([rec, rec])
+    assert_eq(host.sys_arr_len(tls_parse_records(two)), 2)
+    partial = tls_cat([rec, [23, 3, 3, 0, 9, 1]])
+    assert_eq(host.sys_arr_len(tls_parse_records(partial)), 1)
+    assert_eq(tls_record_at(partial, 8) or TlsRecord.{}.ctype, 0)
+    assert_eq(tls_record_at([22, 4, 0, 0, 0], 0) or TlsRecord.{}.ctype, 0)
+    assert_eq(tls_record_at([99, 3, 3, 0, 0], 0) or TlsRecord.{}.ctype, 0)
+    assert_eq(tls_record_at([23, 3, 3, 255, 255], 0) or TlsRecord.{}.ctype, 0)
+}
+
+/// Test fragmentation into 16384-byte records.
+test "tls fragmenting" {
+    data = host.sys_arr_new(40000, 65)
+    wire = tls_fragment(23, data)
+    recs = tls_parse_records(wire)
+    assert_eq(host.sys_arr_len(recs), 3)
+    assert_eq(host.sys_arr_len(recs[0].body), 16384)
+    assert_eq(host.sys_arr_len(recs[1].body), 16384)
+    assert_eq(host.sys_arr_len(recs[2].body), 7232)
+    assert_eq(host.sys_arr_len(tls_fragment(23, [])), 0)
+    assert_eq(host.sys_arr_len(tls_fragment(23, [1])), 6)
+}
+
+/// Test TLS 1.3 inner plaintext type recovery with padding.
+test "tls inner plaintext" {
+    inner = tls_inner_encode([1, 2, 0, 3], 23, 4)
+    #assert(tls_same(inner, [1, 2, 0, 3, 23, 0, 0, 0, 0]))
+    decoded = tls_inner_decode(inner) or TlsInner.{}
+    assert_eq(decoded.ctype, 23)
+    #assert(tls_same(decoded.content, [1, 2, 0, 3]))
+    empty = tls_inner_decode(tls_inner_encode([], 21, 0)) or TlsInner.{}
+    assert_eq(empty.ctype, 21)
+    assert_eq(host.sys_arr_len(empty.content), 0)
+    assert_eq(tls_inner_decode([0, 0, 0]) or TlsInner.{ctype: 99}.ctype, 99)
+    assert_eq(tls_inner_decode([]) or TlsInner.{ctype: 99}.ctype, 99)
+}
+
+/// Test alert records and names.
+test "tls alerts" {
+    #assert(tls_same(tls_alert_record(0), [21, 3, 3, 0, 2, 1, 0]))
+    #assert(tls_same(tls_alert_record(40), [21, 3, 3, 0, 2, 2, 40]))
+    assert_eq(tls_alert_name(0), "close_notify")
+    assert_eq(tls_alert_name(120), "no_application_protocol")
+    assert_eq(tls_alert_name(20), "bad_record_mac")
+    assert_eq(tls_alert_name(250), "alert_250")
+}
+
+/// Test the framing-model seal/open: round trip, tamper and wrong key/sequence.
+test "tls seal and open" {
+    inner = tls_inner_encode([104, 105], 23, 0)
+    body = tls_seal("k1", 0, inner)
+    assert_eq(host.sys_arr_len(body), 3 + 16)
+    #assert(tls_same(tls_open("k1", 0, body) or [], inner))
+    assert_eq(host.sys_arr_len(tls_open("k2", 0, body) or []), 0)
+    assert_eq(host.sys_arr_len(tls_open("k1", 1, body) or []), 0)
+    flipped = tls_slice(body, 0, host.sys_arr_len(body))
+    flipped = host.sys_arr_set(flipped, 0, (flipped[0] + 1) % 256)
+    assert_eq(host.sys_arr_len(tls_open("k1", 0, flipped) or []), 0)
+    tag_flip = host.sys_arr_set(tls_slice(body, 0, host.sys_arr_len(body)), 18, (body[18] + 1) % 256)
+    assert_eq(host.sys_arr_len(tls_open("k1", 0, tag_flip) or []), 0)
+    assert_eq(host.sys_arr_len(tls_open("k1", 0, [1, 2, 3]) or []), 0)
+    #assert(tls_same(tls_seal("k1", 0, inner), tls_seal("k1", 0, inner)))
+    #assert(!(tls_same(tls_seal("k1", 0, inner), tls_seal("k1", 1, inner))))
+    long = host.sys_arr_new(100, 9)
+    #assert(tls_same(tls_open("k", 5, tls_seal("k", 5, long)) or [], long))
+    wire = tls_protect("k1", 3, 22, [1, 2, 3])
+    rec = tls_record_at(wire, 0) or TlsRecord.{}
+    assert_eq(rec.ctype, 23)
+    plain = tls_open("k1", 3, rec.body) or []
+    got = tls_inner_decode(plain) or TlsInner.{}
+    assert_eq(got.ctype, 22)
+    #assert(tls_same(got.content, [1, 2, 3]))
+}
+
+/// Test SNI validation, build and parse.
+test "tls sni extension" {
+    #assert(tls_valid_sni("example.com"))
+    #assert(tls_valid_sni("a-b_c.example.org"))
+    #assert(!(tls_valid_sni("")))
+    #assert(!(tls_valid_sni("a..b")))
+    #assert(!(tls_valid_sni("example.com.")))
+    #assert(!(tls_valid_sni("192.168.0.1")))
+    #assert(!(tls_valid_sni("bad host")))
+    #assert(!(tls_valid_sni("héllo.com")))
+    ext = tls_sni_extension("example.com") or []
+    assert_eq(ext[0], 0)
+    assert_eq(ext[1], 0)
+    assert_eq(host.sys_arr_len(ext), 4 + 2 + 3 + 11)
+    data = tls_slice(ext, 4, host.sys_arr_len(ext))
+    assert_eq(tls_parse_sni(data) or "?", "example.com")
+    assert_eq(host.sys_arr_len(tls_sni_extension("1.2.3.4") or []), 0)
+    assert_eq(tls_parse_sni([0, 3, 0, 0, 0]) or "bad", "bad")
+    assert_eq(tls_parse_sni([0, 5, 1, 0, 2, 97, 98]) or "bad", "bad")
+    assert_eq(tls_parse_sni([]) or "bad", "bad")
+}
+
+/// Test ALPN build, parse and selection.
+test "tls alpn extension" {
+    ext = tls_alpn_extension(["h2", "http/1.1"]) or []
+    assert_eq(ext[1], 16)
+    assert_eq(host.sys_arr_len(ext), 4 + 2 + 3 + 9)
+    data = tls_slice(ext, 4, host.sys_arr_len(ext))
+    names = tls_parse_alpn(data) or []
+    assert_eq(host.sys_arr_len(names), 2)
+    assert_eq(names[0], "h2")
+    assert_eq(names[1], "http/1.1")
+    assert_eq(host.sys_arr_len(tls_alpn_extension([]) or []), 0)
+    assert_eq(host.sys_arr_len(tls_alpn_extension([""]) or []), 0)
+    assert_eq(tls_parse_alpn([0, 3, 5, 104, 50]) or ["bad"], ["bad"])
+    assert_eq(tls_parse_alpn([0, 1, 0]) or ["bad"], ["bad"])
+    assert_eq(tls_parse_alpn([0, 0]) or ["bad"], ["bad"])
+    assert_eq(tls_alpn_select(["http/1.1", "h2"], ["h2", "http/1.1"]), "h2")
+    assert_eq(tls_alpn_select(["http/1.1"], ["h2", "http/1.1"]), "http/1.1")
+    assert_eq(tls_alpn_select(["spdy"], ["h2"]), "")
+    assert_eq(tls_alpn_select([], ["h2"]), "")
+}
+
+/// Test ClientHello build and parse round trip.
+test "tls client hello roundtrip" {
+    random = tls_derive32("t", "r")
+    share = tls_derive32("t", "k")
+    msg = tls_client_hello("example.com", ["h2", "http/1.1"], random, share, tls_derive32("t", "sid")) or []
+    assert_eq(msg[0], 1)
+    msgs = tls_hs_parse_all(msg) or []
+    assert_eq(host.sys_arr_len(msgs), 1)
+    assert_eq(msgs[0].htype, 1)
+    #assert(tls_same(msgs[0].raw, msg))
+    hello = tls_parse_client_hello(msgs[0].body) or TlsHello.{}
+    assert_eq(hello.legacy, 771)
+    assert_eq(hello.sni, "example.com")
+    assert_eq(host.sys_arr_len(hello.alpn), 2)
+    assert_eq(hello.alpn[1], "http/1.1")
+    assert_eq(hello.versions[0], 772)
+    #assert(tls_same(hello.random, random))
+    #assert(tls_same(hello.key_share, share))
+    assert_eq(hello.ciphers[0], 4865)
+    assert_eq(host.sys_arr_len(hello.ciphers), 3)
+    assert_eq(host.sys_arr_len(hello.session_id), 32)
+    assert_eq(host.sys_arr_len(tls_client_hello("x.com", [], random, share, host.sys_arr_new(33, 1)) or []), 0)
+    bare = tls_client_hello("", [], random, share, []) or []
+    bare_hello = tls_parse_client_hello(tls_slice(bare, 4, host.sys_arr_len(bare))) or TlsHello.{}
+    assert_eq(bare_hello.sni, "")
+    assert_eq(host.sys_arr_len(bare_hello.alpn), 0)
+    assert_eq(host.sys_arr_len(tls_client_hello("x.com", [], [1], share, []) or []), 0)
+    assert_eq(host.sys_arr_len(tls_client_hello("x.com", [], random, [1], []) or []), 0)
+    assert_eq(host.sys_arr_len(tls_client_hello("1.2.3.4", [], random, share, []) or []), 0)
+}
+
+/// Test malformed ClientHello bodies are rejected.
+test "tls client hello rejects malformed input" {
+    random = tls_derive32("t", "r")
+    share = tls_derive32("t", "k")
+    msg = tls_client_hello("a.com", [], random, share, []) or []
+    body = tls_slice(msg, 4, host.sys_arr_len(msg))
+    cut = tls_slice(body, 0, 40)
+    assert_eq(tls_parse_client_hello(cut) or TlsHello.{legacy: 99}.legacy, 99)
+    extra = tls_cat([body, [0]])
+    assert_eq(tls_parse_client_hello(extra) or TlsHello.{legacy: 99}.legacy, 99)
+    assert_eq(tls_parse_client_hello([]) or TlsHello.{legacy: 99}.legacy, 99)
+    dup_exts = tls_cat([tls_versions_extension(true), tls_versions_extension(true)])
+    dup_body = tls_cat([tls_u16(771), random, tls_vec8([]), tls_vec16([19, 1]), tls_vec8([0]), tls_vec16(dup_exts)])
+    assert_eq(tls_parse_client_hello(dup_body) or TlsHello.{legacy: 99}.legacy, 99)
+    zip_body = tls_cat([tls_u16(771), random, tls_vec8([]), tls_vec16([19, 1]), tls_vec8([1, 1]), tls_vec16([])])
+    assert_eq(tls_parse_client_hello(zip_body) or TlsHello.{legacy: 99}.legacy, 99)
+    odd_body = tls_cat([tls_u16(771), random, tls_vec8([]), tls_vec16([19, 1, 19]), tls_vec8([0]), tls_vec16([])])
+    assert_eq(tls_parse_client_hello(odd_body) or TlsHello.{legacy: 99}.legacy, 99)
+    assert_eq(host.sys_arr_len(tls_hs_parse_all([1, 0, 0]) or [1]), 1)
+    assert_eq(host.sys_arr_len(tls_hs_parse_all([1, 0, 0, 5, 1]) or [1]), 1)
+}
+
+/// Test ServerHello and EncryptedExtensions round trips.
+test "tls server hello and encrypted extensions" {
+    random = tls_derive32("s", "r")
+    share = tls_derive32("s", "k")
+    sid = tls_derive32("s", "sid")
+    msg = tls_server_hello(random, sid, 4865, share) or []
+    assert_eq(msg[0], 2)
+    hello = tls_parse_server_hello(tls_slice(msg, 4, host.sys_arr_len(msg))) or TlsHello.{}
+    assert_eq(hello.ciphers[0], 4865)
+    assert_eq(hello.versions[0], 772)
+    #assert(tls_same(hello.key_share, share))
+    #assert(tls_same(hello.session_id, sid))
+    #assert(tls_same(hello.random, random))
+    assert_eq(host.sys_arr_len(tls_server_hello([1], sid, 4865, share) or []), 0)
+    ee = tls_encrypted_extensions("h2") or []
+    assert_eq(ee[0], 8)
+    assert_eq(tls_parse_encrypted_extensions(tls_slice(ee, 4, host.sys_arr_len(ee))) or "bad", "h2")
+    bare = tls_encrypted_extensions("") or []
+    assert_eq(tls_parse_encrypted_extensions(tls_slice(bare, 4, host.sys_arr_len(bare))) or "bad", "")
+}
+
+/// Test PEM strip and decode.
+test "tls pem strip" {
+    pem = "-----BEGIN CERTIFICATE-----\nAQID\nBAU=\n-----END CERTIFICATE-----\n"
+    p = tls_pem_strip(pem) or TlsPem.{}
+    assert_eq(p.label, "CERTIFICATE")
+    assert_eq(p.body, "AQIDBAU=")
+    #assert(tls_same(tls_pem_decode(pem) or [], [1, 2, 3, 4, 5]))
+    crlf = "junk\r\n-----BEGIN PRIVATE KEY-----\r\nAQID\r\n BAU= \r\n-----END PRIVATE KEY-----\r\ntrailer"
+    q = tls_pem_strip(crlf) or TlsPem.{}
+    assert_eq(q.label, "PRIVATE KEY")
+    assert_eq(q.body, "AQIDBAU=")
+    hdr = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,AB\n\nAQID\n-----END RSA PRIVATE KEY-----"
+    h = tls_pem_strip(hdr) or TlsPem.{}
+    assert_eq(h.body, "AQID")
+    assert_eq(tls_pem_strip("no pem here") or TlsPem.{label: "none"}.label, "none")
+    assert_eq(tls_pem_strip("-----BEGIN X-----\nAQID\n-----END Y-----") or TlsPem.{label: "none"}.label, "none")
+    assert_eq(tls_pem_strip("-----BEGIN X-----\nAQ!D\n-----END X-----") or TlsPem.{label: "none"}.label, "none")
+    assert_eq(tls_pem_strip("-----BEGIN X") or TlsPem.{label: "none"}.label, "none")
+    assert_eq(host.sys_arr_len(tls_pem_decode("-----BEGIN X-----\nA\n-----END X-----") or []), 0)
+}
+
+/// Run a complete in-memory handshake and return (client, server) after both are connected.
++tls_loopback(sni: str, client_alpn: _, server_prefs: _) : _ {
+    c = TlsConn.client(sni, client_alpn, "client-seed")
+    s = TlsConn.server(server_prefs, [1, 2, 3, 4], "server-seed")
+    hello = @c.start()
+    flight = @s.feed(hello) or []
+    fin = @c.feed(flight) or []
+    @s.feed(fin) or []
+    pair = [c, s]
+    pair
+}
+
+/// Test a full offline handshake with ALPN and SNI.
+test "tls handshake loopback" {
+    c = TlsConn.client("example.com", ["http/1.1", "h2"], "client-seed")
+    s = TlsConn.server(["h2", "http/1.1"], [10, 20, 30], "server-seed")
+    assert_eq(c.phase, 0)
+    assert_eq(s.phase, 9)
+    hello = @c.start()
+    assert_eq(c.phase, 1)
+    assert_eq(hello[0], 22)
+    assert_eq(host.sys_arr_len(@c.start()), 0)
+    flight = @s.feed(hello) or []
+    assert_eq(s.phase, 10)
+    assert_eq(s.sni, "example.com")
+    assert_eq(s.alpn, "h2")
+    recs = tls_parse_records(flight)
+    assert_eq(host.sys_arr_len(recs), 5)
+    assert_eq(recs[0].ctype, 22)
+    for 1..5 { assert_eq(recs[it].ctype, 23) }
+    fin = @c.feed(flight) or []
+    #assert(c.connected())
+    assert_eq(c.alpn, "h2")
+    #assert(tls_same(c.cert, [10, 20, 30]))
+    assert_eq(host.sys_arr_len(tls_parse_records(fin)), 1)
+    back = @s.feed(fin) or [99]
+    assert_eq(host.sys_arr_len(back), 0)
+    #assert(s.connected())
+    #assert(tls_same(c.send_key, s.recv_key))
+    #assert(tls_same(s.send_key, c.recv_key))
+    #assert(!(c.send_key == c.recv_key))
+    assert_eq(c.th_sf, s.th_sf)
+}
+
+/// Test application data in both directions, including fragmentation and byte-wise delivery.
+test "tls application data" {
+    pair = tls_loopback("example.com", ["h2"], ["h2"])
+    c = pair[0]
+    s = pair[1]
+    wire = @c.send_app([104, 105]) or []
+    @s.feed(wire) or []
+    app1 = @s.take_app()
+    #assert(tls_same(app1, [104, 105]))
+    app2 = @s.take_app()
+    assert_eq(host.sys_arr_len(app2), 0)
+    reply = @s.send_app([111, 107]) or []
+    @c.feed(reply) or []
+    app3 = @c.take_app()
+    #assert(tls_same(app3, [111, 107]))
+    big = host.sys_arr_new(20000, 33)
+    bigwire = @c.send_app(big) or []
+    assert_eq(host.sys_arr_len(tls_parse_records(bigwire)), 2)
+    @s.feed(bigwire) or []
+    app4 = @s.take_app()
+    assert_eq(host.sys_arr_len(app4), 20000)
+    drip = @c.send_app([1, 2, 3]) or []
+    for drip { @s.feed([it]) or [] }
+    app5 = @s.take_app()
+    #assert(tls_same(app5, [1, 2, 3]))
+    two = tls_cat([@c.send_app([4]) or [], @c.send_app([5]) or []])
+    @s.feed(two) or []
+    app6 = @s.take_app()
+    #assert(tls_same(app6, [4, 5]))
+    assert_eq(host.sys_arr_len(@c.send_app([]) or [7]), 0)
+}
+
+/// Test handshakes that deliver bytes one at a time and reordered flights.
+test "tls handshake byte-wise delivery" {
+    c = TlsConn.client("example.com", ["h2"], "a")
+    s = TlsConn.server(["h2"], [1], "b")
+    hello = @c.start()
+    flight = []
+    for hello { flight = tls_cat([flight, @s.feed([it]) or []]) }
+    assert_eq(s.phase, 10)
+    fin = []
+    for flight { fin = tls_cat([fin, @c.feed([it]) or []]) }
+    #assert(c.connected())
+    for fin { @s.feed([it]) or [] }
+    #assert(s.connected())
+}
+
+/// Test close_notify delivery.
+test "tls close notify" {
+    pair = tls_loopback("example.com", [], [])
+    c = pair[0]
+    s = pair[1]
+    assert_eq(c.alpn, "")
+    bye = @c.close()
+    #assert(c.closed())
+    assert_eq(host.sys_arr_len(@c.close()), 0)
+    @s.feed(bye) or []
+    #assert(s.closed())
+    assert_eq(s.alert, 0)
+    assert_eq(host.sys_arr_len(@s.send_app([1]) or [9]), 1)
+    #assert(tls_same(s.alert_record(), [21, 3, 3, 0, 2, 1, 0]))
+}
+
+/// Test that protocol violations abort with the right alert.
+test "tls handshake failures" {
+    random = tls_derive32("t", "r")
+    share = tls_derive32("t", "k")
+    no13 = tls_cat([tls_u16(771), random, tls_vec8([]), tls_vec16([19, 1]), tls_vec8([0]), tls_vec16(tls_cat([tls_groups_extension()]))])
+    s1 = TlsConn.server([], [1], "x")
+    rec1 = tls_record_encode(22, tls_hs_msg(1, no13)) or []
+    assert_eq(@s1.feed(rec1) or [99], [99])
+    #assert(s1.failed())
+    assert_eq(s1.alert, 70)
+    assert_eq(@s1.feed([1]) or [98], [98])
+    assert_eq(host.sys_arr_len(s1.alert_record()), 7)
+    s2 = TlsConn.server(["h2"], [1], "x")
+    hello2 = tls_client_hello("a.com", ["spdy"], random, share, []) or []
+    assert_eq(@s2.feed(tls_record_encode(22, hello2) or []) or [99], [99])
+    assert_eq(s2.alert, 120)
+    s3 = TlsConn.server([], [1], "x")
+    junk = tls_record_encode(22, tls_hs_msg(2, [0, 0])) or []
+    assert_eq(@s3.feed(junk) or [99], [99])
+    assert_eq(s3.alert, 10)
+    s4 = TlsConn.server([], [1], "x")
+    assert_eq(@s4.feed([23, 3, 3, 0, 20, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]) or [99], [99])
+    assert_eq(s4.alert, 10)
+    s5 = TlsConn.server([], [1], "x")
+    assert_eq(@s5.feed([77, 3, 3, 0, 0]) or [99], [99])
+    assert_eq(s5.alert, 10)
+    s6 = TlsConn.server([], [1], "x")
+    assert_eq(@s6.feed([22, 3, 3, 255, 255]) or [99], [99])
+    assert_eq(s6.alert, 22)
+    s7 = TlsConn.server([], [1], "x")
+    assert_eq(@s7.feed([22, 2, 0, 0, 0]) or [99], [99])
+    assert_eq(s7.alert, 70)
+    s8 = TlsConn.server([], [1], "x")
+    assert_eq(@s8.feed(tls_alert_record(40)) or [99], [99])
+    #assert(s8.failed())
+    assert_eq(s8.alert, 40)
+}
+
+/// Test tampering with the server flight and with application data.
+test "tls tamper detection" {
+    c = TlsConn.client("example.com", ["h2"], "client-seed")
+    s = TlsConn.server(["h2"], [1, 2], "server-seed")
+    hello = @c.start()
+    flight = @s.feed(hello) or []
+    bad = host.sys_arr_set(tls_slice(flight, 0, host.sys_arr_len(flight)), host.sys_arr_len(flight) - 3, (flight[host.sys_arr_len(flight) - 3] + 1) % 256)
+    assert_eq(@c.feed(bad) or [99], [99])
+    #assert(c.failed())
+    assert_eq(c.alert, 20)
+    pair = tls_loopback("example.com", [], [])
+    c2 = pair[0]
+    s2 = pair[1]
+    wire = @c2.send_app([1, 2, 3]) or []
+    flip = host.sys_arr_set(tls_slice(wire, 0, host.sys_arr_len(wire)), 6, (wire[6] + 1) % 256)
+    assert_eq(@s2.feed(flip) or [99], [99])
+    assert_eq(s2.alert, 20)
+    pair3 = tls_loopback("example.com", [], [])
+    c3 = pair3[0]
+    s3 = pair3[1]
+    w1 = @c3.send_app([1]) or []
+    w2 = @c3.send_app([2]) or []
+    assert_eq(@s3.feed(w2) or [99], [99])
+    assert_eq(s3.alert, 20)
+    assert_eq(host.sys_arr_len(@s3.send_app([1]) or [9]), 1)
+    assert_eq(host.sys_arr_len(w1), host.sys_arr_len(w2))
+}
+
+/// Test that application data before the handshake completes is refused.
+test "tls state machine ordering" {
+    c = TlsConn.client("example.com", [], "c")
+    assert_eq(host.sys_arr_len(@c.send_app([1]) or [9]), 1)
+    s = TlsConn.server([], [1], "s")
+    assert_eq(host.sys_arr_len(@s.start()), 0)
+    hello = @c.start()
+    flight = @s.feed(hello) or []
+    early = tls_protect("not-a-key", 0, 23, [1])
+    assert_eq(@c.feed(early) or [99], [99])
+    assert_eq(c.alert, 10)
+    c2 = TlsConn.client("example.com", [], "c")
+    @c2.start()
+    two_hellos = @c2.feed(hello) or [99]
+    assert_eq(two_hellos, [99])
+    #assert(host.sys_arr_len(flight) > 0)
+}
+
+/// Test that a client rejects a server that selects an ALPN protocol it never offered.
+test "tls client alpn enforcement" {
+    c = TlsConn.client("example.com", ["h2"], "client-seed")
+    s = TlsConn.server(["spdy"], [1], "server-seed")
+    hello = @c.start()
+    assert_eq(@s.feed(hello) or [99], [99])
+    assert_eq(s.alert, 120)
+    plain = TlsConn.server([], [1], "server-seed")
+    c2 = TlsConn.client("example.com", ["h2"], "client-seed")
+    hello2 = @c2.start()
+    flight = @plain.feed(hello2) or []
+    fin2 = @c2.feed(flight) or []
+    #assert(host.sys_arr_len(fin2) > 0)
+    #assert(c2.connected())
+    assert_eq(plain.alpn, "")
+}

@@ -1,0 +1,64 @@
+name: repro-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  gnu-byte-identical:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Dual-build reproducibility (gnu)
+        env:
+          LC_ALL: C
+          LANG: C
+          TZ: UTC
+          CARGO_BUILD_JOBS: "1"
+        run: |
+          chmod +x scripts/repro_check.sh scripts/package_release.sh
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          ./scripts/repro_check.sh --target x86_64-unknown-linux-gnu
+      - name: Upload repro report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-x86_64-unknown-linux-gnu
+          path: docs/repro-x86_64-unknown-linux-gnu.txt
+          if-no-files-found: warn
+
+  musl-byte-identical:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dual-build reproducibility (musl, Alpine)
+        run: |
+          chmod +x scripts/repro_check.sh scripts/package_release.sh
+          EPOCH="$(git log -1 --format=%ct)"
+          IMG=rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e SUPER_VERSION=0.1.0 \
+            -e SUPER_TARGET=x86_64-unknown-linux-musl \
+            -e SOURCE_DATE_EPOCH="$EPOCH" \
+            -e LC_ALL=C -e LANG=C -e TZ=UTC \
+            -e CARGO_BUILD_JOBS=1 \
+            "$IMG" sh -euc '
+              apk add --no-cache bash git build-base musl-dev perl pkgconf openssl-dev tar rsync python3
+              rustup target add x86_64-unknown-linux-musl
+              git config --global --add safe.directory /src
+              chmod +x scripts/repro_check.sh scripts/package_release.sh
+              ./scripts/repro_check.sh --target x86_64-unknown-linux-musl
+            '
+      - name: Upload musl repro report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-x86_64-unknown-linux-musl
+          path: docs/repro-x86_64-unknown-linux-musl.txt
+          if-no-files-found: warn

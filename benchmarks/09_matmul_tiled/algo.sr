@@ -1,0 +1,32 @@
+// 09_matmul_tiled — 256×256 f64 multiply
+use std.math.core
+
++N = 256
++NN = 65536
+
++matmul(@a, @b, @c, n: i64) {
+    for i in 0..n {
+        for k in 0..n {
+            aik = a[i * n + k]
+            for j in 0..n {
+                c[i * n + j] += aik * b[k * n + j]
+            }
+        }
+    }
+}
+
++main() {
+    a = [0.0; 65536]
+    b = [0.0; 65536]
+    c = [0.0; 65536]
+    for 0..NN {
+        a[it] = ((it * 17) % 100) / 100.0
+        b[it] = ((it * 31) % 100) / 100.0
+    }
+    matmul(@a, @b, @c, N)
+    fro = 0.0
+    #simd
+    for 0..NN { fro += c[it] * c[it] }
+    cs = to_int(floor(sqrt(fro) * 1000.0))
+    print("CHECKSUM={cs}")
+}

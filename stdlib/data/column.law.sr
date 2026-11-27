@@ -1,0 +1,15 @@
+//! Laws for std.data.column — real-body (`dt_same` / `dt_abs`).
+//! AI agents must not edit this file; put discharges in `column.proof.sr`.
+
+#law("dt_same is reflexive at zero")
+column_dt_same_zero() {
+    #assert(dt_same(0.0, 0.0))
+    #assert(!dt_same(0.0, 1.0))
+    #assert(!dt_same(2.0, 3.0))
+}
+
+#law("dt_abs of negative three")
+column_dt_abs_neg() {
+    #assert(dt_abs(-3.0) == 3.0)
+    #assert(dt_abs(4.0) == 4.0)
+}

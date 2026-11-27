@@ -1,0 +1,430 @@
+# `super lint --config stdlib/lint.toml stdlib` — lint policy for the standard
+# library, which is not a Pod. Every exception is listed with its reason.
+# Rules: `super lint --rules`; documentation: docs/lint.md.
+
+# S002 stutter: module-prefixed public names (`json_parse` in json.sr) are
+# the established stdlib API and are also imported unqualified; renaming
+# them is a breaking change deferred to a deliberate API pass.
+[[lint.exception]]
+rule = "S002"
+path = "core/bitset.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "core/bytes.sr"
+reason = "established public API (18 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "core/reduce.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "core/regex.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "core/str.sr"
+reason = "established public API (4 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "core/uuid.sr"
+reason = "established public API (4 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "data/frame.sr"
+reason = "established public API (2 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "data/io.sr"
+reason = "established public API (3 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "data/plan.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "datetime/cron.sr"
+reason = "established public API (3 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "db/migrate.sr"
+reason = "established public API (20 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "db/mysql.sr"
+reason = "established public API (13 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "db/redis.sr"
+reason = "established public API (5 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "db/sql.sr"
+reason = "established public API (19 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "db/sqlite.sr"
+reason = "established public API (45 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "diag/bench.sr"
+reason = "established public API (6 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "diag/log.sr"
+reason = "established public API (14 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/bin.sr"
+reason = "established public API (3 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/compress.sr"
+reason = "established public API (3 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/csv.sr"
+reason = "established public API (12 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/json.sr"
+reason = "established public API (47 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/mime.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/toml.sr"
+reason = "established public API (16 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/xlsx.sr"
+reason = "established public API (4 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/xml.sr"
+reason = "established public API (24 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "fmt/yaml.sr"
+reason = "established public API (31 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "game/ai.sr"
+reason = "established public API (22 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "game/assets.sr"
+reason = "established public API (7 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "game/audio.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "game/ecs.sr"
+reason = "established public API (3 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "gui/window.sr"
+reason = "established public API (4 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "html/parse.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "io/console.sr"
+reason = "established public API (2 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "io/poll.sr"
+reason = "established public API (4 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "io/socket.sr"
+reason = "established public API (23 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "io/stdio.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "math/ad.sr"
+reason = "established public API (9 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "math/fft.sr"
+reason = "established public API (19 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "math/interp.sr"
+reason = "established public API (2 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "math/poly.sr"
+reason = "established public API (12 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/grpc.sr"
+reason = "established public API (20 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/http.sr"
+reason = "established public API (25 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/ip.sr"
+reason = "established public API (7 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/quic.sr"
+reason = "established public API (57 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/radix.sr"
+reason = "established public API (5 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/smtp.sr"
+reason = "established public API (47 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/sse.sr"
+reason = "established public API (8 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/tcp.sr"
+reason = "established public API (7 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/tls.sr"
+reason = "established public API (61 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/udp.sr"
+reason = "established public API (2 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/url.sr"
+reason = "established public API (9 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "net/ws.sr"
+reason = "established public API (27 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/argon2.sr"
+reason = "established public API (2 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/hash.sr"
+reason = "established public API (2 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/jwt.sr"
+reason = "established public API (10 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/otp.sr"
+reason = "established public API (34 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/pq.sr"
+reason = "established public API (22 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/sha2.sr"
+reason = "established public API (31 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/vault.sr"
+reason = "established public API (3 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sec/x509.sr"
+reason = "established public API (21 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/cli.sr"
+reason = "established public API (7 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/env.sr"
+reason = "established public API (14 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/epoll.sr"
+reason = "established public API (4 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/ffi.sr"
+reason = "established public API (22 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/fs.sr"
+reason = "established public API (20 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/mmap.sr"
+reason = "established public API (1 module-prefixed name); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/path.sr"
+reason = "established public API (22 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/proc.sr"
+reason = "established public API (11 module-prefixed names); rename is a breaking change"
+
+[[lint.exception]]
+rule = "S002"
+path = "sys/time.sr"
+reason = "established public API (4 module-prefixed names); rename is a breaking change"
+
+# S006 needless-mut: `@` kept on public handle APIs and a frozen kernel.
+[[lint.exception]]
+rule = "S006"
+path = "ai/mcp_client.sr"
+item = "list_tools.self"
+reason = "client handle API: `@self` marks the session as the stateful side of the protocol; dropping it changes the public signature"
+
+[[lint.exception]]
+rule = "S006"
+path = "ai/mcp_client.sr"
+item = "list_resources.self"
+reason = "client handle API: `@self` marks the session as the stateful side of the protocol; dropping it changes the public signature"
+
+[[lint.exception]]
+rule = "S006"
+path = "ai/mcp_client.sr"
+item = "read_resource.self"
+reason = "client handle API: `@self` marks the session as the stateful side of the protocol; dropping it changes the public signature"
+
+[[lint.exception]]
+rule = "S006"
+path = "ai/mcp_client.sr"
+item = "list_prompts.self"
+reason = "client handle API: `@self` marks the session as the stateful side of the protocol; dropping it changes the public signature"
+
+[[lint.exception]]
+rule = "S006"
+path = "core/collections.sr"
+item = "gd_lin_fit_i.xs"
+reason = "frozen benchmark kernel (benchmarks/20): `@` passes the arrays by reference on the measured AOT path"
+
+[[lint.exception]]
+rule = "S006"
+path = "core/collections.sr"
+item = "gd_lin_fit_i.ys"
+reason = "frozen benchmark kernel (benchmarks/20): `@` passes the arrays by reference on the measured AOT path"
+
+[[lint.exception]]
+rule = "S006"
+path = "io/console.sr"
+item = "write_line.self"
+reason = "writes to an OS stream; `@self` marks the side effect on the handle"
+
+[[lint.exception]]
+rule = "S006"
+path = "net/http.sr"
+item = "set_nonblock.self"
+reason = "App/Listener handles: `@` passes the large App by reference on the per-request path and marks fd state changes"
+
+[[lint.exception]]
+rule = "S006"
+path = "net/http.sr"
+item = "app_run_after.a"
+reason = "App/Listener handles: `@` passes the large App by reference on the per-request path and marks fd state changes"
+
+[[lint.exception]]
+rule = "S006"
+path = "net/tcp.sr"
+item = "accept.self"
+reason = "socket I/O on an OS handle; `@self` marks the fd state change (accept/write)"
+
+[[lint.exception]]
+rule = "S006"
+path = "net/tcp.sr"
+item = "write.self"
+reason = "socket I/O on an OS handle; `@self` marks the fd state change (accept/write)"
+
+[[lint.exception]]
+rule = "S006"
+path = "net/udp.sr"
+item = "send_to.self"
+reason = "socket I/O on an OS handle; `@self` marks the fd state change (send/recv)"
+
+[[lint.exception]]
+rule = "S006"
+path = "net/udp.sr"
+item = "recv.self"
+reason = "socket I/O on an OS handle; `@self` marks the fd state change (send/recv)"

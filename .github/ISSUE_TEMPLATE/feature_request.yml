@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose language, stdlib, or tooling behavior (not benchmark score changes)
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [ROADMAP.md](https://github.com/theHamdiz/super-lang/blob/main/ROADMAP.md) for known gaps. Breaking syntax needs a spec delta in `SPECIFICATION.md`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What pain or missing capability does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Syntax sketch, API name, or CLI flag
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Testing plan
+      description: test blocks, crates integration tests, or law files to add
+    validations:
+      required: false

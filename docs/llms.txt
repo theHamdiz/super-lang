@@ -1,0 +1,25 @@
+# Super (llms.txt)
+
+Super 0.1.0 — stack-oriented language with C23 AOT, VM, and numeric JIT.
+
+- Quickstart: https://thehamdiz.github.io/super-lang/quickstart/
+- Language: https://thehamdiz.github.io/super-lang/syntax/
+- HTTP server: https://thehamdiz.github.io/super-lang/http-server/
+- API style: https://thehamdiz.github.io/super-lang/api-style/
+- Conditional compilation: https://thehamdiz.github.io/super-lang/cfg/
+- Pod features: https://thehamdiz.github.io/super-lang/features/
+- Platforms: https://thehamdiz.github.io/super-lang/platform/
+- Spec: https://thehamdiz.github.io/super-lang/spec/
+- Stdlib (127 modules): https://thehamdiz.github.io/super-lang/stdlib-ref/
+- Law/proof: https://thehamdiz.github.io/super-lang/law-proof/
+- Data stacks: https://thehamdiz.github.io/super-lang/data-stacks/
+- Home: https://thehamdiz.github.io/super-lang/
+- Benchmarks: https://thehamdiz.github.io/super-lang/benchmarks/
+- Reproduce: https://github.com/theHamdiz/super-lang/blob/main/benchmarks/REPRODUCE.md
+- Community reproduce: https://thehamdiz.github.io/super-lang/reproduce-benchmarks/
+- Safety claims: https://thehamdiz.github.io/super-lang/safety-claims/
+- Roadmap: https://github.com/theHamdiz/super-lang/blob/main/ROADMAP.md
+- Security: https://github.com/theHamdiz/super-lang/blob/main/SECURITY.md
+- Windows note: Windows C23 AOT sockets: Winsock2 (WSAPoll) in 0.1.0.
+- REPORT: https://github.com/theHamdiz/super-lang/blob/main/docs/REPORT.md
+- results.json: https://github.com/theHamdiz/super-lang/blob/main/docs/results.json

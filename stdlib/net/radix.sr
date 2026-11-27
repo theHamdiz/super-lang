@@ -1,0 +1,318 @@
+//! std.net.radix -- compact radix path router (method × segment tree)
+//!
+//! Import with:
+//!   use std.net.radix
+//!
+//! Static / `:param` / `*wildcard` templates; `lookup_range` matches a path span
+//! in a wire buffer (no path allocation).
+
+use std.core.str
+use std.core.collections
+use std.sec.sha2
+
+/// HTTP method tags for handler slots (GET/POST/PUT/DELETE).
++GET, +POST, +PUT, +DELETE = 0, 1, 2, 3
+/// Segment kinds: static literal, `:param`, `*wildcard`.
++STATIC_SEG, +PARAM_ROUTE, +WILDCARD = 0, 1, 2
+
+/// Lookup result: `status` 0 = hit (`rid`/`pid`), else HTTP 404/405.
++RouteMatch = {
+    status: i64 = 0
+    rid: i64 = -1
+    pid: i64 = 0
+    bad_id: bool = false
+}
+
+/// Dense radix tree over path segments with per-method handler ids.
++RadixRouter = {
+    kind: _
+    seg: _
+    child: _
+    next: _
+    handler: _
+    count: i64 = 0
+
+    node(@self, kind: i64, seg: str, next: i64) : i64 {
+        n = self.count
+        self.kind[n], self.seg[n], self.child[n], self.next[n] = kind, seg, -1, next
+        for m in 0..4 { self.handler[n * 4 + m] = -1 }
+        self.count = n + 1
+        n
+    }
+
+    add(@self, tpl: str, method: i64, rid: i64) {
+        cur, start, n = 0, 1, byte_len(tpl)
+        while start <= n {
+            e = radix_seg_end(tpl, start)
+            part = byte_slice(tpl, start, e)
+            kind = radix_seg_kind(part)
+            found = -1
+            c = self.child[cur]
+            while c >= 0 && found < 0 {
+                if self.kind[c] == kind && (kind != STATIC_SEG || self.seg[c] == part) { found = c }
+                c = self.next[c]
+            }
+            if found < 0 {
+                seg = part
+                if kind != STATIC_SEG { seg = "" }
+                found = @self.node(kind, seg, self.child[cur])
+                self.child[cur] = found
+            }
+            cur, start = found, e + 1
+        }
+        self.handler[cur * 4 + method] = rid
+    }
+
+    allows_any(self, n: i64) : bool {
+        for m in 0..4 {
+            if self.handler[n * 4 + m] >= 0 { return true }
+        }
+        false
+    }
+
+    /// Path is `s[plo..phi)` -- slices into the wire buffer (no path alloc).
+    lookup_range(self, s: str, plo: i64, phi: i64, method: i64) : RouteMatch {
+        ensure phi > plo && byte_match_at(s, "/", plo) else { return RouteMatch.{status: 404} }
+        cur, nparam, pid, bad_id = 0, 0, -1, false
+        start = plo + 1
+        while start <= phi {
+            e = radix_seg_end_limit(s, start, phi)
+            ensure e > start else { return RouteMatch.{status: 404} }
+            st, pm, wc = -1, -1, -1
+            c = self.child[cur]
+            while c >= 0 && st < 0 {
+                when self.kind[c] {
+                    STATIC_SEG => if byte_eq_range(s, start, e, self.seg[c]) { st = c }
+                    PARAM_ROUTE => pm = c
+                    else => wc = c
+                }
+                c = self.next[c]
+            }
+            if st >= 0 {
+                cur = st
+            } else {
+                if pm >= 0 {
+                    cur = pm
+                    if nparam == 0 {
+                        pid = parse_uint_range(s, start, e)
+                        bad_id = pid < 0
+                    }
+                    nparam += 1
+                } else {
+                    if wc < 0 { return RouteMatch.{status: 404} }
+                    cur = wc
+                    break
+                }
+            }
+            start = e + 1
+        }
+        rid = self.handler[cur * 4 + method]
+        if rid < 0 {
+            status = if self.allows_any(cur) { 405 } else { 404 }
+            return RouteMatch.{status}
+        }
+        if bad_id || pid < 0 { pid = 0 }
+        RouteMatch.{status: 0, rid, pid, bad_id}
+    }
+}
+
+/// Empty radix with capacity `maxn` nodes (caller supplies arrays).
++radix_new(maxn: i64) : RadixRouter {
+    r = RadixRouter.{
+        kind: [0; maxn],
+        seg: [""; maxn],
+        child: [0; maxn],
+        next: [0; maxn],
+        handler: [0; maxn * 4]
+    }
+    @r.node(STATIC_SEG, "", -1)
+    r
+}
+
++radix_seg_end(path: str, start: i64) : i64 {
+    e = byte_find_from(path, "/", start)
+    if e < 0 { byte_len(path) } else { e }
+}
+
++radix_seg_end_limit(s: str, start: i64, limit: i64) : i64 {
+    e = byte_find_from(s, "/", start)
+    if e < 0 { return limit }
+    if e > limit { return limit }
+    e
+}
+
++radix_seg_kind(s: str) : i64 {
+    if starts_with(s, ":") { PARAM_ROUTE } else { if starts_with(s, "*") { WILDCARD } else { STATIC_SEG } }
+}
+
+/// First-token method tag from a request line, or -1.
++request_method(req: str) : i64 {
+    return GET if byte_match_at(req, "GET ", 0)
+    return POST if byte_match_at(req, "POST ", 0)
+    return PUT if byte_match_at(req, "PUT ", 0)
+    return DELETE if byte_match_at(req, "DELETE ", 0)
+    -1
+}
+
+/// Method tag → request-line prefix including trailing space.
++method_lit(m: i64) : str {
+    when m {
+        GET => "GET "
+        POST => "POST "
+        PUT => "PUT "
+        else => "DELETE "
+    }
+}
+
+/// Parse `s[lo..hi)` as `uid.exp.sig8`; return uid when MAC+exp valid vs `now`, else -1.
++bearer_uid_range(s: str, lo: i64, hi: i64, key, now: i64) : i64 {
+    n = hi - lo
+    ensure n > 0 else { return -1 }
+    d1 = byte_find_from(s, ".", lo)
+    ensure d1 > lo && d1 < hi else { return -1 }
+    d2 = byte_find_from(s, ".", d1 + 1)
+    ensure d2 > d1 && d2 < hi && hi - d2 - 1 == 8 else { return -1 }
+    d3 = byte_find_from(s, ".", d2 + 1)
+    ensure d3 < 0 || d3 >= hi else { return -1 }
+    uid = parse_uint_range(s, lo, d1)
+    exp = parse_uint_range(s, d1 + 1, d2)
+    ensure uid >= 0 && exp >= 0 else { return -1 }
+    ensure host.sys_hmac_sha256_hex_prefix_eq_range(key, s, lo, d2, 4, s, d2 + 1) && exp > now else { return -1 }
+    uid
+}
+
+skip_ws(s: str, p0: i64, e: i64) : i64 {
+    p = p0
+    while p < e {
+        b = byte_at(s, p)
+        if b != 32 && b != 9 && b != 10 && b != 13 { return p }
+        p += 1
+    }
+    p
+}
+
+json_key_id(s: str, lo: i64, hi: i64) : i64 {
+    n = hi - lo
+    if n == 4 && byte_eq_range(s, lo, hi, "user") { return 1 }
+    if n == 3 && byte_eq_range(s, lo, hi, "qty") { return 2 }
+    if n == 3 && byte_eq_range(s, lo, hi, "sku") { return 3 }
+    if n == 4 && byte_eq_range(s, lo, hi, "note") { return 4 }
+    if n == 4 && byte_eq_range(s, lo, hi, "pass") { return 5 }
+    0
+}
+
+parse_body_fields(s: str, off: i64, nbytes: i64, @ty, @val) : bool {
+    e = off + nbytes
+    for i in 0..6 {
+        ty[i] = 0
+        val[i] = 0
+    }
+    p = skip_ws(s, off, e)
+    ensure p < e && byte_at(s, p) == 123 else { return false }
+    p = skip_ws(s, p + 1, e)
+    if p < e && byte_at(s, p) == 125 {
+        p = skip_ws(s, p + 1, e)
+        return p == e
+    }
+    loop {
+        ensure p < e && byte_at(s, p) == 34 else { return false }
+        p += 1
+        ks = p
+        while p < e && byte_at(s, p) != 34 {
+            if byte_at(s, p) == 92 { return false }
+            p += 1
+        }
+        ensure p < e else { return false }
+        kid = json_key_id(s, ks, p)
+        p = skip_ws(s, p + 1, e)
+        ensure p < e && byte_at(s, p) == 58 else { return false }
+        p = skip_ws(s, p + 1, e)
+        ensure p < e else { return false }
+        fty, fval = 0, 0
+        if byte_at(s, p) == 34 {
+            p += 1
+            vs = p
+            while p < e && byte_at(s, p) != 34 {
+                if byte_at(s, p) == 92 { return false }
+                p += 1
+            }
+            ensure p < e else { return false }
+            fty = 2
+            fval = p - vs
+            p += 1
+        } else {
+            neg = false
+            if byte_at(s, p) == 45 {
+                neg = true
+                p += 1
+            }
+            ds = p
+            while p < e {
+                d = byte_at(s, p) - 48
+                if d < 0 || d > 9 { break }
+                p += 1
+            }
+            v = parse_uint_range(s, ds, p)
+            ensure v >= 0 else { return false }
+            fty = 1
+            fval = if neg { 0 - v } else { v }
+        }
+        if kid > 0 {
+            ty[kid] = fty
+            val[kid] = fval
+        }
+        p = skip_ws(s, p, e)
+        ensure p < e else { return false }
+        b = byte_at(s, p)
+        if b == 44 {
+            p = skip_ws(s, p + 1, e)
+        } else {
+            ensure b == 125 else { return false }
+            p += 1
+            break
+        }
+    }
+    p = skip_ws(s, p, e)
+    p == e
+}
+
+has_int_field(ty, val, i: i64, lo: i64, hi: i64) : bool =>
+    ty[i] == 1 && val[i] >= lo && val[i] <= hi
+
+has_str_field(ty, val, i: i64, lo: i64, hi: i64) : bool =>
+    ty[i] == 2 && val[i] >= lo && val[i] <= hi
+
++body_valid_range(rid: i64, s: str, off: i64, nbytes: i64) : bool {
+    ty = [0; 6]
+    val = [0; 6]
+    ok = parse_body_fields(s, off, nbytes, @ty, @val)
+    ensure ok else { return false }
+    when rid {
+        4 => {
+            ensure has_int_field(ty, val, 1, 1, 9999) else { return false }
+            ensure has_int_field(ty, val, 2, 1, 100) else { return false }
+            has_str_field(ty, val, 3, 4, 4)
+        }
+        6 => {
+            ensure has_int_field(ty, val, 2, 1, 100) else { return false }
+            if ty[4] == 0 { return true }
+            has_str_field(ty, val, 4, 0, 1000)
+        }
+        else => {
+            ensure has_str_field(ty, val, 1, 1, 64) else { return false }
+            has_str_field(ty, val, 5, 1, 64)
+        }
+    }
+}
+
+test "radix static and param" {
+    r = radix_new(32)
+    @r.add("/health", GET, 0)
+    @r.add("/users/:id", GET, 2)
+    m = r.lookup_range("/users/42", 0, 9, GET)
+    assert_eq(m.status, 0)
+    assert_eq(m.rid, 2)
+    assert_eq(m.pid, 42)
+    h = r.lookup_range("/health", 0, 7, GET)
+    assert_eq(h.rid, 0)
+}

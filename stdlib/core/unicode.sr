@@ -1,0 +1,629 @@
+//! std.core.unicode — UTF-8 validation, codepoint iteration, case folding, normalization, display width
+//!
+//! Import with:
+//!   use std.core.unicode
+//!
+//! Strings in Super index by character, so `uc_cps(s)` yields one codepoint per character.
+//! Byte arrays (i64 values 0..255) are the wire form: `utf8_valid`, `utf8_decode_all` and
+//! `Utf8Iter` walk them with strict RFC 3629 rules (no overlongs, no surrogates, max U+10FFFF).
+//!
+//!   ok = utf8_valid(host.sys_str_to_bytes("héllo"))      // true
+//!   cur = Utf8Iter.new(bytes)
+//!   r = @cur.advance()                                        // Utf8Rune.{cp, size, ok}
+//!   width = uc_str_width("日本語")                         // 6
+//!
+//! Normalization covers ASCII (identity) plus the Latin-1 Supplement letters that have a
+//! single canonical combining mark (grave, acute, circumflex, tilde, diaeresis, ring, cedilla).
+//! `nfd` decomposes them, `nfc` recomposes them; all other codepoints pass through unchanged.
+
+use std.core.collections
+
+/// `UC_REPLACEMENT` is U+FFFD, substituted for invalid input.
++UC_REPLACEMENT = 65533
+/// `UC_MAX` is the highest Unicode scalar value, U+10FFFF.
++UC_MAX = 1114111
+
+/// Precomposed Latin-1 letters that have a canonical decomposition.
++UC_COMPOSED = [192, 193, 194, 195, 196, 197, 199, 200, 201, 202, 203, 204, 205, 206, 207, 209, 210, 211, 212, 213, 214, 217, 218, 219, 220, 221, 224, 225, 226, 227, 228, 229, 231, 232, 233, 234, 235, 236, 237, 238, 239, 241, 242, 243, 244, 245, 246, 249, 250, 251, 252, 253, 255]
+/// Base letter of each entry in `UC_COMPOSED`.
++UC_BASE = [65, 65, 65, 65, 65, 65, 67, 69, 69, 69, 69, 73, 73, 73, 73, 78, 79, 79, 79, 79, 79, 85, 85, 85, 85, 89, 97, 97, 97, 97, 97, 97, 99, 101, 101, 101, 101, 105, 105, 105, 105, 110, 111, 111, 111, 111, 111, 117, 117, 117, 117, 121, 121]
+/// Combining mark of each entry in `UC_COMPOSED`.
++UC_MARK = [768, 769, 770, 771, 776, 778, 807, 768, 769, 770, 776, 768, 769, 770, 776, 771, 768, 769, 770, 771, 776, 768, 769, 770, 776, 769, 768, 769, 770, 771, 776, 778, 807, 768, 769, 770, 776, 768, 769, 770, 776, 771, 768, 769, 770, 771, 776, 768, 769, 770, 776, 769, 776]
+
+/// One decoded UTF-8 sequence. `size` is the number of bytes consumed (at least 1 unless the
+/// input was exhausted); an invalid sequence has `ok == false` and `cp == UC_REPLACEMENT`.
++Utf8Rune = {
+    /// Decoded codepoint, or `UC_REPLACEMENT` when invalid. Defaults to `65533`.
+    cp: i64 = 65533
+    /// Bytes consumed from the input. Defaults to `0`.
+    size: i64 = 0
+    /// True when the sequence was well formed. Defaults to `false`.
+    ok: bool = false
+}
+
+/// Cursor over the codepoints of a UTF-8 byte array.
++Utf8Iter = {
+    /// Bytes being decoded. Defaults to `[]`.
+    data: _ = []
+    /// Offset of the next sequence. Defaults to `0`.
+    pos: i64 = 0
+
+    /// Iterator at the start of `data`.
+    new(data: _) : Utf8Iter => Utf8Iter.{data, pos: 0}
+
+    /// True while at least one byte remains.
+    has_next(self) : bool => self.pos < host.sys_arr_len(self.data)
+
+    /// Decode the next sequence and advance past it. Invalid bytes yield `ok == false`
+    /// and advance one byte, so iteration always terminates.
+    advance(@self) : Utf8Rune {
+        r = utf8_decode_at(self.data, self.pos)
+        self.pos += r.size
+        r
+    }
+
+    /// Codepoints still to be read (invalid sequences count as one each).
+    remaining(self) : i64 {
+        probe = Utf8Iter.{data: self.data, pos: self.pos}
+        n = 0
+        while @probe.has_next() {
+            @probe.advance()
+            n += 1
+        }
+        n
+    }
+}
+
+// --- UTF-8 decode / validate / encode --------------------------------------------------
+
+/// True when `data[i]` exists and is a continuation byte (10xxxxxx).
++utf8_cont(data: _, i: i64, n: i64) : bool {
+    if i >= n { return false }
+    b = data[i]
+    if b < 128 { return false }
+    b < 192
+}
+
+/// True when byte `b` is a UTF-8 continuation (`10xxxxxx`).
+#inline
++utf8_is_cont(b: i64) : bool => (b & 192) == 128
+
+/// Encode codepoint `cp` into `doc` at offset `n`; returns the next write offset.
+#inline
++utf8_put(@doc, n: i64, cp: i64) : i64 {
+    if cp < 128 {
+        doc[n] = cp
+        return n + 1
+    }
+    if cp < 2048 {
+        doc[n] = 192 + cp / 64
+        doc[n + 1] = 128 + cp % 64
+        return n + 2
+    }
+    if cp < 65536 {
+        doc[n] = 224 + cp / 4096
+        doc[n + 1] = 128 + (cp / 64) % 64
+        doc[n + 2] = 128 + cp % 64
+        return n + 3
+    }
+    doc[n] = 240 + cp / 262144
+    doc[n + 1] = 128 + (cp / 4096) % 64
+    doc[n + 2] = 128 + (cp / 64) % 64
+    doc[n + 3] = 128 + cp % 64
+    n + 4
+}
+
+/// Draw a random Unicode code point from an `Lcg` (`roll`).
+#inline
++utf8_draw_cp(@rng: Lcg) : i64 {
+    cat = @rng.roll() % 4
+    r = @rng.roll()
+    if cat == 0 { return r % 128 }
+    if cat == 1 { return 128 + r % 1920 }
+    if cat == 2 { return 2048 + r % 53248 }
+    65536 + r % 1048576
+}
+
+/// Strict UTF-8 validate over `doc[0..n)`.
++utf8_valid_n(doc, n: i64) : bool {
+    i = 0
+    while i < n {
+        b0 = doc[i]
+        if b0 < 128 {
+            i += 1
+        } else {
+            if b0 < 194 { return false }
+            if b0 < 224 {
+                if i + 1 >= n || !utf8_is_cont(doc[i + 1]) { return false }
+                i += 2
+            } else {
+                if b0 < 240 {
+                    if i + 2 >= n || !utf8_is_cont(doc[i + 1]) || !utf8_is_cont(doc[i + 2]) { return false }
+                    cp = (b0 - 224) * 4096 + (doc[i + 1] - 128) * 64 + (doc[i + 2] - 128)
+                    if cp < 2048 || (cp >= 55296 && cp <= 57343) { return false }
+                    i += 3
+                } else {
+                    if b0 < 245 {
+                        if i + 3 >= n || !utf8_is_cont(doc[i + 1]) || !utf8_is_cont(doc[i + 2]) || !utf8_is_cont(doc[i + 3]) { return false }
+                        cp = (b0 - 240) * 262144 + (doc[i + 1] - 128) * 4096 + (doc[i + 2] - 128) * 64 + (doc[i + 3] - 128)
+                        if cp < 65536 || cp > 1114111 { return false }
+                        i += 4
+                    } else {
+                        return false
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Count Unicode scalar values in `doc[0..n)` (non-continuation bytes).
++utf8_count_n(doc, n: i64) : i64 {
+    c = 0
+    for i in 0..n {
+        if !utf8_is_cont(doc[i]) { c += 1 }
+    }
+    c
+}
+
+/// Decode one sequence of `data` at byte offset `i`.
++utf8_decode_at(data: _, i: i64) : Utf8Rune {
+    n = host.sys_arr_len(data)
+    bad = Utf8Rune.{cp: 65533, size: 1, ok: false}
+    if i >= n { return Utf8Rune.{cp: 65533, size: 0, ok: false} }
+    b0 = data[i]
+    if b0 < 128 { return Utf8Rune.{cp: b0, size: 1, ok: true} }
+    if b0 < 194 { return bad }
+    if b0 < 224 {
+        if !utf8_cont(data, i + 1, n) { return bad }
+        cp2 = (b0 - 192) * 64 + (data[i + 1] - 128)
+        return Utf8Rune.{cp: cp2, size: 2, ok: true}
+    }
+    if b0 < 240 {
+        if !utf8_cont(data, i + 1, n) { return bad }
+        if !utf8_cont(data, i + 2, n) { return bad }
+        cp3 = (b0 - 224) * 4096 + (data[i + 1] - 128) * 64 + (data[i + 2] - 128)
+        if cp3 < 2048 { return bad }
+        if cp3 >= 55296 {
+            if cp3 <= 57343 { return bad }
+        }
+        return Utf8Rune.{cp: cp3, size: 3, ok: true}
+    }
+    if b0 < 245 {
+        if !utf8_cont(data, i + 1, n) { return bad }
+        if !utf8_cont(data, i + 2, n) { return bad }
+        if !utf8_cont(data, i + 3, n) { return bad }
+        cp4 = (b0 - 240) * 262144 + (data[i + 1] - 128) * 4096 + (data[i + 2] - 128) * 64 + (data[i + 3] - 128)
+        if cp4 < 65536 { return bad }
+        if cp4 > 1114111 { return bad }
+        return Utf8Rune.{cp: cp4, size: 4, ok: true}
+    }
+    bad
+}
+
+/// True when every byte of `data` belongs to a well-formed UTF-8 sequence.
++utf8_valid(data: _) : bool {
+    n = host.sys_arr_len(data)
+    pos = 0
+    good = true
+    while pos < n {
+        r = utf8_decode_at(data, pos)
+        if !r.ok {
+            good = false
+            break
+        }
+        pos += r.size
+    }
+    good
+}
+
+/// Number of codepoints in `data` (an invalid byte counts as one replacement character).
++utf8_count(data: _) : i64 {
+    cur = Utf8Iter.new(data)
+    n = 0
+    while @cur.has_next() {
+        @cur.advance()
+        n += 1
+    }
+    n
+}
+
+/// Codepoints of `data`, with U+FFFD substituted for each invalid byte.
++utf8_decode_all(data: _) : _ {
+    cur = Utf8Iter.new(data)
+    out = []
+    while @cur.has_next() {
+        r = @cur.advance()
+        out = host.sys_arr_push(out, r.cp)
+    }
+    out
+}
+
+/// True when `cp` is a Unicode scalar value (not a surrogate, within range).
++uc_is_scalar(cp: i64) : bool {
+    if cp < 0 { return false }
+    if cp > 1114111 { return false }
+    if cp >= 55296 {
+        if cp <= 57343 { return false }
+    }
+    true
+}
+
+/// UTF-8 bytes of the codepoint `cp`; a non-scalar value encodes U+FFFD.
++utf8_encode(cp: i64) : _ {
+    c = cp
+    if !uc_is_scalar(c) { c = 65533 }
+    if c < 128 { return [c] }
+    if c < 2048 { return [192 + c / 64, 128 + c % 64] }
+    if c < 65536 { return [224 + c / 4096, 128 + (c / 64) % 64, 128 + c % 64] }
+    out4 = [240 + c / 262144, 128 + (c / 4096) % 64, 128 + (c / 64) % 64, 128 + c % 64]
+    out4
+}
+
+/// UTF-8 bytes of every codepoint in `cps`.
++utf8_encode_all(cps: _) : _ {
+    out = []
+    for cps {
+        bytes = utf8_encode(it)
+        for bytes { out = host.sys_arr_push(out, it) }
+    }
+    out
+}
+
+// --- string <-> codepoints ---------------------------------------------------------------
+
+/// Codepoints of `s`, one per character.
++uc_cps(s: str) : _ {
+    out = []
+    n = host.sys_str_len(s)
+    for 0..n { out = host.sys_arr_push(out, host.sys_ord(s[it])) }
+    out
+}
+
+/// String built from the codepoints `cps` (non-scalars become U+FFFD).
++uc_from_cps(cps: _) : str {
+    out = ""
+    for cps {
+        cp = it
+        if !uc_is_scalar(cp) { cp = 65533 }
+        ch = host.sys_chr(cp)
+        out = "{out}{ch}"
+    }
+    out
+}
+
+/// Number of UTF-8 bytes `s` occupies.
++uc_byte_len(s: str) : i64 => host.sys_arr_len(host.sys_str_to_bytes(s))
+
+// --- case folding ------------------------------------------------------------------------
+
+/// ASCII lower-case form of `cp`; other codepoints are unchanged.
++uc_fold_cp(cp: i64) : i64 {
+    if cp < 65 { return cp }
+    if cp > 90 { return cp }
+    cp + 32
+}
+
+/// ASCII upper-case form of `cp`; other codepoints are unchanged.
++uc_upper_cp(cp: i64) : i64 {
+    if cp < 97 { return cp }
+    if cp > 122 { return cp }
+    cp - 32
+}
+
+/// `s` with ASCII letters folded to lower case.
++uc_fold(s: str) : str {
+    out = []
+    for uc_cps(s) { out = host.sys_arr_push(out, uc_fold_cp(it)) }
+    uc_from_cps(out)
+}
+
+/// `s` with ASCII letters converted to upper case.
++uc_upper(s: str) : str {
+    out = []
+    for uc_cps(s) { out = host.sys_arr_push(out, uc_upper_cp(it)) }
+    uc_from_cps(out)
+}
+
+/// Case-insensitive (ASCII fold) equality.
++uc_eq_fold(a: str, b: str) : bool => uc_fold(a) == uc_fold(b)
+
+// --- normalization -----------------------------------------------------------------------
+
+/// Index of `cp` in `UC_COMPOSED`, or -1.
++uc_composed_index(cp: i64) : i64 {
+    found = -1
+    for 0..53 {
+        if UC_COMPOSED[it] == cp { found = it }
+    }
+    found
+}
+
+/// Index of the entry composing `base` + `mark`, or -1.
++uc_compose_index(base: i64, mark: i64) : i64 {
+    found = -1
+    for 0..53 {
+        if UC_BASE[it] == base {
+            if UC_MARK[it] == mark { found = it }
+        }
+    }
+    found
+}
+
+/// True for the combining diacritical marks block (U+0300..U+036F).
++uc_is_combining(cp: i64) : bool {
+    if cp < 768 { return false }
+    cp <= 879
+}
+
+/// Canonical decomposition (NFD) of the codepoints `cps`.
++uc_nfd_cps(cps: _) : _ {
+    out = []
+    for cps {
+        k = uc_composed_index(it)
+        if k < 0 {
+            out = host.sys_arr_push(out, it)
+        } else {
+            out = host.sys_arr_push(out, UC_BASE[k])
+            out = host.sys_arr_push(out, UC_MARK[k])
+        }
+    }
+    out
+}
+
+/// Canonical composition (NFC) of the codepoints `cps`.
++uc_nfc_cps(cps: _) : _ {
+    out = []
+    n = host.sys_arr_len(cps)
+    pos = 0
+    while pos < n {
+        cp = cps[pos]
+        step = 1
+        merged = cp
+        if pos + 1 < n {
+            k = uc_compose_index(cp, cps[pos + 1])
+            if k >= 0 {
+                merged = UC_COMPOSED[k]
+                step = 2
+            }
+        }
+        out = host.sys_arr_push(out, merged)
+        pos += step
+    }
+    out
+}
+
+/// `s` in Normalization Form D.
++nfd(s: str) : str => uc_from_cps(uc_nfd_cps(uc_cps(s)))
+
+/// `s` in Normalization Form C.
++nfc(s: str) : str => uc_from_cps(uc_nfc_cps(uc_nfd_cps(uc_cps(s))))
+
+/// True when `a` and `b` are canonically equivalent.
++uc_canon_eq(a: str, b: str) : bool => nfc(a) == nfc(b)
+
+// --- display width -----------------------------------------------------------------------
+
+/// True when `v` lies within `lo..=hi`.
++uc_in(v: i64, lo: i64, hi: i64) : bool {
+    if v < lo { return false }
+    v <= hi
+}
+
+/// True for East Asian wide / fullwidth ranges and emoji blocks (two terminal cells).
++uc_is_wide(cp: i64) : bool {
+    if cp < 4352 { return false }
+    if uc_in(cp, 4352, 4447) { return true }
+    if uc_in(cp, 11904, 12350) { return true }
+    if uc_in(cp, 12353, 13311) { return true }
+    if uc_in(cp, 13312, 19903) { return true }
+    if uc_in(cp, 19968, 40959) { return true }
+    if uc_in(cp, 40960, 42191) { return true }
+    if uc_in(cp, 44032, 55203) { return true }
+    if uc_in(cp, 63744, 64255) { return true }
+    if uc_in(cp, 65072, 65131) { return true }
+    if uc_in(cp, 65281, 65376) { return true }
+    if uc_in(cp, 65504, 65510) { return true }
+    if uc_in(cp, 127744, 128591) { return true }
+    if uc_in(cp, 129280, 129535) { return true }
+    if uc_in(cp, 131072, 196605) { return true }
+    uc_in(cp, 196608, 262141)
+}
+
+/// Terminal cell width of `cp`: 0 for NUL, combining and zero-width marks, -1 for other
+/// control codes, 2 for wide characters, otherwise 1.
++uc_wcwidth(cp: i64) : i64 {
+    if cp == 0 { return 0 }
+    if cp < 32 { return -1 }
+    if cp < 127 { return 1 }
+    if cp < 160 { return -1 }
+    if uc_is_combining(cp) { return 0 }
+    if uc_in(cp, 8203, 8207) { return 0 }
+    if uc_in(cp, 65024, 65039) { return 0 }
+    if uc_is_wide(cp) { return 2 }
+    1
+}
+
+/// Total terminal cell width of `s`; control characters count as zero.
++uc_str_width(s: str) : i64 {
+    total = 0
+    for uc_cps(s) {
+        w = uc_wcwidth(it)
+        if w > 0 { total += w }
+    }
+    total
+}
+
+// --- tests -------------------------------------------------------------------------------
+
+/// Test that ASCII, Latin, BMP and astral text validates and counts.
+test "utf8_valid accepts well-formed sequences" {
+    #assert(utf8_valid([]))
+    #assert(utf8_valid(host.sys_str_to_bytes("hello")))
+    #assert(utf8_valid(host.sys_str_to_bytes("héllo")))
+    #assert(utf8_valid(host.sys_str_to_bytes("€ 日本語")))
+    #assert(utf8_valid([240, 159, 152, 128]))
+    assert_eq(utf8_count(host.sys_str_to_bytes("héllo")), 5)
+    assert_eq(utf8_count([240, 159, 152, 128, 65]), 2)
+}
+
+/// Test that malformed sequences are rejected.
+test "utf8_valid rejects malformed sequences" {
+    #assert(!(utf8_valid([128])))
+    #assert(!(utf8_valid([192, 175])))
+    #assert(!(utf8_valid([195])))
+    #assert(!(utf8_valid([195, 40])))
+    #assert(!(utf8_valid([224, 128, 175])))
+    #assert(!(utf8_valid([237, 160, 128])))
+    #assert(!(utf8_valid([240, 128, 128, 128])))
+    #assert(!(utf8_valid([244, 144, 128, 128])))
+    #assert(!(utf8_valid([245, 128, 128, 128])))
+    #assert(!(utf8_valid([65, 255, 66])))
+}
+
+/// Test that decode_at reports codepoint and size.
+test "utf8_decode_at reports codepoint and size" {
+    r1 = utf8_decode_at([65], 0)
+    assert_eq(r1.cp, 65)
+    assert_eq(r1.size, 1)
+    #assert(r1.ok)
+    r2 = utf8_decode_at([195, 169], 0)
+    assert_eq(r2.cp, 233)
+    assert_eq(r2.size, 2)
+    r3 = utf8_decode_at([226, 130, 172], 0)
+    assert_eq(r3.cp, 8364)
+    assert_eq(r3.size, 3)
+    r4 = utf8_decode_at([240, 159, 152, 128], 0)
+    assert_eq(r4.cp, 128512)
+    assert_eq(r4.size, 4)
+    r5 = utf8_decode_at([195, 40], 0)
+    #assert(!(r5.ok))
+    assert_eq(r5.cp, 65533)
+    assert_eq(r5.size, 1)
+    r6 = utf8_decode_at([65], 1)
+    assert_eq(r6.size, 0)
+    #assert(!(r6.ok))
+}
+
+/// Test that Utf8Iter walks sequences and substitutes bad bytes.
+test "Utf8Iter walks codepoints" {
+    cur = Utf8Iter.new([72, 195, 169, 255, 226, 130, 172])
+    assert_eq(cur.remaining(), 4)
+    a = @cur.advance()
+    b = @cur.advance()
+    c = @cur.advance()
+    d = @cur.advance()
+    assert_eq(a.cp, 72)
+    assert_eq(b.cp, 233)
+    #assert(!(c.ok))
+    assert_eq(c.cp, 65533)
+    assert_eq(d.cp, 8364)
+    #assert(!(cur.has_next()))
+    assert_eq(cur.pos, 7)
+    cps = utf8_decode_all([72, 195, 169, 255, 226, 130, 172])
+    assert_eq(host.sys_arr_len(cps), 4)
+    assert_eq(cps[2], 65533)
+}
+
+/// Test that encode inverts decode for every width.
+test "utf8_encode and decode round trip" {
+    e0 = utf8_encode(65)
+    assert_eq(host.sys_arr_len(e0), 1)
+    e1 = utf8_encode(233)
+    assert_eq(e1[0], 195)
+    assert_eq(e1[1], 169)
+    e2 = utf8_encode(8364)
+    assert_eq(e2[0], 226)
+    assert_eq(e2[1], 130)
+    assert_eq(e2[2], 172)
+    e3 = utf8_encode(128512)
+    assert_eq(e3[0], 240)
+    assert_eq(e3[1], 159)
+    assert_eq(e3[2], 152)
+    assert_eq(e3[3], 128)
+    bad = utf8_encode(55296)
+    assert_eq(bad[0], 239)
+    assert_eq(bad[1], 191)
+    assert_eq(bad[2], 189)
+    assert_eq(host.sys_arr_len(utf8_encode(2000000)), 3)
+    cps = [72, 233, 8364, 128512, 0, 127, 2047, 2048, 65535, 65536]
+    back = utf8_decode_all(utf8_encode_all(cps))
+    assert_eq(host.sys_arr_len(back), 10)
+    for 0..10 { assert_eq(back[it], cps[it]) }
+    #assert(utf8_valid(utf8_encode_all(cps)))
+}
+
+/// Test that str <-> codepoint helpers agree with the host.
+test "uc_cps and uc_from_cps" {
+    cps = uc_cps("aé€")
+    assert_eq(host.sys_arr_len(cps), 3)
+    assert_eq(cps[0], 97)
+    assert_eq(cps[1], 233)
+    assert_eq(cps[2], 8364)
+    assert_eq(uc_from_cps(cps), "aé€")
+    assert_eq(uc_from_cps([104, 105]), "hi")
+    assert_eq(uc_from_cps([55296, 65]), uc_from_cps([UC_REPLACEMENT, 65]))
+    assert_eq(uc_byte_len("aé€"), 6)
+    assert_eq(uc_byte_len(""), 0)
+}
+
+/// Test that ASCII case folding leaves everything else alone.
+test "ascii case fold" {
+    assert_eq(uc_fold("Hello, WORLD 123"), "hello, world 123")
+    assert_eq(uc_upper("Hello, world 123"), "HELLO, WORLD 123")
+    assert_eq(uc_fold("ÉCOLE"), "École")
+    assert_eq(uc_fold_cp(64), 64)
+    assert_eq(uc_fold_cp(65), 97)
+    assert_eq(uc_fold_cp(90), 122)
+    assert_eq(uc_fold_cp(91), 91)
+    assert_eq(uc_upper_cp(96), 96)
+    assert_eq(uc_upper_cp(97), 65)
+    assert_eq(uc_upper_cp(122), 90)
+    assert_eq(uc_upper_cp(123), 123)
+    #assert(uc_eq_fold("SuPeR", "sUpEr"))
+    #assert(!(uc_eq_fold("super", "supers")))
+}
+
+/// Test that NFD splits and NFC joins Latin-1 letters.
+test "nfd and nfc normalize Latin-1" {
+    assert_eq(nfd("abc XYZ 019"), "abc XYZ 019")
+    assert_eq(nfc("abc XYZ 019"), "abc XYZ 019")
+    d = nfd("é")
+    assert_eq(host.sys_str_len(d), 2)
+    cps = uc_cps(d)
+    assert_eq(cps[0], 101)
+    assert_eq(cps[1], 769)
+    assert_eq(nfc(d), "é")
+    assert_eq(nfd("Ångström"), "A\u{30A}ngstro\u{308}m")
+    assert_eq(nfc("A\u{30A}ngstro\u{308}m"), "Ångström")
+    assert_eq(nfc(nfd("Crème Brûlée ÿ Ñ")), "Crème Brûlée ÿ Ñ")
+    #assert(uc_canon_eq("é", "e\u{301}"))
+    #assert(!(uc_canon_eq("é", "e")))
+    assert_eq(nfd("日本"), "日本")
+    #assert(uc_is_combining(769))
+    #assert(!(uc_is_combining(101)))
+}
+
+/// Test that wcwidth covers ASCII, combining, CJK and emoji.
+test "wcwidth for ASCII and CJK" {
+    assert_eq(uc_wcwidth(0), 0)
+    assert_eq(uc_wcwidth(7), -1)
+    assert_eq(uc_wcwidth(65), 1)
+    assert_eq(uc_wcwidth(126), 1)
+    assert_eq(uc_wcwidth(127), -1)
+    assert_eq(uc_wcwidth(233), 1)
+    assert_eq(uc_wcwidth(769), 0)
+    assert_eq(uc_wcwidth(8203), 0)
+    assert_eq(uc_wcwidth(26085), 2)
+    assert_eq(uc_wcwidth(12354), 2)
+    assert_eq(uc_wcwidth(44032), 2)
+    assert_eq(uc_wcwidth(65313), 2)
+    assert_eq(uc_wcwidth(128512), 2)
+    assert_eq(uc_wcwidth(131072), 2)
+    assert_eq(uc_str_width("hello"), 5)
+    assert_eq(uc_str_width("日本語"), 6)
+    assert_eq(uc_str_width("a日b"), 4)
+    assert_eq(uc_str_width("e\u{301}"), 1)
+    assert_eq(uc_str_width(""), 0)
+}

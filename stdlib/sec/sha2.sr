@@ -1,0 +1,430 @@
+//! std.sec.sha2 — dependency-free SHA-256 and HMAC-SHA256 in pure Super
+//!
+//! Import with:
+//!   use std.sec.sha2
+//!
+//!   sha2_256_hex("abc")                       // ba7816bf...15ad
+//!   sha2_hmac_hex("key", "payload")           // 64 hex chars
+//!   digest = sha2_256([97, 98, 99])           // 32 bytes
+//!
+//! `std.sec.crypto` routes hashing through host intrinsics (`sys_sha256`, ...). This module
+//! is the offline twin: a from-scratch FIPS 180-4 implementation over 32-bit words
+//! (held in i64 and reduced mod 2^32) that needs no host support, so tests and
+//! sandboxed embeds can verify digests and MACs anywhere. It is verified below against
+//! the FIPS 180-4 and RFC 4231 vectors. Text helpers are ASCII-only (other characters
+//! hash as '?'); the byte-array functions are binary-safe. Bytes are i64 in 0..255.
+
+/// `SHA2_HEX` is `"0123456789abcdef"`.
++SHA2_HEX = "0123456789abcdef"
+/// `SHA2_MASK32` is `0xFFFF_FFFF`.
++SHA2_MASK32 = 0xFFFF_FFFF
+
+/// `SHA2_K` is `[1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 24536...`.
++SHA2_K = [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]
+
+/// Printable ASCII 32..126; `¤` marks the four characters a literal cannot hold directly.
++SHA2_ASCII = " !¤#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[¤]^_`abcdefghijklmnopqrstuvwxyz¤|¤~"
+
+/// Length helper for the SHA-256 padding of `s`.
++sha2_len(s: str) : i64 => host.sys_str_len(s)
+
+/// Byte count of `a`.
++sha2_count(a: _) : i64 => a.len
+
+/// ASCII text to bytes; any other character becomes 63 ('?'). Reads each code point once
+/// (no per-character table scan) and fills a pre-sized buffer (no `arr_push` growth).
++sha2_bytes_of(s: str) : _ {
+    n = sha2_len(s)
+    out = [0; n]
+    for 0..n {
+        cp = host.sys_ord(s[it])
+        code = 63
+        if cp >= 32 && cp <= 126 { code = cp }
+        if cp == 10 || cp == 13 || cp == 9 { code = cp }
+        out[it] = code
+    }
+    out
+}
+
+/// Two hex characters for the byte `bytes`.
++sha2_hex_of(bytes: _) : str {
+    out = ""
+    for bytes {
+        hi = SHA2_HEX[it / 16]
+        lo = SHA2_HEX[it % 16]
+        out = "{out}{hi}{lo}"
+    }
+    out
+}
+
+#inline
+/// XOR of the bytes of `a` and `b`.
++sha2_xor8(a: i64, b: i64) : i64 => (a ^ b) & 0xFF
+
+// --- 32-bit word helpers (native bitwise → GCC `rorl` / and/xor) ------------------------------------
+
+#inline
+/// Big-endian 32-bit word at index the value in `x`.
++sha2_u32(x: i64) : i64 => x & SHA2_MASK32
+
+#inline
+/// `x` rotated right by `n` bits.
++sha2_rotr(x: i64, n: i64) : i64 => ((x >>> n) | (x << (32 - n))) & SHA2_MASK32
+
+#inline
+/// `x` shifted right by `n` bits.
++sha2_shr(x: i64, n: i64) : i64 => (x >>> n) & SHA2_MASK32
+
+#inline
+/// XOR of `a`, `b`, and `c`.
++sha2_xor3(a: i64, b: i64, c: i64) : i64 => (a ^ b ^ c) & SHA2_MASK32
+
+#inline
+/// SHA-256 Ch(`e`, `f`, `g`).
++sha2_ch(e: i64, f: i64, g: i64) : i64 => ((e & f) ^ ((~e) & g)) & SHA2_MASK32
+
+#inline
+/// SHA-256 Maj(`a`, `b`, `c`).
++sha2_maj(a: i64, b: i64, c: i64) : i64 => ((a & b) ^ (a & c) ^ (b & c)) & SHA2_MASK32
+
+// --- SHA-256 -------------------------------------------------------------------------------------------
+
+/// Message padded to a multiple of 64 bytes: 0x80, zeros, 64-bit big-endian bit length.
+/// Pre-sizes the buffer once (no per-byte `arr_push` growth in the pad loop).
++sha2_pad(msg: _) : _ {
+    n = sha2_count(msg)
+    // FIPS 180-4: pad to ≡ 56 (mod 64), then 8-byte length. Closed form avoids growth.
+    rem = (n + 1) % 64
+    zeros = if rem <= 56 { 56 - rem } else { 120 - rem }
+    total = n + 1 + zeros + 8
+    out = [0; total]
+    for 0..n { out[it] = msg[it] }
+    out[n] = 128
+    bits = n * 8
+    // bit length is written big-endian; the top three bytes are zero for messages under 128 GiB
+    out[total - 8] = 0
+    out[total - 7] = 0
+    out[total - 6] = 0
+    out[total - 5] = (bits / 4294967296) % 256
+    out[total - 4] = (bits / 16777216) % 256
+    out[total - 3] = (bits / 65536) % 256
+    out[total - 2] = (bits / 256) % 256
+    out[total - 1] = bits % 256
+    out
+}
+
+// Expand one 64-byte block into a reused W[64] buffer (no per-block allocation).
+#inline
+/// Fill `w` with the message schedule for the SHA-256 block at `padded[at..]`.
++sha2_schedule_into(padded: _, at: i64, @w) {
+    for 0..16 {
+        base = at + it * 4
+        w[it] = sha2_u32((padded[base] << 24) | (padded[base + 1] << 16) | (padded[base + 2] << 8) | padded[base + 3])
+    }
+    for 16..64 {
+        w15 = w[it - 15]
+        w2 = w[it - 2]
+        s0 = sha2_xor3(sha2_rotr(w15, 7), sha2_rotr(w15, 18), sha2_shr(w15, 3))
+        s1 = sha2_xor3(sha2_rotr(w2, 17), sha2_rotr(w2, 19), sha2_shr(w2, 10))
+        w[it] = sha2_u32(s1 + w[it - 7] + s0 + w[it - 16])
+    }
+}
+
+#inline
+/// Message schedule word for the SHA-256 block (allocating form).
++sha2_schedule(padded: _, at: i64) : _ {
+    w = [0; 64]
+    sha2_schedule_into(padded, at, @w)
+    w
+}
+
+// Compression of one block; mutates the 8-word chaining value in place.
+#inline
+/// Compress one 64-byte SHA-256 block into `@hv`.
++sha2_block_into(@hv, w: _) {
+    a = hv[0]
+    b = hv[1]
+    c = hv[2]
+    d = hv[3]
+    e = hv[4]
+    f = hv[5]
+    g = hv[6]
+    h = hv[7]
+    for 0..64 {
+        s1 = sha2_xor3(sha2_rotr(e, 6), sha2_rotr(e, 11), sha2_rotr(e, 25))
+        ch = sha2_ch(e, f, g)
+        t1 = sha2_u32(h + s1 + ch + SHA2_K[it] + w[it])
+        s0 = sha2_xor3(sha2_rotr(a, 2), sha2_rotr(a, 13), sha2_rotr(a, 22))
+        mj = sha2_maj(a, b, c)
+        t2 = sha2_u32(s0 + mj)
+        h = g
+        g = f
+        f = e
+        e = sha2_u32(d + t1)
+        d = c
+        c = b
+        b = a
+        a = sha2_u32(t1 + t2)
+    }
+    hv[0] = sha2_u32(hv[0] + a)
+    hv[1] = sha2_u32(hv[1] + b)
+    hv[2] = sha2_u32(hv[2] + c)
+    hv[3] = sha2_u32(hv[3] + d)
+    hv[4] = sha2_u32(hv[4] + e)
+    hv[5] = sha2_u32(hv[5] + f)
+    hv[6] = sha2_u32(hv[6] + g)
+    hv[7] = sha2_u32(hv[7] + h)
+}
+
+#inline
+/// Compress one 64-byte SHA-256 block (allocating form).
++sha2_block(hv: _, w: _) : _ {
+    out = [hv[0], hv[1], hv[2], hv[3], hv[4], hv[5], hv[6], hv[7]]
+    sha2_block_into(@out, w)
+    out
+}
+
+/// SHA-256 of a byte array: 32 bytes.
++sha2_256(msg: _) : _ {
+    padded = sha2_pad(msg)
+    blocks = padded.len / 64
+    hv = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+    w = [0; 64]
+    for 0..blocks {
+        sha2_schedule_into(padded, it * 64, @w)
+        sha2_block_into(@hv, w)
+    }
+    out = [0; 32]
+    for 0..8 {
+        v = hv[it]
+        base = it * 4
+        out[base] = (v >>> 24) & 0xFF
+        out[base + 1] = (v >>> 16) & 0xFF
+        out[base + 2] = (v >>> 8) & 0xFF
+        out[base + 3] = v & 0xFF
+    }
+    out
+}
+
+/// Lowercase hex SHA-256 of `s` (host intrinsic in AOT/VM; matches the pure byte path).
++sha2_256_hex(s: str) : str => host.sys_sha256(s)
+
+// --- HMAC-SHA256 (RFC 2104) ---------------------------------------------------------------------------
+
+/// Raw HMAC-SHA256 of `msg` under key `key` (byte arrays → host intrinsic in AOT/VM).
++sha2_hmac(key: _, msg: _) : _ => host.sys_hmac_sha256_bytes(key, msg)
+
+/// Lowercase hex HMAC-SHA256 of `msg` under key `key` (host intrinsic in AOT/VM).
++sha2_hmac_hex(key: str, msg: str) : str => host.sys_hmac_sha256(key, msg)
+
+/// Compare the first `nbytes` hex digits of HMAC(key, msg[lo..hi)) to `text[tlo..)`.
+/// Named without a trailing `_range` token so UFCS does not parse `…eq.range(…)`.
++sha2_hmac_hex_prefix_ok(
+    key: _,
+    msg: str,
+    lo: i64,
+    hi: i64,
+    nbytes: i64,
+    text: str,
+    tlo: i64
+) : bool => host.sys_hmac_sha256_hex_prefix_eq_range(key, msg, lo, hi, nbytes, text, tlo)
+
+/// Deterministic 32-byte HMAC key: `key[i] = (i * 37 + 11) % 256`.
++sha2_fill_key32() {
+    key = [0; 32]
+    for 0..32 { key[it] = (it * 37 + 11) % 256 }
+    key
+}
+
+/// Append 8 lowercase hex chars of HMAC(key, `msg[lo..hi)`) into StrBuilder handle `sb_h`.
+#inline
++sha2_hmac_sig8_into(sb_h: i64, key: _, msg: str, lo: i64, hi: i64) {
+    host.sys_hmac_sha256_sig8_into_range(sb_h, key, msg, lo, hi)
+}
+
+/// Forged sig8 into a builder (`mac[0] ^= 1` then hex).
+#inline
++sha2_hmac_sig8_forged_into(sb_h: i64, key: _, msg: str, lo: i64, hi: i64) {
+    host.sys_hmac_sha256_sig8_forged_into_range(sb_h, key, msg, lo, hi)
+}
+
+/// Compat aliases used by thinned benches (same host kernels).
++sha2_hmac_sig8_into_range(sb_h: i64, key: _, msg: str, lo: i64, hi: i64) {
+    sha2_hmac_sig8_into(sb_h, key, msg, lo, hi)
+}
++sha2_hmac_sig8_forged_into_range(sb_h: i64, key: _, msg: str, lo: i64, hi: i64) {
+    sha2_hmac_sig8_forged_into(sb_h, key, msg, lo, hi)
+}
+
++sha2_store32(@dst, dig: _, base: i64) {
+    for i in 0..32 { dst[base + i] = dig[i] }
+}
+
+#inline
++sha2_merkle_store_leaf(@level, leaf: _, slot: i64) {
+    sha2_store32(@level, sha2_256(leaf), slot * 32)
+}
+
++sha2_merkle_fold(@level, m: i64, @cat) : i64 {
+    half = m / 2
+    for i in 0..half {
+        for j in 0..32 {
+            cat[j] = level[(2 * i) * 32 + j]
+            cat[32 + j] = level[(2 * i + 1) * 32 + j]
+        }
+        sha2_store32(@level, sha2_256(cat), i * 32)
+    }
+    half
+}
+
+/// Fold `level[0..m)` merkle nodes to a single root (named without a trailing `_root` token).
++sha2_merkle_top(@level, m: i64, @cat) : i64 {
+    n = m
+    while n > 1 { n = sha2_merkle_fold(@level, n, @cat) }
+    n
+}
+
+/// Compat alias — prefer `sha2_merkle_top` (avoids `…merkle.root` UFCS parse).
++sha2_merkle_crown(@level, m: i64, @cat) : i64 => sha2_merkle_top(@level, m, @cat)
+
+// --- tests ------------------------------------------------------------------------------------------------
+
+/// Test that hex output.
+test "hex output" {
+    assert_eq(sha2_hex_of([0, 15, 16, 255, 171]), "000f10ffab")
+    assert_eq(sha2_hex_of([]), "")
+}
+
+/// Test that word helpers.
+test "word helpers" {
+    assert_eq(sha2_rotr(1, 1), 2147483648)
+    assert_eq(sha2_rotr(4294967295, 7), 4294967295)
+    assert_eq(sha2_rotr(2, 1), 1)
+    assert_eq(sha2_shr(256, 4), 16)
+    assert_eq(sha2_xor3(5, 3, 1), 7)
+    assert_eq(sha2_xor3(4294967295, 4294967295, 4294967295), 4294967295)
+    assert_eq(sha2_ch(4294967295, 170, 85), 170)
+    assert_eq(sha2_ch(0, 170, 85), 85)
+    assert_eq(sha2_maj(7, 3, 1), 3)
+    assert_eq(sha2_maj(0, 0, 4294967295), 0)
+}
+
+/// Test that sha256 of the empty string.
+test "sha256 of the empty string" {
+    assert_eq(sha2_256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+}
+
+/// Test that sha256 of abc.
+test "sha256 of abc" {
+    assert_eq(sha2_256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+/// Test that sha256 across the padding boundary.
+test "sha256 across the padding boundary" {
+    a55 = ""
+    for 0..55 { a55 = "{a55}a" }
+    assert_eq(sha2_count(sha2_pad(sha2_bytes_of(a55))), 64)
+    a56 = "{a55}a"
+    assert_eq(sha2_count(sha2_pad(sha2_bytes_of(a56))), 128)
+    assert_eq(sha2_256_hex(a56), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a")
+    a64 = "{a56}aaaaaaaa"
+    assert_eq(sha2_256_hex(a64), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb")
+}
+
+/// Test that sha256 multi-block message.
+test "sha256 multi-block message" {
+    assert_eq(sha2_256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+}
+
+/// Test that sha256 bytes api.
+test "sha256 bytes api" {
+    d = sha2_256([97, 98, 99])
+    assert_eq(sha2_count(d), 32)
+    assert_eq(d[0], 186)
+    assert_eq(d[31], 173)
+    assert_eq(sha2_count(sha2_pad([])), 64)
+}
+
+/// Test that hmac known answers.
+test "hmac known answers" {
+    assert_eq(sha2_hmac_hex("key", "The quick brown fox jumps over the lazy dog"), "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+    assert_eq(sha2_hmac_hex("Jefe", "what do ya want for nothing?"), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    assert_eq(sha2_hmac_hex("", ""), "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad")
+}
+
+/// Byte-array HMAC must match the hex host path (RFC 4231 / known fox vector).
+test "hmac bytes api matches hex" {
+    key = sha2_bytes_of("key")
+    msg = sha2_bytes_of("The quick brown fox jumps over the lazy dog")
+    assert_eq(sha2_hex_of(sha2_hmac(key, msg)), "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+    assert_eq(sha2_hex_of(sha2_hmac([], [])), "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad")
+}
+
+/// Test that hmac with a key longer than the block size.
+test "hmac with a key longer than the block size" {
+    k = ""
+    for 0..100 { k = "{k}k" }
+    assert_eq(sha2_hmac_hex(k, "msg"), "bd56a1782c2830e8abc6ed866a57a1230661e650b84c62f7ee3accc5fa5af491")
+}
+
+/// Test that xor8 and ascii conversion.
+test "xor8 and ascii conversion" {
+    assert_eq(sha2_xor8(170, 85), 255)
+    assert_eq(sha2_xor8(54, 54), 0)
+    b = sha2_bytes_of("Az 09~")
+    assert_eq(b[0], 65)
+    assert_eq(b[1], 122)
+    assert_eq(b[2], 32)
+    assert_eq(b[3], 48)
+    assert_eq(b[5], 126)
+    q = sha2_bytes_of("\"\\")
+    assert_eq(q[0], 34)
+    assert_eq(q[1], 92)
+}
+
+/// Test that the in-place schedule and block helpers match their allocating forms.
+test "in-place schedule and block match allocating forms" {
+    padded = sha2_pad(sha2_bytes_of("abc"))
+    w1 = sha2_schedule(padded, 0)
+    w2 = [0; 64]
+    sha2_schedule_into(padded, 0, @w2)
+    same = true
+    for 0..64 { if w1[it] != w2[it] { same = false } }
+    #assert(same)
+    assert_eq(w1[0], 1633837952)
+    assert_eq(w1[15], 24)
+    iv = [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+    fresh = sha2_block(iv, w1)
+    inplace = [iv[0], iv[1], iv[2], iv[3], iv[4], iv[5], iv[6], iv[7]]
+    sha2_block_into(@inplace, w1)
+    for 0..8 { assert_eq(fresh[it], inplace[it]) }
+    assert_eq(iv[0], 1779033703)
+    assert_eq(fresh[0], 3128432319)
+}
+
+/// Test that reusing one schedule buffer across blocks does not leak state between blocks.
+test "schedule buffer reuse across blocks" {
+    msg = "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrst"
+    assert_eq(sha2_count(sha2_pad(sha2_bytes_of(msg))), 128)
+    assert_eq(sha2_256_hex(msg), "a1f8892caff6d17a915a750bf28df3ce68f77b75209f8f96f7ad4a037e9a635f")
+}
+
+/// Test that ASCII conversion is exact for every printable code and control escapes.
+test "bytes_of covers printable ASCII and falls back to question mark" {
+    all = ""
+    for 32..127 { all = "{all}{host.sys_chr(it)}" }
+    b = sha2_bytes_of(all)
+    assert_eq(sha2_count(b), 95)
+    for 0..95 { assert_eq(b[it], it + 32) }
+    assert_eq(sha2_256_hex(all), "cb2a9233adc1225c5c495c46e62cf6308223c5e241ef33ad109f03141b57966a")
+    ctl = sha2_bytes_of("\n\r\t x")
+    assert_eq(ctl[0], 10)
+    assert_eq(ctl[1], 13)
+    assert_eq(ctl[2], 9)
+    assert_eq(ctl[3], 32)
+    assert_eq(ctl[4], 120)
+    odd = sha2_bytes_of("é¤")
+    assert_eq(odd[0], 63)
+    assert_eq(odd[1], 63)
+    assert_eq(sha2_count(sha2_bytes_of("")), 0)
+}

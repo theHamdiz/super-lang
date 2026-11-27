@@ -1,0 +1,33 @@
+// VM request-scoped reclaim regression (Round 9 Item 5).
+// Spins socket_req_enter / leave in a loop; host sys_req_stats.pending must stay 0.
+
+use std.io.socket
+
++N = 5000
+
++main() {
+    for _ in 0..N {
+        mark = socket_req_enter()
+        shadow = {id: 1, label: "stay", items: [1, 2, 3]}
+        payload = {ok: true, shadow}
+        _ = socket_req_promote(payload)
+        socket_req_leave(mark)
+        stats = socket_req_stats()
+        pending = host.obj_get(stats, "pending") or 0
+        ensure pending == 0 else {
+            print("FAIL pending={pending} after leave")
+            return 1
+        }
+    }
+    print("vm_req_soak: PASS leaves={N}")
+    0
+}
+
+test "stay count rewinds" {
+    mark = socket_req_enter()
+    _ = {note: "x"}
+    socket_req_leave(mark)
+    stats = socket_req_stats()
+    pending = host.obj_get(stats, "pending") or -1
+    assert_eq(pending, 0)
+}

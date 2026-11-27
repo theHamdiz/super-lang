@@ -1,0 +1,45 @@
+[pod]
+name = "03_log_analyzer"
+version = "0.1.0"
+
+# Used by `super build` and `super run` when -d / -r / --profile is omitted.
+# `super test` always uses [profile.test].
+[build]
+profile = "dev"
+backend = "c23"
+mode = "aot"
+
+[profile.dev]
+opt = "0"
+lto = "off"
+debug-info = true
+fast-math = false
+
+[profile.test]
+opt = "2"
+lto = "off"
+debug-info = true
+fast-math = false
+target-cpu = "native"
+
+[profile.release]
+opt = "3"
+lto = "fat"
+strip = true
+fast-math = true
+target-cpu = "native"
+
+[profile.size]
+opt = "s"
+lto = "fat"
+strip = true
+gc-sections = true
+
+[profile.fast]
+opt = "3"
+lto = "fat"
+strip = true
+fast-math = true
+target-cpu = "native"
+
+[dependencies]

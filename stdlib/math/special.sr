@@ -1,0 +1,1006 @@
+//! std.math.special — special functions for f64
+//!
+//! Import with:
+//!   use std.math.special
+//!
+//!   gamma(5.0)              // 24.0
+//!   lgamma(100.0)           // ln(99!)
+//!   digamma(1.0)            // -0.5772156649015329 (Euler-Mascheroni)
+//!   erf(0.5)  erfc(2.0)  erfinv(0.5)
+//!   bessel_j0(2.4048)       // first zero of J0
+//!   lambert_w0(1.0)         // 0.5671432904097838 (omega constant)
+//!
+//! Gamma family: Lanczos (g = 7, n = 9) with exact factorials for small integers,
+//! reflection for negative arguments, and asymptotic series for the polygammas.
+//! `erf` uses the non-alternating series below 2.5 and a continued fraction above;
+//! `erfinv` seeds with Giles' approximation and polishes with Halley steps.
+//! Bessel functions use power series up to |x| = 12 and Hankel asymptotics beyond,
+//! `bessel_k0` / `bessel_k1` integrate `exp(-x cosh t) cosh(nu t)` with the trapezoid rule,
+//! `bessel_kn` recurs upward from them, `bessel_in` sums the (all-positive) series, and `zeta` is
+//! Euler-Maclaurin with reflection for `s < 0`. Lambert W is Halley iteration from
+//! branch-point / asymptotic seeds. Accuracy is about 1e-10 or better everywhere
+//! (usually 1e-14); domain errors return NaN, poles return +/-infinity.
+//! Public helpers are prefixed `sp_` (modules merge flat).
+
+/// `SP_PI` is pi.
++SP_PI = 3.141592653589793
+/// `SP_EULER` is the Euler-Mascheroni constant.
++SP_EULER = 0.5772156649015329
+/// `SP_SQRT_PI` is the square root of pi.
++SP_SQRT_PI = 1.772453850905516
+/// `SP_LN_SQRT_2PI` is ln(sqrt(2 pi)).
++SP_LN_SQRT_2PI = 0.9189385332046727
+/// `SP_E` is Euler's number.
++SP_E = 2.718281828459045
+/// `SP_INF` is positive infinity.
++SP_INF = 1.0 / 0.0
+
+/// Quiet NaN.
++sp_nan() : f64 => host.sys_sqrt(-1.0)
+
+/// Exact float equality. The VM's `==` on floats is tolerance-based (about 1e-9), so numeric
+/// code that needs a true zero / boundary test compares with `<` and `>` instead.
++sp_eq(a: f64, b: f64) : bool => !(a < b) && !(a > b)
+
+/// True when `x` is NaN.
++sp_is_nan(x: f64) : bool => x != x
+
+/// True when `x` is +infinity (IEEE `inf == inf` is not relied on).
++sp_is_inf(x: f64) : bool => x > 1.0e308
+
+/// True when `x` is -infinity.
++sp_is_neg_inf(x: f64) : bool => x < -1.0e308
+
+/// Absolute value of `x`.
++sp_abs(x: f64) : f64 {
+    if x < 0.0 { return -x }
+    x
+}
+
+/// True when `x` is a whole number.
++sp_is_int(x: f64) : bool => sp_eq(host.sys_floor(x), x)
+
+/// Relative / absolute closeness test used by the tests: |a - b| <= tol * (1 + |b|).
++sp_close(a: f64, b: f64, tol: f64) : bool => sp_abs(a - b) <= tol * (1.0 + sp_abs(b))
+
+/// n! as a float for 0 <= n <= 170 (exact below 23).
++sp_factorial(n: i64) : f64 {
+    ensure n >= 0 else { return sp_nan() }
+    ensure n <= 170 else { return SP_INF }
+    acc = 1.0
+    i = 2
+    while i <= n {
+        acc = acc * host.sys_to_float(i)
+        i += 1
+    }
+    acc
+}
+
+// --- gamma family ---------------------------------------------------------------------
+
+/// Lanczos coefficients, g = 7, n = 9 (Godfrey).
++sp_lanczos_sum(x: f64) : f64 {
+    // x is the shifted argument (z - 1).
+    a = 0.99999999999980993
+    a += 676.5203681218851 / (x + 1.0)
+    a += -1259.1392167224028 / (x + 2.0)
+    a += 771.32342877765313 / (x + 3.0)
+    a += -176.61502916214059 / (x + 4.0)
+    a += 12.507343278686905 / (x + 5.0)
+    a += -0.13857109526572012 / (x + 6.0)
+    a += 0.0000099843695780195716 / (x + 7.0)
+    a += 0.00000015056327351493116 / (x + 8.0)
+    a
+}
+
+/// Natural log of |Gamma(x)|. Poles (0, -1, -2, ...) give +infinity.
++lgamma(x: f64) : f64 {
+    if x != x { return x }
+    if x <= 0.0 {
+        if sp_is_int(x) { return SP_INF }
+        s = host.sys_sin(SP_PI * x)
+        return host.sys_ln(SP_PI / sp_abs(s)) - lgamma(1.0 - x)
+    }
+    if x < 0.5 {
+        // Gamma(x) = Gamma(x + 1) / x keeps the Lanczos sum well conditioned.
+        return lgamma(x + 1.0) - host.sys_ln(x)
+    }
+    if x > 1.0e300 { return SP_INF }
+    z = x - 1.0
+    t = z + 7.5
+    SP_LN_SQRT_2PI + (z + 0.5) * host.sys_ln(t) - t + host.sys_ln(sp_lanczos_sum(z))
+}
+
+/// Gamma function. Poles at 0, -1, -2, ... return NaN; overflow above 171.62 returns +infinity.
++gamma(x: f64) : f64 {
+    if x != x { return x }
+    if sp_eq(x, 0.0) { return SP_INF }
+    if x <= 0.0 {
+        if sp_is_int(x) { return sp_nan() }
+        s = host.sys_sin(SP_PI * x)
+        return SP_PI / (s * gamma(1.0 - x))
+    }
+    if x > 171.7 { return SP_INF }
+    if x < 24.0 {
+        if sp_is_int(x) { return sp_factorial(host.sys_to_int(x) - 1) }
+    }
+    if x < 0.5 { return gamma(x + 1.0) / x }
+    z = x - 1.0
+    t = z + 7.5
+    // Split the power to avoid overflow for large x.
+    half = host.sys_pow(t, (z + 0.5) / 2.0)
+    2.5066282746310002 * half * host.sys_exp(-t) * half * sp_lanczos_sum(z)
+}
+
+/// Digamma psi(x) = d/dx ln Gamma(x).
++digamma(x: f64) : f64 {
+    if x != x { return x }
+    if x <= 0.0 {
+        if sp_is_int(x) { return sp_nan() }
+        return digamma(1.0 - x) - SP_PI / host.sys_tan(SP_PI * x)
+    }
+    acc = 0.0
+    y = x
+    while y < 10.0 {
+        acc -= 1.0 / y
+        y += 1.0
+    }
+    inv = 1.0 / y
+    inv2 = inv * inv
+    series = inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 * (1.0 / 132.0 - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))))
+    acc + host.sys_ln(y) - 0.5 * inv - series
+}
+
+/// Trigamma psi'(x).
++trigamma(x: f64) : f64 {
+    if x != x { return x }
+    if x <= 0.0 {
+        if sp_is_int(x) { return SP_INF }
+        s = host.sys_sin(SP_PI * x)
+        return -trigamma(1.0 - x) + SP_PI * SP_PI / (s * s)
+    }
+    acc = 0.0
+    y = x
+    while y < 10.0 {
+        acc += 1.0 / (y * y)
+        y += 1.0
+    }
+    inv = 1.0 / y
+    inv2 = inv * inv
+    series = inv + inv2 / 2.0 + inv * inv2 * (1.0 / 6.0 - inv2 * (1.0 / 30.0 - inv2 * (1.0 / 42.0 - inv2 * (1.0 / 30.0 - inv2 * (5.0 / 66.0 - inv2 * (691.0 / 2730.0 - inv2 * 7.0 / 6.0))))))
+    acc + series
+}
+
+/// Beta function B(a, b) = Gamma(a) Gamma(b) / Gamma(a + b) for positive a, b.
++beta(a: f64, b: f64) : f64 {
+    if a <= 0.0 { return sp_nan() }
+    if b <= 0.0 { return sp_nan() }
+    host.sys_exp(lgamma(a) + lgamma(b) - lgamma(a + b))
+}
+
+/// ln B(a, b).
++lbeta(a: f64, b: f64) : f64 => lgamma(a) + lgamma(b) - lgamma(a + b)
+
+/// Binomial coefficient C(n, k) for real n >= k >= 0 via log-gamma, rounded when n is whole.
++sp_choose(n: f64, k: f64) : f64 {
+    if k < 0.0 { return 0.0 }
+    if k > n { return 0.0 }
+    v = host.sys_exp(lgamma(n + 1.0) - lgamma(k + 1.0) - lgamma(n - k + 1.0))
+    if sp_is_int(n) { return host.sys_round(v) }
+    v
+}
+
+// --- error function -----------------------------------------------------------------
+
+/// erf(x) = 2/sqrt(pi) * integral of exp(-t^2) from 0 to x.
++erf(x: f64) : f64 {
+    if x != x { return x }
+    if x < 0.0 { return -erf(-x) }
+    if x >= 6.0 { return 1.0 }
+    if x < 2.5 {
+        // erf(x) = 2/sqrt(pi) exp(-x^2) sum 2^n x^(2n+1) / (2n+1)!!   (all terms positive)
+        x2 = x * x
+        term = x
+        sum = x
+        n = 0
+        while n < 200 {
+            n += 1
+            term = term * 2.0 * x2 / (2.0 * host.sys_to_float(n) + 1.0)
+            sum += term
+            if term < 1.0e-17 * sum { break }
+        }
+        return 2.0 / SP_SQRT_PI * host.sys_exp(-x2) * sum
+    }
+    1.0 - erfc(x)
+}
+
+/// Complementary error function 1 - erf(x), accurate in the tails.
++erfc(x: f64) : f64 {
+    if x != x { return x }
+    if x < 0.0 { return 2.0 - erfc(-x) }
+    if x >= 27.3 { return 0.0 }
+    if x < 2.5 { return 1.0 - erf(x) }
+    // Continued fraction: erfc(x) = exp(-x^2)/sqrt(pi) / (x + (1/2)/(x + 1/(x + (3/2)/(x + ...))))
+    k = 120
+    frac = x
+    while k >= 1 {
+        frac = x + (host.sys_to_float(k) / 2.0) / frac
+        k -= 1
+    }
+    host.sys_exp(-x * x) / SP_SQRT_PI / frac
+}
+
+/// Inverse error function: erfinv(erf(x)) = x on (-1, 1); +/-1 give +/-infinity.
++erfinv(y: f64) : f64 {
+    if y != y { return y }
+    if y <= -1.0 {
+        if sp_eq(y, -1.0) { return -SP_INF }
+        return sp_nan()
+    }
+    if y >= 1.0 {
+        if sp_eq(y, 1.0) { return SP_INF }
+        return sp_nan()
+    }
+    if sp_eq(y, 0.0) { return 0.0 }
+    // Giles' single-precision seed.
+    w = -host.sys_ln((1.0 - y) * (1.0 + y))
+    p = 0.0
+    if w < 5.0 {
+        w = w - 2.5
+        p = 2.81022636e-08
+        p = 3.43273939e-07 + p * w
+        p = -3.5233877e-06 + p * w
+        p = -4.39150654e-06 + p * w
+        p = 0.00021858087 + p * w
+        p = -0.00125372503 + p * w
+        p = -0.00417768164 + p * w
+        p = 0.246640727 + p * w
+        p = 1.50140941 + p * w
+    } else {
+        w = host.sys_sqrt(w) - 3.0
+        p = -0.000200214257
+        p = 0.000100950558 + p * w
+        p = 0.00134934322 + p * w
+        p = -0.00367342844 + p * w
+        p = 0.00573950773 + p * w
+        p = -0.0076224613 + p * w
+        p = 0.00943887047 + p * w
+        p = 1.00167406 + p * w
+        p = 2.83297682 + p * w
+    }
+    x = p * y
+    ay = sp_abs(y)
+    sign = 1.0
+    if y < 0.0 { sign = -1.0 }
+    ax = sp_abs(x)
+    i = 0
+    while i < 4 {
+        d = 2.0 / SP_SQRT_PI * host.sys_exp(-ax * ax)
+        if ay < 0.9 {
+            f = erf(ax) - ay
+            ax = ax - f / (d + ax * f)
+        } else {
+            // Tail: solve erfc(ax) = 1 - ay with Halley on f = erfc(ax) - q.
+            f = erfc(ax) - (1.0 - ay)
+            ax = ax - f / (ax * f - d)
+        }
+        i += 1
+    }
+    sign * ax
+}
+
+// --- Bessel functions -----------------------------------------------------------------
+
+/// Bessel series switch: power series at or below, Hankel asymptotics above.
++SP_BESSEL_SWITCH = 12.0
+
+/// Hankel asymptotic sums for order `nu` at large `x`: returns [P, Q].
++sp_hankel_pq(nu: f64, x: f64) {
+    mu = 4.0 * nu * nu
+    p = 1.0
+    q = 0.0
+    t = 1.0
+    prev = 1.0e300
+    k = 1
+    while k < 60 {
+        kf = host.sys_to_float(k)
+        odd = 2.0 * kf - 1.0
+        t = t * (mu - odd * odd) / (8.0 * kf * x)
+        mag = sp_abs(t)
+        if mag > prev { break }
+        r = k % 4
+        if r == 1 { q += t }
+        if r == 2 { p -= t }
+        if r == 3 { q -= t }
+        if r == 0 { p += t }
+        prev = mag
+        if mag < 1.0e-17 { break }
+        k += 1
+    }
+    [p, q]
+}
+
+/// Power series for J_n(x), n >= 0, any x with moderate magnitude.
++sp_jn_series(n: i64, x: f64) : f64 {
+    h = x / 2.0
+    q = -h * h
+    term = 1.0
+    i = 1
+    while i <= n {
+        term = term * h / host.sys_to_float(i)
+        i += 1
+    }
+    sum = term
+    k = 0
+    while k < 200 {
+        k += 1
+        term = term * q / (host.sys_to_float(k) * host.sys_to_float(k + n))
+        sum += term
+        if sp_abs(term) < 1.0e-18 * sp_abs(sum) { break }
+    }
+    sum
+}
+
+/// Bessel function of the first kind, order 0.
++bessel_j0(x: f64) : f64 {
+    if x != x { return x }
+    ax = sp_abs(x)
+    if ax <= SP_BESSEL_SWITCH { return sp_jn_series(0, ax) }
+    pq = sp_hankel_pq(0.0, ax)
+    chi = ax - 0.25 * SP_PI
+    host.sys_sqrt(2.0 / (SP_PI * ax)) * (pq[0] * host.sys_cos(chi) - pq[1] * host.sys_sin(chi))
+}
+
+/// Bessel function of the first kind, order 1.
++bessel_j1(x: f64) : f64 {
+    if x != x { return x }
+    ax = sp_abs(x)
+    v = 0.0
+    if ax <= SP_BESSEL_SWITCH {
+        v = sp_jn_series(1, ax)
+    } else {
+        pq = sp_hankel_pq(1.0, ax)
+        chi = ax - 0.75 * SP_PI
+        v = host.sys_sqrt(2.0 / (SP_PI * ax)) * (pq[0] * host.sys_cos(chi) - pq[1] * host.sys_sin(chi))
+    }
+    if x < 0.0 { return -v }
+    v
+}
+
+/// Bessel function of the first kind, integer order `n` (negative orders use J_-n = (-1)^n J_n).
++bessel_jn(n: i64, x: f64) : f64 {
+    if x != x { return x }
+    if n < 0 {
+        v = bessel_jn(-n, x)
+        if (-n) % 2 == 1 { return -v }
+        return v
+    }
+    if n == 0 { return bessel_j0(x) }
+    if n == 1 { return bessel_j1(x) }
+    ax = sp_abs(x)
+    v = 0.0
+    if sp_eq(ax, 0.0) { return 0.0 }
+    if ax <= SP_BESSEL_SWITCH {
+        v = sp_jn_series(n, ax)
+    } else {
+        if host.sys_to_float(n) > ax {
+            v = sp_jn_series(n, ax)
+        } else {
+            // Upward recurrence is stable while n < x.
+            jm = bessel_j0(ax)
+            jc = bessel_j1(ax)
+            k = 1
+            while k < n {
+                jn = 2.0 * host.sys_to_float(k) / ax * jc - jm
+                jm = jc
+                jc = jn
+                k += 1
+            }
+            v = jc
+        }
+    }
+    if x < 0.0 {
+        if n % 2 == 1 { return -v }
+    }
+    v
+}
+
+/// Harmonic number H_k.
++sp_harmonic(k: i64) : f64 {
+    h = 0.0
+    i = 1
+    while i <= k {
+        h += 1.0 / host.sys_to_float(i)
+        i += 1
+    }
+    h
+}
+
+/// Bessel function of the second kind, order 0 (x > 0; x == 0 gives -infinity).
++bessel_y0(x: f64) : f64 {
+    if x != x { return x }
+    if x < 0.0 { return sp_nan() }
+    if sp_eq(x, 0.0) { return -SP_INF }
+    if x <= SP_BESSEL_SWITCH {
+        h = x / 2.0
+        q = h * h
+        term = 1.0
+        harm = 0.0
+        sum = 0.0
+        k = 1
+        while k < 200 {
+            kf = host.sys_to_float(k)
+            term = term * (-q) / (kf * kf)
+            harm += 1.0 / kf
+            c = -term * harm
+            sum += c
+            if sp_abs(c) < 1.0e-18 * (1.0 + sp_abs(sum)) { break }
+            k += 1
+        }
+        return 2.0 / SP_PI * ((host.sys_ln(h) + SP_EULER) * bessel_j0(x) + sum)
+    }
+    pq = sp_hankel_pq(0.0, x)
+    chi = x - 0.25 * SP_PI
+    host.sys_sqrt(2.0 / (SP_PI * x)) * (pq[0] * host.sys_sin(chi) + pq[1] * host.sys_cos(chi))
+}
+
+/// Bessel function of the second kind, order 1 (x > 0).
++bessel_y1(x: f64) : f64 {
+    if x != x { return x }
+    if x < 0.0 { return sp_nan() }
+    if sp_eq(x, 0.0) { return -SP_INF }
+    if x <= SP_BESSEL_SWITCH {
+        h = x / 2.0
+        q = -h * h
+        term = h
+        sum = 0.0
+        k = 0
+        while k < 200 {
+            psi_sum = (sp_harmonic(k) - SP_EULER) + (sp_harmonic(k + 1) - SP_EULER)
+            c = term * psi_sum
+            sum += c
+            if k > 2 {
+                if sp_abs(c) < 1.0e-18 * (1.0 + sp_abs(sum)) { break }
+            }
+            k += 1
+            kf = host.sys_to_float(k)
+            term = term * q / (kf * (kf + 1.0))
+        }
+        return -2.0 / (SP_PI * x) + 2.0 / SP_PI * host.sys_ln(h) * bessel_j1(x) - sum / SP_PI
+    }
+    pq = sp_hankel_pq(1.0, x)
+    chi = x - 0.75 * SP_PI
+    host.sys_sqrt(2.0 / (SP_PI * x)) * (pq[0] * host.sys_sin(chi) + pq[1] * host.sys_cos(chi))
+}
+
+/// Bessel function of the second kind, integer order `n >= 0` (upward recurrence is stable for Y).
++bessel_yn(n: i64, x: f64) : f64 {
+    if x != x { return x }
+    if x < 0.0 { return sp_nan() }
+    if sp_eq(x, 0.0) { return -SP_INF }
+    if n < 0 {
+        v = bessel_yn(-n, x)
+        if (-n) % 2 == 1 { return -v }
+        return v
+    }
+    if n == 0 { return bessel_y0(x) }
+    if n == 1 { return bessel_y1(x) }
+    ym = bessel_y0(x)
+    yc = bessel_y1(x)
+    k = 1
+    while k < n {
+        yn = 2.0 * host.sys_to_float(k) / x * yc - ym
+        ym = yc
+        yc = yn
+        k += 1
+    }
+    yc
+}
+
+/// Modified Bessel function of the first kind, order 0.
++bessel_i0(x: f64) : f64 {
+    if x != x { return x }
+    ax = sp_abs(x)
+    if ax > 700.0 { return SP_INF }
+    q = ax * ax / 4.0
+    term = 1.0
+    sum = 1.0
+    k = 0
+    while k < 500 {
+        k += 1
+        kf = host.sys_to_float(k)
+        term = term * q / (kf * kf)
+        sum += term
+        if term < 1.0e-17 * sum { break }
+    }
+    sum
+}
+
+/// Modified Bessel function of the first kind, order 1.
++bessel_i1(x: f64) : f64 {
+    if x != x { return x }
+    ax = sp_abs(x)
+    if ax > 700.0 { return SP_INF }
+    q = ax * ax / 4.0
+    term = ax / 2.0
+    sum = term
+    k = 0
+    while k < 500 {
+        k += 1
+        kf = host.sys_to_float(k)
+        term = term * q / (kf * (kf + 1.0))
+        sum += term
+        if term < 1.0e-17 * sum { break }
+    }
+    if x < 0.0 { return -sum }
+    sum
+}
+
+/// Modified Bessel function of the second kind, order 0 (x > 0).
++bessel_k0(x: f64) : f64 {
+    if x != x { return x }
+    if x < 0.0 { return sp_nan() }
+    if sp_eq(x, 0.0) { return SP_INF }
+    // K0(x) = integral_0^inf exp(-x cosh t) dt; the trapezoid rule converges geometrically.
+    h = 0.125
+    sum = 0.5 * host.sys_exp(-x)
+    k = 1
+    while k < 400 {
+        e = x * host.sys_cosh(h * host.sys_to_float(k))
+        if e > 745.0 { break }
+        term = host.sys_exp(-e)
+        sum += term
+        if term < 1.0e-18 * sum { break }
+        k += 1
+    }
+    sum * h
+}
+
+/// Modified Bessel function of the first kind, integer order `n` (negative orders use I_-n = I_n).
++bessel_in(n: i64, x: f64) : f64 {
+    if x != x { return x }
+    if n < 0 { return bessel_in(-n, x) }
+    if n == 0 { return bessel_i0(x) }
+    if n == 1 { return bessel_i1(x) }
+    ax = sp_abs(x)
+    if sp_eq(ax, 0.0) { return 0.0 }
+    if ax > 700.0 {
+        if x < 0.0 && n % 2 == 1 { return -SP_INF }
+        return SP_INF
+    }
+    h = ax / 2.0
+    q = h * h
+    term = 1.0
+    i = 1
+    while i <= n {
+        term = term * h / host.sys_to_float(i)
+        i += 1
+    }
+    sum = term
+    k = 0
+    while k < 3000 {
+        k += 1
+        term = term * q / (host.sys_to_float(k) * host.sys_to_float(k + n))
+        sum += term
+        if term < 1.0e-17 * sum { break }
+    }
+    if x < 0.0 && n % 2 == 1 { return -sum }
+    sum
+}
+
+/// Modified Bessel function of the second kind, order 1 (x > 0; x == 0 gives +infinity).
++bessel_k1(x: f64) : f64 {
+    if x != x { return x }
+    if x < 0.0 { return sp_nan() }
+    if sp_eq(x, 0.0) { return SP_INF }
+    // K1(x) = integral_0^inf exp(-x cosh t) cosh(t) dt (trapezoid, geometric convergence).
+    h = 0.125
+    sum = 0.5 * host.sys_exp(-x)
+    k = 1
+    while k < 600 {
+        t = h * host.sys_to_float(k)
+        e = x * host.sys_cosh(t)
+        if e > 745.0 { break }
+        term = host.sys_exp(-e) * host.sys_cosh(t)
+        sum += term
+        if term < 1.0e-18 * sum { break }
+        k += 1
+    }
+    sum * h
+}
+
+/// Modified Bessel function of the second kind, integer order `n` (x > 0; K_-n = K_n), by the
+/// numerically stable upward recurrence K_(k+1) = K_(k-1) + (2k / x) K_k.
++bessel_kn(n: i64, x: f64) : f64 {
+    if x != x { return x }
+    if n < 0 { return bessel_kn(-n, x) }
+    if n == 0 { return bessel_k0(x) }
+    if n == 1 { return bessel_k1(x) }
+    if x < 0.0 { return sp_nan() }
+    if sp_eq(x, 0.0) { return SP_INF }
+    km = bessel_k0(x)
+    kc = bessel_k1(x)
+    k = 1
+    while k < n {
+        kn = km + 2.0 * host.sys_to_float(k) / x * kc
+        km = kc
+        kc = kn
+        k += 1
+    }
+    kc
+}
+
+// --- zeta ----------------------------------------------------------------------------
+
+/// Riemann zeta function. `zeta(1)` is +infinity; negative arguments use the functional equation.
++zeta(s: f64) : f64 {
+    if s != s { return s }
+    if sp_eq(s, 1.0) { return SP_INF }
+    if s < 0.0 {
+        // zeta(s) = 2^s pi^(s-1) sin(pi s / 2) Gamma(1 - s) zeta(1 - s)
+        if sp_is_int(s / 2.0) { return 0.0 }
+        return host.sys_pow(2.0, s) * host.sys_pow(SP_PI, s - 1.0) * host.sys_sin(SP_PI * s / 2.0) * gamma(1.0 - s) * zeta(1.0 - s)
+    }
+    if s > 60.0 { return 1.0 }
+    n = 12
+    nf = 12.0
+    acc = 0.0
+    k = 1
+    while k < n {
+        acc += host.sys_pow(host.sys_to_float(k), -s)
+        k += 1
+    }
+    acc += host.sys_pow(nf, 1.0 - s) / (s - 1.0) + 0.5 * host.sys_pow(nf, -s)
+    // Euler-Maclaurin correction: sum B_2j / (2j)! * s (s+1) ... (s+2j-2) * N^(-s-2j+1)
+    bern = [0.16666666666666666, -0.03333333333333333, 0.023809523809523808, -0.03333333333333333, 0.07575757575757576, -0.2531135531135531, 1.1666666666666667, -7.092156862745098]
+    poch = s
+    npow = host.sys_pow(nf, -s - 1.0)
+    fact = 2.0
+    j = 1
+    while j <= 8 {
+        acc += bern[j - 1] / fact * poch * npow
+        jf = host.sys_to_float(j)
+        poch = poch * (s + 2.0 * jf - 1.0) * (s + 2.0 * jf)
+        fact = fact * (2.0 * jf + 1.0) * (2.0 * jf + 2.0)
+        npow = npow / (nf * nf)
+        j += 1
+    }
+    acc
+}
+
+// --- Lambert W ------------------------------------------------------------------------
+
+/// Halley refinement of w e^w = x starting from `w0`.
++sp_lambert_halley(x: f64, w0: f64) : f64 {
+    w = w0
+    i = 0
+    while i < 60 {
+        ew = host.sys_exp(w)
+        f = w * ew - x
+        d = ew * (w + 1.0) - (w + 2.0) * f / (2.0 * w + 2.0)
+        if sp_eq(d, 0.0) { break }
+        step = f / d
+        w = w - step
+        if sp_abs(step) < 1.0e-15 * (1.0 + sp_abs(w)) { break }
+        i += 1
+    }
+    w
+}
+
+/// Principal branch W0 of the Lambert W function, defined for x >= -1/e.
++lambert_w0(x: f64) : f64 {
+    if x != x { return x }
+    lim = -0.36787944117144233
+    if x < lim {
+        if x > lim - 1.0e-12 { return -1.0 }
+        return sp_nan()
+    }
+    if sp_eq(x, 0.0) { return 0.0 }
+    if sp_eq(x, lim) { return -1.0 }
+    if x > 1.0e308 { return SP_INF }
+    w0 = 0.0
+    if x < -0.25 {
+        p = host.sys_sqrt(2.0 * (SP_E * x + 1.0))
+        w0 = -1.0 + p - p * p / 3.0 + 11.0 / 72.0 * p * p * p
+    } else {
+        if x < 3.0 {
+            w0 = host.sys_ln(1.0 + x) * (1.0 - host.sys_ln(1.0 + host.sys_ln(1.0 + x)) / (2.0 + host.sys_ln(1.0 + x)))
+        } else {
+            l1 = host.sys_ln(x)
+            l2 = host.sys_ln(l1)
+            w0 = l1 - l2 + l2 / l1
+        }
+    }
+    sp_lambert_halley(x, w0)
+}
+
+/// Lower branch W_{-1} of the Lambert W function, defined for -1/e <= x < 0.
++lambert_wm1(x: f64) : f64 {
+    if x != x { return x }
+    lim = -0.36787944117144233
+    if x < lim {
+        if x > lim - 1.0e-12 { return -1.0 }
+        return sp_nan()
+    }
+    if x >= 0.0 {
+        if sp_eq(x, 0.0) { return -SP_INF }
+        return sp_nan()
+    }
+    if sp_eq(x, lim) { return -1.0 }
+    w0 = 0.0
+    if x < -0.25 {
+        p = host.sys_sqrt(2.0 * (SP_E * x + 1.0))
+        w0 = -1.0 - p - p * p / 3.0 - 11.0 / 72.0 * p * p * p
+    } else {
+        l1 = host.sys_ln(-x)
+        l2 = host.sys_ln(-l1)
+        w0 = l1 - l2 + l2 / l1
+    }
+    sp_lambert_halley(x, w0)
+}
+
+// --- tests ---------------------------------------------------------------------------
+
+/// Test the gamma function against known values.
+test "gamma values and poles" {
+    assert_eq(gamma(1.0), 1.0)
+    assert_eq(gamma(5.0), 24.0)
+    assert_eq(gamma(10.0), 362880.0)
+    #assert(sp_close(gamma(0.5), SP_SQRT_PI, 1.0e-13))
+    #assert(sp_close(gamma(1.5), 0.5 * SP_SQRT_PI, 1.0e-13))
+    #assert(sp_close(gamma(2.5), 1.3293403881791370, 1.0e-13))
+    #assert(sp_close(gamma(-0.5), -3.5449077018110318, 1.0e-12))
+    #assert(sp_close(gamma(0.1), 9.513507698668732, 1.0e-12))
+    #assert(sp_close(gamma(30.5) / 1.0e30, 1.0e-30 * gamma(30.5), 1.0e-12))
+    #assert(sp_is_nan(gamma(-2.0)))
+    #assert(sp_is_inf(gamma(200.0)))
+    #assert(sp_close(gamma(100.0) / 9.332621544394415e155, 1.0, 1.0e-12))
+    #assert(sp_close(gamma(0.0 - 1.5), 2.3632718012073547, 1.0e-12))
+}
+
+/// Test the gamma recurrence Gamma(x + 1) = x Gamma(x).
+test "gamma recurrence" {
+    xs = [0.3, 0.7, 1.3, 2.9, 5.5, 8.25, 12.75]
+    for xs {
+        #assert(sp_close(gamma(it + 1.0), it * gamma(it), 1.0e-12))
+    }
+}
+
+/// Test lgamma against known values and consistency with gamma.
+test "lgamma" {
+    #assert(sp_close(lgamma(1.0), 0.0, 1.0e-13))
+    #assert(sp_close(lgamma(2.0), 0.0, 1.0e-13))
+    #assert(sp_close(lgamma(0.5), 0.5723649429247001, 1.0e-13))
+    #assert(sp_close(lgamma(100.0), 359.1342053695754, 1.0e-13))
+    #assert(sp_close(lgamma(1000.0), 5905.220423209181, 1.0e-13))
+    #assert(sp_close(lgamma(-0.5), 1.2655121234846454, 1.0e-12))
+    #assert(sp_close(lgamma(0.01), 4.599479878042021, 1.0e-12))
+    #assert(sp_is_inf(lgamma(0.0)))
+    #assert(sp_is_inf(lgamma(-3.0)))
+    #assert(sp_close(lgamma(7.3), host.sys_ln(gamma(7.3)), 1.0e-13))
+    #assert(sp_close(lgamma(3.7), host.sys_ln(gamma(3.7)), 1.0e-13))
+}
+
+/// Test digamma and trigamma.
+test "digamma and trigamma" {
+    #assert(sp_close(digamma(1.0), -SP_EULER, 1.0e-12))
+    #assert(sp_close(digamma(0.5), -1.9635100260214235, 1.0e-12))
+    #assert(sp_close(digamma(2.0), 1.0 - SP_EULER, 1.0e-12))
+    #assert(sp_close(digamma(10.0), 2.251752589066721, 1.0e-12))
+    #assert(sp_close(digamma(-0.5), 0.03648997397857652, 1.0e-11))
+    #assert(sp_close(digamma(0.01), -100.56088545786867, 1.0e-11))
+    #assert(sp_close(trigamma(1.0), SP_PI * SP_PI / 6.0, 1.0e-12))
+    #assert(sp_close(trigamma(0.5), SP_PI * SP_PI / 2.0, 1.0e-12))
+    #assert(sp_close(trigamma(5.0), 0.22132295573711532, 1.0e-12))
+    #assert(sp_close(trigamma(-0.5), 8.934802200544679, 1.0e-11))
+    #assert(sp_is_nan(digamma(0.0)))
+    // psi(x + 1) = psi(x) + 1/x
+    #assert(sp_close(digamma(3.3 + 1.0), digamma(3.3) + 1.0 / 3.3, 1.0e-12))
+    #assert(sp_close(trigamma(3.3 + 1.0), trigamma(3.3) - 1.0 / (3.3 * 3.3), 1.0e-12))
+}
+
+/// Test beta and binomial helpers.
+test "beta" {
+    #assert(sp_close(beta(1.0, 1.0), 1.0, 1.0e-13))
+    #assert(sp_close(beta(2.0, 3.0), 1.0 / 12.0, 1.0e-13))
+    #assert(sp_close(beta(0.5, 0.5), SP_PI, 1.0e-13))
+    #assert(sp_close(beta(3.5, 2.25), beta(2.25, 3.5), 1.0e-14))
+    #assert(sp_is_nan(beta(0.0, 1.0)))
+    #assert(sp_close(lbeta(5.0, 7.0), host.sys_ln(beta(5.0, 7.0)), 1.0e-13))
+    assert_eq(sp_choose(10.0, 3.0), 120.0)
+    assert_eq(sp_choose(52.0, 5.0), 2598960.0)
+    assert_eq(sp_choose(5.0, 7.0), 0.0)
+}
+
+/// Test erf and erfc.
+test "erf and erfc" {
+    assert_eq(erf(0.0), 0.0)
+    #assert(sp_close(erf(0.5), 0.5204998778130465, 1.0e-14))
+    #assert(sp_close(erf(1.0), 0.8427007929497149, 1.0e-14))
+    #assert(sp_close(erf(2.0), 0.9953222650189527, 1.0e-14))
+    #assert(sp_close(erf(3.0), 0.9999779095030014, 1.0e-14))
+    #assert(sp_close(erf(-1.0), -0.8427007929497149, 1.0e-14))
+    #assert(sp_close(erfc(0.5), 0.4795001221869535, 1.0e-13))
+    #assert(sp_close(erfc(2.0), 0.004677734981047266, 1.0e-12))
+    #assert(sp_close(erfc(3.0) / 2.209049699858544e-05, 1.0, 1.0e-12))
+    #assert(sp_close(erfc(5.0) / 1.5374597944280347e-12, 1.0, 1.0e-11))
+    #assert(sp_close(erfc(10.0) / 2.088487583762545e-45, 1.0, 1.0e-10))
+    #assert(sp_close(erfc(-2.0), 1.9953222650189528, 1.0e-13))
+    assert_eq(erf(10.0), 1.0)
+    assert_eq(erfc(30.0), 0.0)
+    // erf + erfc == 1
+    xs = [0.1, 0.9, 1.7, 2.4, 2.6, 3.5]
+    for xs { #assert(sp_close(erf(it) + erfc(it), 1.0, 1.0e-14)) }
+}
+
+/// Test erfinv round trips.
+test "erfinv" {
+    assert_eq(erfinv(0.0), 0.0)
+    #assert(sp_close(erfinv(0.5), 0.4769362762044699, 1.0e-12))
+    #assert(sp_close(erfinv(-0.5), -0.4769362762044699, 1.0e-12))
+    #assert(sp_close(erfinv(0.9), 1.1630871536766743, 1.0e-12))
+    #assert(sp_close(erfinv(0.999), 2.326753765513525, 1.0e-10))
+    #assert(sp_is_inf(erfinv(1.0)))
+    #assert(sp_is_neg_inf(erfinv(-1.0)))
+    #assert(sp_is_nan(erfinv(1.5)))
+    ys = [-0.97, -0.6, -0.2, 0.05, 0.3, 0.75, 0.95]
+    for ys { #assert(sp_close(erf(erfinv(it)), it, 1.0e-12)) }
+}
+
+/// Test Bessel J.
+test "bessel j0 j1 jn" {
+    assert_eq(bessel_j0(0.0), 1.0)
+    #assert(sp_close(bessel_j0(1.0), 0.7651976865579666, 1.0e-13))
+    #assert(sp_close(bessel_j0(2.404825557695773), 0.0, 1.0e-12))
+    #assert(sp_close(bessel_j0(5.0), -0.1775967713143383, 1.0e-12))
+    #assert(sp_close(bessel_j0(11.0), -0.1711903004071961, 1.0e-12))
+    #assert(sp_close(bessel_j0(15.0), -0.014224472826780773, 1.0e-10))
+    #assert(sp_close(bessel_j0(50.0), 0.05581232766925181, 1.0e-10))
+    #assert(sp_close(bessel_j0(-3.0), bessel_j0(3.0), 1.0e-14))
+    assert_eq(bessel_j1(0.0), 0.0)
+    #assert(sp_close(bessel_j1(1.0), 0.44005058574493355, 1.0e-13))
+    #assert(sp_close(bessel_j1(5.0), -0.3275791375914652, 1.0e-12))
+    #assert(sp_close(bessel_j1(20.0), 0.06683312417584993, 1.0e-10))
+    #assert(sp_close(bessel_j1(-2.0), -bessel_j1(2.0), 1.0e-14))
+    #assert(sp_close(bessel_jn(2, 1.0), 0.1149034849319005, 1.0e-13))
+    #assert(sp_close(bessel_jn(3, 5.0), 0.36483123061366696, 1.0e-12))
+    #assert(sp_close(bessel_jn(5, 2.0), 0.007039629755871686, 1.0e-12))
+    #assert(sp_close(bessel_jn(10, 15.0), 0.0, 0.2))
+    #assert(sp_close(bessel_jn(10, 20.0), 0.18648255802394506, 1.0e-9))
+    #assert(sp_close(bessel_jn(-2, 1.0), bessel_jn(2, 1.0), 1.0e-14))
+    #assert(sp_close(bessel_jn(-3, 1.0), -bessel_jn(3, 1.0), 1.0e-14))
+    assert_eq(bessel_jn(4, 0.0), 0.0)
+    // recurrence J_{n-1} + J_{n+1} = 2n/x J_n
+    #assert(sp_close(bessel_jn(2, 7.5) + bessel_jn(4, 7.5), 6.0 / 7.5 * bessel_jn(3, 7.5), 1.0e-11))
+}
+
+/// Test Bessel Y.
+test "bessel y0 y1 yn" {
+    #assert(sp_close(bessel_y0(1.0), 0.08825696421567697, 1.0e-12))
+    #assert(sp_close(bessel_y0(5.0), -0.30851762524903376, 1.0e-12))
+    #assert(sp_close(bessel_y0(0.1), -1.5342386513503667, 1.0e-12))
+    #assert(sp_close(bessel_y0(20.0), 0.06264059680093727, 1.0e-10))
+    #assert(sp_close(bessel_y1(1.0), -0.7812128213002887, 1.0e-12))
+    #assert(sp_close(bessel_y1(5.0), 0.1478631433912268, 1.0e-12))
+    #assert(sp_close(bessel_y1(0.5), -1.4714723926702430, 1.0e-12))
+    #assert(sp_close(bessel_y1(20.0), -0.16551161436252008, 1.0e-10))
+    #assert(sp_close(bessel_yn(2, 1.0), -1.6506826068162546, 1.0e-11))
+    #assert(sp_close(bessel_yn(3, 5.0), 0.14626716269319212, 1.0e-11))
+    #assert(sp_is_neg_inf(bessel_y0(0.0)))
+    #assert(sp_is_nan(bessel_y1(-1.0)))
+    #assert(sp_is_nan(bessel_yn(2, -1.0)))
+    // Wronskian J1(x) Y0(x) - J0(x) Y1(x) = 2 / (pi x)
+    ws = [0.7, 3.0, 9.0, 14.0]
+    for ws {
+        w = bessel_j1(it) * bessel_y0(it) - bessel_j0(it) * bessel_y1(it)
+        #assert(sp_close(w, 2.0 / (SP_PI * it), 1.0e-9))
+    }
+}
+
+/// Test modified Bessel I and K.
+test "bessel i0 k0" {
+    assert_eq(bessel_i0(0.0), 1.0)
+    #assert(sp_close(bessel_i0(1.0), 1.2660658777520082, 1.0e-13))
+    #assert(sp_close(bessel_i0(5.0), 27.239871823604442, 1.0e-12))
+    #assert(sp_close(bessel_i0(-2.0), bessel_i0(2.0), 1.0e-15))
+    #assert(sp_close(bessel_i0(30.0) / 781672297823.9775, 1.0, 1.0e-12))
+    #assert(sp_close(bessel_i1(1.0), 0.5651591039924851, 1.0e-13))
+    #assert(sp_close(bessel_k0(1.0), 0.42102443824070834, 1.0e-12))
+    #assert(sp_close(bessel_k0(0.1), 2.427069024702017, 1.0e-12))
+    #assert(sp_close(bessel_k0(5.0), 0.0036910983340425942, 1.0e-12))
+    #assert(sp_close(bessel_k0(20.0) / 5.741237815336524e-10, 1.0, 1.0e-11))
+    #assert(sp_is_inf(bessel_k0(0.0)))
+    #assert(sp_is_nan(bessel_k0(-1.0)))
+}
+
+/// Test zeta.
+test "zeta" {
+    #assert(sp_close(zeta(2.0), SP_PI * SP_PI / 6.0, 1.0e-13))
+    #assert(sp_close(zeta(4.0), SP_PI * SP_PI * SP_PI * SP_PI / 90.0, 1.0e-13))
+    #assert(sp_close(zeta(3.0), 1.2020569031595942, 1.0e-13))
+    #assert(sp_close(zeta(1.5), 2.612375348685488, 1.0e-12))
+    #assert(sp_close(zeta(0.5), -1.4603545088095868, 1.0e-11))
+    #assert(sp_close(zeta(0.0), -0.5, 1.0e-11))
+    #assert(sp_close(zeta(-1.0), -1.0 / 12.0, 1.0e-11))
+    #assert(sp_close(zeta(-3.0), 1.0 / 120.0, 1.0e-11))
+    assert_eq(zeta(-2.0), 0.0)
+    #assert(sp_is_inf(zeta(1.0)))
+    #assert(sp_close(zeta(10.0), 1.0009945751278182, 1.0e-13))
+    assert_eq(zeta(100.0), 1.0)
+    #assert(sp_close(zeta(1.05), 20.580844300021, 1.0e-6))
+}
+
+/// Test Lambert W.
+test "lambert w0 and wm1" {
+    assert_eq(lambert_w0(0.0), 0.0)
+    #assert(sp_close(lambert_w0(1.0), 0.5671432904097838, 1.0e-13))
+    #assert(sp_close(lambert_w0(SP_E), 1.0, 1.0e-13))
+    #assert(sp_close(lambert_w0(-0.3), -0.4894022271802149, 1.0e-12))
+    #assert(sp_close(lambert_w0(10.0), 1.7455280027406994, 1.0e-13))
+    #assert(sp_close(lambert_w0(1000.0), 5.249602852401596, 1.0e-13))
+    #assert(sp_close(lambert_w0(-0.36787944117144233), -1.0, 1.0e-12))
+    #assert(sp_is_nan(lambert_w0(-0.5)))
+    #assert(sp_close(lambert_wm1(-0.1), -3.577152063957297, 1.0e-12))
+    #assert(sp_close(lambert_wm1(-0.3), -1.7813370234216276, 1.0e-12))
+    #assert(sp_close(lambert_wm1(-0.001), -9.118006470402742, 1.0e-12))
+    #assert(sp_is_nan(lambert_wm1(0.5)))
+    #assert(sp_is_neg_inf(lambert_wm1(0.0)))
+    // W(x) e^W(x) = x on both branches
+    xs = [-0.35, -0.2, -0.05, 0.3, 2.0, 50.0]
+    for xs {
+        w = lambert_w0(it)
+        #assert(sp_close(w * host.sys_exp(w), it, 1.0e-12))
+    }
+    ys = [-0.35, -0.2, -0.05, -0.001]
+    for ys {
+        w = lambert_wm1(it)
+        #assert(sp_close(w * host.sys_exp(w), it, 1.0e-12))
+        #assert(w <= -1.0)
+    }
+}
+
+/// Test that modified Bessel I of integer order matches reference values.
+test "bessel_in matches reference values and symmetries" {
+    #assert(sp_close(bessel_in(2, 1.0), 0.1357476697670383, 1.0e-12))
+    #assert(sp_close(bessel_in(3, 2.5), 0.4743704087780359, 1.0e-12))
+    #assert(sp_close(bessel_in(5, 10.0), 777.1882864032599, 1.0e-12))
+    #assert(sp_close(bessel_in(10, 30.0), 145831809975.96716, 1.0e-11))
+    #assert(sp_close(bessel_in(0, 0.5), 1.0634833707413236, 1.0e-12))
+    #assert(sp_close(bessel_in(1, 0.5), bessel_i1(0.5), 1.0e-15))
+    assert_eq(bessel_in(4, 0.0), 0.0)
+    #assert(sp_close(bessel_in(-3, 2.5), bessel_in(3, 2.5), 1.0e-15))
+    #assert(sp_close(bessel_in(3, -2.5), -bessel_in(3, 2.5), 1.0e-15))
+    #assert(sp_close(bessel_in(2, -1.0), bessel_in(2, 1.0), 1.0e-15))
+    #assert(sp_is_inf(bessel_in(2, 800.0)))
+    #assert(sp_is_nan(bessel_in(2, sp_nan())))
+    // recurrence I_(n-1) - I_(n+1) = (2n / x) I_n
+    x = 3.7
+    #assert(sp_close(bessel_in(4, x) - bessel_in(6, x), 10.0 / x * bessel_in(5, x), 1.0e-11))
+}
+
+/// Test that modified Bessel K of order 1 and integer order matches reference values.
+test "bessel_k1 and bessel_kn match reference values" {
+    #assert(sp_close(bessel_k1(0.1), 9.853844780870606, 1.0e-12))
+    #assert(sp_close(bessel_k1(1.0), 0.6019072301972346, 1.0e-12))
+    #assert(sp_close(bessel_k1(2.5), 0.07389081634774705, 1.0e-12))
+    #assert(sp_close(bessel_k1(10.0), 1.8648773453825585e-05, 1.0e-12))
+    #assert(sp_close(bessel_k1(0.001), 999.9962381560855, 1.0e-11))
+    #assert(sp_close(bessel_kn(2, 1.0), 1.6248388986351774, 1.0e-12))
+    #assert(sp_close(bessel_kn(3, 2.0), 0.6473853909486342, 1.0e-12))
+    #assert(sp_close(bessel_kn(5, 0.5), 12097.979476096392, 1.0e-11))
+    #assert(sp_close(bessel_kn(10, 10.0), 0.0016142553003906696, 1.0e-11))
+    #assert(sp_close(bessel_kn(0, 1.0), bessel_k0(1.0), 1.0e-15))
+    #assert(sp_close(bessel_kn(1, 1.0), bessel_k1(1.0), 1.0e-15))
+    #assert(sp_close(bessel_kn(-3, 2.0), bessel_kn(3, 2.0), 1.0e-15))
+    #assert(sp_is_inf(bessel_k1(0.0)))
+    #assert(sp_is_inf(bessel_kn(4, 0.0)))
+    #assert(sp_is_nan(bessel_k1(-1.0)))
+    #assert(sp_is_nan(bessel_kn(3, -1.0)))
+    #assert(sp_is_nan(bessel_k1(sp_nan())))
+    // Wronskian-type identity I_0 K_1 + I_1 K_0 = 1 / x
+    for [0.2, 1.0, 3.0, 8.0] {
+        x = it
+        w = bessel_i0(x) * bessel_k1(x) + bessel_i1(x) * bessel_k0(x)
+        #assert(sp_close(w, 1.0 / x, 1.0e-11))
+    }
+}

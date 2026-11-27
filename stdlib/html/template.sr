@@ -1,0 +1,1173 @@
+//! std.html.template — Html/Text string templates with comptime diagnostics
+//!
+//! Import: use std.html.template
+//!
+//! Modes:
+//!   - Html: contextual auto-escaping (text / quoted attr / URL / script|style)
+//!   - Text: plain (LLM prompt assembly); no escaping
+//!
+//! Minimal logic: path interp, filters, raw/js/css, if/else, for, partials.
+//! Whitespace trim is opt-in via {{- / -}}. Stable codes T001–T004 never renumber.
+//! Escape hatch raw(x) is greppable. Destination-driven via TplWriter.
+
+use std.core.str
+use std.core.collections
+use std.html.core
+
++T001 = "T001"
++T002 = "T002"
++T003 = "T003"
++T004 = "T004"
+
++MODE_HTML = 0
++MODE_TEXT = 1
+
++NK_LIT = 0
++NK_INTERP = 1
++NK_IF = 2
++NK_FOR = 3
++NK_PARTIAL = 4
+
++CTX_TEXT = 0
++CTX_ATTR_Q = 1
++CTX_ATTR_U = 2
++CTX_URL = 3
++CTX_SCRIPT = 4
++CTX_STYLE = 5
+
++Escaped: Display = {
+    s: str = ""
+    display(self) : str => self.s
+    of(s: str) : Escaped => Escaped.{s}
+}
+
++Raw: Display = {
+    s: str = ""
+    display(self) : str => self.s
+    of(s: str) : Raw => Raw.{s}
+}
+
++Js: Display = {
+    s: str = ""
+    display(self) : str => escape_js(self.s)
+    of(s: str) : Js => Js.{s}
+}
+
++Css: Display = {
+    s: str = ""
+    display(self) : str => escape_css(self.s)
+    of(s: str) : Css => Css.{s}
+}
+
++TplNode = {
+    kind: i64 = 0
+    text: str = ""
+    path: str = ""
+    filter: str = ""
+    item: str = ""
+    raw: bool = false
+    js: bool = false
+    css: bool = false
+    then_body: _ = []
+    else_body: _ = []
+    for_body: _ = []
+}
+
++Template = {
+    mode: i64 = 0
+    nodes: _ = []
+    src: str = ""
+}
+
++PartialRegistry = {
+    names: _ = []
+    bodies: _ = []
+
+    empty() : PartialRegistry => PartialRegistry.{names: [], bodies: []}
+
+    put(@self, name: str, tpl: Template) : PartialRegistry {
+        self.names = host.sys_arr_push(self.names, name)
+        self.bodies = host.sys_arr_push(self.bodies, tpl)
+        self
+    }
+
+    get(self, name: str) : Template! {
+        n = host.sys_arr_len(self.names)
+        for 0..n {
+            if self.names[it] == name {
+                return self.bodies[it]
+            }
+        }
+        fail "{T002}: unknown partial"
+    }
+}
+
++TplWriter = {
+    buf: str = ""
+    writes: i64 = 0
+    bytes: i64 = 0
+    allocs: i64 = 0
+
+    new() : TplWriter => TplWriter.{buf: "", writes: 0, bytes: 0, allocs: 0}
+
+    write(@self, s: str) : i64 {
+        before = char_count(self.buf)
+        self.buf = self.buf + s
+        after = char_count(self.buf)
+        self.writes = self.writes + 1
+        self.bytes = self.bytes + (after - before)
+        if after > before {
+            self.allocs = self.allocs + 1
+        }
+        after
+    }
+
+    finish(self) : str => self.buf
+}
+
+tpl_filter_ok(f: str) : bool {
+    if f == "" { return true }
+    if f == "upper" { return true }
+    if f == "lower" { return true }
+    if f == "trim" { return true }
+    if f == "len" { return true }
+    if f == "json" { return true }
+    if f == "escape" { return true }
+    false
+}
+
+tpl_is_ident(s: str) : bool {
+    n = char_count(s)
+    if n == 0 { return false }
+    c0 = host.sys_ord(s[0])
+    ok0 = false
+    if c0 >= 65 {
+        if c0 <= 90 { ok0 = true }
+    }
+    if c0 >= 97 {
+        if c0 <= 122 { ok0 = true }
+    }
+    if c0 == 95 { ok0 = true }
+    if !ok0 { return false }
+    for 1..n {
+        c = host.sys_ord(s[it])
+        ok = false
+        if c >= 48 {
+            if c <= 57 { ok = true }
+        }
+        if c >= 65 {
+            if c <= 90 { ok = true }
+        }
+        if c >= 97 {
+            if c <= 122 { ok = true }
+        }
+        if c == 95 { ok = true }
+        if !ok { return false }
+    }
+    true
+}
+
+tpl_is_path(s: str) : bool {
+    parts = split(s, ".")
+    n = host.sys_arr_len(parts)
+    if n == 0 { return false }
+    for 0..n {
+        if !tpl_is_ident(parts[it]) { return false }
+    }
+    true
+}
+
++compile_html(src: str) : Template! => tpl_compile(src, MODE_HTML, [], [])
++compile_html(src: str, known: _) : Template! => tpl_compile(src, MODE_HTML, known, [])
++compile_html(src: str, known: _, partials: _) : Template! => tpl_compile(src, MODE_HTML, known, partials)
+
++compile_text(src: str) : Template! => tpl_compile(src, MODE_TEXT, [], [])
++compile_text(src: str, known: _) : Template! => tpl_compile(src, MODE_TEXT, known, [])
++compile_text(src: str, known: _, partials: _) : Template! => tpl_compile(src, MODE_TEXT, known, partials)
+
+/// Frontend comptime checker recognizes HtmlTpl.compile / TextTpl.compile.
++HtmlTpl = {
+    compile(src: str) : Template! => compile_html(src)
+    compile(src: str, known: _) : Template! => compile_html(src, known)
+    compile(src: str, known: _, partials: _) : Template! => compile_html(src, known, partials)
+}
+
++TextTpl = {
+    compile(src: str) : Template! => compile_text(src)
+    compile(src: str, known: _) : Template! => compile_text(src, known)
+    compile(src: str, known: _, partials: _) : Template! => compile_text(src, known, partials)
+}
+
+tpl_compile(src: str, mode: i64, known: _, partials: _) : Template! {
+    nodes = tpl_parse_body(src, 0, char_count(src), mode) or err {
+        fail err
+        return
+    }
+    _ = tpl_check_names(nodes, known, partials) or err {
+        fail err
+        return
+    }
+    if mode == MODE_HTML {
+        _ = tpl_check_html_ctx(src, nodes) or err {
+            fail err
+            return
+        }
+    }
+    Template.{mode, nodes, src}
+}
+
+tpl_is_ws(c: str) : bool {
+    if c == " " { return true }
+    if c == "\t" { return true }
+    if c == "\n" { return true }
+    if c == "\r" { return true }
+    false
+}
+
+tpl_rtrim_ws(s: str) : str {
+    n = char_count(s)
+    while n > 0 {
+        if !tpl_is_ws(s[n - 1]) { break }
+        n = n - 1
+    }
+    s[0..n]
+}
+
+tpl_ltrim_idx(src: str, i: i64, end: i64) : i64 {
+    while i < end {
+        if !tpl_is_ws(src[i]) { break }
+        i = i + 1
+    }
+    i
+}
+
+tpl_parse_body(src: str, start: i64, end: i64, mode: i64) : _! {
+    out = []
+    i = start
+    pending_trim_r = false
+    while i < end {
+        if pending_trim_r {
+            i = tpl_ltrim_idx(src, i, end)
+            pending_trim_r = false
+        }
+        open = find_from(src, "{{", i)
+        if open < 0 {
+            if i < end {
+                out = host.sys_arr_push(out, TplNode.{kind: NK_LIT, text: src[i..end]})
+            }
+            return out
+        }
+        if open >= end {
+            if i < end {
+                out = host.sys_arr_push(out, TplNode.{kind: NK_LIT, text: src[i..end]})
+            }
+            return out
+        }
+        if open > i {
+            out = host.sys_arr_push(out, TplNode.{kind: NK_LIT, text: src[i..open]})
+        }
+        after = open + 2
+        if after >= end {
+            fail "{T001}: unclosed template tag"
+            return
+        }
+        tag_start = after
+        trim_l = false
+        if src[tag_start] == "-" {
+            trim_l = true
+            tag_start = tag_start + 1
+        }
+        close = find_from(src, "}}", tag_start)
+        if close < 0 {
+            fail "{T001}: unclosed template tag"
+            return
+        }
+        if close >= end {
+            fail "{T001}: unclosed template tag"
+            return
+        }
+        tag_end = close
+        close_end = close + 2
+        trim_r = false
+        if tag_end > tag_start {
+            if src[tag_end - 1] == "-" {
+                trim_r = true
+                tag_end = tag_end - 1
+            }
+        }
+        if trim_l {
+            nout = host.sys_arr_len(out)
+            if nout > 0 {
+                last = out[nout - 1]
+                if last.kind == NK_LIT {
+                    last.text = tpl_rtrim_ws(last.text)
+                    out = host.sys_arr_set(out, nout - 1, last)
+                }
+            }
+        }
+        pending_trim_r = trim_r
+        raw_tag = trim(src[tag_start..tag_end])
+        if raw_tag == "" {
+            fail "{T001}: empty template tag"
+            return
+        }
+        if starts_with(raw_tag, "/") {
+            fail "{T001}: unexpected closing tag"
+            return
+        }
+        if starts_with(raw_tag, "#if") {
+            path = trim(raw_tag[3..char_count(raw_tag)])
+            if path == "" {
+                fail "{T001}: #if expects a dotted path"
+                return
+            }
+            if !tpl_is_path(path) {
+                fail "{T001}: #if expects a dotted path"
+                return
+            }
+            parts = tpl_split_if(src, close_end, end) or err {
+                fail err
+                return
+            }
+            then_b = tpl_parse_body(src, parts[0], parts[1], mode) or err {
+                fail err
+                return
+            }
+            else_b = []
+            if parts[2] < parts[3] {
+                else_b = tpl_parse_body(src, parts[2], parts[3], mode) or err {
+                    fail err
+                    return
+                }
+            }
+            out = host.sys_arr_push(out, TplNode.{kind: NK_IF, path, then_body: then_b, else_body: else_b})
+            i = parts[4]
+            continue
+        }
+        if starts_with(raw_tag, "#for ") {
+            rest = trim(raw_tag[5..char_count(raw_tag)])
+            sp = find(rest, " in ")
+            if sp < 0 {
+                fail "{T001}: #for expects x in path"
+                return
+            }
+            item = trim(rest[0..sp])
+            path = trim(rest[(sp + 4)..char_count(rest)])
+            if !tpl_is_ident(item) {
+                fail "{T001}: #for has invalid item or path"
+                return
+            }
+            if !tpl_is_path(path) {
+                fail "{T001}: #for has invalid item or path"
+                return
+            }
+            parts = tpl_split_close(src, close_end, end, "/for") or err {
+                fail err
+                return
+            }
+            body = tpl_parse_body(src, parts[0], parts[1], mode) or err {
+                fail err
+                return
+            }
+            out = host.sys_arr_push(out, TplNode.{kind: NK_FOR, item, path, for_body: body})
+            i = parts[2]
+            continue
+        }
+        if starts_with(raw_tag, "#else") {
+            fail "{T001}: #else without matching #if"
+            return
+        }
+        if starts_with(raw_tag, ">") {
+            name = trim(raw_tag[1..char_count(raw_tag)])
+            if !tpl_is_ident(name) {
+                fail "{T001}: partial name must be an identifier"
+                return
+            }
+            out = host.sys_arr_push(out, TplNode.{kind: NK_PARTIAL, text: name})
+            i = close_end
+            continue
+        }
+        interp = tpl_parse_interp(raw_tag) or err {
+            fail err
+            return
+        }
+        out = host.sys_arr_push(out, interp)
+        i = close_end
+    }
+    out
+}
+
+tpl_parse_interp(tag: str) : TplNode! {
+    t = trim(tag)
+    if starts_with(t, "raw(") {
+        if ends_with(t, ")") {
+            p = trim(t[4..(char_count(t) - 1)])
+            if !tpl_is_path(p) {
+                fail "{T001}: raw(...) expects a dotted path"
+                return
+            }
+            return TplNode.{kind: NK_INTERP, path: p, raw: true}
+        }
+    }
+    if starts_with(t, "js(") {
+        if ends_with(t, ")") {
+            p = trim(t[3..(char_count(t) - 1)])
+            if !tpl_is_path(p) {
+                fail "{T001}: js(...) expects a dotted path"
+                return
+            }
+            return TplNode.{kind: NK_INTERP, path: p, js: true}
+        }
+    }
+    if starts_with(t, "css(") {
+        if ends_with(t, ")") {
+            p = trim(t[4..(char_count(t) - 1)])
+            if !tpl_is_path(p) {
+                fail "{T001}: css(...) expects a dotted path"
+                return
+            }
+            return TplNode.{kind: NK_INTERP, path: p, css: true}
+        }
+    }
+    path_part = t
+    filter = ""
+    bar = find(t, "|")
+    if bar >= 0 {
+        path_part = trim(t[0..bar])
+        filter = trim(t[(bar + 1)..char_count(t)])
+    }
+    if !tpl_is_path(path_part) {
+        fail "{T001}: invalid interpolation path"
+        return
+    }
+    if !tpl_filter_ok(filter) {
+        fail "{T001}: unknown filter"
+        return
+    }
+    if contains(path_part, "(") {
+        fail "{T001}: arbitrary expressions are not allowed in templates"
+        return
+    }
+    if contains(path_part, "+") {
+        fail "{T001}: arbitrary expressions are not allowed in templates"
+        return
+    }
+    if contains(path_part, " ") {
+        fail "{T001}: arbitrary expressions are not allowed in templates"
+        return
+    }
+    TplNode.{kind: NK_INTERP, path: path_part, filter}
+}
+
+tpl_split_close(src: str, start: i64, end: i64, close: str) : _! {
+    i = start
+    depth = 1
+    while i < end {
+        open = find_from(src, "{{", i)
+        if open < 0 { break }
+        if open >= end { break }
+        after = open + 2
+        tag_start = after
+        if tag_start < end {
+            if src[tag_start] == "-" {
+                tag_start = tag_start + 1
+            }
+        }
+        c = find_from(src, "}}", tag_start)
+        if c < 0 { break }
+        tag_end = c
+        close_end = c + 2
+        if tag_end > tag_start {
+            if src[tag_end - 1] == "-" {
+                tag_end = tag_end - 1
+            }
+        }
+        raw_tag = trim(src[tag_start..tag_end])
+        if starts_with(raw_tag, "#if") {
+            depth = depth + 1
+        } else {
+            if starts_with(raw_tag, "#for") {
+                depth = depth + 1
+            } else {
+                if raw_tag == close {
+                    depth = depth - 1
+                    if depth == 0 {
+                        return [start, open, close_end]
+                    }
+                }
+            }
+        }
+        i = close_end
+    }
+    fail "{T001}: unclosed block"
+}
+
+tpl_split_if(src: str, start: i64, end: i64) : _! {
+    i = start
+    depth = 1
+    else_open = -1
+    else_body = -1
+    while i < end {
+        open = find_from(src, "{{", i)
+        if open < 0 { break }
+        if open >= end { break }
+        after = open + 2
+        tag_start = after
+        if tag_start < end {
+            if src[tag_start] == "-" {
+                tag_start = tag_start + 1
+            }
+        }
+        c = find_from(src, "}}", tag_start)
+        if c < 0 { break }
+        tag_end = c
+        close_end = c + 2
+        if tag_end > tag_start {
+            if src[tag_end - 1] == "-" {
+                tag_end = tag_end - 1
+            }
+        }
+        raw_tag = trim(src[tag_start..tag_end])
+        if starts_with(raw_tag, "#if") {
+            depth = depth + 1
+        } else {
+            if starts_with(raw_tag, "#for") {
+                depth = depth + 1
+            } else {
+                if raw_tag == "#else" {
+                    if depth == 1 {
+                        else_open = open
+                        else_body = close_end
+                    }
+                } else {
+                    if raw_tag == "/if" {
+                        depth = depth - 1
+                        if depth == 0 {
+                            if else_open >= 0 {
+                                return [start, else_open, else_body, open, close_end]
+                            }
+                            return [start, open, open, open, close_end]
+                        }
+                    }
+                }
+            }
+        }
+        i = close_end
+    }
+    fail "{T001}: unclosed #if"
+}
+
+tpl_known_has(known: _, name: str) : bool {
+    n = host.sys_arr_len(known)
+    for 0..n {
+        if known[it] == name { return true }
+    }
+    false
+}
+
+tpl_known_unrenderable(known: _, name: str) : bool {
+    mark = "!" + name
+    n = host.sys_arr_len(known)
+    for 0..n {
+        if known[it] == mark { return true }
+    }
+    false
+}
+
+tpl_check_names(nodes: _, known: _, partials: _) : bool! {
+    kn = host.sys_arr_len(known)
+    pn = host.sys_arr_len(partials)
+    if kn == 0 {
+        if pn == 0 {
+            return true
+        }
+    }
+    n = host.sys_arr_len(nodes)
+    for 0..n {
+        node = nodes[it]
+        if node.kind == NK_INTERP {
+            root = split(node.path, ".")[0]
+            if tpl_known_unrenderable(known, root) {
+                fail "{T003}: value is not renderable (needs Display, Escaped, Raw, Js, or Css)"
+                return
+            }
+            if tpl_known_unrenderable(known, node.path) {
+                fail "{T003}: value is not renderable (needs Display, Escaped, Raw, Js, or Css)"
+                return
+            }
+            if kn > 0 {
+                if !tpl_known_has(known, root) {
+                    if !tpl_known_has(known, node.path) {
+                        fail "{T002}: unknown template name"
+                        return
+                    }
+                }
+            }
+        }
+        if node.kind == NK_IF {
+            root = split(node.path, ".")[0]
+            if kn > 0 {
+                if !tpl_known_has(known, root) {
+                    if !tpl_known_has(known, node.path) {
+                        fail "{T002}: unknown template name"
+                        return
+                    }
+                }
+            }
+            _ = tpl_check_names(node.then_body, known, partials) or err {
+                fail err
+                return
+            }
+            _ = tpl_check_names(node.else_body, known, partials) or err {
+                fail err
+                return
+            }
+        }
+        if node.kind == NK_FOR {
+            root = split(node.path, ".")[0]
+            if kn > 0 {
+                if !tpl_known_has(known, root) {
+                    if !tpl_known_has(known, node.path) {
+                        fail "{T002}: unknown template name"
+                        return
+                    }
+                }
+            }
+            nested = known
+            nested = host.sys_arr_push(nested, node.item)
+            _ = tpl_check_names(node.for_body, nested, partials) or err {
+                fail err
+                return
+            }
+        }
+        if node.kind == NK_PARTIAL {
+            if pn > 0 {
+                if !tpl_known_has(partials, node.text) {
+                    fail "{T002}: unknown partial"
+                    return
+                }
+            }
+        }
+    }
+    true
+}
+
+tpl_html_ctx_at(src: str, offset: i64) : i64 {
+    before = src[0..offset]
+    low = to_lower(before)
+    so = find_last(low, "<script")
+    sc = find_last(low, "</script")
+    if so >= 0 {
+        if sc < 0 {
+            return CTX_SCRIPT
+        }
+        if sc < so {
+            return CTX_SCRIPT
+        }
+    }
+    to = find_last(low, "<style")
+    tc = find_last(low, "</style")
+    if to >= 0 {
+        if tc < 0 {
+            return CTX_STYLE
+        }
+        if tc < to {
+            return CTX_STYLE
+        }
+    }
+    lt = find_last(before, "<")
+    if lt >= 0 {
+        tag = before[lt..char_count(before)]
+        if !contains(tag, ">") {
+            eq = find_last(tag, "=")
+            if eq >= 0 {
+                after_eq = trim(tag[(eq + 1)..char_count(tag)])
+                left = trim(tag[0..eq])
+                sp = find_last(left, " ")
+                attr = left
+                if sp >= 0 {
+                    attr = left[(sp + 1)..char_count(left)]
+                }
+                al = to_lower(attr)
+                is_url = false
+                if al == "href" { is_url = true }
+                if al == "src" { is_url = true }
+                if al == "action" { is_url = true }
+                if al == "formaction" { is_url = true }
+                if al == "poster" { is_url = true }
+                if starts_with(after_eq, "\"") {
+                    if is_url { return CTX_URL }
+                    return CTX_ATTR_Q
+                }
+                if starts_with(after_eq, "'") {
+                    if is_url { return CTX_URL }
+                    return CTX_ATTR_Q
+                }
+                return CTX_ATTR_U
+            }
+        }
+    }
+    CTX_TEXT
+}
+
+tpl_check_html_ctx(src: str, nodes: _) : bool! {
+    n = host.sys_arr_len(nodes)
+    pos = 0
+    for 0..n {
+        node = nodes[it]
+        if node.kind == NK_INTERP {
+            open = find_from(src, "{{", pos)
+            if open < 0 { open = 0 }
+            ctx = tpl_html_ctx_at(src, open)
+            if ctx == CTX_SCRIPT {
+                if !node.js {
+                    if !node.raw {
+                        fail "{T004}: interpolation in script requires js(x) or raw(x)"
+                        return
+                    }
+                }
+            }
+            if ctx == CTX_STYLE {
+                if !node.css {
+                    if !node.raw {
+                        fail "{T004}: interpolation in style requires css(x) or raw(x)"
+                        return
+                    }
+                }
+            }
+            if ctx == CTX_ATTR_U {
+                if !node.raw {
+                    fail "{T004}: unquoted attribute interpolation is unsafe"
+                    return
+                }
+            }
+            pos = open + 2
+        }
+        if node.kind == NK_IF {
+            _ = tpl_check_html_ctx(src, node.then_body) or err {
+                fail err
+                return
+            }
+            _ = tpl_check_html_ctx(src, node.else_body) or err {
+                fail err
+                return
+            }
+        }
+        if node.kind == NK_FOR {
+            _ = tpl_check_html_ctx(src, node.for_body) or err {
+                fail err
+                return
+            }
+        }
+    }
+    true
+}
+
+tpl_lookup(ctx: _, path: str) : str! {
+    key = split(path, ".")[0]
+    n = host.sys_arr_len(ctx)
+    i = 0
+    while i + 1 < n {
+        if ctx[i] == key {
+            return "{ctx[i + 1]}"
+        }
+        i = i + 2
+    }
+    fail "{T002}: unknown template name"
+}
+
+tpl_apply_filter(s: str, filter: str) : str {
+    if filter == "" { return s }
+    if filter == "upper" { return to_upper(s) }
+    if filter == "lower" { return to_lower(s) }
+    if filter == "trim" { return trim(s) }
+    if filter == "len" { return "{len(s)}" }
+    if filter == "escape" { return escape_text(s) }
+    if filter == "json" { return "\"" + escape_text(s) + "\"" }
+    s
+}
+
+tpl_escape_for(mode: i64, ctx: i64, s: str, raw: bool, js: bool, css: bool) : str! {
+    if mode == MODE_TEXT { return s }
+    if raw { return s }
+    if js { return escape_js(s) }
+    if css { return escape_css(s) }
+    if ctx == CTX_URL {
+        return escape_url(s) or err {
+            fail err
+            return
+        }
+    }
+    if ctx == CTX_ATTR_Q { return escape_attr(s) }
+    if ctx == CTX_ATTR_U { return escape_attr(s) }
+    escape_text(s)
+}
+
++render_to(@w: TplWriter, tpl: Template, ctx: _) : str! {
+    render_to_reg(@w, tpl, ctx, PartialRegistry.empty())
+}
+
++render_to_reg(@w: TplWriter, tpl: Template, ctx: _, reg: PartialRegistry) : str! {
+    _ = tpl_render_nodes(@w, tpl.mode, tpl.src, tpl.nodes, ctx, reg, 0) or err {
+        fail err
+        return
+    }
+    w.finish()
+}
+
++render(tpl: Template, ctx: _) : str! {
+    w = TplWriter.new()
+    render_to(@w, tpl, ctx)
+}
+
++render_reg(tpl: Template, ctx: _, reg: PartialRegistry) : str! {
+    w = TplWriter.new()
+    render_to_reg(@w, tpl, ctx, reg)
+}
+
+tpl_render_nodes(@w: TplWriter, mode: i64, src: str, nodes: _, ctx: _, reg: PartialRegistry, scan_pos: i64) : i64! {
+    n = host.sys_arr_len(nodes)
+    pos = scan_pos
+    for 0..n {
+        node = nodes[it]
+        if node.kind == NK_LIT {
+            @w.write(node.text)
+        }
+        if node.kind == NK_INTERP {
+            open = find_from(src, "{{", pos)
+            if open < 0 { open = 0 }
+            ctx_kind = CTX_TEXT
+            if mode == MODE_HTML {
+                ctx_kind = tpl_html_ctx_at(src, open)
+            }
+            raw_s = tpl_lookup(ctx, node.path) or err {
+                fail err
+                return
+            }
+            filtered = tpl_apply_filter(raw_s, node.filter)
+            esc = tpl_escape_for(mode, ctx_kind, filtered, node.raw, node.js, node.css) or err {
+                fail err
+                return
+            }
+            @w.write(esc)
+            pos = open + 2
+        }
+        if node.kind == NK_IF {
+            v = tpl_lookup(ctx, node.path) or "false"
+            truthy = true
+            if v == "" { truthy = false }
+            if v == "false" { truthy = false }
+            if v == "0" { truthy = false }
+            if v == "none" { truthy = false }
+            if truthy {
+                pos = tpl_render_nodes(@w, mode, src, node.then_body, ctx, reg, pos) or err {
+                    fail err
+                    return
+                }
+            } else {
+                pos = tpl_render_nodes(@w, mode, src, node.else_body, ctx, reg, pos) or err {
+                    fail err
+                    return
+                }
+            }
+        }
+        if node.kind == NK_FOR {
+            items = tpl_lookup_list(ctx, node.path) or err {
+                fail err
+                return
+            }
+            ln = host.sys_arr_len(items)
+            for 0..ln {
+                nested = tpl_ctx_with(ctx, node.item, items[it])
+                pos = tpl_render_nodes(@w, mode, src, node.for_body, nested, reg, pos) or err {
+                    fail err
+                    return
+                }
+            }
+        }
+        if node.kind == NK_PARTIAL {
+            sub = reg.get(node.text) or err {
+                fail err
+                return
+            }
+            pos = tpl_render_nodes(@w, sub.mode, sub.src, sub.nodes, ctx, reg, 0) or err {
+                fail err
+                return
+            }
+        }
+    }
+    pos
+}
+
+tpl_lookup_list(ctx: _, path: str) : _! {
+    n = host.sys_arr_len(ctx)
+    i = 0
+    while i + 1 < n {
+        if ctx[i] == path {
+            return ctx[i + 1]
+        }
+        i = i + 2
+    }
+    fail "{T002}: unknown template name"
+}
+
+tpl_ctx_with(ctx: _, key: str, val: _) : _ {
+    out = []
+    n = host.sys_arr_len(ctx)
+    i = 0
+    replaced = false
+    while i + 1 < n {
+        k = ctx[i]
+        v = ctx[i + 1]
+        if k == key {
+            out = host.sys_arr_push(out, k)
+            out = host.sys_arr_push(out, val)
+            replaced = true
+        } else {
+            out = host.sys_arr_push(out, k)
+            out = host.sys_arr_push(out, v)
+        }
+        i = i + 2
+    }
+    if !replaced {
+        out = host.sys_arr_push(out, key)
+        out = host.sys_arr_push(out, val)
+    }
+    out
+}
+
+/// Independent XSS oracle (hand-rolled; must not call escape_text).
++xss_ref_oracle(s: str) : str {
+    out = ""
+    n = char_count(s)
+    for 0..n {
+        c = s[it]
+        if c == "&" {
+            out = out + "&amp;"
+        } else {
+            if c == "<" {
+                out = out + "&lt;"
+            } else {
+                if c == ">" {
+                    out = out + "&gt;"
+                } else {
+                    if c == "\"" {
+                        out = out + "&quot;"
+                    } else {
+                        if c == "'" {
+                            out = out + "&#39;"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Alias kept for callers; differential tests use xss_ref_oracle.
++ref_escape_text(s: str) : str => xss_ref_oracle(s)
+
+test "T001 malformed unclosed tag" {
+    // Non-literal so comptime checker does not fail the file; runtime still returns T001.
+    src = "{" + "{" + "name"
+    bad = false
+    code = ""
+    _ = compile_text(src) or err {
+        bad = true
+        code = err
+        Template.{}
+    }
+    #assert(bad)
+    #assert(contains(code, T001))
+}
+
+test "T002 unknown name at compile" {
+    src = "{" + "{" + "name" + "}" + "}"
+    bad = false
+    code = ""
+    _ = compile_text(src, ["title"]) or err {
+        bad = true
+        code = err
+        Template.{}
+    }
+    #assert(bad)
+    #assert(contains(code, T002))
+}
+
+test "T003 not renderable known bang" {
+    src = "{" + "{" + "blob" + "}" + "}"
+    bad = false
+    code = ""
+    _ = compile_text(src, ["!blob"]) or err {
+        bad = true
+        code = err
+        Template.{}
+    }
+    #assert(bad)
+    #assert(contains(code, T003))
+}
+
+test "T004 script context requires js" {
+    src = "<script>" + "{" + "{" + "x" + "}" + "}" + "</script>"
+    bad = false
+    code = ""
+    _ = compile_html(src) or err {
+        bad = true
+        code = err
+        Template.{}
+    }
+    #assert(bad)
+    #assert(contains(code, T004))
+}
+
+test "html text interpolation escapes" {
+    t = compile_html(r"<p>{{name}}</p>", ["name"]) or Template.{}
+    s = render(t, ["name", "<script>"]) or ""
+    assert_eq(s, "<p>&lt;script&gt;</p>")
+}
+
+test "quoted attr escapes" {
+    t = compile_html(r#"<div title="{{t}}"></div>"#, ["t"]) or Template.{}
+    s = render(t, ["t", "x\" onmouseover=\"alert(1)"]) or ""
+    #assert(contains(s, "&quot;"))
+    #assert(!(contains(s, "title=\"x\" onmouseover")))
+}
+
+test "url attr blocks javascript" {
+    t = compile_html(r#"<a href="{{u}}">x</a>"#, ["u"]) or Template.{}
+    bad = false
+    _ = render(t, ["u", "javascript:alert(1)"]) or err {
+        bad = true
+        ""
+    }
+    #assert(bad)
+}
+
+test "text mode no escape for prompts" {
+    t = compile_text(r"User: {{q}}", ["q"]) or Template.{}
+    s = render(t, ["q", "<b>"]) or ""
+    assert_eq(s, "User: <b>")
+}
+
+test "if else for partials" {
+    card = compile_text(r"[{{name}}]", ["name"]) or Template.{}
+    reg = PartialRegistry.empty()
+    @reg.put("card", card)
+    t = compile_text(r"{{#if on}}Y{{#else}}N{{/if}}-{{#for i in xs}}{{i}}{{/for}}-{{> card}}", ["on", "xs", "name"], ["card"]) or Template.{}
+    s = render_reg(t, ["on", "true", "xs", ["a", "b"], "name", "Z"], reg) or ""
+    assert_eq(s, "Y-ab-[Z]")
+}
+
+test "raw is greppable escape hatch" {
+    t = compile_html(r"<div>{{raw(html)}}</div>", ["html"]) or Template.{}
+    s = render(t, ["html", "<b>ok</b>"]) or ""
+    assert_eq(s, "<div><b>ok</b></div>")
+}
+
+test "whitespace trim is opt-in" {
+    // Default: surrounding spaces preserved exactly.
+    t = compile_text(r"A {{ name }} B", ["name"]) or Template.{}
+    s = render(t, ["name", "X"]) or ""
+    assert_eq(s, "A X B")
+    // Opt-in {{- / -}} trims adjacent whitespace.
+    t2 = compile_text(r"A {{- name -}} B", ["name"]) or Template.{}
+    s2 = render(t2, ["name", "X"]) or ""
+    assert_eq(s2, "AXB")
+}
+
+test "destination writer counts growth allocs for prompt assembly" {
+    sys = compile_text(r"system: {{sys}}\n", ["sys"]) or Template.{}
+    msg = compile_text(r"{{#for m in messages}}{{m}}\n{{/for}}", ["messages", "m"]) or Template.{}
+    w = TplWriter.new()
+    _ = render_to(@w, sys, ["sys", "You are helpful."]) or ""
+    before_allocs = w.allocs
+    before_writes = w.writes
+    _ = render_to(@w, msg, ["messages", ["hi", "there", "friend"]]) or ""
+    // One destination buffer: every write grows that buffer (allocs track growth copies).
+    #assert(w.allocs >= before_allocs)
+    #assert(w.writes > before_writes)
+    assert_eq(w.allocs, w.writes)
+    out = w.finish()
+    #assert(contains(out, "system: You are helpful."))
+    #assert(contains(out, "hi"))
+    #assert(contains(out, "friend"))
+    #assert(char_count(out) > 0)
+    // Size is bounded by summed pieces (no extra retained intermediates beyond buf).
+    assert_eq(w.bytes, char_count(out))
+}
+
+test "XSS corpus at least 30 payloads escaped in text context" {
+    payloads = [
+        "<script>alert(1)</script>",
+        "\" onmouseover=\"alert(1)",
+        "' onfocus='alert(1)",
+        "</script><script>alert(1)",
+        "<img src=x onerror=alert(1)>",
+        "<svg onload=alert(1)>",
+        "javascript:alert(1)",
+        "JAVASCRIPT:alert(1)",
+        "vbscript:msgbox(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "&lt;script&gt;",
+        ";alert(1)//",
+        "<iframe src=javascript:alert(1)>",
+        "<body onload=alert(1)>",
+        "<input onfocus=alert(1) autofocus>",
+        "<math><mtext></table><script>alert(1)</script>",
+        "<link rel=stylesheet href=javascript:alert(1)>",
+        "<meta http-equiv=refresh content=0>",
+        "<form action=javascript:alert(1)><input type=submit>",
+        "<object data=javascript:alert(1)>",
+        "<embed src=javascript:alert(1)>",
+        "<a href=javascript:alert(1)>x</a>",
+        "<scr<script>ipt>alert(1)</script>",
+        "7*7 template injection",
+        "dollar template injection",
+        "u003cscriptu003e",
+        "<style>@import javascript:alert(1)</style>",
+        "1; DROP TABLE users",
+        "<img src=x onerror=alert(xss)>",
+        "script alert script",
+        "<div style=width:expression(alert(1))>",
+        "<!-- --!><script>alert(1)</script>",
+        "<svg><desc><![CDATA[</desc><script>alert(1)</script>]]></svg>",
+        "<img src=1 href=1 onerror=alert(1)>",
+    ]
+    n = host.sys_arr_len(payloads)
+    #assert(n >= 30)
+    t = compile_html(r"<p>{{x}}</p>", ["x"]) or Template.{}
+    i = 0
+    while i < n {
+        p = payloads[i]
+        got = render(t, ["x", p]) or ""
+        // Differential vs independent oracle (not escape_text).
+        ref = "<p>" + xss_ref_oracle(p) + "</p>"
+        assert_eq(got, ref)
+        #assert(!(contains(got, "<script>")))
+        i = i + 1
+    }
+    // Hand-known goldens (oracle sanity).
+    assert_eq(xss_ref_oracle("&<>\"'"), "&amp;&lt;&gt;&quot;&#39;")
+    assert_eq(render(t, ["x", "&<>\"'"]) or "", "<p>&amp;&lt;&gt;&quot;&#39;</p>")
+}
+
+test "property: Html escapes untrusted; Text does not; raw is greppable" {
+    evil = "<script>x</script>"
+    th = compile_html(r"<p>{{x}}</p>", ["x"]) or Template.{}
+    tt = compile_text(r"p={{x}}", ["x"]) or Template.{}
+    tr = compile_html(r"<p>{{raw(x)}}</p>", ["x"]) or Template.{}
+    assert_eq(render(th, ["x", evil]) or "", "<p>&lt;script&gt;x&lt;/script&gt;</p>")
+    assert_eq(render(tt, ["x", evil]) or "", "p=<script>x</script>")
+    assert_eq(render(tr, ["x", evil]) or "", "<p><script>x</script></p>")
+}
+
+test "js encoder allowed in script" {
+    t = compile_html(r#"<script>var x="{{js(v)}}";</script>"#, ["v"]) or Template.{}
+    s = render(t, ["v", "</script>"]) or ""
+    // Payload must be JS-escaped; template tags still contain '<'.
+    #assert(contains(s, "\\u003c"))
+    #assert(!(contains(s, "var x=\"</script>\"")))
+}

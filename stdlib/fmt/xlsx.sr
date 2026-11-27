@@ -1,0 +1,1759 @@
+//! std.fmt.xlsx — Office Open XML spreadsheets (.xlsx): in-memory workbooks, writer and reader
+//!
+//! Import with:
+//!   use std.fmt.xlsx
+//!
+//!   wb = XlWorkbook.new()
+//!   s = @wb.add_sheet("Sales")                                   // sheet index, -1 for an invalid or duplicate name
+//!   @wb.push_row(s, [xl_text("region"), xl_text("total")])
+//!   @wb.push_row(s, [xl_text("EU"), xl_num(110.5)])
+//!   @wb.put(s, 5, 2, xl_bool(true))                              // sparse writes grow the sheet; gaps stay empty
+//!   bytes = wb.to_bytes() or []                                  // a zip: [Content_Types].xml, workbook, styles, sharedStrings, sheets
+//!   back = xlsx_read(bytes) or XlWorkbook.new()                  // reads what to_bytes wrote, and files made by Excel & co
+//!   total = back.cell(0, 1, 1).num                               // 110.5
+//!   xlsx_write_file("sales.xlsx", wb) or false                   // and xlsx_read_file("sales.xlsx")
+//!
+//! A cell is empty, a number (`f64`), a string or a boolean (`XlCell.kind`: `XL_EMPTY`, `XL_NUM`, `XL_STR`,
+//! `XL_BOOL`). Rows and columns are 0-based (`A1` is row 0, column 0); `xl_ref` / `xl_parse_ref` convert to and from
+//! `A1` references. The writer emits shared strings, deterministic zip metadata (1980-01-01), and skips empty cells,
+//! `NaN` and infinities (Excel cannot store them); characters that XML 1.0 forbids are dropped from text.
+//! The reader goes through the zip central directory, so it accepts stored and DEFLATE-compressed members
+//! (`xl_inflate`: stored, fixed and dynamic Huffman blocks, CRC-32 verified), shared strings (including rich text,
+//! phonetic runs are ignored), inline strings, booleans, error values (kept as their text) and sparse rows.
+//! Dates are plain serial numbers (styles are not interpreted); formulas contribute their cached value.
+//! Public helpers are prefixed `xl_` / `xlsx_`.
+
+use std.core.str
+use std.core.collections
+use std.fmt.xml
+use std.io.archive
+use std.sys.fs
+
+/// Cell kind: nothing stored.
++XL_EMPTY = 0
+/// Cell kind: number.
++XL_NUM = 1
+/// Cell kind: string.
++XL_STR = 2
+/// Cell kind: boolean.
++XL_BOOL = 3
+/// Largest row count of a sheet.
++XL_MAX_ROWS = 1048576
+/// Largest column count of a sheet.
++XL_MAX_COLS = 16384
+
+/// One cell value; only the field matching `kind` is meaningful.
++XlCell = {
+    kind: i64 = 0
+    num: f64 = 0.0
+    text: str = ""
+    flag: bool = false
+
+    /// True for `XL_EMPTY`.
+    is_empty(self) : bool => self.kind == XL_EMPTY
+
+    /// Text form: numbers without a trailing `.0`, booleans as `true`/`false`, empty as `""`.
+    show(self) : str {
+        if self.kind == XL_NUM { return xl_num_text(self.num) }
+        if self.kind == XL_STR { return self.text }
+        if self.kind == XL_BOOL {
+            if self.flag { return "true" }
+            return "false"
+        }
+        ""
+    }
+}
+
+/// Empty cell.
++xl_empty() : XlCell => XlCell.{kind: XL_EMPTY, num: 0.0, text: "", flag: false}
+
+/// Number cell.
++xl_num(v: f64) : XlCell => XlCell.{kind: XL_NUM, num: v, text: "", flag: false}
+
+/// String cell.
++xl_text(s: str) : XlCell => XlCell.{kind: XL_STR, num: 0.0, text: s, flag: false}
+
+/// Boolean cell.
++xl_bool(b: bool) : XlCell => XlCell.{kind: XL_BOOL, num: 0.0, text: "", flag: b}
+
+/// Cell from free text: empty for `""`, number for numeric text, boolean for `true`/`false`, else string.
++xl_auto(s: str) : XlCell {
+    t = trim(s)
+    if t == "" { return xl_empty() }
+    low = to_lower(t)
+    if low == "true" { return xl_bool(true) }
+    if low == "false" { return xl_bool(false) }
+    v = xl_parse_num(t) or err { return xl_text(s) }
+    xl_num(v)
+}
+
+// --- numbers ---------------------------------------------------------------------------------------
+
+/// Text of a number: integral values print without a fraction (`3`), others as the shortest decimal (`0.5`).
++xl_num_text(v: f64) : str {
+    whole = host.sys_floor(v)
+    if v - whole < 1.0e-300 && v < 1.0e15 && v > -1.0e15 {
+        n = host.sys_to_int(v)
+        return "{n}"
+    }
+    "{v}"
+}
+
+/// Parse a decimal number with optional sign, fraction and `e`/`E` exponent (`-1.5E-3`, `.5`, `7.`).
++xl_parse_num(s: str) : f64! {
+    t = trim(s)
+    n = host.sys_str_len(t)
+    if n == 0 {
+        fail "xlsx: empty number"
+        return
+    }
+    neg = false
+    from = 0
+    if t[0] == "-" {
+        neg = true
+        from = 1
+    }
+    if t[0] == "+" { from = 1 }
+    mant = ""
+    expo = ""
+    in_exp = false
+    digits = 0
+    i = from
+    while i < n {
+        c = t[i]
+        if c == "e" || c == "E" {
+            if in_exp || digits == 0 {
+                fail "xlsx: bad number {s}"
+                return
+            }
+            in_exp = true
+        } else {
+            if in_exp {
+                after_e = t[i - 1] == "e" || t[i - 1] == "E"
+                signed = (c == "+" || c == "-") && after_e
+                if !is_digit(c) && !signed {
+                    fail "xlsx: bad number {s}"
+                    return
+                }
+                expo = "{expo}{c}"
+            } else {
+                if is_digit(c) {
+                    digits += 1
+                } else {
+                    if c != "." {
+                        fail "xlsx: bad number {s}"
+                        return
+                    }
+                }
+                mant = "{mant}{c}"
+            }
+        }
+        i += 1
+    }
+    if digits == 0 {
+        fail "xlsx: bad number {s}"
+        return
+    }
+    if mant[0] == "." { mant = "0{mant}" }
+    ml = host.sys_str_len(mant)
+    if mant[ml - 1] == "." { mant = "{mant}0" }
+    v = to_f64(mant) or err {
+        fail "xlsx: bad number {s}"
+        return
+    }
+    if in_exp {
+        if expo == "" || expo == "+" || expo == "-" {
+            fail "xlsx: bad number {s}"
+            return
+        }
+        sign = 1
+        digits_only = expo
+        if expo[0] == "-" {
+            sign = -1
+            digits_only = expo[1..host.sys_str_len(expo)]
+        }
+        if expo[0] == "+" { digits_only = expo[1..host.sys_str_len(expo)] }
+        k = to_i64(digits_only) or err {
+            fail "xlsx: bad number {s}"
+            return
+        }
+        scale = host.sys_pow(10.0, host.sys_to_float(k))
+        if sign > 0 { v = v * scale } else { v = v / scale }
+    }
+    if neg { v = -v }
+    v
+}
+
+// --- references ------------------------------------------------------------------------------------
+
+/// Column letters for a 0-based column (`0` → `A`, `25` → `Z`, `26` → `AA`).
++xl_col_name(col: i64) : str {
+    if col < 0 { return "" }
+    out = ""
+    n = col + 1
+    while n > 0 {
+        r = (n - 1) % 26
+        out = "{chr(65 + r)}{out}"
+        n = (n - 1) / 26
+    }
+    out
+}
+
+/// 0-based column of the letters `name` (`AB` → `27`), or `-1` when they are not letters.
++xl_col_index(name: str) : i64 {
+    n = host.sys_str_len(name)
+    if n == 0 { return -1 }
+    v = 0
+    i = 0
+    while i < n {
+        b = ord(name[i])
+        if b >= 97 && b <= 122 { b -= 32 }
+        if b < 65 || b > 90 { return -1 }
+        v = v * 26 + (b - 64)
+        i += 1
+    }
+    v - 1
+}
+
+/// `A1` reference of 0-based `row`, `col`.
++xl_ref(row: i64, col: i64) : str {
+    r = row + 1
+    "{xl_col_name(col)}{r}"
+}
+
+/// `[row, col]` (0-based) of an `A1` reference such as `AB12` (`$` anchors are ignored), or `[-1, -1]`.
++xl_parse_ref(ref: str) : _ {
+    n = host.sys_str_len(ref)
+    letters = ""
+    num = ""
+    seen_digit = false
+    i = 0
+    while i < n {
+        c = ref[i]
+        if c != "$" {
+            if is_digit(c) {
+                seen_digit = true
+                num = "{num}{c}"
+            } else {
+                if seen_digit { return [-1, -1] }
+                letters = "{letters}{c}"
+            }
+        }
+        i += 1
+    }
+    col = xl_col_index(letters)
+    if col < 0 || num == "" { return [-1, -1] }
+    row = (to_i64(num) or 0) - 1
+    if row < 0 { return [-1, -1] }
+    return [row, col]
+}
+
+/// True when `name` is a valid Excel sheet name (1-31 characters, none of `[]:*?/\`).
++xl_valid_sheet_name(name: str) : bool {
+    n = char_count(name)
+    if n < 1 || n > 31 { return false }
+    bad = "[]:*?/\\"
+    for 0..host.sys_str_len(name) {
+        if contains(bad, name[it]) { return false }
+    }
+    true
+}
+
+/// Copy of `arr` with entry `i` replaced by `v`.
++xl_replace(arr: _, i: i64, v: _) {
+    out = arr
+    out[i] = v
+    return out
+}
+
+// --- workbook model --------------------------------------------------------------------------------
+
+/// A named grid of cells; `rows[r][c]` is the cell at row `r`, column `c` (rows may be ragged).
++XlSheet = {
+    name: str = ""
+    rows: _ = []
+
+    /// Number of rows (including blank ones inside the used range).
+    height(self) : i64 => host.sys_arr_len(self.rows)
+
+    /// Length of the longest row.
+    width(self) : i64 {
+        w = 0
+        for self.rows {
+            n = host.sys_arr_len(it)
+            if n > w { w = n }
+        }
+        w
+    }
+
+    /// Cell at `row`, `col`; empty when outside the stored range.
+    get(self, row: i64, col: i64) : XlCell {
+        if row < 0 || row >= host.sys_arr_len(self.rows) { return xl_empty() }
+        line = self.rows[row]
+        if col < 0 || col >= host.sys_arr_len(line) { return xl_empty() }
+        item = line[col]
+        c: XlCell = item
+        c
+    }
+
+    /// Number of non-empty cells.
+    count(self) : i64 {
+        n = 0
+        for self.rows {
+            line = it
+            for line {
+                item = it
+                c: XlCell = item
+                if c.kind != XL_EMPTY { n += 1 }
+            }
+        }
+        n
+    }
+}
+
+/// A list of sheets.
++XlWorkbook = {
+    sheets: _ = []
+
+    /// Empty workbook.
+    new() : XlWorkbook => XlWorkbook.{sheets: []}
+
+    /// Number of sheets.
+    sheet_count(self) : i64 => host.sys_arr_len(self.sheets)
+
+    /// Index of the sheet called `name` (case-insensitive), or `-1`.
+    sheet_index(self, name: str) : i64 {
+        want = to_lower(name)
+        i = 0
+        for self.sheets {
+            item = it
+            sh: XlSheet = item
+            if to_lower(sh.name) == want { return i }
+            i += 1
+        }
+        -1
+    }
+
+    /// Sheet names in order.
+    sheet_names(self) {
+        out = []
+        for 0..self.sheet_count() {
+            sh = self.sheet(it)
+            out = host.sys_arr_push(out, sh.name)
+        }
+        return out
+    }
+
+    /// Sheet `i` (an unnamed empty sheet when out of range).
+    sheet(self, i: i64) : XlSheet {
+        if i < 0 || i >= host.sys_arr_len(self.sheets) { return XlSheet.{name: "", rows: []} }
+        item = self.sheets[i]
+        sh: XlSheet = item
+        sh
+    }
+
+    /// Cell `row`, `col` of sheet `i`; empty when anything is out of range.
+    cell(self, i: i64, row: i64, col: i64) : XlCell => self.sheet(i).get(row, col)
+
+    /// Append an empty sheet and return its index, or `-1` for an invalid or duplicate name.
+    add_sheet(@self, name: str) : i64 {
+        ensure xl_valid_sheet_name(name) else { return -1 }
+        ensure self.sheet_index(name) < 0 else { return -1 }
+        self.sheets = host.sys_arr_push(self.sheets, XlSheet.{name, rows: []})
+        host.sys_arr_len(self.sheets) - 1
+    }
+
+    /// Store `cell` at `row`, `col` of sheet `i`, growing the sheet; false when the position is out of range.
+    put(@self, i: i64, row: i64, col: i64, cell: XlCell) : bool {
+        ensure i >= 0 && i < host.sys_arr_len(self.sheets) && row >= 0 && col >= 0 && row < XL_MAX_ROWS && col < XL_MAX_COLS else {
+            return false
+        }
+        sh = self.sheet(i)
+        rows = sh.rows
+        while host.sys_arr_len(rows) <= row { rows = host.sys_arr_push(rows, []) }
+        line = rows[row]
+        while host.sys_arr_len(line) <= col { line = host.sys_arr_push(line, xl_empty()) }
+        line[col] = cell
+        rows[row] = line
+        self.sheets = xl_replace(self.sheets, i, XlSheet.{name: sh.name, rows})
+        true
+    }
+
+    /// Append a row of cells to sheet `i`; false when the sheet or width is out of range.
+    push_row(@self, i: i64, cells: _) : bool {
+        ensure i >= 0 && i < host.sys_arr_len(self.sheets) && host.sys_arr_len(cells) <= XL_MAX_COLS else { return false }
+        sh = self.sheet(i)
+        ensure host.sys_arr_len(sh.rows) < XL_MAX_ROWS else { return false }
+        self.sheets = xl_replace(self.sheets, i, XlSheet.{name: sh.name, rows: host.sys_arr_push(sh.rows, cells)})
+        true
+    }
+
+    /// The `.xlsx` file as bytes.
+    to_bytes(self) : _! => xlsx_write(self)
+}
+
+// --- writing ---------------------------------------------------------------------------------------
+
+/// Distinct strings in first-seen order (shared strings table); ids are dense from 0.
++XlStrings = {
+    map: _ = []
+    keys: _ = []
+    total: i64 = 0
+
+    /// Empty table.
+    new() : XlStrings => XlStrings.{map: HashMap.new(), keys: [], total: 0}
+
+    /// Id of `s`, inserting it when new; counts every use.
+    intern(@self, s: str) : i64 {
+        self.total += 1
+        probe = xl_hash(s)
+        while true {
+            m: HashMap = self.map
+            slot = m.get(probe) or -1
+            if slot < 0 {
+                id = host.sys_arr_len(self.keys)
+                @m.put(probe, id)
+                self.map = m
+                self.keys = host.sys_arr_push(self.keys, s)
+                return id
+            }
+            if self.keys[slot] == s { return slot }
+            probe += 1
+        }
+        -1
+    }
+}
+
+/// 31-bit polynomial string hash.
++xl_hash(s: str) : i64 {
+    h = 5381
+    n = host.sys_str_len(s)
+    i = 0
+    while i < n {
+        h = (h * 33 + host.sys_ord(s[i])) & 2147483647
+        i += 1
+    }
+    h
+}
+
+/// `s` without characters XML 1.0 cannot carry (controls other than tab, newline, carriage return).
++xl_clean(s: str) : str {
+    n = host.sys_str_len(s)
+    dirty = false
+    for 0..n {
+        b = host.sys_ord(s[it])
+        if b < 32 && b != 9 && b != 10 && b != 13 { dirty = true }
+    }
+    ensure dirty else { return s }
+    out = ""
+    i = 0
+    while i < n {
+        b = host.sys_ord(s[i])
+        if b >= 32 || b == 9 || b == 10 || b == 13 {
+            c = s[i]
+            out = "{out}{c}"
+        }
+        i += 1
+    }
+    out
+}
+
+/// XML of one worksheet; strings are interned into `st`.
++xl_sheet_xml(sh: XlSheet, @st: XlStrings) : str {
+    parts = []
+    r = 0
+    n = sh.height()
+    while r < n {
+        line = sh.rows[r]
+        cells = []
+        c = 0
+        w = host.sys_arr_len(line)
+        while c < w {
+            item = line[c]
+            cell: XlCell = item
+            ref = xl_ref(r, c)
+            piece = ""
+            if cell.kind == XL_NUM {
+                lt = cell.num < 1.0e308 && cell.num > -1.0e308
+                if lt { piece = "<c r=\"{ref}\"><v>{xl_num_text(cell.num)}</v></c>" }
+            }
+            if cell.kind == XL_STR {
+                id = @st.intern(xl_clean(cell.text))
+                piece = "<c r=\"{ref}\" t=\"s\"><v>{id}</v></c>"
+            }
+            if cell.kind == XL_BOOL {
+                bit = 0
+                if cell.flag { bit = 1 }
+                piece = "<c r=\"{ref}\" t=\"b\"><v>{bit}</v></c>"
+            }
+            if piece != "" { cells = host.sys_arr_push(cells, piece) }
+            c += 1
+        }
+        if host.sys_arr_len(cells) > 0 {
+            rn = r + 1
+            row_body = join(cells, "")
+            parts = host.sys_arr_push(parts, "<row r=\"{rn}\">{row_body}</row>")
+        }
+        r += 1
+    }
+    dim = "A1"
+    if sh.height() > 0 && sh.width() > 0 { dim = "A1:{xl_ref(sh.height() - 1, sh.width() - 1)}" }
+    body = join(parts, "")
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><dimension ref=\"{dim}\"/><sheetData>{body}</sheetData></worksheet>"
+}
+
+/// XML of the shared strings table.
++xl_strings_xml(st: XlStrings) : str {
+    parts = []
+    for st.keys {
+        parts = host.sys_arr_push(parts, "<si><t xml:space=\"preserve\">{xml_escape_text(it)}</t></si>")
+    }
+    body = join(parts, "")
+    refs = st.total
+    unique = host.sys_arr_len(st.keys)
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"{refs}\" uniqueCount=\"{unique}\">{body}</sst>"
+}
+
+/// Minimal valid `styles.xml`.
++xl_styles_xml() : str =>
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/></cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles></styleSheet>"
+
+/// `[Content_Types].xml` for `n` sheets.
++xl_content_types_xml(n: i64) : str {
+    parts = []
+    for 0..n {
+        k = it + 1
+        parts = host.sys_arr_push(parts, "<Override PartName=\"/xl/worksheets/sheet{k}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>")
+    }
+    sheets = join(parts, "")
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>{sheets}<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/><Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/></Types>"
+}
+
+/// `_rels/.rels`.
++xl_root_rels_xml() : str =>
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
+
+/// `xl/workbook.xml` listing the sheets.
++xl_workbook_xml(names: _) : str {
+    parts = []
+    for names {
+        k = index + 1
+        parts = host.sys_arr_push(parts, "<sheet name=\"{xml_escape_attr(it)}\" sheetId=\"{k}\" r:id=\"rId{k}\"/>")
+    }
+    sheets = join(parts, "")
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>{sheets}</sheets></workbook>"
+}
+
+/// `xl/_rels/workbook.xml.rels` for `n` sheets (styles and shared strings follow the sheets).
++xl_workbook_rels_xml(n: i64) : str {
+    parts = []
+    for 0..n {
+        k = it + 1
+        parts = host.sys_arr_push(parts, "<Relationship Id=\"rId{k}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{k}.xml\"/>")
+    }
+    sheets = join(parts, "")
+    a = n + 1
+    b = n + 2
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{sheets}<Relationship Id=\"rId{a}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/><Relationship Id=\"rId{b}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/></Relationships>"
+}
+
+/// Serialize a workbook as a stored zip (`.xlsx`). Fails when the workbook has no sheet (Excel rejects such files).
++xlsx_write(wb: XlWorkbook) : _! {
+    n = wb.sheet_count()
+    if n == 0 {
+        fail "xlsx: a workbook needs at least one sheet"
+        return
+    }
+    st = XlStrings.new()
+    sheet_xml = []
+    for wb.sheets {
+        item = it
+        sh: XlSheet = item
+        sheet_xml = host.sys_arr_push(sheet_xml, xl_sheet_xml(sh, @st))
+    }
+    z = ZipWriter.new()
+    t = ar_dos_time(0, 0, 0)
+    d = ar_dos_date(1980, 1, 1)
+    @z.add("[Content_Types].xml", host.sys_str_to_bytes(xl_content_types_xml(n)), t, d) or err {
+        fail "xlsx: {err}"
+        return
+    }
+    @z.add("_rels/.rels", host.sys_str_to_bytes(xl_root_rels_xml()), t, d) or err {
+        fail "xlsx: {err}"
+        return
+    }
+    @z.add("xl/workbook.xml", host.sys_str_to_bytes(xl_workbook_xml(wb.sheet_names())), t, d) or err {
+        fail "xlsx: {err}"
+        return
+    }
+    @z.add("xl/_rels/workbook.xml.rels", host.sys_str_to_bytes(xl_workbook_rels_xml(n)), t, d) or err {
+        fail "xlsx: {err}"
+        return
+    }
+    @z.add("xl/styles.xml", host.sys_str_to_bytes(xl_styles_xml()), t, d) or err {
+        fail "xlsx: {err}"
+        return
+    }
+    @z.add("xl/sharedStrings.xml", host.sys_str_to_bytes(xl_strings_xml(st)), t, d) or err {
+        fail "xlsx: {err}"
+        return
+    }
+    for sheet_xml {
+        k = index + 1
+        @z.add("xl/worksheets/sheet{k}.xml", host.sys_str_to_bytes(it), t, d) or err {
+            fail "xlsx: {err}"
+            return
+        }
+    }
+    z.finish()
+}
+
+/// Write `wb` to the file `path`.
++xlsx_write_file(path: str, wb: XlWorkbook) : bool! {
+    bytes = xlsx_write(wb) or err {
+        fail "{err}"
+        return
+    }
+    fs_write_bytes(path, bytes) or err {
+        fail "{err}"
+        return
+    }
+    true
+}
+
+// --- DEFLATE (RFC 1951) ------------------------------------------------------------------------------
+
+/// Base match lengths for length symbols 257..285.
++XL_LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+/// Extra bits for length symbols 257..285.
++XL_LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+/// Base distances for distance symbols 0..29.
++XL_DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+/// Extra bits for distance symbols 0..29.
++XL_DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+/// Order in which code-length code lengths are stored in a dynamic block header.
++XL_CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
+/// Canonical Huffman decoding table: `counts[len]` codes of each length and `symbols` sorted by code.
++XlHuff = {
+    counts: _ = []
+    symbols: _ = []
+}
+
+/// Table for the code lengths `lens[0..n]` (0 = unused symbol). Over-subscribed sets give `ok == false`.
++xl_huff(lens: _, n: i64) : XlHuff {
+    counts = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for 0..n { counts[lens[it]] += 1 }
+    offs = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for 1..15 { offs[it + 1] = offs[it] + counts[it] }
+    symbols = []
+    for 0..n { symbols = host.sys_arr_push(symbols, 0) }
+    for 0..n {
+        l = lens[it]
+        if l != 0 {
+            symbols[offs[l]] = it
+            offs[l] += 1
+        }
+    }
+    XlHuff.{counts, symbols}
+}
+
+/// True when the code lengths do not over-subscribe the code space.
++xl_huff_valid(h: XlHuff) : bool {
+    left = 1
+    for 1..16 {
+        left = left * 2 - h.counts[it]
+        if left < 0 { return false }
+    }
+    true
+}
+
+/// Bit-level state for one DEFLATE stream.
++XlInflater = {
+    src: _ = []
+    pos: i64 = 0
+    end: i64 = 0
+    bitbuf: i64 = 0
+    bitcnt: i64 = 0
+    out: _ = []
+    bad: bool = false
+
+    /// Next `need` bits (LSB first); sets `bad` and returns 0 on running out of input.
+    bits(@self, need: i64) : i64 {
+        while self.bitcnt < need {
+            if self.pos >= self.end {
+                self.bad = true
+                return 0
+            }
+            self.bitbuf = self.bitbuf | (self.src[self.pos] << self.bitcnt)
+            self.pos += 1
+            self.bitcnt += 8
+        }
+        v = self.bitbuf & ((1 << need) - 1)
+        self.bitbuf = self.bitbuf >> need
+        self.bitcnt -= need
+        v
+    }
+
+    /// Decode one symbol with `h`, or `-1` on an invalid code or truncated input.
+    decode(@self, h: XlHuff) : i64 {
+        code = 0
+        first = 0
+        base = 0
+        width = 1
+        while width <= 15 {
+            code = code | @self.bits(1)
+            if self.bad { return -1 }
+            num = h.counts[width]
+            if code - num < first { return h.symbols[base + (code - first)] }
+            base += num
+            first += num
+            first = first << 1
+            code = code << 1
+            width += 1
+        }
+        -1
+    }
+
+    /// Stored block: byte-align, `LEN`, `NLEN`, then raw bytes. False on corrupt input.
+    stored(@self) : bool {
+        self.bitbuf = 0
+        self.bitcnt = 0
+        if self.pos + 4 > self.end { return false }
+        n = self.src[self.pos] + self.src[self.pos + 1] * 256
+        inv = self.src[self.pos + 2] + self.src[self.pos + 3] * 256
+        if n != (65535 - inv) { return false }
+        self.pos += 4
+        if self.pos + n > self.end { return false }
+        out = self.out
+        for 0..n { out = host.sys_arr_push(out, self.src[self.pos + it]) }
+        self.out = out
+        self.pos += n
+        true
+    }
+
+    /// Compressed block body using `lit` / `dist` tables. False on corrupt input.
+    codes(@self, lit: XlHuff, dist: XlHuff) : bool {
+        out = self.out
+        while true {
+            sym = @self.decode(lit)
+            if sym < 0 { return false }
+            if sym < 256 {
+                out = host.sys_arr_push(out, sym)
+            } else {
+                if sym == 256 {
+                    self.out = out
+                    return true
+                }
+                sym -= 257
+                if sym >= 29 { return false }
+                length = XL_LEN_BASE[sym] + @self.bits(XL_LEN_EXTRA[sym])
+                ds = @self.decode(dist)
+                if ds < 0 || ds >= 30 { return false }
+                d = XL_DIST_BASE[ds] + @self.bits(XL_DIST_EXTRA[ds])
+                if self.bad { return false }
+                size = host.sys_arr_len(out)
+                if d > size { return false }
+                from = size - d
+                for 0..length { out = host.sys_arr_push(out, out[from + it]) }
+            }
+        }
+        false
+    }
+
+    /// Dynamic block: read the code-length tables, then the body. False on corrupt input.
+    dynamic(@self) : bool {
+        nlen = 257 + @self.bits(5)
+        ndist = 1 + @self.bits(5)
+        ncode = 4 + @self.bits(4)
+        if self.bad || nlen > 286 || ndist > 30 { return false }
+        lens = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        for 0..ncode { lens[XL_CL_ORDER[it]] = @self.bits(3) }
+        if self.bad { return false }
+        cl = xl_huff(lens, 19)
+        if !xl_huff_valid(cl) { return false }
+        lengths = []
+        total = nlen + ndist
+        while host.sys_arr_len(lengths) < total {
+            sym = @self.decode(cl)
+            if sym < 0 { return false }
+            if sym < 16 {
+                lengths = host.sys_arr_push(lengths, sym)
+            } else {
+                rep = 0
+                val = 0
+                if sym == 16 {
+                    if host.sys_arr_len(lengths) == 0 { return false }
+                    val = lengths[host.sys_arr_len(lengths) - 1]
+                    rep = 3 + @self.bits(2)
+                }
+                if sym == 17 { rep = 3 + @self.bits(3) }
+                if sym == 18 { rep = 11 + @self.bits(7) }
+                if self.bad || host.sys_arr_len(lengths) + rep > total { return false }
+                for 0..rep { lengths = host.sys_arr_push(lengths, val) }
+            }
+        }
+        ll = []
+        dl = []
+        for 0..nlen { ll = host.sys_arr_push(ll, lengths[it]) }
+        for 0..ndist { dl = host.sys_arr_push(dl, lengths[nlen + it]) }
+        if ll[256] == 0 { return false }
+        lit = xl_huff(ll, nlen)
+        dist = xl_huff(dl, ndist)
+        if !xl_huff_valid(lit) || !xl_huff_valid(dist) { return false }
+        @self.codes(lit, dist)
+    }
+
+    /// Fixed-Huffman block. False on corrupt input.
+    fixed(@self) : bool {
+        ll = []
+        for 0..288 {
+            l = 8
+            if it >= 144 && it < 256 { l = 9 }
+            if it >= 256 && it < 280 { l = 7 }
+            ll = host.sys_arr_push(ll, l)
+        }
+        dl = []
+        for 0..30 { dl = host.sys_arr_push(dl, 5) }
+        @self.codes(xl_huff(ll, 288), xl_huff(dl, 30))
+    }
+}
+
+/// Inflate the raw DEFLATE stream in `data[start .. start + nbytes]`. Returns the bytes, or fails on corrupt data.
++xl_inflate(data: _, start: i64, nbytes: i64) : _! {
+    if start < 0 || nbytes < 0 || start + nbytes > host.sys_arr_len(data) {
+        fail "inflate: range outside the data"
+        return
+    }
+    inf = XlInflater.{src: data, pos: start, end: start + nbytes, bitbuf: 0, bitcnt: 0, out: [], bad: false}
+    last = false
+    while !last {
+        final_bit = @inf.bits(1)
+        last = final_bit == 1
+        kind = @inf.bits(2)
+        if inf.bad {
+            fail "inflate: truncated stream"
+            return
+        }
+        ok = false
+        if kind == 0 { ok = @inf.stored() }
+        if kind == 1 { ok = @inf.fixed() }
+        if kind == 2 { ok = @inf.dynamic() }
+        if !ok {
+            fail "inflate: corrupt block"
+            return
+        }
+    }
+    inf.out
+}
+
+// --- reading ---------------------------------------------------------------------------------------
+
+/// Members listed in the zip central directory (stored or deflated), with `data_off` pointing at their bytes.
++xl_zip_entries(b: _) : _! {
+    n = host.sys_arr_len(b)
+    if n < 22 {
+        fail "xlsx: not a zip file"
+        return
+    }
+    at = n - 22
+    low = n - 22 - 65535
+    if low < 0 { low = 0 }
+    while at >= low && ar_get_u32(b, at) != AR_ZIP_EOCD_SIG { at -= 1 }
+    if at < low {
+        fail "xlsx: zip end record not found"
+        return
+    }
+    entries_n = ar_get_u16(b, at + 10)
+    pos = ar_get_u32(b, at + 16)
+    out = []
+    for 0..entries_n {
+        if pos + 46 > n || ar_get_u32(b, pos) != AR_ZIP_CENTRAL_SIG {
+            fail "xlsx: corrupt central directory"
+            return
+        }
+        nlen = ar_get_u16(b, pos + 28)
+        xlen = ar_get_u16(b, pos + 30)
+        clen = ar_get_u16(b, pos + 32)
+        lho = ar_get_u32(b, pos + 42)
+        if pos + 46 + nlen > n || lho + 30 > n || ar_get_u32(b, lho) != AR_ZIP_LOCAL_SIG {
+            fail "xlsx: corrupt zip member header"
+            return
+        }
+        lname = ar_get_u16(b, lho + 26)
+        lextra = ar_get_u16(b, lho + 28)
+        e = ZipEntry.{
+            name: host.sys_bytes_to_str(ar_slice(b, pos + 46, nlen)),
+            method: ar_get_u16(b, pos + 10),
+            flags: ar_get_u16(b, pos + 8),
+            crc: ar_get_u32(b, pos + 16),
+            comp_size: ar_get_u32(b, pos + 20),
+            size: ar_get_u32(b, pos + 24),
+            dos_time: ar_get_u16(b, pos + 12),
+            dos_date: ar_get_u16(b, pos + 14),
+            offset: lho,
+            data_off: lho + 30 + lname + lextra,
+        }
+        if e.data_off + e.comp_size > n {
+            fail "xlsx: zip member runs past the end of the file"
+            return
+        }
+        out = host.sys_arr_push(out, e)
+        pos = pos + 46 + nlen + xlen + clen
+    }
+    out
+}
+
+/// Uncompressed bytes of member `e` (CRC-32 verified), or fail.
++xl_member_bytes(b: _, e: ZipEntry) : _! {
+    data = []
+    if e.method == 0 {
+        data = ar_zip_data(b, e)
+    } else {
+        if e.method == 8 {
+            data = xl_inflate(b, e.data_off, e.comp_size) or err {
+                fail "xlsx: {e.name}: {err}"
+                return
+            }
+        } else {
+            fail "xlsx: {e.name}: unsupported compression method {e.method}"
+            return
+        }
+    }
+    if host.sys_arr_len(data) != e.size || ar_crc32(data) != e.crc {
+        fail "xlsx: {e.name}: checksum mismatch"
+        return
+    }
+    data
+}
+
+/// Text of the member called `name` (matched exactly), or fail.
++xl_member_text(b: _, entries: _, name: str) : str! {
+    for entries {
+        item = it
+        e: ZipEntry = item
+        if e.name == name {
+            data = xl_member_bytes(b, e) or err {
+                fail "{err}"
+                return
+            }
+            return host.sys_bytes_to_str(data)
+        }
+    }
+    fail "xlsx: missing member {name}"
+    return
+}
+
+/// True when a member called `name` exists.
++xl_has_member(entries: _, name: str) : bool {
+    for entries {
+        item = it
+        e: ZipEntry = item
+        if e.name == name { return true }
+    }
+    false
+}
+
+/// The shared strings of an `sst` document (rich-text runs are concatenated, phonetic runs ignored).
++xl_read_strings(xml: str) : _! {
+    r = XmlReader.new(xml)
+    out = []
+    in_si = false
+    in_t = false
+    in_rph = false
+    cur = ""
+    going = true
+    while going {
+        t = @r.pull() or err {
+            fail "xlsx: sharedStrings: {err}"
+            return
+        }
+        if t.kind == XML_EOF { going = false }
+        if t.kind == XML_START {
+            if t.name == "si" {
+                in_si = true
+                cur = ""
+            }
+            if t.name == "rPh" { in_rph = true }
+            if t.name == "t" && in_si && !in_rph { in_t = true }
+        }
+        if t.kind == XML_END {
+            if t.name == "t" { in_t = false }
+            if t.name == "rPh" { in_rph = false }
+            if t.name == "si" {
+                in_si = false
+                out = host.sys_arr_push(out, cur)
+            }
+        }
+        if (t.kind == XML_TEXT || t.kind == XML_CDATA) && in_t { cur = "{cur}{t.text}" }
+    }
+    out
+}
+
+/// Cell for the raw pieces of a `<c>` element (`ctype` = its `t` attribute).
++xl_resolve_cell(ctype: str, v: str, inline: str, strings: _) : XlCell {
+    if ctype == "s" {
+        id = to_i64(trim(v)) or -1
+        if id >= 0 && id < host.sys_arr_len(strings) { return xl_text(strings[id]) }
+        return xl_empty()
+    }
+    if ctype == "b" {
+        s = trim(v)
+        return xl_bool(s == "1" || s == "true")
+    }
+    if ctype == "inlineStr" { return xl_text(inline) }
+    if ctype == "str" || ctype == "e" || ctype == "d" { return xl_text(v) }
+    if trim(v) == "" { return xl_empty() }
+    num = xl_parse_num(v) or err { return xl_text(v) }
+    xl_num(num)
+}
+
+/// Parse a worksheet document into a sheet called `name`.
++xl_read_sheet(name: str, xml: str, strings: _) : XlSheet! {
+    r = XmlReader.new(xml)
+    rows = []
+    cells = []
+    in_row = false
+    in_c = false
+    in_v = false
+    in_is = false
+    in_t = false
+    in_rph = false
+    c_ref = ""
+    c_type = ""
+    c_v = ""
+    c_is = ""
+    next_col = 0
+    going = true
+    while going {
+        t = @r.pull() or err {
+            fail "xlsx: {name}: {err}"
+            return
+        }
+        if t.kind == XML_EOF { going = false }
+        if t.kind == XML_START {
+            if t.name == "row" {
+                target = host.sys_arr_len(rows)
+                declared = (to_i64(t.attr("r") or "0") or 0) - 1
+                if declared > target { target = declared }
+                if target >= XL_MAX_ROWS {
+                    fail "xlsx: {name}: row index out of range"
+                    return
+                }
+                while host.sys_arr_len(rows) < target { rows = host.sys_arr_push(rows, []) }
+                cells = []
+                in_row = true
+                next_col = 0
+            }
+            if t.name == "c" && in_row {
+                in_c = true
+                c_ref = t.attr("r") or ""
+                c_type = t.attr("t") or ""
+                c_v = ""
+                c_is = ""
+            }
+            if t.name == "v" && in_c { in_v = true }
+            if t.name == "is" && in_c { in_is = true }
+            if t.name == "rPh" { in_rph = true }
+            if t.name == "t" && in_is && !in_rph { in_t = true }
+        }
+        if t.kind == XML_END {
+            if t.name == "v" { in_v = false }
+            if t.name == "t" { in_t = false }
+            if t.name == "rPh" { in_rph = false }
+            if t.name == "is" { in_is = false }
+            if t.name == "c" && in_c {
+                in_c = false
+                col = next_col
+                if c_ref != "" {
+                    pr = xl_parse_ref(c_ref)
+                    if pr[1] >= 0 { col = pr[1] }
+                }
+                if col >= XL_MAX_COLS {
+                    fail "xlsx: {name}: column index out of range"
+                    return
+                }
+                cell = xl_resolve_cell(c_type, c_v, c_is, strings)
+                while host.sys_arr_len(cells) <= col { cells = host.sys_arr_push(cells, xl_empty()) }
+                cells[col] = cell
+                next_col = col + 1
+            }
+            if t.name == "row" && in_row {
+                in_row = false
+                rows = host.sys_arr_push(rows, cells)
+                cells = []
+            }
+        }
+        if t.kind == XML_TEXT || t.kind == XML_CDATA {
+            if in_v { c_v = "{c_v}{t.text}" }
+            if in_t { c_is = "{c_is}{t.text}" }
+        }
+    }
+    XlSheet.{name, rows}
+}
+
+/// Resolve a relationship target to a zip member path.
++xl_target_path(target: str) : str {
+    if starts_with(target, "/") { return strip_prefix(target, "/") }
+    "xl/{target}"
+}
+
+/// Read an `.xlsx` file image. Fails on a damaged zip, missing parts, or malformed XML.
++xlsx_read(b: _) : XlWorkbook! {
+    entries = xl_zip_entries(b) or err {
+        fail "{err}"
+        return
+    }
+    wbxml = xl_member_text(b, entries, "xl/workbook.xml") or err {
+        fail "{err}"
+        return
+    }
+    strings = []
+    if xl_has_member(entries, "xl/sharedStrings.xml") {
+        sst = xl_member_text(b, entries, "xl/sharedStrings.xml") or err {
+            fail "{err}"
+            return
+        }
+        strings = xl_read_strings(sst) or err {
+            fail "{err}"
+            return
+        }
+    }
+    rel_ids = []
+    rel_targets = []
+    if xl_has_member(entries, "xl/_rels/workbook.xml.rels") {
+        rels = xl_member_text(b, entries, "xl/_rels/workbook.xml.rels") or err {
+            fail "{err}"
+            return
+        }
+        rr = XmlReader.new(rels)
+        going = true
+        while going {
+            t = @rr.pull() or err {
+                fail "xlsx: workbook rels: {err}"
+                return
+            }
+            if t.kind == XML_EOF { going = false }
+            if t.kind == XML_START && t.name == "Relationship" {
+                rel_ids = host.sys_arr_push(rel_ids, t.attr("Id") or "")
+                rel_targets = host.sys_arr_push(rel_targets, t.attr("Target") or "")
+            }
+        }
+    }
+    wb = XlWorkbook.new()
+    wr = XmlReader.new(wbxml)
+    going = true
+    k = 0
+    while going {
+        t = @wr.pull() or err {
+            fail "xlsx: workbook: {err}"
+            return
+        }
+        if t.kind == XML_EOF { going = false }
+        if t.kind == XML_START && t.name == "sheet" {
+            k += 1
+            name = t.attr("name") or "Sheet{k}"
+            rid = t.attr("r:id") or ""
+            path = "xl/worksheets/sheet{k}.xml"
+            for 0..host.sys_arr_len(rel_ids) {
+                if rel_ids[it] == rid && rid != "" { path = xl_target_path(rel_targets[it]) }
+            }
+            xml = xl_member_text(b, entries, path) or err {
+                fail "{err}"
+                return
+            }
+            sheet = xl_read_sheet(name, xml, strings) or err {
+                fail "{err}"
+                return
+            }
+            wb.sheets = host.sys_arr_push(wb.sheets, sheet)
+        }
+    }
+    if wb.sheet_count() == 0 {
+        fail "xlsx: workbook has no sheets"
+        return
+    }
+    wb
+}
+
+/// Read the `.xlsx` file at `path`.
++xlsx_read_file(path: str) : XlWorkbook! {
+    raw = fs_read_bytes(path) or err {
+        fail "{err}"
+        return
+    }
+    bytes = host.sys_io_bytes_to_array(raw)
+    xlsx_read(bytes) or err {
+        fail "{err}"
+        return
+    }
+}
+
+// --- tests ------------------------------------------------------------------------------------------
+
+xl_foreign() : _ => [80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 134, 126, 254, 158, 155, 0, 0, 0, 195, 0, 0, 0, 19, 0, 0, 0, 91, 67, 111, 110, 116, 101, 110, 116, 95, 84, 121, 112, 101, 115, 93, 46, 120, 109, 108, 37, 142, 75, 14, 194, 48, 12, 5, 175, 18, 121, 79, 83, 88, 32, 132, 146, 118, 193, 231, 4, 229, 0, 86, 234, 126, 68, 226, 68, 141, 65, 233, 237, 81, 233, 122, 158, 230, 141, 105, 75, 240, 234, 75, 75, 158, 35, 91, 56, 86, 53, 40, 98, 23, 251, 153, 71, 11, 175, 238, 121, 184, 128, 202, 130, 220, 163, 143, 76, 22, 86, 202, 208, 54, 166, 91, 19, 101, 85, 130, 231, 108, 97, 18, 73, 87, 173, 179, 155, 40, 96, 174, 98, 34, 46, 193, 15, 113, 9, 40, 185, 138, 203, 168, 19, 186, 55, 142, 164, 79, 117, 125, 214, 46, 178, 16, 203, 65, 54, 7, 52, 230, 78, 3, 126, 188, 168, 71, 17, 226, 189, 163, 4, 15, 234, 182, 239, 182, 43, 11, 152, 146, 159, 29, 202, 28, 89, 111, 84, 55, 70, 255, 35, 154, 31, 80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 167, 124, 1, 158, 219, 0, 0, 0, 97, 1, 0, 0, 15, 0, 0, 0, 120, 108, 47, 119, 111, 114, 107, 98, 111, 111, 107, 46, 120, 109, 108, 141, 144, 177, 78, 195, 48, 16, 134, 95, 197, 186, 129, 141, 56, 237, 80, 170, 16, 167, 75, 133, 212, 129, 9, 120, 128, 35, 190, 52, 86, 237, 187, 200, 231, 66, 120, 123, 68, 74, 165, 178, 49, 221, 240, 223, 247, 253, 210, 223, 238, 230, 20, 205, 7, 101, 13, 194, 14, 86, 85, 13, 134, 184, 23, 31, 248, 232, 224, 237, 245, 233, 126, 11, 70, 11, 178, 199, 40, 76, 14, 190, 72, 97, 215, 181, 159, 146, 79, 239, 34, 39, 51, 167, 200, 234, 96, 44, 101, 106, 172, 213, 126, 164, 132, 90, 201, 68, 60, 167, 56, 72, 78, 88, 180, 146, 124, 180, 58, 101, 66, 175, 35, 81, 73, 209, 174, 235, 122, 99, 19, 6, 134, 139, 161, 201, 255, 113, 200, 48, 132, 158, 246, 210, 159, 19, 113, 185, 72, 50, 69, 44, 65, 88, 199, 48, 41, 116, 237, 210, 160, 191, 215, 48, 38, 114, 176, 199, 130, 230, 14, 211, 244, 104, 158, 37, 19, 152, 37, 60, 120, 7, 43, 48, 185, 9, 222, 65, 62, 248, 7, 176, 127, 177, 23, 234, 133, 253, 205, 247, 122, 217, 162, 144, 131, 49, 120, 79, 124, 3, 111, 127, 96, 123, 45, 183, 215, 125, 186, 111, 80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 110, 56, 111, 61, 178, 0, 0, 0, 48, 1, 0, 0, 26, 0, 0, 0, 120, 108, 47, 95, 114, 101, 108, 115, 47, 119, 111, 114, 107, 98, 111, 111, 107, 46, 120, 109, 108, 46, 114, 101, 108, 115, 125, 207, 77, 106, 195, 48, 16, 64, 225, 171, 136, 217, 199, 227, 100, 209, 134, 16, 197, 187, 64, 182, 197, 61, 192, 96, 77, 108, 19, 73, 35, 52, 67, 163, 220, 190, 171, 254, 4, 74, 183, 111, 241, 193, 59, 14, 45, 69, 247, 193, 85, 87, 201, 30, 182, 93, 15, 142, 243, 36, 97, 205, 179, 135, 247, 241, 188, 217, 131, 83, 163, 28, 40, 74, 102, 15, 15, 86, 24, 78, 199, 55, 142, 100, 171, 100, 93, 214, 162, 174, 165, 152, 213, 195, 98, 86, 14, 136, 58, 45, 156, 72, 59, 41, 156, 91, 138, 87, 169, 137, 76, 59, 169, 51, 22, 154, 110, 52, 51, 238, 250, 254, 5, 235, 111, 3, 158, 77, 119, 9, 30, 234, 37, 188, 130, 27, 31, 133, 61, 52, 188, 75, 189, 233, 194, 108, 224, 70, 170, 51, 155, 135, 239, 164, 24, 200, 168, 107, 41, 2, 254, 13, 237, 255, 133, 176, 197, 159, 172, 104, 119, 249, 178, 240, 233, 244, 244, 9, 80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 193, 217, 103, 101, 242, 0, 0, 0, 102, 1, 0, 0, 20, 0, 0, 0, 120, 108, 47, 115, 104, 97, 114, 101, 100, 83, 116, 114, 105, 110, 103, 115, 46, 120, 109, 108, 117, 143, 203, 78, 195, 64, 12, 69, 127, 197, 242, 130, 29, 153, 20, 16, 66, 101, 102, 186, 168, 64, 176, 41, 17, 42, 31, 48, 73, 220, 38, 82, 230, 193, 216, 169, 194, 223, 163, 164, 89, 176, 97, 97, 201, 87, 190, 58, 58, 214, 187, 201, 15, 112, 161, 204, 125, 12, 6, 55, 69, 137, 64, 161, 137, 109, 31, 206, 6, 191, 142, 175, 183, 79, 8, 44, 46, 180, 110, 136, 129, 12, 254, 16, 227, 206, 106, 102, 129, 201, 15, 129, 13, 118, 34, 105, 171, 20, 55, 29, 121, 199, 69, 76, 20, 38, 63, 156, 98, 246, 78, 184, 136, 249, 172, 56, 101, 114, 45, 119, 68, 226, 7, 117, 87, 150, 143, 202, 187, 62, 32, 52, 113, 12, 98, 240, 1, 97, 12, 253, 247, 72, 251, 107, 190, 71, 171, 185, 183, 90, 236, 193, 121, 210, 74, 172, 86, 115, 158, 39, 91, 157, 171, 108, 117, 173, 172, 86, 203, 38, 246, 179, 111, 58, 184, 214, 230, 179, 213, 139, 219, 150, 147, 107, 200, 96, 202, 196, 148, 47, 132, 86, 104, 18, 184, 113, 62, 61, 131, 143, 121, 5, 47, 192, 14, 184, 54, 56, 255, 94, 27, 220, 224, 12, 173, 222, 62, 14, 47, 199, 247, 253, 218, 170, 186, 63, 18, 255, 240, 1, 146, 107, 91, 106, 97, 149, 153, 171, 138, 89, 236, 47, 80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 63, 171, 197, 73, 77, 1, 0, 0, 151, 2, 0, 0, 22, 0, 0, 0, 120, 108, 47, 119, 111, 114, 107, 115, 104, 101, 101, 116, 115, 47, 100, 97, 116, 97, 46, 120, 109, 108, 109, 82, 203, 110, 131, 48, 16, 252, 21, 119, 43, 245, 82, 5, 243, 8, 121, 213, 56, 74, 155, 180, 233, 185, 143, 187, 11, 38, 65, 197, 54, 178, 45, 66, 254, 190, 50, 68, 8, 80, 111, 171, 157, 217, 153, 157, 181, 201, 182, 17, 37, 170, 185, 54, 133, 146, 9, 4, 158, 15, 136, 203, 84, 101, 133, 60, 37, 240, 245, 249, 58, 91, 1, 50, 150, 201, 140, 149, 74, 242, 4, 174, 220, 192, 150, 146, 139, 210, 191, 230, 204, 185, 69, 141, 40, 165, 73, 224, 108, 109, 181, 193, 216, 164, 103, 46, 152, 241, 84, 197, 101, 35, 202, 92, 105, 193, 172, 241, 148, 62, 97, 83, 105, 206, 178, 118, 72, 148, 56, 244, 253, 5, 22, 172, 144, 64, 73, 86, 8, 46, 221, 2, 72, 243, 60, 129, 93, 176, 57, 198, 128, 41, 105, 185, 123, 102, 25, 37, 90, 93, 144, 78, 32, 0, 74, 82, 87, 236, 2, 64, 54, 1, 3, 148, 212, 212, 39, 184, 166, 4, 167, 55, 236, 121, 136, 5, 99, 236, 101, 136, 133, 61, 134, 181, 186, 244, 38, 81, 111, 226, 170, 154, 6, 94, 124, 152, 69, 19, 29, 7, 229, 116, 23, 61, 6, 4, 231, 142, 53, 15, 199, 140, 125, 212, 58, 253, 252, 183, 197, 161, 195, 140, 213, 173, 10, 52, 240, 192, 68, 245, 4, 87, 184, 137, 53, 215, 241, 192, 107, 55, 192, 91, 177, 251, 253, 251, 55, 246, 239, 198, 140, 183, 142, 81, 200, 178, 144, 252, 163, 21, 46, 12, 37, 150, 118, 29, 130, 45, 37, 216, 117, 250, 137, 99, 4, 200, 36, 48, 119, 151, 30, 229, 143, 93, 126, 103, 52, 91, 14, 60, 250, 44, 147, 107, 239, 29, 189, 166, 65, 24, 205, 227, 197, 114, 181, 246, 167, 89, 227, 193, 197, 215, 235, 201, 201, 241, 224, 141, 113, 255, 169, 232, 31, 80, 75, 3, 4, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 157, 241, 66, 90, 170, 0, 0, 0, 233, 0, 0, 0, 21, 0, 0, 0, 120, 108, 47, 119, 111, 114, 107, 115, 104, 101, 101, 116, 115, 47, 116, 119, 111, 46, 120, 109, 108, 77, 142, 81, 106, 195, 48, 16, 68, 175, 34, 246, 191, 94, 217, 144, 80, 138, 36, 147, 16, 114, 130, 244, 0, 194, 222, 198, 166, 146, 214, 104, 133, 237, 220, 190, 216, 13, 33, 127, 143, 55, 204, 48, 166, 93, 99, 80, 51, 101, 25, 57, 89, 168, 43, 13, 138, 82, 199, 253, 152, 238, 22, 190, 111, 215, 143, 79, 80, 82, 124, 234, 125, 224, 68, 22, 30, 36, 208, 58, 179, 112, 254, 149, 129, 168, 168, 53, 134, 36, 22, 134, 82, 166, 47, 68, 233, 6, 138, 94, 42, 158, 40, 173, 49, 252, 112, 142, 190, 72, 197, 249, 142, 50, 101, 242, 253, 94, 138, 1, 27, 173, 143, 24, 253, 152, 192, 153, 221, 93, 124, 241, 206, 100, 94, 84, 182, 80, 131, 51, 221, 6, 167, 141, 102, 87, 107, 131, 179, 51, 216, 61, 245, 249, 95, 55, 186, 106, 14, 175, 4, 51, 47, 206, 224, 219, 26, 190, 110, 186, 63, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 134, 126, 254, 158, 155, 0, 0, 0, 195, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 0, 0, 91, 67, 111, 110, 116, 101, 110, 116, 95, 84, 121, 112, 101, 115, 93, 46, 120, 109, 108, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 167, 124, 1, 158, 219, 0, 0, 0, 97, 1, 0, 0, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 204, 0, 0, 0, 120, 108, 47, 119, 111, 114, 107, 98, 111, 111, 107, 46, 120, 109, 108, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 110, 56, 111, 61, 178, 0, 0, 0, 48, 1, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 212, 1, 0, 0, 120, 108, 47, 95, 114, 101, 108, 115, 47, 119, 111, 114, 107, 98, 111, 111, 107, 46, 120, 109, 108, 46, 114, 101, 108, 115, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 193, 217, 103, 101, 242, 0, 0, 0, 102, 1, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 190, 2, 0, 0, 120, 108, 47, 115, 104, 97, 114, 101, 100, 83, 116, 114, 105, 110, 103, 115, 46, 120, 109, 108, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 63, 171, 197, 73, 77, 1, 0, 0, 151, 2, 0, 0, 22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 226, 3, 0, 0, 120, 108, 47, 119, 111, 114, 107, 115, 104, 101, 101, 116, 115, 47, 100, 97, 116, 97, 46, 120, 109, 108, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 8, 0, 181, 139, 120, 93, 157, 241, 66, 90, 170, 0, 0, 0, 233, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 99, 5, 0, 0, 120, 108, 47, 119, 111, 114, 107, 115, 104, 101, 101, 116, 115, 47, 116, 119, 111, 46, 120, 109, 108, 80, 75, 5, 6, 0, 0, 0, 0, 6, 0, 6, 0, 143, 1, 0, 0, 64, 6, 0, 0, 0, 0]
+
+test "column names and references" {
+    assert_eq(xl_col_name(0), "A")
+    assert_eq(xl_col_name(25), "Z")
+    assert_eq(xl_col_name(26), "AA")
+    assert_eq(xl_col_name(27), "AB")
+    assert_eq(xl_col_name(51), "AZ")
+    assert_eq(xl_col_name(52), "BA")
+    assert_eq(xl_col_name(701), "ZZ")
+    assert_eq(xl_col_name(702), "AAA")
+    assert_eq(xl_col_name(16383), "XFD")
+    assert_eq(xl_col_name(-1), "")
+    assert_eq(xl_col_index("A"), 0)
+    assert_eq(xl_col_index("ab"), 27)
+    assert_eq(xl_col_index("XFD"), 16383)
+    assert_eq(xl_col_index(""), -1)
+    assert_eq(xl_col_index("A1"), -1)
+    for 0..1500 { assert_eq(xl_col_index(xl_col_name(it)), it) }
+    assert_eq(xl_ref(0, 0), "A1")
+    assert_eq(xl_ref(11, 27), "AB12")
+    assert_eq(xl_ref(1048575, 16383), "XFD1048576")
+    p = xl_parse_ref("AB12")
+    assert_eq(p[0], 11)
+    assert_eq(p[1], 27)
+    q = xl_parse_ref("$C$3")
+    assert_eq(q[0], 2)
+    assert_eq(q[1], 2)
+    assert_eq(xl_parse_ref("12")[0], -1)
+    assert_eq(xl_parse_ref("A")[0], -1)
+    assert_eq(xl_parse_ref("A0")[0], -1)
+    assert_eq(xl_parse_ref("1A")[0], -1)
+    assert_eq(xl_parse_ref("")[1], -1)
+    for 0..60 {
+        rr = xl_parse_ref(xl_ref(it * 7, it * 13))
+        assert_eq(rr[0], it * 7)
+        assert_eq(rr[1], it * 13)
+    }
+}
+
+test "sheet name validation" {
+    #assert(xl_valid_sheet_name("Sheet1"))
+    #assert(xl_valid_sheet_name("Data & More"))
+    #assert(!(xl_valid_sheet_name("")))
+    #assert(xl_valid_sheet_name("abcdefghijklmnopqrstuvwxyz12345"))
+    #assert(!(xl_valid_sheet_name("abcdefghijklmnopqrstuvwxyz123456")))
+    #assert(!(xl_valid_sheet_name("a/b")))
+    #assert(!(xl_valid_sheet_name("a\\b")))
+    #assert(!(xl_valid_sheet_name("a:b")))
+    #assert(!(xl_valid_sheet_name("a*b")))
+    #assert(!(xl_valid_sheet_name("a?b")))
+    #assert(!(xl_valid_sheet_name("[a]")))
+}
+
+test "number parsing and printing" {
+    assert_eq(xl_parse_num("42") or -1.0, 42.0)
+    assert_eq(xl_parse_num("-42") or 0.0, -42.0)
+    assert_eq(xl_parse_num("+42") or 0.0, 42.0)
+    assert_eq(xl_parse_num("  3.25 ") or 0.0, 3.25)
+    assert_eq(xl_parse_num(".5") or 0.0, 0.5)
+    assert_eq(xl_parse_num("-.5") or 0.0, -0.5)
+    assert_eq(xl_parse_num("7.") or 0.0, 7.0)
+    assert_eq(xl_parse_num("1.5E-3") or 0.0, 0.0015)
+    assert_eq(xl_parse_num("2e3") or 0.0, 2000.0)
+    assert_eq(xl_parse_num("2E+3") or 0.0, 2000.0)
+    assert_eq(xl_parse_num("-1.25e2") or 0.0, -125.0)
+    assert_eq(xl_parse_num("1e0") or 0.0, 1.0)
+    assert_eq(xl_parse_num("12345678901") or 0.0, 12345678901.0)
+    assert_eq(xl_parse_num("0.1") or 0.0, 0.1)
+    assert_eq(xl_parse_num("") or 99.0, 99.0)
+    assert_eq(xl_parse_num("abc") or 99.0, 99.0)
+    assert_eq(xl_parse_num("1.2.3") or 99.0, 99.0)
+    assert_eq(xl_parse_num("-") or 99.0, 99.0)
+    assert_eq(xl_parse_num(".") or 99.0, 99.0)
+    assert_eq(xl_parse_num("e5") or 99.0, 99.0)
+    assert_eq(xl_parse_num("1e") or 99.0, 99.0)
+    assert_eq(xl_parse_num("1e+") or 99.0, 99.0)
+    assert_eq(xl_parse_num("1e5e2") or 99.0, 99.0)
+    assert_eq(xl_parse_num("1-2") or 99.0, 99.0)
+    assert_eq(xl_parse_num("1e2.5") or 99.0, 99.0)
+    assert_eq(xl_num_text(3.0), "3")
+    assert_eq(xl_num_text(-12.0), "-12")
+    assert_eq(xl_num_text(0.5), "0.5")
+    assert_eq(xl_num_text(0.0), "0")
+    assert_eq(xl_num_text(-0.25), "-0.25")
+    assert_eq(xl_num_text(123456789012.0), "123456789012")
+    assert_eq(xl_num_text(0.1 + 0.2), "0.30000000000000004")
+    // text -> number -> text is stable
+    for [0.0, 1.0, -3.5, 1234.5678, 0.001, 99999.0, -0.75] {
+        assert_eq(xl_parse_num(xl_num_text(it)) or -1.0e9, it)
+    }
+}
+
+test "cells" {
+    #assert(xl_empty().is_empty())
+    #assert(!(xl_num(1.0).is_empty()))
+    assert_eq(xl_num(2.0).show(), "2")
+    assert_eq(xl_num(2.5).show(), "2.5")
+    assert_eq(xl_text("hi").show(), "hi")
+    assert_eq(xl_bool(true).show(), "true")
+    assert_eq(xl_bool(false).show(), "false")
+    assert_eq(xl_empty().show(), "")
+    assert_eq(xl_auto("").kind, XL_EMPTY)
+    assert_eq(xl_auto("   ").kind, XL_EMPTY)
+    assert_eq(xl_auto("12").kind, XL_NUM)
+    assert_eq(xl_auto("12").num, 12.0)
+    assert_eq(xl_auto("-1.5").num, -1.5)
+    #assert(xl_auto("TRUE").flag)
+    assert_eq(xl_auto("false").kind, XL_BOOL)
+    assert_eq(xl_auto("12abc").kind, XL_STR)
+    assert_eq(xl_auto("12abc").text, "12abc")
+    assert_eq(xl_auto(" pad ").text, " pad ")
+}
+
+test "workbook model" {
+    wb = XlWorkbook.new()
+    assert_eq(wb.sheet_count(), 0)
+    assert_eq(@wb.add_sheet("A"), 0)
+    assert_eq(@wb.add_sheet("B"), 1)
+    assert_eq(@wb.add_sheet("a"), -1)
+    assert_eq(@wb.add_sheet("bad/name"), -1)
+    assert_eq(@wb.add_sheet(""), -1)
+    assert_eq(wb.sheet_count(), 2)
+    assert_eq(wb.sheet_index("b"), 1)
+    assert_eq(wb.sheet_index("zzz"), -1)
+    names = wb.sheet_names()
+    assert_eq(names[0], "A")
+    assert_eq(names[1], "B")
+    assert_eq(wb.sheet(0).height(), 0)
+    assert_eq(wb.sheet(0).width(), 0)
+    assert_eq(wb.sheet(7).name, "")
+    assert_eq(wb.sheet(-1).name, "")
+    // sparse put grows rows and columns
+    #assert(@wb.put(0, 2, 3, xl_num(5.0)))
+    assert_eq(wb.sheet(0).height(), 3)
+    assert_eq(wb.sheet(0).width(), 4)
+    assert_eq(wb.cell(0, 2, 3).num, 5.0)
+    assert_eq(wb.cell(0, 2, 0).kind, XL_EMPTY)
+    assert_eq(wb.cell(0, 0, 0).kind, XL_EMPTY)
+    assert_eq(wb.cell(0, 9, 9).kind, XL_EMPTY)
+    assert_eq(wb.cell(0, -1, 0).kind, XL_EMPTY)
+    assert_eq(wb.cell(5, 0, 0).kind, XL_EMPTY)
+    assert_eq(wb.sheet(0).count(), 1)
+    // overwrite
+    #assert(@wb.put(0, 2, 3, xl_text("x")))
+    assert_eq(wb.cell(0, 2, 3).text, "x")
+    assert_eq(wb.sheet(0).count(), 1)
+    // out of range writes are refused
+    #assert(!(@wb.put(0, -1, 0, xl_num(1.0))))
+    #assert(!(@wb.put(0, 0, -1, xl_num(1.0))))
+    #assert(!(@wb.put(0, XL_MAX_ROWS, 0, xl_num(1.0))))
+    #assert(!(@wb.put(0, 0, XL_MAX_COLS, xl_num(1.0))))
+    #assert(!(@wb.put(9, 0, 0, xl_num(1.0))))
+    #assert(!(@wb.push_row(9, [])))
+    // rows
+    #assert(@wb.push_row(1, [xl_text("a"), xl_num(1.0)]))
+    #assert(@wb.push_row(1, [xl_text("b")]))
+    assert_eq(wb.sheet(1).height(), 2)
+    assert_eq(wb.sheet(1).width(), 2)
+    assert_eq(wb.cell(1, 1, 0).text, "b")
+    assert_eq(wb.cell(1, 1, 1).kind, XL_EMPTY)
+    assert_eq(wb.sheet(1).count(), 3)
+}
+
+test "write and read round trip" {
+    wb = XlWorkbook.new()
+    s0 = @wb.add_sheet("Report")
+    @wb.push_row(s0, [xl_text("name"), xl_text("value"), xl_text("flag")])
+    @wb.push_row(s0, [xl_text("alpha"), xl_num(1.5), xl_bool(true)])
+    @wb.push_row(s0, [xl_text("beta"), xl_num(-2.0), xl_bool(false)])
+    @wb.push_row(s0, [xl_text("alpha"), xl_num(1234567.125), xl_empty()])
+    @wb.push_row(s0, [xl_text("<tag> & \"quotes\" 'single'"), xl_num(0.000125), xl_bool(true)])
+    @wb.push_row(s0, [xl_text("  leading and trailing  "), xl_num(0.0), xl_text("")])
+    @wb.push_row(s0, [xl_text("line1\nline2\ttab"), xl_num(99999999999.0), xl_text("héllo wörld ✓ 日本")])
+    s1 = @wb.add_sheet("Sparse & Co")
+    @wb.put(s1, 4, 5, xl_text("far"))
+    @wb.put(s1, 0, 0, xl_num(1.0))
+    @wb.put(s1, 2, 27, xl_bool(true))
+    s2 = @wb.add_sheet("Empty")
+    assert_eq(s2, 2)
+    bytes = wb.to_bytes() or []
+    #assert(host.sys_arr_len(bytes) > 500)
+    back = xlsx_read(bytes) or XlWorkbook.new()
+    assert_eq(back.sheet_count(), 3)
+    names = back.sheet_names()
+    assert_eq(names[0], "Report")
+    assert_eq(names[1], "Sparse & Co")
+    assert_eq(names[2], "Empty")
+    rep = back.sheet(0)
+    assert_eq(rep.height(), 7)
+    assert_eq(rep.width(), 3)
+    assert_eq(rep.get(0, 0).text, "name")
+    assert_eq(rep.get(1, 0).text, "alpha")
+    assert_eq(rep.get(1, 1).num, 1.5)
+    assert_eq(rep.get(1, 2).kind, XL_BOOL)
+    #assert(rep.get(1, 2).flag)
+    assert_eq(rep.get(2, 1).num, -2.0)
+    #assert(!(rep.get(2, 2).flag))
+    assert_eq(rep.get(3, 1).num, 1234567.125)
+    assert_eq(rep.get(3, 2).kind, XL_EMPTY)
+    assert_eq(rep.get(4, 0).text, "<tag> & \"quotes\" 'single'")
+    assert_eq(rep.get(4, 1).num, 0.000125)
+    assert_eq(rep.get(5, 0).text, "  leading and trailing  ")
+    assert_eq(rep.get(5, 1).kind, XL_NUM)
+    assert_eq(rep.get(5, 2).kind, XL_STR)
+    assert_eq(rep.get(5, 2).text, "")
+    assert_eq(rep.get(6, 0).text, "line1\nline2\ttab")
+    assert_eq(rep.get(6, 1).num, 99999999999.0)
+    assert_eq(rep.get(6, 2).text, "héllo wörld ✓ 日本")
+    sp = back.sheet(1)
+    assert_eq(sp.height(), 5)
+    assert_eq(sp.width(), 28)
+    assert_eq(sp.get(0, 0).num, 1.0)
+    assert_eq(sp.get(4, 5).text, "far")
+    #assert(sp.get(2, 27).flag)
+    assert_eq(sp.get(2, 26).kind, XL_EMPTY)
+    assert_eq(sp.count(), 3)
+    assert_eq(back.sheet(2).height(), 0)
+    // writing again from the read model is a fixed point
+    again = back.to_bytes() or []
+    assert_eq(host.sys_arr_len(again), host.sys_arr_len(bytes))
+    assert_eq(ar_crc32(again), ar_crc32(bytes))
+}
+
+test "sparse writes beyond column Z round trip" {
+    wb = XlWorkbook.new()
+    s = @wb.add_sheet("S")
+    @wb.put(s, 2, 27, xl_bool(true))
+    @wb.put(s, 0, 702, xl_num(7.0))
+    back = xlsx_read(wb.to_bytes() or []) or XlWorkbook.new()
+    #assert(back.cell(0, 2, 27).flag)
+    assert_eq(back.cell(0, 0, 702).num, 7.0)
+    assert_eq(back.sheet(0).width(), 703)
+    assert_eq(back.sheet(0).count(), 2)
+}
+
+test "package layout" {
+    wb = XlWorkbook.new()
+    a = @wb.add_sheet("One")
+    b = @wb.add_sheet("Two <&>")
+    @wb.push_row(a, [xl_text("x"), xl_text("y"), xl_text("x")])
+    @wb.push_row(b, [xl_num(1.0)])
+    bytes = wb.to_bytes() or []
+    entries = xl_zip_entries(bytes) or []
+    names = []
+    for entries {
+        item = it
+        e: ZipEntry = item
+        names = host.sys_arr_push(names, e.name)
+        assert_eq(e.method, 0)
+        #assert(ar_zip_verify(bytes, e))
+    }
+    assert_eq(host.sys_arr_len(names), 8)
+    assert_eq(names[0], "[Content_Types].xml")
+    assert_eq(names[1], "_rels/.rels")
+    assert_eq(names[2], "xl/workbook.xml")
+    assert_eq(names[3], "xl/_rels/workbook.xml.rels")
+    assert_eq(names[4], "xl/styles.xml")
+    assert_eq(names[5], "xl/sharedStrings.xml")
+    assert_eq(names[6], "xl/worksheets/sheet1.xml")
+    assert_eq(names[7], "xl/worksheets/sheet2.xml")
+    #assert(xl_has_member(entries, "xl/styles.xml"))
+    #assert(!(xl_has_member(entries, "xl/nothing.xml")))
+    sst = xl_member_text(bytes, entries, "xl/sharedStrings.xml") or ""
+    assert_eq(xml_count(sst, "si") or -1, 2)
+    assert_eq(xml_attr_of(sst, "sst", "count") or "?", "3")
+    assert_eq(xml_attr_of(sst, "sst", "uniqueCount") or "?", "2")
+    wbx = xl_member_text(bytes, entries, "xl/workbook.xml") or ""
+    assert_eq(xml_count(wbx, "sheet") or -1, 2)
+    assert_eq(xml_attr_of(wbx, "sheet", "name") or "?", "One")
+    #assert(contains(wbx, "Two &lt;&amp;&gt;"))
+    sheet = xl_member_text(bytes, entries, "xl/worksheets/sheet1.xml") or ""
+    assert_eq(xml_attr_of(sheet, "dimension", "ref") or "?", "A1:C1")
+    assert_eq(xml_count(sheet, "c") or -1, 3)
+    // every part is well-formed XML
+    for entries {
+        item = it
+        e: ZipEntry = item
+        xml = xl_member_text(bytes, entries, e.name) or ""
+        summary = xml_summary(xml) or ""
+        #assert(summary != "")
+    }
+    // deterministic output
+    assert_eq(ar_crc32(wb.to_bytes() or []), ar_crc32(bytes))
+}
+
+test "writer edge cases" {
+    empty = XlWorkbook.new()
+    msg = empty.to_bytes() or err { "{err}" }
+    assert_eq(msg, "xlsx: a workbook needs at least one sheet")
+    wb = XlWorkbook.new()
+    s = @wb.add_sheet("S")
+    bad = host.sys_sqrt(-1.0)
+    @wb.push_row(s, [xl_num(bad), xl_text("a\x01b\x02"), xl_num(1.0e300 * 1.0e300), xl_num(2.0)])
+    back = xlsx_read(wb.to_bytes() or []) or XlWorkbook.new()
+    assert_eq(back.cell(0, 0, 0).kind, XL_EMPTY)
+    assert_eq(back.cell(0, 0, 1).text, "ab")
+    assert_eq(back.cell(0, 0, 2).kind, XL_EMPTY)
+    assert_eq(back.cell(0, 0, 3).num, 2.0)
+    assert_eq(xl_clean("plain"), "plain")
+    assert_eq(xl_clean("a\x00b\tc\nd\re"), "ab\tc\nd\re")
+    // dimension of an empty sheet
+    only = XlWorkbook.new()
+    @only.add_sheet("Blank")
+    sheet = xl_sheet_xml(only.sheet(0), @XlStrings.new())
+    assert_eq(xml_attr_of(sheet, "dimension", "ref") or "?", "A1")
+}
+
+test "shared string table dedupes and counts uses" {
+    st = XlStrings.new()
+    assert_eq(@st.intern("a"), 0)
+    assert_eq(@st.intern("b"), 1)
+    assert_eq(@st.intern("a"), 0)
+    assert_eq(@st.intern(""), 2)
+    assert_eq(@st.intern("b"), 1)
+    assert_eq(st.total, 5)
+    assert_eq(host.sys_arr_len(st.keys), 3)
+    // many distinct strings exercise hash probing
+    big = XlStrings.new()
+    for 0..400 { assert_eq(@big.intern("k{it}"), it) }
+    for 0..400 { assert_eq(@big.intern("k{it}"), it) }
+    assert_eq(host.sys_arr_len(big.keys), 400)
+    assert_eq(big.total, 800)
+    xml = xl_strings_xml(st)
+    #assert(contains(xml, "count=\"5\" uniqueCount=\"3\""))
+    assert_eq(xl_hash("") , 5381)
+}
+
+test "inflate stored, fixed and dynamic blocks" {
+    stored = [1, 23, 0, 232, 255, 115, 116, 111, 114, 101, 100, 32, 98, 108, 111, 99, 107, 32, 100, 97, 116, 97, 32, 49, 50, 51, 52, 53]
+    out = xl_inflate(stored, 0, host.sys_arr_len(stored)) or []
+    assert_eq(host.sys_bytes_to_str(out), "stored block data 12345")
+    fixed = [203, 72, 205, 201, 201, 87, 200, 192, 78, 2, 0]
+    fo = xl_inflate(fixed, 0, host.sys_arr_len(fixed)) or []
+    assert_eq(host.sys_bytes_to_str(fo), "hello hello hello hello hello")
+    dyn = [109, 85, 11, 110, 172, 48, 12, 188, 10, 87, 203, 182, 81, 23, 61, 194, 162, 150, 72, 21, 167, 127, 177, 199, 142, 199, 108, 37, 150, 13, 177, 61, 158, 248, 151, 173, 180, 199, 103, 89, 234, 241, 179, 110, 175, 125, 217, 251, 242, 168, 103, 89, 190, 74, 107, 101, 249, 89, 191, 198, 251, 179, 110, 99, 167, 245, 229, 44, 38, 253, 126, 190, 22, 249, 39, 213, 223, 85, 30, 172, 207, 231, 29, 98, 136, 84, 87, 16, 0, 7, 157, 137, 40, 11, 249, 185, 127, 136, 117, 9, 4, 39, 248, 175, 28, 135, 226, 249, 6, 115, 20, 4, 40, 96, 247, 18, 251, 16, 201, 175, 226, 40, 216, 132, 150, 145, 118, 42, 221, 128, 101, 125, 172, 113, 128, 13, 145, 122, 181, 245, 227, 123, 136, 69, 223, 215, 205, 221, 130, 246, 21, 39, 8, 108, 40, 72, 228, 142, 55, 44, 200, 220, 49, 108, 192, 80, 244, 135, 111, 69, 220, 114, 170, 142, 117, 134, 149, 67, 45, 190, 76, 211, 254, 6, 187, 30, 54, 204, 27, 118, 120, 175, 47, 156, 23, 95, 10, 107, 103, 34, 3, 236, 140, 36, 13, 204, 178, 29, 207, 194, 33, 184, 56, 122, 160, 127, 24, 193, 64, 115, 246, 8, 207, 174, 25, 159, 94, 21, 193, 17, 135, 0, 39, 82, 102, 110, 247, 187, 242, 238, 248, 106, 10, 1, 184, 154, 34, 120, 241, 150, 213, 155, 190, 193, 220, 98, 161, 90, 10, 6, 130, 16, 190, 185, 163, 32, 82, 132, 93, 77, 210, 228, 226, 7, 31, 2, 198, 56, 38, 158, 25, 24, 47, 245, 72, 32, 27, 82, 233, 154, 175, 132, 15, 9, 184, 106, 89, 255, 209, 13, 68, 25, 138, 225, 165, 71, 187, 187, 165, 134, 128, 76, 154, 230, 5, 72, 147, 179, 179, 27, 203, 241, 32, 96, 134, 154, 242, 110, 148, 189, 166, 46, 31, 26, 22, 92, 251, 106, 119, 222, 16, 139, 136, 161, 21, 197, 244, 47, 235, 95, 36, 18, 86, 120, 139, 130, 185, 133, 144, 251, 120, 86, 155, 213, 201, 57, 59, 113, 22, 50, 222, 206, 24, 53, 71, 40, 45, 117, 251, 120, 120, 212, 241, 72, 27, 198, 220, 172, 216, 113, 148, 156, 15, 184, 231, 118, 223, 187, 91, 232, 65, 99, 234, 64, 105, 239, 220, 29, 84, 229, 169, 212, 115, 5, 115, 251, 214, 27, 13, 26, 11, 111, 185, 200, 99, 151, 99, 20, 147, 137, 186, 196, 195, 74, 97, 140, 166, 23, 221, 24, 248, 92, 28, 115, 186, 86, 174, 110, 10, 182, 24, 216, 16, 100, 143, 153, 157, 72, 162, 188, 82, 11, 245, 63, 131, 146, 226, 69, 249, 225, 107, 225, 65, 105, 116, 7, 144, 204, 190, 32, 197, 40, 44, 61, 23, 53, 169, 216, 229, 113, 192, 221, 232, 146, 91, 147, 243, 64, 241, 219, 86, 129, 93, 63, 177, 137, 248, 202, 138, 2, 203, 19, 133, 146, 53, 139, 237, 230, 157, 107, 122, 222, 230, 145, 70, 152, 213, 232, 136, 52, 59, 252, 99, 102, 142, 90, 3, 67, 158, 238, 69, 47, 111, 225, 187, 207, 146, 176, 58, 106, 61, 19, 154, 61, 106, 187, 56, 155, 251, 241, 127, 168, 4, 24, 135, 48, 202, 144, 187, 141, 25, 210, 168, 137, 4, 198, 221, 64, 193, 211, 239, 253, 222, 46, 154, 130, 210, 233, 114, 39, 196, 7, 31, 153, 246, 185, 16, 116, 3, 203, 158, 238, 44, 18, 131, 106, 62, 112, 138, 137, 211, 155, 179, 143, 187, 42, 170, 4, 56, 87, 125, 63, 108, 36, 59, 66, 22, 123, 92, 124, 97, 61, 211, 19, 88, 60, 46, 162, 82, 235, 89, 254, 3]
+    dout = xl_inflate(dyn, 0, host.sys_arr_len(dyn)) or []
+    assert_eq(host.sys_arr_len(dout), 2671)
+    assert_eq(ar_crc32(dout), 1694200615)
+    #assert(starts_with(host.sys_bytes_to_str(dout), "lambda epsilon nu beta gamma sigma delta"))
+    multi = [74, 203, 44, 42, 46, 81, 40, 72, 44, 42, 81, 72, 195, 202, 4, 0, 0, 0, 255, 255, 43, 78, 77, 206, 207, 75, 81, 40, 72, 44, 42, 81, 40, 70, 176, 1]
+    mo = xl_inflate(multi, 0, host.sys_arr_len(multi)) or []
+    assert_eq(host.sys_bytes_to_str(mo), "first part first part first part second part second part")
+    empty = [3, 0]
+    assert_eq(host.sys_arr_len(xl_inflate(empty, 0, host.sys_arr_len(empty)) or [1]), 0)
+    rep = [75, 76, 28, 5, 196, 2, 0]
+    ro = xl_inflate(rep, 0, host.sys_arr_len(rep)) or []
+    assert_eq(host.sys_arr_len(ro), 300)
+    assert_eq(ro[0], 97)
+    assert_eq(ro[299], 97)
+    // a sub-range of a larger buffer
+    padded = [9, 9, 9]
+    for fixed { padded = host.sys_arr_push(padded, it) }
+    padded = host.sys_arr_push(padded, 7)
+    po = xl_inflate(padded, 3, host.sys_arr_len(fixed)) or []
+    assert_eq(host.sys_bytes_to_str(po), "hello hello hello hello hello")
+}
+
+test "inflate rejects corrupt input" {
+    fixed = [203, 72, 205, 201, 201, 87, 200, 192, 78, 2, 0]
+    cut = [fixed[0], fixed[1], fixed[2]]
+    assert_eq(xl_inflate(cut, 0, 3) or "bad", "bad")
+    // block type 3 is reserved
+    assert_eq(xl_inflate([7, 0, 0, 0], 0, 4) or "bad", "bad")
+    // stored block whose NLEN does not complement LEN
+    assert_eq(xl_inflate([1, 3, 0, 3, 0, 65, 66, 67], 0, 8) or "bad", "bad")
+    // stored block longer than the input
+    assert_eq(xl_inflate([1, 9, 0, 246, 255, 65], 0, 6) or "bad", "bad")
+    // good stored block for contrast
+    good = xl_inflate([1, 3, 0, 252, 255, 65, 66, 67], 0, 8) or []
+    assert_eq(host.sys_bytes_to_str(good), "ABC")
+    // match distance before the start of output (fixed block: match with distance 1 but no literals)
+    assert_eq(xl_inflate([3, 2, 0], 0, 3) or "bad", "bad")
+    assert_eq(xl_inflate([], 0, 0) or "bad", "bad")
+    assert_eq(xl_inflate(fixed, 0, 99) or "bad", "bad")
+    assert_eq(xl_inflate(fixed, -1, 2) or "bad", "bad")
+    // truncated dynamic block
+    dyn = [109, 85, 11, 110, 172, 48, 12, 188, 10, 87, 203, 182, 81, 23, 61, 194, 162, 150, 72, 21, 167, 127, 177, 199, 142, 199, 108, 37, 150, 13, 177, 61, 158, 248, 151, 173, 180, 199, 103, 89, 234, 241, 179, 110, 175, 125, 217, 251, 242, 168, 103, 89, 190, 74, 107, 101, 249, 89, 191, 198, 251, 179, 110, 99, 167, 245, 229, 44, 38, 253, 126, 190, 22, 249, 39, 213, 223, 85, 30, 172, 207, 231, 29, 98, 136, 84, 87, 16, 0, 7, 157, 137, 40, 11, 249, 185, 127, 136, 117, 9, 4, 39, 248, 175, 28, 135, 226, 249, 6, 115, 20, 4, 40, 96, 247, 18, 251, 16, 201, 175, 226, 40, 216, 132, 150, 145, 118, 42, 221, 128, 101, 125, 172, 113, 128, 13, 145, 122, 181, 245, 227, 123, 136, 69, 223, 215, 205, 221, 130, 246, 21, 39, 8, 108, 40, 72, 228, 142, 55, 44, 200, 220, 49, 108, 192, 80, 244, 135, 111, 69, 220, 114, 170, 142, 117, 134, 149, 67, 45, 190, 76, 211, 254, 6, 187, 30, 54, 204, 27, 118, 120, 175, 47, 156, 23, 95, 10, 107, 103, 34, 3, 236, 140, 36, 13, 204, 178, 29, 207, 194, 33, 184, 56, 122, 160, 127, 24, 193, 64, 115, 246, 8, 207, 174, 25, 159, 94, 21, 193, 17, 135, 0, 39, 82, 102, 110, 247, 187, 242, 238, 248, 106, 10, 1, 184, 154, 34, 120, 241, 150, 213, 155, 190, 193, 220, 98, 161, 90, 10, 6, 130, 16, 190, 185, 163, 32, 82, 132, 93, 77, 210, 228, 226, 7, 31, 2, 198, 56, 38, 158, 25, 24, 47, 245, 72, 32, 27, 82, 233, 154, 175, 132, 15, 9, 184, 106, 89, 255, 209, 13, 68, 25, 138, 225, 165, 71, 187, 187, 165, 134, 128, 76, 154, 230, 5, 72, 147, 179, 179, 27, 203, 241, 32, 96, 134, 154, 242, 110, 148, 189, 166, 46, 31, 26, 22, 92, 251, 106, 119, 222, 16, 139, 136, 161, 21, 197, 244, 47, 235, 95, 36, 18, 86, 120, 139, 130, 185, 133, 144, 251, 120, 86, 155, 213, 201, 57, 59, 113, 22, 50, 222, 206, 24, 53, 71, 40, 45, 117, 251, 120, 120, 212, 241, 72, 27, 198, 220, 172, 216, 113, 148, 156, 15, 184, 231, 118, 223, 187, 91, 232, 65, 99, 234, 64, 105, 239, 220, 29, 84, 229, 169, 212, 115, 5, 115, 251, 214, 27, 13, 26, 11, 111, 185, 200, 99, 151, 99, 20, 147, 137, 186, 196, 195, 74, 97, 140, 166, 23, 221, 24, 248, 92, 28, 115, 186, 86, 174, 110, 10, 182, 24, 216, 16, 100, 143, 153, 157, 72, 162, 188, 82, 11, 245, 63, 131, 146, 226, 69, 249, 225, 107, 225, 65, 105, 116, 7, 144, 204, 190, 32, 197, 40, 44, 61, 23, 53, 169, 216, 229, 113, 192, 221, 232, 146, 91, 147, 243, 64, 241, 219, 86, 129, 93, 63, 177, 137, 248, 202, 138, 2, 203, 19, 133, 146, 53, 139, 237, 230, 157, 107, 122, 222, 230, 145, 70, 152, 213, 232, 136, 52, 59, 252, 99, 102, 142, 90, 3, 67, 158, 238, 69, 47, 111, 225, 187, 207, 146, 176, 58, 106, 61, 19, 154, 61, 106, 187, 56, 155, 251, 241, 127, 168, 4, 24, 135, 48, 202, 144, 187, 141, 25, 210, 168, 137, 4, 198, 221, 64, 193, 211, 239, 253, 222, 46, 154, 130, 210, 233, 114, 39, 196, 7, 31, 153, 246, 185, 16, 116, 3, 203, 158, 238, 44, 18, 131, 106, 62, 112, 138, 137, 211, 155, 179, 143, 187, 42, 170, 4, 56, 87, 125, 63, 108, 36, 59, 66, 22, 123, 92, 124, 97, 61, 211, 19, 88, 60, 46, 162, 82, 235, 89, 254, 3]
+    assert_eq(xl_inflate(dyn, 0, 100) or "bad", "bad")
+    // flipping bits inside a dynamic block never crashes: it either fails or yields different bytes
+    broken = dyn
+    broken[20] = (broken[20] ^ 255)
+    r = xl_inflate(broken, 0, host.sys_arr_len(broken)) or []
+    #assert(host.sys_arr_len(r) != 2671 || ar_crc32(r) != 1694200615)
+}
+
+test "huffman table helpers" {
+    h = xl_huff([2, 1, 3, 3], 4)
+    #assert(xl_huff_valid(h))
+    assert_eq(h.counts[1], 1)
+    assert_eq(h.counts[2], 1)
+    assert_eq(h.counts[3], 2)
+    assert_eq(h.symbols[0], 1)
+    assert_eq(h.symbols[1], 0)
+    assert_eq(h.symbols[2], 2)
+    assert_eq(h.symbols[3], 3)
+    // over-subscribed: three codes of length 1
+    #assert(!(xl_huff_valid(xl_huff([1, 1, 1], 3))))
+    // incomplete is accepted (a single code)
+    #assert(xl_huff_valid(xl_huff([1], 1)))
+}
+
+test "reads a DEFLATE-compressed workbook written by another tool" {
+    bytes = xl_foreign()
+    entries = xl_zip_entries(bytes) or []
+    assert_eq(host.sys_arr_len(entries), 6)
+    first: ZipEntry = entries[0]
+    assert_eq(first.method, 8)
+    assert_eq(first.name, "[Content_Types].xml")
+    wb = xlsx_read(bytes) or XlWorkbook.new()
+    assert_eq(wb.sheet_count(), 2)
+    assert_eq(wb.sheet_names()[0], "Data & More")
+    assert_eq(wb.sheet_names()[1], "Second")
+    d = wb.sheet(0)
+    assert_eq(d.height(), 5)
+    assert_eq(d.width(), 8)
+    assert_eq(d.get(0, 0).text, "Name")
+    assert_eq(d.get(0, 1).text, "Rich text & more")
+    assert_eq(d.get(0, 2).text, "  padded  ")
+    assert_eq(d.get(1, 0).kind, XL_EMPTY)
+    assert_eq(d.get(2, 0).num, 0.0015)
+    assert_eq(d.get(2, 1).kind, XL_EMPTY)
+    assert_eq(d.get(2, 2).num, 42.0)
+    assert_eq(d.get(2, 3).kind, XL_BOOL)
+    #assert(d.get(2, 3).flag)
+    assert_eq(d.get(2, 4).text, "xy")
+    assert_eq(d.get(2, 5).text, "#DIV/0!")
+    assert_eq(d.get(2, 6).text, "inline")
+    assert_eq(d.get(2, 7).kind, XL_EMPTY)
+    assert_eq(d.get(3, 0).kind, XL_EMPTY)
+    assert_eq(d.get(4, 0).num, -7.0)
+    assert_eq(d.get(4, 1).kind, XL_BOOL)
+    #assert(!(d.get(4, 1).flag))
+    assert_eq(d.get(4, 2).kind, XL_EMPTY)
+    assert_eq(d.get(4, 3).num, 12345678901.0)
+    assert_eq(d.get(4, 4).kind, XL_EMPTY)
+    two = wb.sheet(1)
+    assert_eq(two.name, "Second")
+    assert_eq(two.get(0, 0).num, 10.0)
+    assert_eq(two.get(0, 1).num, 20.25)
+    assert_eq(xl_target_path("worksheets/a.xml"), "xl/worksheets/a.xml")
+    assert_eq(xl_target_path("/xl/worksheets/a.xml"), "xl/worksheets/a.xml")
+    // the foreign workbook survives a trip through our own writer
+    again = xlsx_read(wb.to_bytes() or []) or XlWorkbook.new()
+    assert_eq(again.cell(0, 0, 1).text, "Rich text & more")
+    assert_eq(again.cell(0, 4, 3).num, 12345678901.0)
+    assert_eq(again.cell(1, 0, 1).num, 20.25)
+}
+
+test "reader rejects damaged files" {
+    assert_eq(xlsx_read([]) or "bad", "bad")
+    assert_eq(xlsx_read([1, 2, 3, 4]) or "bad", "bad")
+    junk = []
+    for 0..100 { junk = host.sys_arr_push(junk, it) }
+    assert_eq(xlsx_read(junk) or "bad", "bad")
+    good = xl_foreign()
+    // flip a byte inside the compressed data of the first member: CRC or inflate must object
+    broken = good
+    broken[60] = (broken[60] ^ 255)
+    first: ZipEntry = (xl_zip_entries(good) or [])[0]
+    #assert(first.data_off <= 60 && 60 < first.data_off + first.comp_size)
+    assert_eq(xl_member_bytes(broken, (xl_zip_entries(broken) or [])[0]) or "bad", "bad")
+    // missing workbook part
+    z = ZipWriter.new()
+    @z.add("hello.txt", host.sys_str_to_bytes("hi"), 0, 0) or false
+    assert_eq(xlsx_read(z.finish()) or "bad", "bad")
+    msg = xlsx_read(z.finish()) or err { "{err}" }
+    assert_eq(msg, "xlsx: missing member xl/workbook.xml")
+    // workbook without sheets
+    z2 = ZipWriter.new()
+    @z2.add("xl/workbook.xml", host.sys_str_to_bytes("<workbook><sheets></sheets></workbook>"), 0, 0) or false
+    msg2 = xlsx_read(z2.finish()) or err { "{err}" }
+    assert_eq(msg2, "xlsx: workbook has no sheets")
+    // sheet part missing
+    z3 = ZipWriter.new()
+    @z3.add("xl/workbook.xml", host.sys_str_to_bytes("<workbook><sheets><sheet name=\"A\" sheetId=\"1\"/></sheets></workbook>"), 0, 0) or false
+    msg3 = xlsx_read(z3.finish()) or err { "{err}" }
+    assert_eq(msg3, "xlsx: missing member xl/worksheets/sheet1.xml")
+    // malformed XML inside a sheet
+    z4 = ZipWriter.new()
+    @z4.add("xl/workbook.xml", host.sys_str_to_bytes("<workbook><sheets><sheet name=\"A\" sheetId=\"1\"/></sheets></workbook>"), 0, 0) or false
+    @z4.add("xl/worksheets/sheet1.xml", host.sys_str_to_bytes("<worksheet><sheetData><row></worksheet>"), 0, 0) or false
+    assert_eq(xlsx_read(z4.finish()) or "bad", "bad")
+    // an unsupported compression method is reported
+    z5 = ZipWriter.new()
+    @z5.add("xl/workbook.xml", host.sys_str_to_bytes("<workbook/>"), 0, 0) or false
+    img = z5.finish()
+    img[8] = 99
+    img[9] = 0
+    ents = xl_zip_entries(img) or []
+    e5: ZipEntry = ents[0]
+    img2 = img
+    assert_eq(e5.method, 0)
+    img2[host.sys_arr_len(img2) - 22 - 46 - 15 + 10] = 99
+    msg5 = xlsx_read(img2) or err { "{err}" }
+    #assert(contains(msg5, "unsupported compression method 99"))
+}
+
+test "minimal third-party sheet without shared strings or rels" {
+    z = ZipWriter.new()
+    @z.add("xl/workbook.xml", host.sys_str_to_bytes("<workbook><sheets><sheet name=\"Only\" sheetId=\"1\"/></sheets></workbook>"), 0, 0) or false
+    @z.add("xl/worksheets/sheet1.xml", host.sys_str_to_bytes("<worksheet><sheetData><row r=\"2\"><c r=\"B2\"><v>3</v></c><c r=\"A2\" t=\"inlineStr\"><is><r><t>ab</t></r><r><t>cd</t></r></is></c></row></sheetData></worksheet>"), 0, 0) or false
+    wb = xlsx_read(z.finish()) or XlWorkbook.new()
+    assert_eq(wb.sheet_count(), 1)
+    assert_eq(wb.sheet(0).height(), 2)
+    // cells are placed by reference even when listed out of order
+    assert_eq(wb.cell(0, 1, 0).text, "abcd")
+    assert_eq(wb.cell(0, 1, 1).num, 3.0)
+}
+
+test "resolve cell kinds" {
+    strings = ["zero", "one"]
+    assert_eq(xl_resolve_cell("s", "1", "", strings).text, "one")
+    assert_eq(xl_resolve_cell("s", "7", "", strings).kind, XL_EMPTY)
+    assert_eq(xl_resolve_cell("s", "x", "", strings).kind, XL_EMPTY)
+    #assert(xl_resolve_cell("b", "1", "", strings).flag)
+    #assert(!(xl_resolve_cell("b", "0", "", strings).flag))
+    assert_eq(xl_resolve_cell("", "2.5", "", strings).num, 2.5)
+    assert_eq(xl_resolve_cell("n", "2.5", "", strings).num, 2.5)
+    assert_eq(xl_resolve_cell("", "", "", strings).kind, XL_EMPTY)
+    assert_eq(xl_resolve_cell("", "oops", "", strings).text, "oops")
+    assert_eq(xl_resolve_cell("inlineStr", "", "hey", strings).text, "hey")
+    assert_eq(xl_resolve_cell("str", "calc", "", strings).text, "calc")
+    assert_eq(xl_resolve_cell("e", "#N/A", "", strings).text, "#N/A")
+    assert_eq(xl_resolve_cell("d", "2020-01-02", "", strings).text, "2020-01-02")
+}
+
+test "file round trip" {
+    dir = host.sys_temp_dir() or "/tmp"
+    path = "{dir}/super_xlsx_roundtrip_test.xlsx"
+    wb = XlWorkbook.new()
+    s = @wb.add_sheet("Disk")
+    @wb.push_row(s, [xl_text("k"), xl_num(2.5), xl_bool(true)])
+    #assert(xlsx_write_file(path, wb) or false)
+    back = xlsx_read_file(path) or XlWorkbook.new()
+    assert_eq(back.cell(0, 0, 0).text, "k")
+    assert_eq(back.cell(0, 0, 1).num, 2.5)
+    #assert(back.cell(0, 0, 2).flag)
+    assert_eq(xlsx_read_file("{dir}/super_xlsx_missing_file.xlsx") or "bad", "bad")
+    assert_eq(xlsx_write_file(path, XlWorkbook.new()) or "bad", "bad")
+    fs_remove(path) or false
+}
+
+test "large sheet round trip" {
+    wb = XlWorkbook.new()
+    s = @wb.add_sheet("Big")
+    for 0..300 {
+        label = "row{it % 17}"
+        v = host.sys_to_float(it) * 0.5
+        @wb.push_row(s, [xl_text(label), xl_num(v), xl_bool(it % 2 == 0), xl_num(host.sys_to_float(it * it))])
+    }
+    back = xlsx_read(wb.to_bytes() or []) or XlWorkbook.new()
+    sh = back.sheet(0)
+    assert_eq(sh.height(), 300)
+    assert_eq(sh.width(), 4)
+    assert_eq(sh.count(), 1200)
+    assert_eq(sh.get(299, 1).num, 149.5)
+    assert_eq(sh.get(17, 0).text, "row0")
+    assert_eq(sh.get(100, 3).num, 10000.0)
+    #assert(!(sh.get(3, 2).flag))
+    st = XlStrings.new()
+    xml = xl_sheet_xml(sh, @st)
+    assert_eq(host.sys_arr_len(st.keys), 17)
+    assert_eq(st.total, 300)
+    assert_eq(xml_attr_of(xml, "dimension", "ref") or "?", "A1:D300")
+}

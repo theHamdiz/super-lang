@@ -1,0 +1,160 @@
+// Game #4 — 2D rigid-body / particle sandbox with parallel integration
+//
+// Run: super test examples/06_physics_sandbox/
+
+use std.game.physics2d
+use std.gui
+
+ColliderKind = {
+    Circle
+    Box
+    Mesh
+}
+
+#COLLIDER_VARIANTS = ColliderKind.variants
+#COLLIDER_VARIANT_COUNT = 3
+
++RigidBody = {
+    x: f64 = 0.0
+    y: f64 = 0.0
+    vx: f64 = 0.0
+    vy: f64 = 0.0
+    r: f64 = 1.0
+    mass: f64 = 1.0
+
+    integrate_euler(@self, dt: f64) : f64 {
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        self.x
+    }
+
+    impulse(self, other: RigidBody) : f64 {
+        dx = self.x - other.x
+        dy = self.y - other.y
+        dist2 = dx * dx + dy * dy
+        reach = self.r + other.r
+        if dist2 <= reach * reach {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
++AABB = {
+    min_x: f64 = 0.0
+    min_y: f64 = 0.0
+    max_x: f64 = 1.0
+    max_y: f64 = 1.0
+
+    overlaps(self, other: AABB) : bool {
+        self.min_x <= other.max_x && self.max_x >= other.min_x && self.min_y <= other.max_y && self.max_y >= other.min_y
+    }
+}
+
++quadtree_nodes(n: i64) : i64 {
+    // Broadphase node count for n bodies (approx).
+    n * 2
+}
+
++step_parallel(n: i64, _dt: f64) : i64 {
+    bodies = 0
+    par 0..n {
+        bodies += 1
+    }
+    n
+}
+
++solver_passes() : i64 {
+    iters = 0
+    #unroll(4)
+    for 0..4 {
+        iters += 1
+    }
+    iters
+}
+
++contact_pipeline(n: i64) : i64 {
+    // Call unrolled solver outside the scope — nested Super calls inside
+    // scope+spawn currently park the parent fiber incorrectly.
+    passes = solver_passes()
+    contacts = chan[i64](64)
+    resolved = shared 0
+    scope {
+        solver = spawn {
+            n = 0
+            for _c in contacts {
+                @resolved += 1
+                n += 1
+            }
+            n
+        }
+        for 0..n {
+            contacts.send(it + passes)
+        }
+        contacts.close()
+        got = await solver
+        got + resolved.load()
+    }
+}
+
+test "euler integrates" {
+    b = RigidBody{x: 0.0, y: 0.0, vx: 10.0, vy: 0.0, r: 1.0, mass: 1.0}
+    @b.integrate_euler(0.1)
+    assert_eq(b.x, 1.0)
+}
+
+test "aabb overlap" {
+    a = AABB{min_x: 0.0, min_y: 0.0, max_x: 2.0, max_y: 2.0}
+    b = AABB{min_x: 1.0, min_y: 1.0, max_x: 3.0, max_y: 3.0}
+    #assert(a.overlaps(b))
+}
+
+test "circle impulse detect" {
+    a = RigidBody{x: 0.0, y: 0.0, vx: 0.0, vy: 0.0, r: 1.0, mass: 1.0}
+    b = RigidBody{x: 0.5, y: 0.0, vx: 0.0, vy: 0.0, r: 1.0, mass: 1.0}
+    far = RigidBody{x: 5.0, y: 0.0, vx: 0.0, vy: 0.0, r: 1.0, mass: 1.0}
+    assert_eq(a.impulse(b), 1.0)
+    assert_eq(a.impulse(far), 0.0)
+}
+
+test "quadtree sizing" {
+    assert_eq(quadtree_nodes(50), 100)
+}
+
+test "parallel step" {
+    assert_eq(step_parallel(100, 0.016), 100)
+}
+
+test "contact channel" {
+    assert_eq(contact_pipeline(8), 16)
+}
+
+test "comptime collider variants" {
+    assert_eq(#COLLIDER_VARIANT_COUNT, 3)
+    assert_eq(len(#COLLIDER_VARIANTS), #COLLIDER_VARIANT_COUNT)
+    assert_eq(solver_passes(), 4)
+}
+
++inspector() : str {
+    app = Gui.new("Physics", 160, 80)
+    root = @app.column("root")
+    @app.label(root, "title", "World")
+    @app.layout()
+    @app.paint()
+}
+
+test "inspector paint names the world" {
+    frame = inspector()
+    #assert(contains(frame, "World"))
+    #assert(contains(frame, "fill 0 0"))
+}
+
+test "stdlib: physics2d circle contact and aabb agree with sandbox" {
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(1.5, 0.0, 1.0, 1.0)
+    #assert(p2_collide(a, b).hit)
+    far = p2_circle(5.0, 0.0, 1.0, 1.0)
+    #assert(!(p2_collide(a, far).hit))
+    #assert(p2_aabb_overlap(1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0))
+}

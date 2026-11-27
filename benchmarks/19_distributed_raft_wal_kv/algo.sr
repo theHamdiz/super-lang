@@ -1,0 +1,152 @@
+// 19_distributed_raft_wal_kv — single-process Raft log replication (leader + 2 followers):
+// CRC-32 protected WAL records (std.fmt.compress) with big-endian fields (std.fmt.bin), lossy /
+// corrupting virtual links, majority commit, KV state machine.
+// No real networking: every packet fate comes from a deterministic LCG.
+use std.core.bytes
+use std.fmt.bin
+use std.fmt.compress
+use std.math.core
+use std.core.collections
+
+MOD = 1000000007
+TICKS = 6000
+DRAIN = 200
+REC = 20
+TERM = 1
+BATCH = 4
+KEYS = 512
+DROP_PCT = 35
+ACK_DROP_PCT = 15
+CORRUPT_PCT = 3
+CAP = 120000
+
+Checksum = {
+    v: i64 = 0
+    fold(@self, x: i64) { self.v = (self.v * 131 + x) % MOD }
+}
+
+// ---- WAL records: idx, term, key, val, crc32(first 16 bytes) — 4 big-endian bytes each ----
+
+record(idx: i64, key: i64, val: i64) {
+    // Dense bytes via stdlib `bytes_fixed`
+    r = bytes_fixed(REC)
+    be32_put(@r, 0, idx)
+    be32_put(@r, 4, TERM)
+    be32_put(@r, 8, key)
+    be32_put(@r, 12, val)
+    // Range CRC, no slice alloc
+    be32_put(@r, 16, crc32_bytes_range(r, 0, 16))
+    r
+}
+
+intact(buf, at: i64) : bool =>
+    crc32_bytes_range(buf, at, at + 16) == be32_get(buf, at + 16)
+
+Node = {
+    wal: _ = []
+    len: i64 = 0
+    applied: i64 = 0
+    kv: _ = []
+    next: i64 = 1
+    matched: i64 = 0
+
+    // Append the record at `msg[at..at + REC]` to this node's log (bulk copy).
+    append(@self, msg, at: i64) {
+        base = self.len * REC
+        bytes_copy_range(@self.wal, base, msg, at, REC)
+        self.len += 1
+    }
+
+    // Apply committed entries to the KV map, re-verifying each CRC.
+    apply_upto(@self, upto: i64) {
+        while self.applied < upto {
+            at = self.applied * REC
+            if intact(self.wal, at) { self.kv[be32_get(self.wal, at + 8) % KEYS] = be32_get(self.wal, at + 12) }
+            self.applied += 1
+        }
+    }
+
+    digest(self) : i64 {
+        d = 0
+        for self.kv { d = (d * 131 + it) % MOD }
+        d
+    }
+
+    wal_crc(self) : i64 => crc32_bytes_range(self.wal, 0, self.len * REC)
+}
+
+node() : Node => .{wal: bytes_fixed(CAP), kv: [0; KEYS]}
+
+Link = {
+    sent: i64 = 0
+    dropped: i64 = 0
+    crc_rejects: i64 = 0
+    acks_lost: i64 = 0
+}
+
+// One AppendEntries round from `leader` to `f` over a lossy link.
+// `msg` is the `[BATCH*REC]` byte scratch (reused).
+replicate(leader: Node, @f: Node, @rng: Lcg, @link: Link, leader_commit: i64, @msg) {
+    ensure f.next <= leader.len else { return }
+    cnt = i_min(leader.len - f.next + 1, BATCH)
+    drop = @rng.roll() % 100
+    corrupt = @rng.roll() % 100
+    ack_drop = @rng.roll() % 100
+    link.sent += 1
+    ensure drop >= DROP_PCT else {
+        link.dropped += 1
+        return
+    }
+    start = (f.next - 1) * REC
+    nbytes = cnt * REC
+    bytes_copy_range(@msg, 0, leader.wal, start, nbytes)
+    if corrupt < CORRUPT_PCT {
+        at = @rng.roll() % nbytes
+        msg[at] = msg[at] ^ 90
+    }
+    for j in 0..cnt {
+        at = j * REC
+        if !intact(msg, at) {
+            link.crc_rejects += 1
+            break
+        }
+        idx = be32_get(msg, at)
+        if idx > f.len + 1 { break }
+        if idx == f.len + 1 { @f.append(msg, at) }
+    }
+    @f.apply_upto(i_min(leader_commit, f.len))
+    ensure ack_drop >= ACK_DROP_PCT else {
+        link.acks_lost += 1
+        return
+    }
+    f.matched = i_max(f.matched, f.len)
+    f.next = f.len + 1
+}
+
+median3(a: i64, b: i64, c: i64) : i64 => i_max(i_min(a, b), i_min(i_max(a, b), c))
+
++main() {
+    rng = Lcg.{s: 19019}
+    leader, f1, f2 = node(), node(), node()
+    link = Link.{}
+    msg = bytes_fixed(BATCH * REC)
+    commit = 0
+    for t in 0..(TICKS + DRAIN) {
+        if t < TICKS {
+            key = @rng.roll() % KEYS
+            val = @rng.roll() % 1000000
+            @leader.append(record(leader.len + 1, key, val), 0)
+        }
+        leader_commit = commit
+        replicate(leader, @f1, @rng, @link, leader_commit, @msg)
+        replicate(leader, @f2, @rng, @link, leader_commit, @msg)
+        commit = i_max(commit, median3(leader.len, f1.matched, f2.matched))
+        @leader.apply_upto(commit)
+    }
+    cs = Checksum.{}
+    stats = [leader.len, f1.len, f2.len, commit, leader.applied, f1.applied, f2.applied]
+    for stats { @cs.fold(it) }
+    for [link.sent, link.dropped, link.crc_rejects, link.acks_lost] { @cs.fold(it) }
+    for [leader.digest(), f1.digest(), f2.digest(), leader.wal_crc(), f1.wal_crc()] { @cs.fold(it) }
+    print("CHECKSUM={cs.v}")
+}

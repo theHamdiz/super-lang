@@ -1,0 +1,6 @@
+//! Pod.toml manifest at examples/doc_pod/Pod.toml — pack with `super pod verify`.
+//! Run: super check examples/doc_pod/main.sr
+
++main() {
+    print("doc pod example — see Pod.toml beside this file")
+}

@@ -1,0 +1,116 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj
+2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj
+3 0 obj<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>endobj
+4 0 obj<< /Length 3515 >>stream
+BT
+/F1 10 Tf
+50 780 Td
+14 TL
+(Super 20-Algo Benchmark Suite) Tj T*
+(Generated: 2026-11-25T23:05:48+0200) Tj T*
+(Host: hq cpus=32) Tj T*
+() Tj T*
+(LOC by language \(code\):) Tj T*
+(  c: total=31320 code=29758) Tj T*
+(  super: total=3114 code=2786) Tj T*
+(  bun: total=2392 code=2200) Tj T*
+(  kotlin: total=2644 code=2447) Tj T*
+(  lua: total=3022 code=2752) Tj T*
+(  python: total=2745 code=2339) Tj T*
+(  julia: total=3412 code=3050) Tj T*
+(  rust: total=3627 code=3337) Tj T*
+(  zig: total=3584 code=3287) Tj T*
+(  GRAND: total=55860 code=51956) Tj T*
+() Tj T*
+(Standings \(geo-mean vs C\):) Tj T*
+(  zig: 1.087x) Tj T*
+(  c: 1.000x) Tj T*
+(  super_aot: 0.946x) Tj T*
+(  rust: 0.798x) Tj T*
+(  super_jit: 0.758x) Tj T*
+(  julia: 0.281x) Tj T*
+(  lua: 0.249x) Tj T*
+(  bun: 0.175x) Tj T*
+(  kotlin: 0.123x) Tj T*
+(  python: 0.032x) Tj T*
+() Tj T*
+(01_nbody gate=ok cs=13388893 LOC[c=46 super=44 bun=55 kotlin=55 lua=50 python=53 julia=64 rust=56 zig=66]) Tj T*
+(  c: ok median=0.0077s) Tj T*
+(  super_aot: ok median=0.0071s) Tj T*
+(  super_jit: ok median=0.0091s) Tj T*
+(  bun: ok median=0.0206s) Tj T*
+(  kotlin: ok median=0.0602s) Tj T*
+(  lua: ok median=0.0111s) Tj T*
+(  python: ok median=0.4619s) Tj T*
+(  julia: ok median=0.0201s) Tj T*
+(  rust: ok median=0.0079s) Tj T*
+(  zig: ok median=0.0079s) Tj T*
+(02_mandelbrot_parallel gate=ok cs=2120966 LOC[c=24 super=22 bun=26 kotlin=39 lua=25 python=34 julia=45 rust=39) Tj T*
+(  c: ok median=0.0113s) Tj T*
+(  super_aot: ok median=0.0026s) Tj T*
+(  super_jit: ok median=0.0071s) Tj T*
+(  bun: ok median=0.0140s) Tj T*
+(  kotlin: ok median=0.1004s) Tj T*
+(  lua: ok median=0.0066s) Tj T*
+(  python: ok median=0.2426s) Tj T*
+(  julia: ok median=0.0246s) Tj T*
+(  rust: ok median=0.0029s) Tj T*
+(  zig: ok median=0.0055s) Tj T*
+(03_astar_pathfinding gate=ok cs=1622 LOC[c=120 super=105 bun=132 kotlin=123 lua=115 python=116 julia=132 rust=) Tj T*
+(  c: ok median=0.0015s) Tj T*
+(  super_aot: ok median=0.0014s) Tj T*
+(  super_jit: ok median=0.0034s) Tj T*
+(  bun: ok median=0.0102s) Tj T*
+(  kotlin: ok median=0.0473s) Tj T*
+(  lua: ok median=0.0054s) Tj T*
+(  python: ok median=0.0357s) Tj T*
+(  julia: ok median=0.0223s) Tj T*
+(  rust: ok median=0.0017s) Tj T*
+(  zig: ok median=0.0014s) Tj T*
+(04_json_serde gate=ok cs=10980458832 LOC[c=17 super=14 bun=7 kotlin=14 lua=29 python=14 julia=28 rust=18 zig=2) Tj T*
+(  c: ok median=0.0009s) Tj T*
+(  super_aot: ok median=0.0006s) Tj T*
+(  super_jit: ok median=0.0024s) Tj T*
+(  bun: ok median=0.0114s) Tj T*
+(  kotlin: ok median=0.0417s) Tj T*
+(  lua: ok median=0.0020s) Tj T*
+(  python: ok median=0.0262s) Tj T*
+(  julia: ok median=0.0166s) Tj T*
+(  rust: ok median=0.0011s) Tj T*
+(  zig: ok median=0.0008s) Tj T*
+(05_parallel_mapreduce gate=ok cs=1422520636761 LOC[c=134 super=97 bun=146 kotlin=123 lua=121 python=117 julia=) Tj T*
+(  c: ok median=0.0055s) Tj T*
+(  super_aot: ok median=0.0021s) Tj T*
+(  super_jit: ok median=0.0040s) Tj T*
+(  bun: ok median=0.1513s) Tj T*
+(  kotlin: ok median=0.2336s) Tj T*
+(  lua: ok median=0.0305s) Tj T*
+(  python: ok median=0.1852s) Tj T*
+(  julia: ok median=0.0300s) Tj T*
+(  rust: ok median=0.0073s) Tj T*
+(  zig: ok median=0.0106s) Tj T*
+(06_mergesort_radix gate=ok cs=3556374819638513243 LOC[c=40 super=29 bun=41 kotlin=39 lua=42 python=54 julia=59) Tj T*
+(  c: ok median=0.0057s) Tj T*
+(  super_aot: ok median=0.0051s) Tj T*
+(  super_jit: ok median=0.0069s) Tj T*
+(  bun: ok median=0.1433s) Tj T*
+(  kotlin: ok median=0.0573s) Tj T*
+(  lua: ok median=0.0117s) Tj T*
+ET
+endstream
+endobj
+5 0 obj<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000062 00000 n 
+0000000117 00000 n 
+0000000241 00000 n 
+0000003806 00000 n 
+trailer<< /Size 6 /Root 1 0 R /Info << /Title (Super Benchmark Report) >> >>
+startxref
+3874
+%%EOF

@@ -1,0 +1,15 @@
+//! JSON encode/decode with stdlib fmt (no live server required).
+//! Run: super check examples/doc_http_json/main.sr
+
+use std.fmt.json
+
++User = { id: i64, name: str }
+
++main() {
+    u = User.{id: 1, name: "Ada"}
+    txt = json.encode_map([["id", host.sys_to_str(u.id)], ["name", u.name]]) or err {
+        print("encode failed: {err}")
+        return
+    }
+    print(txt)
+}

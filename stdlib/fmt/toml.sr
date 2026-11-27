@@ -1,0 +1,495 @@
+//! std.fmt.toml — TOML subset: sections, scalars, scalar arrays
+//!
+//! Import with:
+//!   use std.fmt.toml
+//!
+//!   doc = toml_parse(fs_read_str("super.toml") or "") or err { return }
+//!   host = doc.get_str("server.host") or "localhost"
+//!   port = doc.get_int("server.port") or 8080
+//!   tags = doc.get_raw("build.tags") or "[]"
+//!
+//! Keys are stored flattened as "section.key" with the raw value text, so lookup
+//! is a flat scan and nested tables cost nothing. Supported values: basic
+//! strings ("..." with \" \\ \n \t), literal strings ('...'), integers (with
+//! `_` separators), floats, booleans and flat arrays of scalars.
+//! Not supported: inline tables, multiline strings, dates, arrays of tables.
+
+use std.core.collections
+use std.sys.fs
+
+/// `TomlDoc` is a flat table of TOML keys and raw values.
++TomlDoc = {
+    /// Keys on `TomlDoc`. Defaults to `[]`.
+    keys: _ = []
+    /// Vals on `TomlDoc`. Defaults to `[]`.
+    vals: _ = []
+
+    /// Create a fresh `TomlDoc`.
+    new() : TomlDoc => TomlDoc.{keys: [], vals: []}
+
+    /// Slot on this `TomlDoc` (`key`). Returns `i64`.
+    slot(self, key: str) : i64 {
+        pos = -1
+        names = self.keys
+        for names {
+            if it == key { pos = index }
+        }
+        pos
+    }
+
+    /// Put on this `TomlDoc` (`key`, `raw`). Returns `i64`.
+    put(@self, key: str, raw: str) : i64 {
+        at = self.slot(key)
+        if at >= 0 {
+            self.vals = arr_set(self.vals, at, raw)
+            at
+        } else {
+            self.keys = arr_push(self.keys, key)
+            self.vals = arr_push(self.vals, raw)
+            self.slot(key)
+        }
+    }
+
+    /// Get raw on this `TomlDoc` (`key`). Returns `str`, or `none`.
+    get_raw(self, key: str) : str? {
+        at = self.slot(key)
+        ensure at >= 0 else { return none }
+        vals = self.vals
+        vals[at]
+    }
+
+    /// Count on this `TomlDoc`. Returns `i64`.
+    count(self) : i64 {
+        n = 0
+        names = self.keys
+        for names { n += 1 }
+        n
+    }
+
+    /// Get str on this `TomlDoc` (`key`). Returns `str`, or `none`.
+    get_str(self, key: str) : str? {
+        raw = self.get_raw(key) or none
+        ensure raw != none else { return none }
+        n = toml_len(raw)
+        ensure n >= 2 else { return none }
+        if raw[0] == "\"" && raw[n - 1] == "\"" { return toml_unquote(raw) }
+        if raw[0] == "'" && raw[n - 1] == "'" { return toml_unquote(raw) }
+        none
+    }
+
+    /// Get int on this `TomlDoc` (`key`). Returns `i64`, or `none`.
+    get_int(self, key: str) : i64? {
+        raw = self.get_raw(key) or none
+        ensure raw != none else { return none }
+        toml_parse_int(raw)
+    }
+
+    /// Get bool on this `TomlDoc` (`key`). Returns `bool`, or `none`.
+    get_bool(self, key: str) : bool? {
+        raw = self.get_raw(key) or none
+        ensure raw != none else { return none }
+        if raw == "true" { return true }
+        if raw == "false" { return false }
+        none
+    }
+
+    /// Get float on this `TomlDoc` (`key`). Returns `f64`, or `none`.
+    get_float(self, key: str) : f64? {
+        raw = self.get_raw(key) or none
+        ensure raw != none else { return none }
+        n = toml_len(raw)
+        from = 0
+        neg = false
+        if n > 0 && raw[0] == "-" {
+            neg = true
+            from = 1
+        }
+        ensure from < n else { return none }
+        whole = 0.0
+        frac = 0.0
+        scale = 1.0
+        seen_dot = false
+        bad = false
+        for from..n {
+            c = raw[it]
+            if c == "." && !seen_dot {
+                seen_dot = true
+            } else {
+                if c != "_" {
+                    d = toml_digit(c)
+                    if d < 0 { bad = true }
+                    if seen_dot {
+                        scale = scale / 10.0
+                        frac += d * scale
+                    } else {
+                        whole = whole * 10.0 + d
+                    }
+                }
+            }
+        }
+        ensure !bad else { return none }
+        v = whole + frac
+        if neg { v = 0.0 - v }
+        v
+    }
+}
+
+/// Toml len (`s`). Returns `i64`.
++toml_len(s: str) : i64 => host.sys_str_len(s)
+
+/// Toml is space (`c`).
++toml_is_space(c: str) : bool => c == " " || c == "\t" || c == "\r"
+
+/// Toml trim (`s`). Returns `str`.
++toml_trim(s: str) : str {
+    n = toml_len(s)
+    lo = n
+    hi = 0
+    for 0..n {
+        if !toml_is_space(s[it]) {
+            if lo == n { lo = it }
+            hi = it + 1
+        }
+    }
+    ensure lo < hi else { return "" }
+    s[lo..hi]
+}
+
+/// Drop a trailing `# comment` that is not inside a string.
++toml_strip_comment(line: str) : str {
+    n = toml_len(line)
+    in_dq = false
+    in_sq = false
+    cut = n
+    skip = 0
+    for 0..n {
+        c = line[it]
+        if it >= skip {
+            if in_dq {
+                if c == "\\" { skip = it + 2 }
+                if c == "\"" { in_dq = false }
+            } else {
+                if in_sq {
+                    if c == "'" { in_sq = false }
+                } else {
+                    if c == "\"" { in_dq = true }
+                    if c == "'" { in_sq = true }
+                    if c == "#" && cut == n { cut = it }
+                }
+            }
+        }
+    }
+    line[0..cut]
+}
+
+/// Toml find (`s`, `ch`). Returns `i64`.
++toml_find(s: str, ch: str) : i64 {
+    pos = -1
+    for 0..toml_len(s) {
+        if pos < 0 && s[it] == ch { pos = it }
+    }
+    pos
+}
+
+// --- parsing -----------------------------------------------------------------------------
+
+/// Toml parse (`text`). Returns `TomlDoc`, or fails.
++toml_parse(text: str) : TomlDoc! {
+    doc = TomlDoc.new()
+    n = toml_len(text)
+    section = ""
+    start = 0
+    lineno = 0
+    for 0..(n + 1) {
+        if it == n || text[it] == "\n" {
+            line = toml_trim(toml_strip_comment(text[start..it]))
+            start = it + 1
+            lineno += 1
+            ln = toml_len(line)
+            if ln > 0 {
+                if line[0] == "[" {
+                    ensure line[ln - 1] == "]" else {
+                        fail "toml: unterminated section header on line {lineno}"
+                        return
+                    }
+                    section = toml_trim(line[1..(ln - 1)])
+                    ensure section != "" else {
+                        fail "toml: empty section name on line {lineno}"
+                        return
+                    }
+                } else {
+                    eq = toml_find(line, "=")
+                    ensure eq > 0 else {
+                        fail "toml: expected key = value on line {lineno}"
+                        return
+                    }
+                    key = toml_trim(line[0..eq])
+                    raw = toml_trim(line[(eq + 1)..ln])
+                    ensure raw != "" else {
+                        fail "toml: missing value on line {lineno}"
+                        return
+                    }
+                    full = key
+                    if section != "" { full = "{section}.{key}" }
+                    @doc.put(full, raw)
+                }
+            }
+        }
+    }
+    doc
+}
+
+// --- typed getters -------------------------------------------------------------------------
+
+/// Toml unquote (`raw`). Returns `str`.
++toml_unquote(raw: str) : str {
+    n = toml_len(raw)
+    ensure n >= 2 else { return raw }
+    if raw[0] == "'" && raw[n - 1] == "'" { return raw[1..(n - 1)] }
+    ensure raw[0] == "\"" && raw[n - 1] == "\"" else { return raw }
+    out = ""
+    skip = 1
+    for 1..(n - 1) {
+        if it >= skip {
+            c = raw[it]
+            if c == "\\" && it + 1 < n - 1 {
+                e = raw[it + 1]
+                skip = it + 2
+                if e == "n" {
+                    out = "{out}\n"
+                } else {
+                    if e == "t" { out = "{out}\t" } else { out = "{out}{e}" }
+                }
+            } else {
+                out = "{out}{c}"
+                skip = it + 1
+            }
+        }
+    }
+    out
+}
+
+/// Toml digit (`c`). Returns `i64`.
++toml_digit(c: str) : i64 {
+    digits = "0123456789"
+    pos = -1
+    for 0..10 {
+        if digits[it] == c { pos = it }
+    }
+    pos
+}
+
+/// Toml parse int (`raw`). Returns `i64`, or `none`.
++toml_parse_int(raw: str) : i64? {
+    n = toml_len(raw)
+    ensure n > 0 else { return none }
+    from = 0
+    sign = 1
+    if raw[0] == "-" {
+        sign = -1
+        from = 1
+    }
+    if raw[0] == "+" { from = 1 }
+    ensure from < n else { return none }
+    acc = 0
+    bad = false
+    seen = false
+    for from..n {
+        c = raw[it]
+        if c != "_" {
+            d = toml_digit(c)
+            if d < 0 { bad = true }
+            acc = acc * 10 + d
+            seen = true
+        }
+    }
+    ensure !bad && seen else { return none }
+    sign * acc
+}
+
+// --- arrays of scalars ---------------------------------------------------------------------
+
+/// Raw text of the i-th element of a flat array like `["a", "b, c", 3]`, or none.
++toml_array_at(raw: str, i: i64) : str? {
+    n = toml_len(raw)
+    ensure n >= 2 && raw[0] == "[" && raw[n - 1] == "]" else { return none }
+    idx = 0
+    start = 1
+    in_dq = false
+    found = none
+    skip = 0
+    for 1..n {
+        c = raw[it]
+        if it >= skip {
+            if in_dq {
+                if c == "\\" { skip = it + 2 }
+                if c == "\"" { in_dq = false }
+            } else {
+                if c == "\"" { in_dq = true }
+                if c == "," || it == n - 1 {
+                    piece = toml_trim(raw[start..it])
+                    if piece != "" {
+                        if idx == i { found = piece }
+                        idx += 1
+                    }
+                    start = it + 1
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Toml array len (`raw`). Returns `i64`.
++toml_array_len(raw: str) : i64 {
+    n = 0
+    live = true
+    for 0..4096 {
+        if live {
+            item = toml_array_at(raw, it) or none
+            if item == none { live = false } else { n += 1 }
+        }
+    }
+    n
+}
+
+// --- encoding --------------------------------------------------------------------------------
+
+/// Toml quote (`s`). Returns `str`.
++toml_quote(s: str) : str {
+    out = ""
+    for 0..toml_len(s) {
+        c = s[it]
+        if c == "\"" {
+            out = "{out}\\\""
+        } else {
+            if c == "\\" {
+                out = "{out}\\\\"
+            } else {
+                if c == "\n" { out = "{out}\\n" } else { out = "{out}{c}" }
+            }
+        }
+    }
+    "\"{out}\""
+}
+
+/// Toml section (`name`). Returns `str`.
++toml_section(name: str) : str => "[{name}]"
+/// Toml kv (`key`, `raw`). Returns `str`.
++toml_kv(key: str, raw: str) : str => "{key} = {raw}"
+
+/// Render the document: root keys first, then one `[section]` block per prefix.
++toml_encode(doc: TomlDoc) : str {
+    out = ""
+    current = ""
+    names = doc.keys
+    vals = doc.vals
+    for names {
+        at = index
+        key = it
+        dot = -1
+        for 0..toml_len(key) {
+            if key[it] == "." { dot = it }
+        }
+        section = ""
+        name = key
+        if dot > 0 {
+            section = key[0..dot]
+            name = key[(dot + 1)..toml_len(key)]
+        }
+        if section != current {
+            if out != "" { out = "{out}\n" }
+            out = "{out}[{section}]\n"
+            current = section
+        }
+        out = "{out}{name} = {vals[at]}\n"
+    }
+    out
+}
+
+// --- tests ----------------------------------------------------------------------------------------
+
+/// Test that parse sections, scalars and comments.
+test "parse sections, scalars and comments" {
+    src = "title = \"super\"\n# a comment\n[server]\nhost = \"0.0.0.0\"  # inline\nport = 8_080\ntls = true\n\n[server.limits]\nrate = 2.5\n"
+    doc = toml_parse(src) or TomlDoc.new()
+    assert_eq(doc.count(), 5)
+    assert_eq(doc.get_str("title") or "?", "super")
+    assert_eq(doc.get_str("server.host") or "?", "0.0.0.0")
+    assert_eq(doc.get_int("server.port") or 0, 8080)
+    #assert(doc.get_bool("server.tls") or false)
+    assert_eq(doc.get_float("server.limits.rate") or 0.0, 2.5)
+}
+
+/// Test that missing keys and wrong types are none.
+test "missing keys and wrong types are none" {
+    doc = toml_parse("a = 1\nb = \"x\"\nc = true\n") or TomlDoc.new()
+    assert_eq(doc.get_int("zzz") or -1, -1)
+    assert_eq(doc.get_int("b") or -1, -1)
+    assert_eq(doc.get_str("a") or "none", "none")
+    #assert(!(doc.get_bool("a") or false))
+    assert_eq(doc.get_float("b") or 0.0, 0.0)
+}
+
+/// Test that string escapes and literal strings.
+test "string escapes and literal strings" {
+    doc = toml_parse("a = \"say \\\"hi\\\"\\n\"\nb = 'C:\\path'\nc = \"has # hash\"\n") or TomlDoc.new()
+    assert_eq(doc.get_str("a") or "?", "say \"hi\"\n")
+    assert_eq(doc.get_str("b") or "?", "C:\\path")
+    assert_eq(doc.get_str("c") or "?", "has # hash")
+}
+
+/// Test that negative numbers.
+test "negative numbers" {
+    doc = toml_parse("i = -42\nf = -0.5\n") or TomlDoc.new()
+    assert_eq(doc.get_int("i") or 0, -42)
+    assert_eq(doc.get_float("f") or 0.0, 0.0 - 0.5)
+}
+
+/// Test that later duplicate keys win.
+test "later duplicate keys win" {
+    doc = toml_parse("a = 1\na = 2\n") or TomlDoc.new()
+    assert_eq(doc.get_int("a") or 0, 2)
+    assert_eq(doc.count(), 1)
+}
+
+/// Test that arrays of scalars.
+test "arrays of scalars" {
+    doc = toml_parse("tags = [\"a\", \"b, c\", 3]\nempty = []\n") or TomlDoc.new()
+    raw = doc.get_raw("tags") or "[]"
+    assert_eq(toml_array_len(raw), 3)
+    assert_eq(toml_array_at(raw, 0) or "?", "\"a\"")
+    assert_eq(toml_unquote(toml_array_at(raw, 1) or "?"), "b, c")
+    assert_eq(toml_array_at(raw, 2) or "?", "3")
+    assert_eq(toml_array_at(raw, 3) or "none", "none")
+    assert_eq(toml_array_len(doc.get_raw("empty") or "[]"), 0)
+}
+
+/// Test that malformed documents fail.
+test "malformed documents fail" {
+    assert_eq((toml_parse("[server\nport = 1") or TomlDoc.new()).count(), 0)
+    assert_eq((toml_parse("no equals here") or TomlDoc.new()).count(), 0)
+    assert_eq((toml_parse("k =") or TomlDoc.new()).count(), 0)
+    assert_eq((toml_parse("[]\nk = 1") or TomlDoc.new()).count(), 0)
+}
+
+/// Test that encode helpers.
+test "encode helpers" {
+    assert_eq(toml_quote("a\"b"), "\"a\\\"b\"")
+    assert_eq(toml_section("server"), "[server]")
+    assert_eq(toml_kv("port", "8080"), "port = 8080")
+}
+
+/// Test that encode / parse round trip.
+test "encode / parse round trip" {
+    doc = TomlDoc.new()
+    @doc.put("name", toml_quote("super"))
+    @doc.put("server.host", toml_quote("localhost"))
+    @doc.put("server.port", "9000")
+    text = toml_encode(doc)
+    assert_eq(text, "name = \"super\"\n\n[server]\nhost = \"localhost\"\nport = 9000\n")
+    back = toml_parse(text) or TomlDoc.new()
+    assert_eq(back.get_str("server.host") or "?", "localhost")
+    assert_eq(back.get_int("server.port") or 0, 9000)
+    assert_eq(back.get_str("name") or "?", "super")
+}

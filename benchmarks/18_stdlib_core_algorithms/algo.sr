@@ -1,0 +1,205 @@
+// 18_stdlib_core_algorithms — kernels (A DFA/find extract, B UTF-8, C columnar SQL, D UF unify).
+// LAW-BENCH-001: no host FFI in this file.
+use std.core.str
+use std.core.bytes
+use std.core.collections
+use std.core.unicode
+use std.math.core
+
+MOD = 1000000007
+NLINES = 3000
+NDOC = 60
+PERDOC = 200
+NR = 6000
+NQ = 24
+NDEPT = 16
+NVARS = 2500
+NCONST = 4
+NCOMP = 6000
+NTOT = 8504
+NCON = 5000
+
+LEVELS = ["INFO", "WARN", "ERROR", "DEBUG"]
+CODES = [200, 201, 204, 301, 400, 401, 404, 500, 503]
+BAD_BYTES = [128, 192, 193, 245, 255, 224]
+
+part_a(@rng: Lcg, @cs) {
+    classes = [0; 8]
+    took_sum = 0
+    took_max = 0
+    took_n = 0
+    user_sum = 0
+    bad = 0
+    bytes = 0
+    sb = str_builder_fixed(160)
+    for i in 0..NLINES {
+        mo = 1 + @rng.roll() % 12
+        dd = 1 + @rng.roll() % 28
+        hh = @rng.roll() % 24
+        mi = @rng.roll() % 60
+        ss = @rng.roll() % 60
+        level = LEVELS[@rng.roll() % 4]
+        svc = @rng.roll() % 100
+        uid = @rng.roll() % 100000
+        code = CODES[@rng.roll() % 9]
+        ms = @rng.roll() % 3000
+        sb_log_prefix(@sb, "2026", mo, dd, hh, mi, ss, level, svc, uid)
+        if i % 13 == 5 {
+            @sb.lit(" status=abc")
+        } else {
+            @sb.lit(" status=")
+            @sb.dec(code)
+        }
+        if i % 17 != 3 {
+            @sb.lit(" took=")
+            @sb.dec(ms)
+            @sb.lit("ms")
+        }
+        line = sb.text()
+        st = extract_uint_after(line, "status=")
+        tk = extract_uint_after(line, "took=")
+        us = extract_uint_after(line, "user=")
+        if st < 0 {
+            bad += 1
+        } else {
+            classes[st / 100] += 1
+        }
+        if tk >= 0 {
+            took_sum += tk
+            took_n += 1
+            took_max = i_max(took_max, tk)
+        }
+        user_sum += us
+        bytes += byte_len(line) + 1
+    }
+    for classes { fold_mul_mod(@cs, it, 131, MOD) }
+    fold_mul_mod3(@cs, took_sum, took_max, took_n, 131, MOD)
+    fold_mul_mod3(@cs, user_sum, bad, bytes, 131, MOD)
+}
+
+part_b(@rng: Lcg, @cs) {
+    doc = [0; PERDOC * 4]
+    valid_docs = 0
+    total_cp = 0
+    for d in 0..NDOC {
+        n = 0
+        for 0..PERDOC {
+            n = utf8_put(@doc, n, utf8_draw_cp(@rng))
+        }
+        if d % 5 == 2 {
+            at = @rng.roll() % n
+            doc[at] = BAD_BYTES[@rng.roll() % 6]
+        }
+        ok = 0
+        runes = 0
+        if utf8_valid_n(doc, n) {
+            ok = 1
+            runes = utf8_count_n(doc, n)
+        }
+        fold_mul_mod3(@cs, ok, runes, n, 131, MOD)
+        valid_docs += ok
+        total_cp += runes
+    }
+    fold_mul_mod(@cs, valid_docs, 131, MOD)
+    fold_mul_mod(@cs, total_cp, 131, MOD)
+}
+
+part_c(@rng: Lcg, @cs) {
+    dept = [0; NR]
+    age = [0; NR]
+    sal = [0; NR]
+    act = [0; NR]
+    for i in 0..NR {
+        dept[i] = @rng.roll() % NDEPT
+        age[i] = 18 + @rng.roll() % 50
+        sal[i] = 30000 + @rng.roll() % 90000
+        active = 0
+        if @rng.roll() % 10 != 0 { active = 1 }
+        act[i] = active
+    }
+    for 0..NQ {
+        lo = 18 + @rng.roll() % 30
+        hi = 40000 + @rng.roll() % 80000
+        need = @rng.roll() % 2
+        cnt = [0; NDEPT]
+        sum = [0; NDEPT]
+        mx = [0; NDEPT]
+        taken = [0; NDEPT]
+        for i in 0..NR {
+            if age[i] >= lo && sal[i] < hi && act[i] >= need {
+                g = dept[i]
+                cnt[g] += 1
+                sum[g] += sal[i]
+                mx[g] = i_max(mx[g], age[i])
+            }
+        }
+        for 0..3 {
+            best = 0 - 1
+            for g in 0..NDEPT {
+                if cnt[g] >= 5 && taken[g] == 0 {
+                    if best < 0 || sum[g] > sum[best] { best = g }
+                }
+            }
+            if best >= 0 {
+                taken[best] = 1
+                fold_mul_mod3(@cs, best, cnt[best], sum[best], 131, MOD)
+                fold_mul_mod(@cs, mx[best], 131, MOD)
+                fold_mul_mod(@cs, sum[best] / ((best + 1) * 1000), 131, MOD)
+            } else {
+                fold_mul_mod(@cs, 999, 131, MOD)
+            }
+        }
+    }
+}
+
+part_d(@rng: Lcg, @cs) {
+    kind = [0; NTOT]
+    left = [0 - 1; NTOT]
+    right = [0 - 1; NTOT]
+    parent = [0; NTOT]
+    for i in 0..NTOT { parent[i] = i }
+    for c in 0..NCONST {
+        kind[NVARS + c] = 1
+        left[NVARS + c] = c
+    }
+    for i in (NVARS + NCONST)..NTOT {
+        kind[i] = 2
+        left[i] = @rng.roll() % i
+        right[i] = @rng.roll() % i
+    }
+    g = HmTypes.{
+        kind,
+        left,
+        right,
+        parent,
+        work_a: [0; 2 * NTOT + 16],
+        work_b: [0; 2 * NTOT + 16]
+    }
+    fails = 0
+    for 0..NCON {
+        pick = @rng.roll() % 2
+        x = @rng.roll()
+        if pick == 0 { x = x % NVARS } else { x = x % NTOT }
+        y = @rng.roll() % NTOT
+        if !@g.unify(x, y) { fails += 1 }
+    }
+    fold_mul_mod(@cs, fails, 131, MOD)
+    fold_mul_mod(@cs, g.unions, 131, MOD)
+    classes = 0
+    for i in 0..NTOT {
+        r = @g.root(i)
+        if r == i { classes += 1 }
+        fold_mul_mod(@cs, r * 3 + g.kind[r], 131, MOD)
+    }
+    fold_mul_mod(@cs, classes, 131, MOD)
+}
+
++main() {
+    rng = Lcg.{s: 18018}
+    cs = [0]
+    part_a(@rng, @cs)
+    part_b(@rng, @cs)
+    part_c(@rng, @cs)
+    part_d(@rng, @cs)
+    print("CHECKSUM={cs[0]}")
+}

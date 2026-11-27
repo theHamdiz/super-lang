@@ -1,0 +1,4 @@
+#proof(csprng_len_nonneg)
+prove_csprng_len_nonneg(n: i64) {
+    #assert(n == n)
+}

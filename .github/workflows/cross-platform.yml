@@ -1,0 +1,121 @@
+name: cross-platform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unix-tier1:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Select a C23-capable host compiler
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: |
+          mkdir -p "$RUNNER_TEMP/c23-bin"
+          ln -s "$(command -v clang)" "$RUNNER_TEMP/c23-bin/cc"
+          echo "$RUNNER_TEMP/c23-bin" >> "$GITHUB_PATH"
+      - name: Frontend, PAL, and feature gates
+        run: |
+          cargo test -p super-frontend --lib --locked cfg
+          cargo test -p super-host --lib --locked platform_poller_reports_listener_readiness
+          cargo test -p super-cli --test cli --locked build_selects_cfg_items_from_pod_features
+      - name: C23 hello-world
+        run: |
+          cargo run -p super-cli --locked -- build examples/doc_hello/hello.sr --codegen-units single --out "$RUNNER_TEMP/super-hello"
+          "$RUNNER_TEMP/super-hello"
+      - name: Pod feature configurations
+        run: |
+          cargo build -p super-cli --locked
+          (cd examples/doc_features && ../../target/debug/super build)
+          (cd examples/doc_features && ../../target/debug/super build --all-features)
+          (cd examples/doc_features && ../../target/debug/super build --no-default-features)
+      - name: Installer rejects corrupt checksum
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          shellcheck install.sh scripts/test_install_checksum.sh
+          scripts/test_install_checksum.sh
+
+  linux-musl-tier1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native musl frontend, PAL, features, and C23 smoke
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src rust:1-alpine sh -euc '
+            apk add --no-cache bash build-base git perl pkgconf openssl-dev
+            git config --global --add safe.directory /src
+            cargo test -p super-frontend --lib --locked cfg
+            cargo test -p super-host --lib --locked platform_poller_reports_listener_readiness
+            cargo test -p super-cli --test cli --locked build_selects_cfg_items_from_pod_features
+            cargo run -p super-cli --locked -- build examples/doc_hello/hello.sr \
+              --codegen-units single --out /tmp/super-hello
+            /tmp/super-hello
+            cargo build -p super-cli --locked
+            (cd examples/doc_features && ../../target/debug/super build)
+            (cd examples/doc_features && ../../target/debug/super build --all-features)
+            (cd examples/doc_features && ../../target/debug/super build --no-default-features)
+          '
+
+  windows-tier1:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust host and VM fallback
+        run: |
+          cargo check -p super-host --all-targets --locked
+          cargo test -p super-runtime --lib --locked unavailable_executable_memory_falls_back_to_vm
+          cargo test -p super-cli --test cli --locked build_selects_cfg_items_from_pod_features
+      - name: C23 hello-world
+        shell: pwsh
+        run: |
+          cargo run -p super-cli --locked -- build examples/doc_hello/hello.sr --codegen-units single --cc-bin clang --out "$env:RUNNER_TEMP\super-hello.exe"
+          & "$env:RUNNER_TEMP\super-hello.exe"
+      - name: C23 AOT TCP loopback (Winsock2)
+        shell: pwsh
+        run: |
+          cargo run -p super-cli --locked -- build examples/aot_tcp_echo/main.sr --codegen-units single --cc-bin clang --out "$env:RUNNER_TEMP\aot-tcp-echo.exe"
+          & "$env:RUNNER_TEMP\aot-tcp-echo.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Pod feature configurations
+        shell: pwsh
+        run: |
+          cargo build -p super-cli --locked
+          Push-Location examples/doc_features
+          ..\..\target\debug\super.exe build
+          ..\..\target\debug\super.exe build --all-features
+          ..\..\target\debug\super.exe build --no-default-features
+          Pop-Location
+      - name: PowerShell installer parses on 5.1+
+        shell: powershell
+        run: |
+          foreach ($script in @(".\install.ps1", ".\docs\install.ps1", ".\scripts\test_install_checksum.ps1")) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script), [ref]$null, [ref]$errors)
+            if ($errors.Count) { $errors | Out-String | Write-Error }
+          }
+          .\scripts\test_install_checksum.ps1
+
+  freebsd-tier2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Native FreeBSD compile and smoke
+        uses: vmactions/freebsd-vm@v1
+        with:
+          prepare: pkg install -y rust
+          run: |
+            cargo test -p super-frontend --lib --locked cfg
+            cargo test -p super-host --lib --locked platform_poller_reports_listener_readiness
+            cargo run -p super-cli --locked -- build examples/doc_hello/hello.sr --codegen-units single --out /tmp/super-hello
+            /tmp/super-hello

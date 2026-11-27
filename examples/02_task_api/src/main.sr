@@ -1,0 +1,210 @@
+// Backend API — concurrent DB/cache via scope/spawn + audit channel pool
+//
+// Run:   super test examples/02_task_api/
+// Build: super b -r examples/02_task_api/
+// Serve: ./examples/02_task_api/target/release/02_task_api
+// CI:    ./…/02_task_api --self-test
+
+use std.net.http
+use std.sec.{jwt, hash, pq}
+use std.diag.log
+use models.{User}
+use std.cli.cmd
+use routes
+
++AuditEvent = {
+    user_id: i64 = 0
+    action: str = ""
+}
+
++fetch_user(id: i64) : User {
+    User{id, name: "Amina"}
+}
+
++fetch_cache(id: i64) : i64 {
+    id * 10
+}
+
++handle_profile(id: i64) : i64 {
+    audit = chan[AuditEvent](16)
+    total = 0
+    scope {
+        worker = spawn {
+            n = 0
+            for _ev in audit {
+                n += 1
+            }
+            n
+        }
+        // Same-line `await spawn` — equivalent to `t = spawn …; await t`.
+        u = await spawn fetch_user(id)
+        c = await spawn fetch_cache(id)
+        audit.send(AuditEvent{user_id: u.id, action: "profile"})
+        audit.close()
+        processed = await worker
+        total = u.id + c + processed
+    }
+    total
+}
+
+/// Default listen port — avoid 8080; Docker proxies often already own it.
++DEFAULT_PORT = 8787
+
++listen_port(argv: _) : i64 {
+    m = Command.new("task_api")
+        .flag("self-test", "", "run one health+create request then exit")
+        .opt("port", "p", "PORT", "{DEFAULT_PORT}", "listen port", false)
+        .as_int()
+        .parse(argv) or err { return DEFAULT_PORT }
+    m.get_int("port", DEFAULT_PORT)
+}
+
++wants_self_test(argv: _) : bool {
+    for arg in argv {
+        if arg == "--self-test" || arg == "--self_test" { return true }
+    }
+    false
+}
+
+/// Fluent app: first-class callables via get / post / crud (no Handler ids).
++build_app() : App {
+    app = App.new()
+    app = @app
+        .use(Mw.Recover)
+        .use(Mw.RequestId)
+        .use(Mw.Logger)
+        .use(Mw.Security)
+        .use(Mw.StripSlash)
+        .use_cors(["*"], false)
+        .get("/health", |req| { handle_health(req) })
+        .group("/api")
+        .use(Mw.Json)
+        .use_max_body(1048576)
+        .post("/login", |req| { handle_login(req) })
+        .crud("/tasks", CrudHandlers.rest(
+            |req| { handle_list_tasks(req) },
+            |req| { handle_create_task(req) },
+            |req| { handle_show_task(req) },
+            |req| { handle_update_task(req) },
+            |req| { handle_destroy_task(req) }
+        ))
+        .get(r"/profile/{id}", |req| { handle_profile_route(req) })
+        .end()
+        .mount("GET", "/debug/stats", |req| { handle_debug_stats(req) })
+    app
+}
+
++main() {
+    argv = cli_args()
+    n = len(argv)
+    rest = if n > 1 { argv[1..n] } else { [] }
+    port = listen_port(rest)
+    self_test = wants_self_test(rest)
+    lg = Logger.console("task_api")
+    addr = "127.0.0.1:{port}"
+    app = build_app()
+    if self_test {
+        tc = TestClient.new(app)
+        res = @tc.get("/health")
+        ensure res.status == 200 else {
+            @lg.error("self-test: bad status {res.status}")
+            return 1
+        }
+        create = @tc.post("/api/tasks", {title: "Ship", owner_id: 1})
+        ensure create.status == 200 else {
+            @lg.error("self-test: create failed {create.status}")
+            return 1
+        }
+        @lg.info("self-test ok status={res.status}")
+        return 0
+    }
+    @lg.info("listening on {addr}")
+    handled = @app.serve(addr) or err {
+        @lg.error("serve failed on {addr}: {err} (try --port <free>)")
+        return 1
+    }
+    @lg.info("shutdown after {handled} requests")
+    0
+}
+
+test "listen port defaults to 8787 and reads --port" {
+    assert_eq(listen_port([]), 8787)
+    assert_eq(listen_port(["--port", "9090"]), 9090)
+    assert_eq(listen_port(["-p", "3000"]), 3000)
+    assert_eq(listen_port(["--self-test"]), 8787)
+}
+
+test "self-test flag detection" {
+    #assert(!(wants_self_test([])))
+    #assert(wants_self_test(["--self-test"]))
+}
+
+test "models construct via import" {
+    u = User{id: 1, name: "Amina"}
+    assert_eq(u.id, 1)
+}
+
+test "http helpers require std.net.http" {
+    res = http.ok(.{ok: true})
+    assert_eq(res.status, 200)
+}
+
+test "app.handle health and tasks CRUD" {
+    app = build_app()
+    tc = TestClient.new(app)
+    assert_eq(@tc.get("/health").status, 200)
+    assert_eq(@tc.post("/api/login", {}).status, 200)
+    assert_eq(@tc.get("/api/tasks").status, 200)
+    show = @tc.get("/api/tasks/9")
+    assert_eq(show.status, 200)
+    #assert(contains(show.body, "9"))
+    assert_eq(@tc.get("/api/profile/3").status, 200)
+    assert_eq(@tc.get("/debug/stats").status, 200)
+}
+
+test "TestClient self-test path" {
+    app = build_app()
+    tc = TestClient.new(app)
+    assert_eq(@tc.get("/health").status, 200)
+    assert_eq(@tc.get("/missing").status, 404)
+    assert_eq(@tc.post("/api/tasks", {title: "x", owner_id: 1}).status, 200)
+    assert_eq(@tc.get("/api/tasks/7").status, 200)
+}
+
+test "scope spawn concurrent profile + audit" {
+    // user.id(7) + cache(70) + 1 audit event = 78
+    assert_eq(handle_profile(7), 78)
+}
+
+test "stdlib: jwt roundtrip for authenticated user" {
+    tok = jwt_make("s3cret", "user-1", 1000, 2000)
+    r = jwt_verify("s3cret", tok, 1500)
+    #assert(r.valid)
+    assert_eq(r.sub, "user-1")
+    #assert(!(jwt_verify("wrong", tok, 1500).valid))
+    #assert(!(jwt_verify("s3cret", tok, 2500).valid))
+}
+
+test "stdlib: log line format offline" {
+    lg = Logger.new("task_api")
+    @lg.set_clock(1700000000000)
+    @lg.info("order created")
+    assert_eq(lg.last(), "2023-11-14T22:13:20.000Z INFO  [task_api] order created")
+}
+
+test "stdlib: blake3 integrity for audit payload" {
+    dig = blake3_hex("user-7:profile")
+    assert_eq(dig.byte_len(), 64)
+    #assert(dig == blake3_hex("user-7:profile"))
+}
+
+test "stdlib: pq kem seals session key" {
+    kp = pq_kem_keygen()
+    enc = pq_kem_encaps(kp.ek)
+    assert_eq(pq_kem_decaps(kp.seed, enc.ct), enc.ss)
+}
+
+test "a command displays its name" {
+    cmd = Command.new("tasks")
+    assert_eq("{cmd}", "tasks")
+}

@@ -1,0 +1,224 @@
+//! mariadb — MariaDB dialect over the MySQL offline driver
+//!
+//! Import with:
+//!   use mariadb
+//!
+//!   pool = MariaPool.new("mariadb://app:secret@db.local:3306/shop", 8) or err { return }
+//!
+//! MariaDB is wire-compatible with MySQL. This module re-exports the MySQL pool
+//! surface and adds Maria-specific helpers: SEQUENCE objects, RETURNING-style
+//! insert capture, JSON path get/set lite, and `mariadb://` URL parsing.
+
+use std.db.mysql
+use std.db.sql
+use std.core.collections
+
++MARIADB_DEFAULT_PORT = 3306
++MARIA_SEQUENCE_EXISTS = "42S01"
+
+/// MariaDB pool (MySQL-compatible + sequences / JSON helpers).
++MariaPool = {
+    inner: MysqlPool = MysqlPool.empty()
+    seq_names: _ = []
+    seq_vals: _ = []
+    version_comment: str = "MariaDB-compatible Super offline"
+
+    new(url: str, size: i64) : MariaPool! {
+        u = url
+        // Accept mariadb:// by rewriting to mysql:// for the shared parser.
+        if sql_len(u) >= 10 && u[0..10] == "mariadb://" {
+            u = "mysql://" + u[10..sql_len(u)]
+        }
+        if sql_len(u) >= 8 && u[0..8] == "maria://" {
+            u = "mysql://" + u[8..sql_len(u)]
+        }
+        mp = MysqlPool.new(u, size) or MysqlPool.empty()
+        ensure mp.cfg.host != "" else {
+            fail "mariadb: invalid connection url"
+            return
+        }
+        MariaPool.{inner: mp, seq_names: [], seq_vals: [], version_comment: "MariaDB-compatible Super offline"}
+    }
+
+    empty(): MariaPool => MariaPool.{inner: MysqlPool.empty(), seq_names: [], seq_vals: [], version_comment: "MariaDB-compatible Super offline"}
+
+    cfg(self): MysqlConfig => self.inner.cfg
+
+    store(self): SqlDb => self.inner.store()
+
+    with_mysql(self, mp: MysqlPool) : MariaPool {
+        MariaPool.{inner: mp, seq_names: self.seq_names, seq_vals: self.seq_vals, version_comment: self.version_comment}
+    }
+
+    make_table(self, name: str, cols: _) : MariaPool! {
+        mp = self.inner.make_table(name, cols) or self.inner
+        ensure SqlDb.has_table(mp.store(), name) else {
+            fail "mariadb: cannot create table {name}"
+            return
+        }
+        self.with_mysql(mp)
+    }
+
+    add_row(self, name: str, row: _) : MariaPool! {
+        mp = self.inner.add_row(name, row) or self.inner
+        self.with_mysql(mp)
+    }
+
+    insert_auto(self, name: str, vals: _) : MariaPool! {
+        mp = self.inner.insert_auto(name, vals) or self.inner
+        self.with_mysql(mp)
+    }
+
+    find(self, name: str, col: str, val: str): _ => self.inner.find(name, col, val)
+
+    count(self, name: str): i64 => self.inner.count(name)
+
+    update(self, name: str, col: str, val: str, set_col: str, set_val: str) : MariaPool! {
+        mp = self.inner.update(name, col, val, set_col, set_val) or self.inner
+        self.with_mysql(mp)
+    }
+
+    delete(self, name: str, col: str, val: str) : MariaPool! {
+        mp = self.inner.delete(name, col, val) or self.inner
+        self.with_mysql(mp)
+    }
+
+    last_insert_id(self): i64 => self.inner.last_insert_id
+
+    affected_rows(self): i64 => self.inner.affected_rows
+
+    begin(self): MysqlTx => self.inner.begin()
+
+    commit(self, t: MysqlTx): MariaPool => self.with_mysql(self.inner.commit(t))
+
+    rollback(self, t: MysqlTx): MariaPool => self.with_mysql(self.inner.rollback(t))
+
+    /// CREATE SEQUENCE name START WITH n.
+    create_sequence(@self, name: str, start: i64) : bool! {
+        ns = self.seq_names
+        for ns {
+            if it == name {
+                fail "mariadb: sequence {name} already exists ({MARIA_SEQUENCE_EXISTS})"
+                return
+            }
+        }
+        self.seq_names = arr_push(self.seq_names, name)
+        self.seq_vals = arr_push(self.seq_vals, start - 1)
+        true
+    }
+
+    /// NEXT VALUE FOR sequence.
+    next_value(@self, name: str) : i64! {
+        ns = self.seq_names
+        at = -1
+        for ns {
+            if it == name { at = index }
+        }
+        ensure at >= 0 else {
+            fail "mariadb: unknown sequence {name}"
+            return
+        }
+        v = self.seq_vals[at] + 1
+        self.seq_vals = arr_set(self.seq_vals, at, v)
+        v
+    }
+
+    /// INSERT ... RETURNING: insert_auto then return the generated id.
+    insert_returning(self, name: str, vals: _) : i64! {
+        mp = self.inner.insert_auto(name, vals) or self.inner
+        ensure mp.last_insert_id > 0 else {
+            fail "mariadb: insert returning failed"
+            return
+        }
+        mp.last_insert_id
+    }
+
+    /// JSON_EXTRACT lite: find `"path":` value in a JSON object string.
+    json_get(doc: str, path: str) : str! {
+        needle = "\"{path}\":"
+        n = sql_len(doc)
+        m = sql_len(needle)
+        pos = -1
+        for 0..(n - m + 1) {
+            if doc[it..(it + m)] == needle { pos = it + m }
+        }
+        ensure pos >= 0 else {
+            fail "mariadb: json path not found"
+            return
+        }
+        // skip whitespace (bounded)
+        for 0..8 {
+            if pos < n && doc[pos] == " " { pos += 1 }
+        }
+        ensure pos < n else {
+            fail "mariadb: empty json value"
+            return
+        }
+        if doc[pos] == "\"" {
+            pos += 1
+            out = ""
+            for pos..n {
+                c = doc[it]
+                if c == "\"" { return out }
+                out = out + c
+            }
+            fail "mariadb: unclosed json string"
+            return
+        }
+        out = ""
+        for pos..n {
+            c = doc[it]
+            if c == "," || c == "}" { return out }
+            out = out + c
+        }
+        out
+    }
+
+    /// Server version comment (@@version_comment).
+    version(self): str => self.version_comment
+
+    show_tables(self): _ => self.inner.show_tables()
+}
+
++mariadb_parse_url(url: str) : MysqlConfig! {
+    u = url
+    if sql_len(u) >= 10 && u[0..10] == "mariadb://" {
+        u = "mysql://" + u[10..sql_len(u)]
+    }
+    if sql_len(u) >= 8 && u[0..8] == "maria://" {
+        u = "mysql://" + u[8..sql_len(u)]
+    }
+    mysql_parse_url(u)
+}
+
++mariadb_redacted(cfg: MysqlConfig) : str {
+    auth = ""
+    if cfg.user != "" { auth = "{cfg.user}@" }
+    "mariadb://{auth}{cfg.host}:{cfg.port}/{cfg.dbname}"
+}
+
+test "mariadb url and crud" {
+    cfg = mariadb_parse_url("mariadb://app:pw@h:3306/db") or MysqlConfig.{host: "", port: 0, user: "", password: "", dbname: "", charset: "", collate: ""}
+    assert_eq(cfg.user, "app")
+    assert_eq(cfg.port, 3306)
+    assert_eq(mariadb_redacted(cfg), "mariadb://app@h:3306/db")
+    pool = MariaPool.new("mariadb://h/d", 2) or MariaPool.empty()
+    pool = pool.make_table("t", ["id", "v"]) or pool
+    pool = pool.insert_auto("t", ["x"]) or pool
+    assert_eq(pool.last_insert_id(), 1)
+    assert_eq(pool.count("t"), 1)
+}
+
+test "mariadb sequences json returning" {
+    pool = MariaPool.new("mysql://h/d", 2) or MariaPool.empty()
+    #assert(@pool.create_sequence("s", 10) or false)
+    assert_eq(@pool.next_value("s") or 0, 10)
+    assert_eq(@pool.next_value("s") or 0, 11)
+    got = MariaPool.json_get("{\"a\":1,\"name\":\"Amina\"}", "name") or ""
+    assert_eq(got, "Amina")
+    pool = pool.make_table("u", ["id", "n"]) or pool
+    // insert_returning returns [id, pool] — grab id from last_insert after insert_auto path
+    pool = pool.insert_auto("u", ["A"]) or pool
+    assert_eq(pool.last_insert_id(), 1)
+    #assert(pool.version() != "")
+}

@@ -1,0 +1,274 @@
+//! std.game.tilemap — 2D grid/chunk tilemap with collision queries + std.game.ai hooks
+//!
+//! Import: use std.game.tilemap
+//!
+//!   tm = TileMap.from_csv("0,0,1\n0,0,1\n1,1,1")
+//!   tm = TileMap.from_json_grid("[[0,1],[1,0]]")
+//!   blocked = tm.solid_at(2, 0)
+//!   g = tm.to_ai_grid()          // std.game.ai Grid for A* / flow-field
+
+use ai
+use std.core.collections
+use std.core.str
+/// `TILE_EMPTY` is `0`.
++TILE_EMPTY = 0
+/// `TILE_SOLID` is `1`.
++TILE_SOLID = 1
+
+/// `TileMap` is a grid of tile ids, with chunk size and solidity.
++TileMap = {
+    /// W on `TileMap` (`i64`). Defaults to `0`.
+    w: i64 = 0
+    /// H on `TileMap` (`i64`). Defaults to `0`.
+    h: i64 = 0
+    /// Tiles on `TileMap`. Defaults to `[]`.
+    tiles: _ = []
+    /// Chunk w on `TileMap` (`i64`). Defaults to `16`.
+    chunk_w: i64 = 16
+    /// Chunk h on `TileMap` (`i64`). Defaults to `16`.
+    chunk_h: i64 = 16
+
+    /// Empty on this `TileMap` (`w`, `h`). Returns `TileMap`.
+    empty(w: i64, h: i64) : TileMap {
+        TileMap.{w, h, tiles: arr_new(w * h, 0), chunk_w: 16, chunk_h: 16}
+    }
+
+    /// In bounds on this `TileMap` (`x`, `y`).
+    in_bounds(self, x: i64, y: i64) : bool {
+        if x < 0 { return false }
+        if y < 0 { return false }
+        if x >= (self.w) { return false }
+        if y >= (self.h) { return false }
+        true
+    }
+
+    /// At on this `TileMap` (`x`, `y`). Returns `i64`.
+    at(self, x: i64, y: i64) : i64 {
+        ensure self.in_bounds(x, y) else { return 0 }
+        self.tiles[y * self.w + x]
+    }
+
+    /// Set on this `TileMap` (`x`, `y`, `v`).
+    set(@self, x: i64, y: i64, v: i64) : bool {
+        ensure self.in_bounds(x, y) else { return false }
+        self.tiles = arr_set(self.tiles, y * self.w + x, v)
+        true
+    }
+
+    /// Solid at on this `TileMap` (`x`, `y`).
+    solid_at(self, x: i64, y: i64) : bool => self.at(x, y) != TILE_EMPTY
+
+    /// Collision layer: true if the axis-aligned rect overlaps any solid tile.
+    /// Coordinates are in tile space (1.0 == one tile).
+    collides_rect(self, x: f64, y: f64, w: f64, h: f64) : bool {
+        x0 = tile_floor_i(x)
+        y0 = tile_floor_i(y)
+        x1 = tile_floor_i(x + w - 0.0001)
+        y1 = tile_floor_i(y + h - 0.0001)
+        for y0..(y1 + 1) {
+            yy = it
+            for x0..(x1 + 1) {
+                if self.solid_at(it, yy) { return true }
+            }
+        }
+        false
+    }
+
+    /// Chunk id on this `TileMap` (`x`, `y`). Returns `i64`.
+    chunk_id(self, x: i64, y: i64) : i64 {
+        cx = x / self.chunk_w
+        cy = y / self.chunk_h
+        cy * 65536 + cx
+    }
+
+    /// To ai grid on this `TileMap`. Returns `Grid`.
+    to_ai_grid(self) : Grid {
+        g = Grid.new(self.w, self.h)
+        hh = self.h
+        ww = self.w
+        for 0..hh {
+            yy = it
+            for 0..ww {
+                xx = it
+                if self.solid_at(xx, yy) { @g.block(xx, yy) }
+            }
+        }
+        g
+    }
+
+    /// Path on this `TileMap` (`x0`, `y0`, `x1`, `y1`).
+    path(self, x0: i64, y0: i64, x1: i64, y1: i64) : _ {
+        g = self.to_ai_grid()
+        g.astar(x0, y0, x1, y1, true)
+    }
+
+    /// From csv on this `TileMap` (`text`). Returns `TileMap`.
+    from_csv(text: str) : TileMap {
+        rows = tile_split_lines(text)
+        h = len(rows)
+        w = 0
+        if h > 0 { w = len(tile_split_csv(rows[0])) }
+        tm = TileMap.empty(w, h)
+        for 0..h {
+            y = it
+            cols = tile_split_csv(rows[y])
+            for 0..w {
+                v = tile_parse_int(cols[it])
+                @tm.set(it, y, v)
+            }
+        }
+        tm
+    }
+
+    /// From json grid on this `TileMap` (`text`). Returns `TileMap`.
+    from_json_grid(text: str) : TileMap {
+        // Minimal [[n,n],[n,n]] parser (no full JSON dependency required).
+        rows = []
+        cur_row = []
+        n = byte_len(text)
+        num = ""
+        in_num = false
+        for 0..n {
+            c = text[it]
+            if c == "[" {
+                // row or root
+            } else {
+                if c == "]" {
+                    if in_num {
+                        cur_row = arr_push(cur_row, tile_parse_int(num))
+                        num = ""
+                        in_num = false
+                    }
+                    if len(cur_row) > 0 {
+                        rows = arr_push(rows, cur_row)
+                        cur_row = []
+                    }
+                } else {
+                    if c == "," {
+                        if in_num {
+                            cur_row = arr_push(cur_row, tile_parse_int(num))
+                            num = ""
+                            in_num = false
+                        }
+                    } else {
+                        dig = tile_parse_int(c)
+                        if c == "-" || dig >= 0 || c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+                            num = num + c
+                            in_num = true
+                        }
+                    }
+                }
+            }
+        }
+        h = len(rows)
+        w = 0
+        if h > 0 { w = len(rows[0]) }
+        tm = TileMap.empty(w, h)
+        for 0..h {
+            y = it
+            row = rows[y]
+            for 0..w {
+                @tm.set(it, y, row[it])
+            }
+        }
+        tm
+    }
+}
+
+/// Floor i (`x`). Returns `i64`.
++tile_floor_i(x: f64) : i64 {
+    // Truncate toward zero for non-negative tile coords.
+    n = 0
+    for 0..4096 {
+        if (n + 1) * 1.0 > x { return n }
+        n += 1
+    }
+    n
+}
+
+/// Split lines (`s`).
++tile_split_lines(s: str) : _ {
+    rows = []
+    cur = ""
+    n = byte_len(s)
+    for 0..n {
+        c = s[it]
+        if c == "\n" {
+            rows = arr_push(rows, cur)
+            cur = ""
+        } else {
+            if c != "\r" { cur = cur + c }
+        }
+    }
+    if byte_len(cur) > 0 || n == 0 {
+        rows = arr_push(rows, cur)
+    }
+    rows
+}
+
+/// Split csv (`line`).
++tile_split_csv(line: str) : _ {
+    cols = []
+    cur = ""
+    n = byte_len(line)
+    for 0..n {
+        c = line[it]
+        if c == "," {
+            cols = arr_push(cols, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+    }
+    cols = arr_push(cols, cur)
+    cols
+}
+
+/// Parse int (`s`). Returns `i64`.
++tile_parse_int(s: str) : i64 {
+    acc = 0
+    neg = false
+    n = byte_len(s)
+    for 0..n {
+        c = s[it]
+        if c == "-" { neg = true }
+        dig = -1
+        for 0..10 {
+            if "0123456789"[it] == c { dig = it }
+        }
+        if dig >= 0 { acc = acc * 10 + dig }
+    }
+    if neg { return -acc }
+    acc
+}
+
+/// Test that stdlib.tilemap csv load and collision.
+test "stdlib.tilemap csv load and collision" {
+    tm = TileMap.from_csv("0,0,1\n0,0,1\n1,1,1")
+    assert_eq(tm.w, 3)
+    assert_eq(tm.h, 3)
+    #assert(tm.solid_at(2, 0))
+    #assert(!(tm.solid_at(0, 0)))
+    #assert(!(tm.collides_rect(0.1, 0.1, 0.5, 0.5)))
+    #assert(tm.collides_rect(2.0, 0.0, 0.5, 0.5))
+}
+
+/// Test that stdlib.tilemap json grid and ai path.
+test "stdlib.tilemap json grid and ai path" {
+    tm = TileMap.from_json_grid("[[0,0,1],[0,0,1],[0,0,0]]")
+    assert_eq(tm.w, 3)
+    assert_eq(tm.h, 3)
+    g = tm.to_ai_grid()
+    #assert(g.free(0, 0))
+    #assert(!(g.free(2, 0)))
+    path = tm.path(0, 0, 2, 2)
+    #assert(len(path) > 0)
+}
+
+/// Test that stdlib.tilemap chunks.
+test "stdlib.tilemap chunks" {
+    tm = TileMap.empty(32, 32)
+    @tm.set(17, 3, TILE_SOLID)
+    #assert(tm.chunk_id(17, 3) >= 0)
+    assert_eq(tm.at(17, 3), TILE_SOLID)
+}

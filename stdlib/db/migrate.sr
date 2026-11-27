@@ -1,0 +1,365 @@
+//! std.db.migrate — transactional schema migration runner
+//!
+//! Import: use std.db.migrate
+//!
+//!   m = Migration.{version: 1, name: "init", up_sql: "...", down_sql: "..."}
+//!   conn = migrate_sqlite(sqlite_memory(), [m]) or err { return }
+//!   pool = migrate_pg(pool, [m]) or err { return }
+//!
+//! Creates `_super_migrations(version, name, applied_at)` and applies pending
+//! migrations inside `begin`/`commit` (Postgres) or `sqlite_begin`/`sqlite_commit`.
+
+use sql
+use sqlite
+use postgres
+use std.core.collections
+use std.core.str
+use std.math.core
+/// `MIGRATE_TABLE` is `"_super_migrations"`.
++MIGRATE_TABLE = "_super_migrations"
+
+/// `Migration` is one versioned up/down SQL pair.
++Migration = {
+    /// Version on `Migration` (`i64`). Defaults to `0`.
+    version: i64 = 0
+    /// Name on `Migration` (`str`). Defaults to `""`.
+    name: str = ""
+    /// Up sql on `Migration` (`str`). Defaults to `""`.
+    up_sql: str = ""
+    /// Down sql on `Migration` (`str`). Defaults to `""`.
+    down_sql: str = ""
+}
+
+/// `MigrateResult` reports how many migrations ran and the schema version afterwards.
++MigrateResult = {
+    /// Applied on `MigrateResult` (`i64`). Defaults to `0`.
+    applied: i64 = 0
+    /// Current on `MigrateResult` (`i64`). Defaults to `0`.
+    current: i64 = 0
+}
+
+/// Ensure table sql. Returns `str`.
++migrate_ensure_table_sql() : str {
+    "CREATE TABLE IF NOT EXISTS {MIGRATE_TABLE} (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)"
+}
+
+/// Record sql (`m`). Returns `str`.
++migrate_record_sql(m: Migration) : str {
+    "INSERT INTO {MIGRATE_TABLE} (version, name, applied_at) VALUES ({m.version}, '{m.name}', 'now')"
+}
+
+/// Sort (`ms`).
++migrate_sort(ms: _) : _ {
+    // Bubble sort by version ascending.
+    out = ms
+    n = len(out)
+    for 0..n {
+        for 1..n {
+            j = it
+            a = out[j - 1]
+            b = out[j]
+            if (a.version > b.version) {
+                out = arr_set(out, j - 1, b)
+                out = arr_set(out, j, a)
+            }
+        }
+    }
+    out
+}
+
+/// Applied versions (`db`).
++migrate_applied_versions(db: SqlDb) : _ {
+    ensure SqlDb.has_table(db, MIGRATE_TABLE) else { return [] }
+    rows = SqlDb.table(db, MIGRATE_TABLE).rows
+    out = []
+    for rows {
+        v = migrate_to_int(it[0])
+        out = arr_push(out, v)
+    }
+    out
+}
+
+/// Has version (`applied`, `version`).
++migrate_has_version(applied: _, version: i64) : bool {
+    for applied {
+        if it == version { return true }
+    }
+    false
+}
+
+/// To int (`s`). Returns `i64`.
++migrate_to_int(s: str) : i64 {
+    acc = 0
+    n = byte_len(s)
+    for 0..n {
+        dig = migrate_digit(s[it])
+        if dig >= 0 { acc = acc * 10 + dig }
+    }
+    acc
+}
+
+/// Digit (`c`). Returns `i64`.
++migrate_digit(c: str) : i64 {
+    found = -1
+    for 0..10 {
+        if "0123456789"[it] == c { found = it }
+    }
+    found
+}
+
+/// Apply up sql (`db`, `sql_text`). Returns `SqlDb`, or fails.
++migrate_apply_up_sql(db: SqlDb, sql_text: str) : SqlDb! {
+    // Recognise simple CREATE TABLE name (col, ...) for the in-memory fake.
+    ensure sql_text != "" else {
+        fail "migrate: empty up_sql"
+        return
+    }
+    if migrate_starts_with(sql_text, "CREATE TABLE") {
+        name = migrate_table_name(sql_text)
+        cols = migrate_table_cols(sql_text)
+        ensure name != "" else {
+            fail "migrate: cannot parse CREATE TABLE"
+            return
+        }
+        next = SqlDb.create_table(db, name, cols) or db
+        return next
+    }
+    if migrate_starts_with(sql_text, "INSERT INTO") {
+        // best-effort: ignore body for fake; real drivers would exec
+        return db
+    }
+    db
+}
+
+/// Starts with (`s`, `prefix`).
++migrate_starts_with(s: str, prefix: str) : bool {
+    pn = byte_len(prefix)
+    sn = byte_len(s)
+    ensure sn >= pn else { return false }
+    for 0..pn {
+        if s[it] != prefix[it] { return false }
+    }
+    true
+}
+
+/// Table name (`sql_text`). Returns `str`.
++migrate_table_name(sql_text: str) : str {
+    // CREATE TABLE [IF NOT EXISTS] name (
+    n = byte_len(sql_text)
+    i = 12
+    for 0..32 {
+        if i < n && sql_text[i] == " " { i += 1 }
+    }
+    if i + 13 <= n {
+        maybe = ""
+        for i..(i + 13) { maybe = maybe + sql_text[it] }
+        if maybe == "IF NOT EXISTS" {
+            i = i + 13
+            for 0..32 {
+                if i < n && sql_text[i] == " " { i += 1 }
+            }
+        }
+    }
+    name = ""
+    for i..n {
+        c = sql_text[it]
+        if c == " " || c == "(" || c == "\n" { return name }
+        name = name + c
+    }
+    name
+}
+
+/// Table cols (`sql_text`).
++migrate_table_cols(sql_text: str) : _ {
+    // Very small parser: (a, b, c)
+    n = byte_len(sql_text)
+    open = -1
+    for 0..n {
+        if open < 0 && sql_text[it] == "(" { open = it + 1 }
+    }
+    ensure open >= 0 else { return ["id"] }
+    close = n
+    for open..n {
+        if sql_text[it] == ")" { close = it }
+    }
+    cols = []
+    cur = ""
+    for open..close {
+        c = sql_text[it]
+        if c == "," {
+            if byte_len(cur) > 0 {
+                cols = arr_push(cols, migrate_trim(cur))
+                cur = ""
+            }
+        } else {
+            if c != "\n" { cur = cur + c }
+        }
+    }
+    if byte_len(migrate_trim(cur)) > 0 {
+        cols = arr_push(cols, migrate_trim(cur))
+    }
+    // Keep only identifier before type
+    out = []
+    for cols {
+        name = migrate_first_word(it)
+        if name != "" { out = arr_push(out, name) }
+    }
+    if len(out) == 0 { return ["id"] }
+    out
+}
+
+/// Trim (`s`). Returns `str`.
++migrate_trim(s: str) : str {
+    n = byte_len(s)
+    lo = 0
+    hi = n
+    for 0..n {
+        if lo < n && s[lo] == " " { lo += 1 }
+    }
+    for 0..n {
+        if hi > lo && s[hi - 1] == " " { hi -= 1 }
+    }
+    out = ""
+    for lo..hi { out = out + s[it] }
+    out
+}
+
+/// First word (`s`). Returns `str`.
++migrate_first_word(s: str) : str {
+    t = migrate_trim(s)
+    out = ""
+    n = byte_len(t)
+    for 0..n {
+        c = t[it]
+        if c == " " || c == "\t" { return out }
+        out = out + c
+    }
+    out
+}
+
+// --- SQLite driver --------------------------------------------------------------------------------
+
+/// Sqlite one (`conn`, `ver`, `name`, `up`). Returns `SqliteConn`, or fails.
++migrate_sqlite_one(conn: SqliteConn, ver: i64, name: str, up: str) : SqliteConn! {
+    c = conn
+    if !SqlDb.has_table(c.db, MIGRATE_TABLE) {
+        c = sqlite_create(c, MIGRATE_TABLE, ["version", "name", "applied_at"]) or c
+    }
+    applied = migrate_applied_versions(c.db)
+    if migrate_has_version(applied, ver) { return c }
+    // Snapshot for manual rollback if up/record fails.
+    snap = c.db
+    next_db = migrate_apply_up_sql(c.db, up) or snap
+    c = sqlite_next(c, next_db, c.last_id, c.changes)
+    c = sqlite_insert(c, MIGRATE_TABLE, ["{ver}", name, "now"]) or err {
+        c = sqlite_next(c, snap, c.last_id, 0)
+        fail "migrate: cannot record {name}"
+        return
+    }
+    c
+}
+
+/// Sqlite (`conn`, `migrations`). Returns `SqliteConn`, or fails.
++migrate_sqlite(conn: SqliteConn, migrations: _) : SqliteConn! {
+    ms = migrate_sort(migrations)
+    c = conn
+    n = len(ms)
+    for 0..n {
+        m = ms[it]
+        c = migrate_sqlite_one(c, m.version, m.name, m.up_sql) or c
+    }
+    c
+}
+
+/// Sqlite current (`conn`). Returns `i64`.
++migrate_sqlite_current(conn: SqliteConn) : i64 {
+    applied = migrate_applied_versions(conn.db)
+    best = 0
+    for applied { best = it > best ? it : best }
+    best
+}
+
+// --- PostgreSQL driver ----------------------------------------------------------------------------
+
+/// Pg (`pool`, `migrations`). Returns `PgPool`, or fails.
++migrate_pg(pool: PgPool, migrations: _) : PgPool! {
+    ms = migrate_sort(migrations)
+    p = pool
+    if !SqlDb.has_table(PgPool.store(p), MIGRATE_TABLE) {
+        p = PgPool.make_table(p, MIGRATE_TABLE, ["version", "name", "applied_at"]) or p
+    }
+    applied = migrate_applied_versions(PgPool.store(p))
+    n = len(ms)
+    for 0..n {
+        m = ms[it]
+        ver = m.version
+        name = m.name
+        up = m.up_sql
+        if !migrate_has_version(applied, ver) {
+            tx = PgPool.begin(p)
+            work = migrate_apply_up_sql(PgTx.store(tx), up) or err {
+                p = PgPool.rollback(p, tx)
+                fail "migrate: up failed for {name}"
+                return
+            }
+            work = SqlDb.insert(work, MIGRATE_TABLE, ["{ver}", name, "now"]) or work
+            tx = PgTx.with(tx, work)
+            p = PgPool.commit(p, tx)
+            applied = arr_push(applied, ver)
+        }
+    }
+    p
+}
+
+/// Pg current (`pool`). Returns `i64`.
++migrate_pg_current(pool: PgPool) : i64 {
+    applied = migrate_applied_versions(PgPool.store(pool))
+    best = 0
+    for applied { best = it > best ? it : best }
+    best
+}
+
+/// Test that stdlib.migrate sqlite applies pending once.
+test "stdlib.migrate sqlite applies pending once" {
+    c = sqlite_memory()
+    c = migrate_sqlite_one(c, 1, "users", "CREATE TABLE users (id INTEGER, name TEXT)") or c
+    assert_eq(migrate_sqlite_current(c), 1)
+    #assert(SqlDb.has_table(c.db, "users"))
+    c = migrate_sqlite_one(c, 2, "tasks", "CREATE TABLE tasks (id INTEGER, title TEXT)") or c
+    assert_eq(migrate_sqlite_current(c), 2)
+    #assert(SqlDb.has_table(c.db, "tasks"))
+    #assert(SqlDb.has_table(c.db, MIGRATE_TABLE))
+    // Idempotent
+    c2 = migrate_sqlite_one(c, 1, "users", "CREATE TABLE users (id INTEGER, name TEXT)") or c
+    assert_eq(migrate_sqlite_current(c2), 2)
+    assert_eq(SqlDb.count(c2.db, MIGRATE_TABLE), 2)
+}
+
+/// Pg one (`pool`, `ver`, `name`, `up`). Returns `PgPool`, or fails.
++migrate_pg_one(pool: PgPool, ver: i64, name: str, up: str) : PgPool! {
+    p = pool
+    if !SqlDb.has_table(PgPool.store(p), MIGRATE_TABLE) {
+        p = PgPool.make_table(p, MIGRATE_TABLE, ["version", "name", "applied_at"]) or p
+    }
+    applied = migrate_applied_versions(PgPool.store(p))
+    ensure !migrate_has_version(applied, ver) else { return p }
+    tx = PgPool.begin(p)
+    work = migrate_apply_up_sql(PgTx.store(tx), up) or err {
+        p = PgPool.rollback(p, tx)
+        fail "migrate: up failed for {name}"
+        return
+    }
+    work = SqlDb.insert(work, MIGRATE_TABLE, ["{ver}", name, "now"]) or work
+    tx = PgTx.with(tx, work)
+    PgPool.commit(p, tx)
+}
+
+/// Test that stdlib.migrate postgres transactional apply.
+test "stdlib.migrate postgres transactional apply" {
+    pool = PgPool.new("postgres://app:x@localhost:5432/shop", 4) or PgPool.empty()
+    pool = migrate_pg_one(pool, 1, "init", "CREATE TABLE items (id INTEGER, sku TEXT)") or pool
+    assert_eq(migrate_pg_current(pool), 1)
+    #assert(SqlDb.has_table(PgPool.store(pool), "items"))
+    pool2 = migrate_pg_one(pool, 1, "init", "CREATE TABLE items (id INTEGER, sku TEXT)") or pool
+    assert_eq(SqlDb.count(PgPool.store(pool2), MIGRATE_TABLE), 1)
+}

@@ -1,0 +1,755 @@
+//! std.math.poly — monomial polynomials and Chebyshev series approximation
+//!
+//! Import with:
+//!   use std.math.poly
+//!
+//!   p = [1.0, -3.0, 0.0, 2.0]                    // 1 - 3x + 2x^3, ascending coefficients
+//!   poly_eval(p, 2.0)                            // 11.0  (Horner)
+//!   poly_deriv(p)                                // [-3.0, 0.0, 6.0]
+//!   poly_mul(p, [1.0, 1.0])                      // polynomial product
+//!   poly_from_roots([1.0, 2.0, 3.0])             // [-6.0, 11.0, -6.0, 1.0]
+//!   qr = poly_divmod(p, [1.0, 1.0])              // [quotient, remainder]
+//!
+//!   s = cheb_fit_tape(pl_tape_exp(), -1.0, 1.0, 16)   // ChebSeries from a ReverseTape
+//!   s.value_at(0.3)                              // Clenshaw evaluation
+//!   s.derivative().value_at(0.3)                 // d/dx
+//!   s.area(-1.0, 1.0)                            // exact integral of the series
+//!   s.roots()                                    // real roots on [a, b], sorted
+//!   a = cheb_fit_auto(tape, 0.0, 3.0, 0.000000000001, 256)   // doubles n until the tail is below tol
+//!   cheb_to_mono(s.c)                            // monomial coefficients on [-1, 1]
+//!
+//! A `ChebSeries` is `sum c_k T_k(t)` with `t = (2x - a - b) / (b - a)`, fitted by the
+//! discrete cosine transform of samples at Chebyshev points of the second kind (the same points as
+//! `std.math.interp.cheb_points`). Functions are `ReverseTape` values (see `std.math.ad`). Public helpers are
+//! prefixed `pl_` or `poly_`/`cheb_` (modules merge flat); floats compare with `<`/`>` since `==` is
+//! tolerance-based on the VM.
+
+use std.math.ad
+
+/// Pi.
++PL_PI = 3.141592653589793
+
+/// Absolute value.
++pl_abs(x: f64) : f64 {
+    if x < 0.0 { return -x }
+    x
+}
+
+// --- monomial basis (ascending coefficients) --------------------------------------------------
+
+/// Number of coefficients after dropping exact trailing zeros (leading terms); `0` for the zero polynomial.
++poly_len(p: _) : i64 {
+    n = host.sys_arr_len(p)
+    while n > 0 {
+        if pl_abs(p[n - 1]) > 0.0 { return n }
+        n -= 1
+    }
+    0
+}
+
+/// Degree of `p` (`-1` for the zero polynomial).
++poly_degree(p: _) : i64 => poly_len(p) - 1
+
+/// `p` without exact trailing zero coefficients.
++poly_trim(p: _) {
+    n = poly_len(p)
+    out = []
+    i = 0
+    while i < n {
+        out = host.sys_arr_push(out, p[i])
+        i += 1
+    }
+    out
+}
+
+/// Horner evaluation of `p` at `x`.
++poly_eval(p: _, x: f64) : f64 {
+    acc = 0.0
+    i = host.sys_arr_len(p) - 1
+    while i >= 0 {
+        acc = acc * x + p[i]
+        i -= 1
+    }
+    acc
+}
+
+/// Derivative polynomial.
++poly_deriv(p: _) {
+    out = []
+    i = 1
+    n = host.sys_arr_len(p)
+    while i < n {
+        out = host.sys_arr_push(out, p[i] * host.sys_to_float(i))
+        i += 1
+    }
+    out
+}
+
+/// Antiderivative polynomial with constant term `c0`.
++poly_integ(p: _, c0: f64) {
+    out = [c0]
+    i = 0
+    n = host.sys_arr_len(p)
+    while i < n {
+        out = host.sys_arr_push(out, p[i] / host.sys_to_float(i + 1))
+        i += 1
+    }
+    out
+}
+
+/// Sum of two polynomials.
++poly_add(a: _, b: _) {
+    na = host.sys_arr_len(a)
+    nb = host.sys_arr_len(b)
+    n = na
+    if nb > n { n = nb }
+    out = []
+    i = 0
+    while i < n {
+        v = 0.0
+        if i < na { v += a[i] }
+        if i < nb { v += b[i] }
+        out = host.sys_arr_push(out, v)
+        i += 1
+    }
+    out
+}
+
+/// `k * p`.
++poly_scale(p: _, k: f64) {
+    out = []
+    for p { out = host.sys_arr_push(out, it * k) }
+    out
+}
+
+/// Product of two polynomials (`O(n m)`).
++poly_mul(a: _, b: _) {
+    na = host.sys_arr_len(a)
+    nb = host.sys_arr_len(b)
+    ensure na > 0 && nb > 0 else { return [] }
+    out = host.sys_arr_new(na + nb - 1, 0.0)
+    i = 0
+    while i < na {
+        j = 0
+        while j < nb {
+            out = host.sys_arr_set(out, i + j, out[i + j] + a[i] * b[j])
+            j += 1
+        }
+        i += 1
+    }
+    out
+}
+
+/// Monic polynomial with the given roots.
++poly_from_roots(roots: _) {
+    out = [1.0]
+    for roots { out = poly_mul(out, [-it, 1.0]) }
+    out
+}
+
+/// Polynomial long division: `[quotient, remainder]` with `a = q b + r` and `deg r < deg b`.
+/// Division by the zero polynomial returns `[[], a]`.
++poly_divmod(a: _, b: _) {
+    nb = poly_len(b)
+    ensure nb > 0 else { return [[], a] }
+    r = poly_trim(a)
+    nr = host.sys_arr_len(r)
+    ensure nr >= nb else { return [[], r] }
+    nq = nr - nb + 1
+    q = host.sys_arr_new(nq, 0.0)
+    lead = b[nb - 1]
+    k = nq - 1
+    while k >= 0 {
+        f = r[k + nb - 1] / lead
+        q = host.sys_arr_set(q, k, f)
+        j = 0
+        while j < nb {
+            r = host.sys_arr_set(r, k + j, r[k + j] - f * b[j])
+            j += 1
+        }
+        k -= 1
+    }
+    rem = []
+    i = 0
+    while i < nb - 1 {
+        rem = host.sys_arr_push(rem, r[i])
+        i += 1
+    }
+    return [q, poly_trim(rem)]
+}
+
+/// Composition `p(q(x))`.
++poly_compose(p: _, q: _) {
+    out = []
+    i = host.sys_arr_len(p) - 1
+    while i >= 0 {
+        out = poly_add(poly_mul(out, q), [p[i]])
+        i -= 1
+    }
+    out
+}
+
+// --- Chebyshev basis ------------------------------------------------------------------------
+
+/// Chebyshev polynomial `T_n(t)` by the three-term recurrence (valid for any real `t`).
++cheb_t(n: i64, t: f64) : f64 {
+    if n <= 0 { return 1.0 }
+    if n == 1 { return t }
+    prev = 1.0
+    cur = t
+    k = 2
+    while k <= n {
+        next = 2.0 * t * cur - prev
+        prev = cur
+        cur = next
+        k += 1
+    }
+    cur
+}
+
+/// Clenshaw evaluation of `sum c_k T_k(t)`.
++cheb_eval(c: _, t: f64) : f64 {
+    n = host.sys_arr_len(c)
+    ensure n > 0 else { return 0.0 }
+    b1 = 0.0
+    b2 = 0.0
+    k = n - 1
+    while k >= 1 {
+        b0 = c[k] + 2.0 * t * b1 - b2
+        b2 = b1
+        b1 = b0
+        k -= 1
+    }
+    c[0] + t * b1 - b2
+}
+
+/// Monomial coefficients (ascending) of `sum c_k T_k(t)`.
++cheb_to_mono(c: _) {
+    n = host.sys_arr_len(c)
+    ensure n > 0 else { return [] }
+    out = poly_scale([1.0], c[0])
+    if n == 1 { return out }
+    prev = [1.0]
+    cur = [0.0, 1.0]
+    out = poly_add(out, poly_scale(cur, c[1]))
+    k = 2
+    while k < n {
+        next = poly_add(poly_mul([0.0, 2.0], cur), poly_scale(prev, -1.0))
+        out = poly_add(out, poly_scale(next, c[k]))
+        prev = cur
+        cur = next
+        k += 1
+    }
+    out
+}
+
+/// Drop trailing Chebyshev coefficients with `|c_k| <= tol` (keeps at least one).
++cheb_trim(c: _, tol: f64) {
+    n = host.sys_arr_len(c)
+    while n > 1 {
+        if pl_abs(c[n - 1]) > tol { break }
+        n -= 1
+    }
+    out = []
+    i = 0
+    while i < n {
+        out = host.sys_arr_push(out, c[i])
+        i += 1
+    }
+    out
+}
+
+/// Chebyshev coefficients of the degree-`n` interpolant of samples `ys` (length `n + 1`) taken at
+/// `x_j = cos(j pi / n)`, via the type-I discrete cosine transform with a precomputed cosine table.
++cheb_coeffs(ys: _) {
+    n = host.sys_arr_len(ys) - 1
+    ensure n >= 1 else { return [ys[0]] }
+    tab = []
+    m = 0
+    while m < 2 * n {
+        tab = host.sys_arr_push(tab, host.sys_cos(PL_PI * host.sys_to_float(m) / host.sys_to_float(n)))
+        m += 1
+    }
+    out = []
+    k = 0
+    while k <= n {
+        s = 0.0
+        j = 0
+        while j <= n {
+            w = ys[j]
+            if j == 0 || j == n { w = w / 2.0 }
+            s += w * tab[(k * j) % (2 * n)]
+            j += 1
+        }
+        s = s * 2.0 / host.sys_to_float(n)
+        if k == 0 || k == n { s = s / 2.0 }
+        out = host.sys_arr_push(out, s)
+        k += 1
+    }
+    out
+}
+
+/// A Chebyshev series `sum c_k T_k(t)` on `[a, b]`.
++ChebSeries = {
+    c: _ = []
+    a: f64 = -1.0
+    b: f64 = 1.0
+
+    /// Degree (number of coefficients minus one).
+    degree(self) : i64 => host.sys_arr_len(self.c) - 1
+
+    /// Value at `x` (extrapolates outside `[a, b]`).
+    value_at(self, x: f64) : f64 {
+        t = (2.0 * x - self.a - self.b) / (self.b - self.a)
+        cheb_eval(self.c, t)
+    }
+
+    /// First derivative as a series on the same interval.
+    derivative(self) : ChebSeries {
+        n = host.sys_arr_len(self.c) - 1
+        ensure n >= 1 else { return ChebSeries.{c: [0.0], a: self.a, b: self.b} }
+        dd = host.sys_arr_new(n + 2, 0.0)
+        k = n
+        while k >= 1 {
+            dd = host.sys_arr_set(dd, k - 1, dd[k + 1] + 2.0 * host.sys_to_float(k) * self.c[k])
+            k -= 1
+        }
+        dd = host.sys_arr_set(dd, 0, dd[0] / 2.0)
+        scale = 2.0 / (self.b - self.a)
+        out = []
+        i = 0
+        while i < n {
+            out = host.sys_arr_push(out, dd[i] * scale)
+            i += 1
+        }
+        ChebSeries.{c: out, a: self.a, b: self.b}
+    }
+
+    /// Antiderivative that vanishes at `a`.
+    antiderivative(self) : ChebSeries {
+        n = host.sys_arr_len(self.c)
+        ensure n >= 1 else { return ChebSeries.{c: [0.0], a: self.a, b: self.b} }
+        scale = (self.b - self.a) / 2.0
+        cs = host.sys_arr_new(n + 2, 0.0)
+        for self.c { cs = host.sys_arr_set(cs, index, it) }
+        out = host.sys_arr_new(n + 1, 0.0)
+        first = cs[0] - cs[2] / 2.0
+        out = host.sys_arr_set(out, 1, first * scale)
+        k = 2
+        while k <= n {
+            out = host.sys_arr_set(out, k, (cs[k - 1] - cs[k + 1]) / (2.0 * host.sys_to_float(k)) * scale)
+            k += 1
+        }
+        // constant of integration: value 0 at t = -1 (T_k(-1) = (-1)^k)
+        c0 = 0.0
+        j = 1
+        while j <= n {
+            if j % 2 == 1 { c0 += out[j] } else { c0 -= out[j] }
+            j += 1
+        }
+        out = host.sys_arr_set(out, 0, c0)
+        ChebSeries.{c: out, a: self.a, b: self.b}
+    }
+
+    /// Exact integral of the series from `lo` to `hi`.
+    area(self, lo: f64, hi: f64) : f64 {
+        f = self.antiderivative()
+        f.value_at(hi) - f.value_at(lo)
+    }
+
+    /// Sorted real roots in `[a, b]` found by sign-change bracketing on a dense grid followed by bisection
+    /// (exact zeros on the grid are reported directly).
+    /// Roots of even multiplicity (no sign change) are not reported.
+    roots(self) {
+        deg = host.sys_arr_len(self.c)
+        m = 8 * deg
+        if m < 64 { m = 64 }
+        out = []
+        h = (self.b - self.a) / host.sys_to_float(m)
+        x0 = self.a
+        f0 = self.value_at(x0)
+        if !(f0 < 0.0) && !(f0 > 0.0) { out = host.sys_arr_push(out, x0) }
+        i = 1
+        while i <= m {
+            x1 = self.a + h * host.sys_to_float(i)
+            f1 = self.value_at(x1)
+            if !(f1 < 0.0) && !(f1 > 0.0) { out = host.sys_arr_push(out, x1) }
+            if f0 < 0.0 && f1 > 0.0 || f0 > 0.0 && f1 < 0.0 {
+                lo = x0
+                hi = x1
+                flo = f0
+                it_n = 0
+                while it_n < 100 {
+                    mid = (lo + hi) / 2.0
+                    fm = self.value_at(mid)
+                    if flo < 0.0 && fm < 0.0 || flo > 0.0 && fm > 0.0 {
+                        lo = mid
+                        flo = fm
+                    } else {
+                        hi = mid
+                    }
+                    it_n += 1
+                }
+                out = host.sys_arr_push(out, (lo + hi) / 2.0)
+            }
+            x0 = x1
+            f0 = f1
+            i += 1
+        }
+        out
+    }
+
+    /// Monomial coefficients in the variable `t = (2x - a - b) / (b - a)`.
+    to_poly(self) => cheb_to_mono(self.c)
+
+    /// Drop trailing coefficients not larger than `tol`.
+    trimmed(self, tol: f64) : ChebSeries => ChebSeries.{c: cheb_trim(self.c, tol), a: self.a, b: self.b}
+}
+
+/// Series of degree `len(ys) - 1` interpolating `ys` at Chebyshev points on `[a, b]` (descending order, `x_0 = b`).
++cheb_fit_values(ys: _, a: f64, b: f64) : ChebSeries => ChebSeries.{c: cheb_coeffs(ys), a, b}
+
+/// Sample a one-input tape at `n + 1` Chebyshev points of `[a, b]`.
++cheb_sample(f: ReverseTape, a: f64, b: f64, n: i64) {
+    out = []
+    mid = (a + b) / 2.0
+    half = (b - a) / 2.0
+    j = 0
+    while j <= n {
+        t = host.sys_cos(PL_PI * host.sys_to_float(j) / host.sys_to_float(n))
+        out = host.sys_arr_push(out, f.value([mid + half * t]))
+        j += 1
+    }
+    out
+}
+
+/// Degree-`n` Chebyshev series of the tape `f` on `[a, b]` (`n >= 1`).
++cheb_fit_tape(f: ReverseTape, a: f64, b: f64, n: i64) : ChebSeries {
+    m = n
+    if m < 1 { m = 1 }
+    cheb_fit_values(cheb_sample(f, a, b, m), a, b)
+}
+
+/// Adaptive fit: double the degree from 8 until the last two coefficients are below `tol` times the largest
+/// one (or `max_n` is reached), then trim the negligible tail.
++cheb_fit_auto(f: ReverseTape, a: f64, b: f64, tol: f64, max_n: i64) : ChebSeries {
+    n = 8
+    series = cheb_fit_tape(f, a, b, n)
+    while n < max_n {
+        scale = 0.0
+        for series.c {
+            if pl_abs(it) > scale { scale = pl_abs(it) }
+        }
+        cut = tol * scale
+        k = host.sys_arr_len(series.c)
+        if pl_abs(series.c[k - 1]) <= cut && pl_abs(series.c[k - 2]) <= cut { break }
+        n = n * 2
+        if n > max_n { n = max_n }
+        series = cheb_fit_tape(f, a, b, n)
+    }
+    scale = 0.0
+    for series.c {
+        if pl_abs(it) > scale { scale = pl_abs(it) }
+    }
+    series.trimmed(tol * scale)
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+/// Tape for `exp(x)`.
++pl_tape_exp() : ReverseTape {
+    t = ReverseTape.new()
+    x = @t.input()
+    e = @t.n_exp(x)
+    @t.out(e)
+    t
+}
+
+/// Tape for `sin(5x)`.
++pl_tape_sin5() : ReverseTape {
+    t = ReverseTape.new()
+    x = @t.input()
+    a = @t.n_mulc(x, 5.0)
+    s = @t.n_sin(a)
+    @t.out(s)
+    t
+}
+
+/// Tape for the Runge function `1 / (1 + 25 x^2)`.
++pl_tape_runge() : ReverseTape {
+    t = ReverseTape.new()
+    x = @t.input()
+    sq = @t.n_square(x)
+    d = @t.n_mulc(sq, 25.0)
+    e = @t.n_addc(d, 1.0)
+    one = @t.konst(1.0)
+    q = @t.n_div(one, e)
+    @t.out(q)
+    t
+}
+
+test "monomial: eval, derivative, integral, degree" {
+    p = [1.0, -3.0, 0.0, 2.0]
+    assert_eq(poly_eval(p, 2.0), 11.0)
+    assert_eq(poly_eval(p, 0.0), 1.0)
+    assert_eq(poly_eval(p, -1.0), 2.0)
+    assert_eq(poly_eval([], 5.0), 0.0)
+    assert_eq(poly_eval([4.0], 5.0), 4.0)
+    d = poly_deriv(p)
+    assert_eq(host.sys_arr_len(d), 3)
+    assert_eq(d[0], -3.0)
+    assert_eq(d[1], 0.0)
+    assert_eq(d[2], 6.0)
+    assert_eq(host.sys_arr_len(poly_deriv([5.0])), 0)
+    i = poly_integ(d, 1.0)
+    assert_eq(host.sys_arr_len(i), 4)
+    assert_eq(i[0], 1.0)
+    assert_eq(i[1], -3.0)
+    assert_eq(i[3], 2.0)
+    assert_eq(poly_degree(p), 3)
+    assert_eq(poly_degree([1.0, 2.0, 0.0, 0.0]), 1)
+    assert_eq(poly_degree([0.0, 0.0]), -1)
+    assert_eq(poly_degree([]), -1)
+    assert_eq(host.sys_arr_len(poly_trim([1.0, 2.0, 0.0, 0.0])), 2)
+}
+
+test "monomial: add, scale, mul, from_roots" {
+    s = poly_add([1.0, 2.0], [3.0, 4.0, 5.0])
+    assert_eq(host.sys_arr_len(s), 3)
+    assert_eq(s[0], 4.0)
+    assert_eq(s[1], 6.0)
+    assert_eq(s[2], 5.0)
+    sc = poly_scale([1.0, -2.0], 3.0)
+    assert_eq(sc[0], 3.0)
+    assert_eq(sc[1], -6.0)
+    m = poly_mul([1.0, 1.0], [-1.0, 1.0])
+    assert_eq(host.sys_arr_len(m), 3)
+    assert_eq(m[0], -1.0)
+    assert_eq(m[1], 0.0)
+    assert_eq(m[2], 1.0)
+    assert_eq(host.sys_arr_len(poly_mul([], [1.0])), 0)
+    r = poly_from_roots([1.0, 2.0, 3.0])
+    assert_eq(r[0], -6.0)
+    assert_eq(r[1], 11.0)
+    assert_eq(r[2], -6.0)
+    assert_eq(r[3], 1.0)
+    assert_eq(poly_eval(r, 2.0), 0.0)
+    assert_eq(poly_eval(r, 4.0), 6.0)
+    assert_eq(host.sys_arr_len(poly_from_roots([])), 1)
+    // (p q)(x) = p(x) q(x)
+    p = [2.0, -1.0, 3.0]
+    q = [1.0, 0.5, -2.0, 1.0]
+    pq = poly_mul(p, q)
+    k = 0
+    while k <= 10 {
+        x = -2.0 + 0.4 * host.sys_to_float(k)
+        #assert(pl_abs(poly_eval(pq, x) - poly_eval(p, x) * poly_eval(q, x)) < 1.0e-12)
+        k += 1
+    }
+}
+
+test "monomial: divmod and compose" {
+    // x^3 - 6x^2 + 11x - 6 = (x - 1)(x^2 - 5x + 6)
+    qr = poly_divmod([-6.0, 11.0, -6.0, 1.0], [-1.0, 1.0])
+    q = qr[0]
+    r = qr[1]
+    assert_eq(host.sys_arr_len(q), 3)
+    assert_eq(q[0], 6.0)
+    assert_eq(q[1], -5.0)
+    assert_eq(q[2], 1.0)
+    assert_eq(host.sys_arr_len(r), 0)
+    // with remainder: (x^2 + 1) / (x - 2) = x + 2 remainder 5
+    qr2 = poly_divmod([1.0, 0.0, 1.0], [-2.0, 1.0])
+    assert_eq(qr2[0][0], 2.0)
+    assert_eq(qr2[0][1], 1.0)
+    assert_eq(qr2[1][0], 5.0)
+    // identity a = q b + r on a random-ish example
+    a = [3.0, -2.0, 0.5, 4.0, 1.0]
+    b = [1.0, 0.0, 2.0]
+    d = poly_divmod(a, b)
+    back = poly_add(poly_mul(d[0], b), d[1])
+    k = 0
+    while k <= 8 {
+        x = -1.5 + 0.4 * host.sys_to_float(k)
+        #assert(pl_abs(poly_eval(back, x) - poly_eval(a, x)) < 1.0e-10)
+        k += 1
+    }
+    #assert(host.sys_arr_len(d[1]) < 3)
+    // lower degree dividend; zero divisor
+    small = poly_divmod([1.0, 2.0], [0.0, 0.0, 1.0])
+    assert_eq(host.sys_arr_len(small[0]), 0)
+    assert_eq(small[1][1], 2.0)
+    zero = poly_divmod([1.0, 2.0], [0.0])
+    assert_eq(host.sys_arr_len(zero[0]), 0)
+    assert_eq(zero[1][0], 1.0)
+    // compose p(q(x)) with p = x^2 + 1, q = 2x - 1
+    c = poly_compose([1.0, 0.0, 1.0], [-1.0, 2.0])
+    assert_eq(c[0], 2.0)
+    assert_eq(c[1], -4.0)
+    assert_eq(c[2], 4.0)
+}
+
+test "chebyshev polynomials and Clenshaw" {
+    assert_eq(cheb_t(0, 0.3), 1.0)
+    assert_eq(cheb_t(1, 0.3), 0.3)
+    #assert(pl_abs(cheb_t(2, 0.3) - (2.0 * 0.09 - 1.0)) < 1.0e-15)
+    #assert(pl_abs(cheb_t(3, 0.3) - (4.0 * 0.027 - 0.9)) < 1.0e-15)
+    // T_n(cos theta) = cos(n theta)
+    th = 0.7
+    n = 0
+    while n <= 12 {
+        #assert(pl_abs(cheb_t(n, host.sys_cos(th)) - host.sys_cos(host.sys_to_float(n) * th)) < 1.0e-12)
+        n += 1
+    }
+    // Clenshaw agrees with the direct sum
+    c = [0.5, -1.0, 0.25, 2.0, -0.125]
+    k = 0
+    while k <= 10 {
+        t = -1.0 + 0.2 * host.sys_to_float(k)
+        direct = 0.0
+        j = 0
+        while j < 5 {
+            direct += c[j] * cheb_t(j, t)
+            j += 1
+        }
+        #assert(pl_abs(cheb_eval(c, t) - direct) < 1.0e-13)
+        k += 1
+    }
+    assert_eq(cheb_eval([], 0.3), 0.0)
+    assert_eq(cheb_eval([2.5], 0.3), 2.5)
+    // monomial conversion matches
+    mono = cheb_to_mono(c)
+    j = 0
+    while j <= 10 {
+        t = -1.0 + 0.2 * host.sys_to_float(j)
+        #assert(pl_abs(poly_eval(mono, t) - cheb_eval(c, t)) < 1.0e-12)
+        j += 1
+    }
+    // T3 = 4t^3 - 3t
+    t3 = cheb_to_mono([0.0, 0.0, 0.0, 1.0])
+    assert_eq(t3[1], -3.0)
+    assert_eq(t3[3], 4.0)
+    assert_eq(host.sys_arr_len(cheb_to_mono([])), 0)
+    assert_eq(cheb_to_mono([7.0])[0], 7.0)
+    assert_eq(host.sys_arr_len(cheb_trim([1.0, 0.5, 0.0, 0.0], 0.0)), 2)
+    assert_eq(host.sys_arr_len(cheb_trim([0.0, 0.0], 0.1)), 1)
+}
+
+test "chebyshev fit of exp" {
+    s = cheb_fit_tape(pl_tape_exp(), -1.0, 1.0, 16)
+    assert_eq(s.degree(), 16)
+    // known coefficients: c0 = I0(1), c1 = 2 I1(1)
+    #assert(pl_abs(s.c[0] - 1.2660658777520082) < 1.0e-14)
+    #assert(pl_abs(s.c[1] - 1.1303182079849703) < 1.0e-14)
+    #assert(pl_abs(s.c[2] - 0.2714953395340765) < 1.0e-13)
+    k = 0
+    while k <= 40 {
+        x = -1.0 + 2.0 * host.sys_to_float(k) / 40.0
+        #assert(pl_abs(s.value_at(x) - host.sys_exp(x)) < 1.0e-14)
+        k += 1
+    }
+    // derivative of exp is exp; antiderivative of exp is exp - exp(-1)
+    d = s.derivative()
+    assert_eq(d.degree(), 15)
+    f = s.antiderivative()
+    assert_eq(f.degree(), 17)
+    j = 0
+    while j <= 20 {
+        x = -1.0 + 2.0 * host.sys_to_float(j) / 20.0
+        #assert(pl_abs(d.value_at(x) - host.sys_exp(x)) < 1.0e-12)
+        #assert(pl_abs(f.value_at(x) - (host.sys_exp(x) - host.sys_exp(-1.0))) < 1.0e-13)
+        j += 1
+    }
+    #assert(pl_abs(s.area(-1.0, 1.0) - (host.sys_exp(1.0) - host.sys_exp(-1.0))) < 1.0e-13)
+    #assert(pl_abs(s.area(0.0, 0.5) - (host.sys_exp(0.5) - 1.0)) < 1.0e-13)
+    #assert(pl_abs(f.value_at(-1.0)) < 1.0e-14)
+}
+
+test "chebyshev series on a general interval" {
+    // f(x) = sin(5x) on [0.1, 3]
+    s = cheb_fit_tape(pl_tape_sin5(), 0.1, 3.0, 40)
+    k = 0
+    while k <= 30 {
+        x = 0.1 + 2.9 * host.sys_to_float(k) / 30.0
+        #assert(pl_abs(s.value_at(x) - host.sys_sin(5.0 * x)) < 1.0e-12)
+        k += 1
+    }
+    d = s.derivative()
+    j = 0
+    while j <= 30 {
+        x = 0.1 + 2.9 * host.sys_to_float(j) / 30.0
+        #assert(pl_abs(d.value_at(x) - 5.0 * host.sys_cos(5.0 * x)) < 1.0e-9)
+        j += 1
+    }
+    // integral of sin(5x) = (cos(0.5) - cos(15)) / 5
+    exact = (host.sys_cos(0.5) - host.sys_cos(15.0)) / 5.0
+    #assert(pl_abs(s.area(0.1, 3.0) - exact) < 1.0e-12)
+    #assert(pl_abs(s.area(3.0, 0.1) + exact) < 1.0e-12)
+    // roots are k pi / 5 inside the interval
+    r = s.roots()
+    assert_eq(host.sys_arr_len(r), 4)
+    #assert(pl_abs(r[0] - PL_PI / 5.0) < 1.0e-10)
+    #assert(pl_abs(r[1] - 2.0 * PL_PI / 5.0) < 1.0e-10)
+    #assert(pl_abs(r[2] - 3.0 * PL_PI / 5.0) < 1.0e-10)
+    #assert(pl_abs(r[3] - 4.0 * PL_PI / 5.0) < 1.0e-10)
+    // cheb_fit_values on explicit samples reproduces a cubic exactly (degree-3 series)
+    ys = [8.0, 1.5, -1.5, -2.0]
+    c = cheb_fit_values(ys, -1.0, 1.0)
+    assert_eq(c.degree(), 3)
+    #assert(pl_abs(c.value_at(1.0) - 8.0) < 1.0e-12)
+    #assert(pl_abs(c.value_at(-1.0) + 2.0) < 1.0e-12)
+    #assert(pl_abs(c.value_at(0.5) - 1.5) < 1.0e-12)
+    #assert(pl_abs(c.value_at(-0.5) + 1.5) < 1.0e-12)
+}
+
+test "chebyshev: constants, line, trimming and degenerate sizes" {
+    cst = cheb_fit_values([3.0, 3.0, 3.0], 0.0, 2.0)
+    #assert(pl_abs(cst.c[0] - 3.0) < 1.0e-14)
+    #assert(pl_abs(cst.c[1]) < 1.0e-14)
+    #assert(pl_abs(cst.c[2]) < 1.0e-14)
+    assert_eq(cst.trimmed(1.0e-12).degree(), 0)
+    one = cheb_fit_values([4.0], -1.0, 1.0)
+    assert_eq(one.degree(), 0)
+    assert_eq(one.value_at(0.7), 4.0)
+    assert_eq(one.derivative().value_at(0.7), 0.0)
+    // line 2x + 1 on [-1, 1]: c0 = 1, c1 = 2
+    line = cheb_fit_values([3.0, 1.0, -1.0], -1.0, 1.0)
+    #assert(pl_abs(line.c[0] - 1.0) < 1.0e-14)
+    #assert(pl_abs(line.c[1] - 2.0) < 1.0e-14)
+    #assert(pl_abs(line.c[2]) < 1.0e-14)
+    #assert(pl_abs(line.derivative().value_at(0.3) - 2.0) < 1.0e-13)
+    #assert(pl_abs(line.area(0.0, 1.0) - 2.0) < 1.0e-13)
+    // a line has exactly one root
+    r = line.roots()
+    assert_eq(host.sys_arr_len(r), 1)
+    #assert(pl_abs(r[0] + 0.5) < 1.0e-12)
+    // to_poly of a degree-2 series
+    q = cheb_fit_values([2.0, 0.0, 2.0], -1.0, 1.0)
+    mono = q.to_poly()
+    #assert(pl_abs(mono[0]) < 1.0e-13)
+    #assert(pl_abs(mono[2] - 2.0) < 1.0e-13)
+    // antiderivative of constant on [0, 2]: 3 (x - 0)
+    f = cst.antiderivative()
+    #assert(pl_abs(f.value_at(2.0) - 6.0) < 1.0e-13)
+    #assert(pl_abs(f.value_at(0.0)) < 1.0e-13)
+    #assert(pl_abs(f.value_at(1.0) - 3.0) < 1.0e-13)
+}
+
+test "chebyshev adaptive fit" {
+    e = cheb_fit_auto(pl_tape_exp(), -1.0, 1.0, 0.0000000000001, 128)
+    // exp needs about 14 terms for 1e-13
+    #assert(e.degree() >= 11)
+    #assert(e.degree() <= 20)
+    #assert(pl_abs(e.value_at(0.37) - host.sys_exp(0.37)) < 1.0e-12)
+    // Runge needs far more terms and is capped by max_n
+    r = cheb_fit_auto(pl_tape_runge(), -1.0, 1.0, 0.000000001, 256)
+    #assert(r.degree() > 50)
+    #assert(pl_abs(r.value_at(0.93) - 1.0 / (1.0 + 25.0 * 0.93 * 0.93)) < 1.0e-8)
+    #assert(pl_abs(r.value_at(0.0) - 1.0) < 1.0e-8)
+    capped = cheb_fit_auto(pl_tape_runge(), -1.0, 1.0, 0.000000000001, 16)
+    #assert(capped.degree() <= 16)
+    // exact polynomial is detected at low degree
+    p = cheb_fit_auto(tape_poly([1.0, -3.0, 0.0, 2.0]), -2.0, 2.0, 0.000000000001, 64)
+    assert_eq(p.degree(), 3)
+    #assert(pl_abs(p.value_at(1.5) - poly_eval([1.0, -3.0, 0.0, 2.0], 1.5)) < 1.0e-11)
+}

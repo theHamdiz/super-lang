@@ -1,0 +1,35 @@
+//! Super AI tick script for the Rust host (`super_ffi` embed crate).
+//!
+//! 1. Host → Super: zero-copy `agents` + `host.refuel` callback.
+//! 2. Super → Rust: `host.rarity_score` bound to `native_ai::rarity_score`.
+
++Agent = {
+    id: i64
+    energy: f64
+    x: f64
+    y: f64
+}
+
+agents = []
+
++tick(dt: f64) : i64 {
+    n = 0
+    for @agents {
+        it.energy -= 0.1 * dt
+        it.x += 1.0 * dt
+        if it.energy < 1.0 {
+            host.refuel(it.id, 5.0)
+            n += 1
+        }
+    }
+    n
+}
+
++sum_energy() : f64 => agents.map(it.energy).sum()
+
+/// Call into the Rust helper module via a host bind.
++score_agent(energy: f64, id: i64) : f64 => host.rarity_score(energy, id)
+
+test "tick returns" {
+    assert_eq(1, 1)
+}

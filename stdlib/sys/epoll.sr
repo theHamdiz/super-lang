@@ -1,0 +1,173 @@
+//! std.sys.epoll — Linux edge/level-triggered readiness polling
+//!
+//! Lowest-level readiness wrapper (epoll_create1 / epoll_ctl / epoll_wait); std.io.poll
+//! and the deprecated re-export build on it. Also the readiness fallback behind std.sys.io_uring.
+//!
+//! Import with:
+//!   use std.sys.epoll
+//!
+//!   poll = Epoll.new() or err { return }
+//!   @poll.add(listener.fd, EPOLL_IN, listener.fd)
+//!   ready = poll.wait(128, 0) or err { return }
+
+/// `EPOLL_IN` is `1`.
++EPOLL_IN = 1
+/// `EPOLL_OUT` is `4`.
++EPOLL_OUT = 4
+/// `EPOLL_ERR` is `8`.
++EPOLL_ERR = 8
+/// `EPOLL_HUP` is `16`.
++EPOLL_HUP = 16
+/// `EPOLL_EDGE` is `2147483648`.
++EPOLL_EDGE = 2147483648
+
+/// `EPOLL_CTL_ADD` is `1`.
++EPOLL_CTL_ADD = 1
+/// `EPOLL_CTL_DEL` is `2`.
++EPOLL_CTL_DEL = 2
+/// `EPOLL_CTL_MOD` is `3`.
++EPOLL_CTL_MOD = 3
+
+/// Not named `socket_set_nonblock` — that name is owned by std.io.socket so poll keeps
+/// working when both io.poll and io.socket are imported in the same module.
++epoll_set_nonblock(fd: i64, enabled: bool) : bool! {
+    host.sys_socket_set_nonblock(fd, enabled) or err { fail "{err}" }
+}
+
+/// `Epoll` is a Linux epoll interest list.
++Epoll = {
+    /// Fd on `Epoll` (`i64`). Defaults to `-1`.
+    fd: i64 = -1
+
+    /// Create a new `Epoll!`.
+    new() : Epoll! {
+        fd = host.sys_epoll_create() or err {
+            fail "{err}"
+            return
+        }
+        Epoll.{fd}
+    }
+
+    /// Add on this `Epoll` (`socket`, `events`, `token`). Returns `bool`, or fails.
+    add(@self, socket: i64, events: i64, token: i64) : bool! {
+        host.sys_epoll_ctl(self.fd, EPOLL_CTL_ADD, socket, events, token) or err { fail "{err}" }
+    }
+
+    /// Modify on this `Epoll` (`socket`, `events`, `token`). Returns `bool`, or fails.
+    modify(@self, socket: i64, events: i64, token: i64) : bool! {
+        host.sys_epoll_ctl(self.fd, EPOLL_CTL_MOD, socket, events, token) or err { fail "{err}" }
+    }
+
+    /// Remove on this `Epoll` (`socket`). Returns `bool`, or fails.
+    remove(@self, socket: i64) : bool! {
+        host.sys_epoll_ctl(self.fd, EPOLL_CTL_DEL, socket, 0, 0) or err { fail "{err}" }
+    }
+
+    /// Wait on this `Epoll` (`max_events`, `timeout_ms`), or fail.
+    wait(self, max_events: i64, timeout_ms: i64) : _! {
+        host.sys_epoll_wait(self.fd, max_events, timeout_ms) or err { fail "{err}" }
+    }
+
+    /// Close this `Epoll` and release the underlying resource.
+    close(@self) : bool {
+        ensure self.fd >= 0 else { return false }
+        old = self.fd
+        self.fd = -1
+        host.sys_epoll_close(old)
+    }
+}
+
+/// Readable (`events`).
++epoll_readable(events: i64) : bool => (events & EPOLL_IN) != 0
+/// Writable (`events`).
++epoll_writable(events: i64) : bool => (events & EPOLL_OUT) != 0
+/// Failed (`events`).
++epoll_failed(events: i64) : bool => (events & (EPOLL_ERR | EPOLL_HUP)) != 0
+
+/// Test that epoll event helpers classify flags.
+test "epoll event helpers classify flags" {
+    #assert(epoll_readable(EPOLL_IN))
+    #assert(!(epoll_readable(EPOLL_OUT)))
+    #assert(epoll_writable(EPOLL_IN | EPOLL_OUT))
+    #assert(epoll_failed(EPOLL_ERR))
+    #assert(epoll_failed(EPOLL_HUP))
+    #assert(!(epoll_failed(EPOLL_IN)))
+}
+
+/// Test that epoll reports a listener becoming readable.
+test "epoll reports a listener becoming readable" {
+    ep = Epoll.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    listener = host.sys_tcp_listen("127.0.0.1:0") or err {
+        assert_eq(1, 0)
+        return
+    }
+    addr = host.sys_fd_local_addr(listener) or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(@ep.add(listener, EPOLL_IN, 41) or false)
+    quiet = ep.wait(8, 0) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(quiet), 0)
+    client = host.sys_tcp_connect(addr) or err {
+        assert_eq(1, 0)
+        return
+    }
+    ready = ep.wait(8, 200) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(ready), 1)
+    assert_eq(ready[0].token, 41)
+    #assert(epoll_readable(ready[0].events))
+    host.sys_fd_close(client)
+    host.sys_fd_close(listener)
+    #assert(@ep.close())
+    #assert(!(@ep.close()))
+}
+
+/// Test that epoll modify and remove.
+test "epoll modify and remove" {
+    ep = Epoll.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    udp = host.sys_udp_bind("127.0.0.1:0") or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(@ep.add(udp, EPOLL_OUT, 5) or false)
+    first = ep.wait(4, 200) or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(epoll_writable(first[0].events))
+    #assert(@ep.modify(udp, EPOLL_IN, 6) or false)
+    idle = ep.wait(4, 0) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(idle), 0)
+    #assert(@ep.remove(udp) or false)
+    // removing twice, or adding a bogus handle, is an error value
+    #assert(!(@ep.remove(udp) or false))
+    #assert(!(@ep.add(987654, EPOLL_IN, 1) or false))
+    host.sys_fd_close(udp)
+    #assert(@ep.close())
+}
+
+/// Test that epoll_set_nonblock rejects bad handles.
+test "epoll_set_nonblock rejects bad handles" {
+    #assert(!(epoll_set_nonblock(424242, true) or false))
+    udp = host.sys_udp_bind("127.0.0.1:0") or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(epoll_set_nonblock(udp, true) or false)
+    host.sys_fd_close(udp)
+}

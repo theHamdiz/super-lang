@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>name</key>
+	<string>Super</string>
+	<key>uuid</key>
+	<string>8F4A2C1D-5B3E-4A9F-9D2C-1E7B6A3F8C0D</string>
+	<key>contactName</key>
+	<string>Super Contributors</string>
+	<key>description</key>
+	<string>Syntax highlighting, snippets, and editor preferences for Super (.sr)</string>
+	<key>mainBundle</key>
+	<string>Super</string>
+</dict>
+</plist>

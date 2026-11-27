@@ -1,0 +1,16 @@
+//! stdlib AI tokenizer (BPE) approximate counter.
+//! Run: super test examples/doc_ai/main.sr
+
+use std.ai.tokenizer
+
++main() {
+    t = Tokenizer.mini()
+    approx = t.approx_count("Super agents read fewer tokens.")
+    print("approx tokens={approx}")
+}
+
+test "tokenizer returns positive count" {
+    t = Tokenizer.mini()
+    n = t.approx_count("abc")
+    #assert(n >= 1)
+}

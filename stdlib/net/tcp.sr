@@ -1,0 +1,779 @@
+//! std.net.tcp — blocking TCP listen / connect / read / write over host syscalls
+//!
+//! Import with:
+//!   use std.net.tcp
+//!
+//!   ln = TcpListener.bind("127.0.0.1:0") or err { return }
+//!   c = TcpStream.connect("127.0.0.1:{ln.port()}") or err { return }
+//!   @c.write_str("ping\n")
+//!   s = @ln.accept() or err { return }
+//!   line = @s.read_line(4096) or err { return }      // "ping"
+//!   body = @s.read_exact(16) or err { return }       // exactly 16 bytes, across reads
+//!
+//! All operations are blocking; give a stream a deadline with `set_timeout` (a read or write
+//! that exceeds it returns an error value and the stream stays usable). A stream keeps the
+//! bytes it read past a delimiter in one pending buffer, so `read`, `read_exact`, `read_until`
+//! and `read_line` can be mixed freely and every byte is delivered exactly once.
+//!
+//! Memory is bounded by what the caller asks for: no call buffers more than `max` bytes.
+
+use std.core.collections
+use std.core.str
+use std.io.socket
+
+/// Largest single host read; the pending buffer and `max` arguments bound everything else.
++TCP_READ_CHUNK = 4096
+
+/// `TcpListener` accepts TCP connections on a bound port.
++TcpListener = {
+    /// Listening socket descriptor. Defaults to `-1`.
+    fd: i64 = -1
+    /// The address actually bound (`127.0.0.1:0` resolves to the real port).
+    addr: str = ""
+    /// True after `close`. Defaults to `false`.
+    closed: bool = false
+
+    /// Bind to `addr` and return the listening socket, or fail.
+    bind(addr: str) : TcpListener! {
+        fd = socket_tcp_listen(addr) or err {
+            fail "{err}"
+            return
+        }
+        bound = socket_local_addr(fd) or addr
+        TcpListener.{fd, addr: bound, closed: false}
+    }
+
+    /// Same as `tcp_port_of`.
+    port(self) : i64 => tcp_port_of(self.addr)
+
+    /// Local addr on this `TcpListener`. Returns `str`.
+    local_addr(self) : str => self.addr
+
+    /// Accept the next TCP connection, or fail.
+    accept(@self) : TcpStream! {
+        ensure !(self.closed) else {
+            fail "listener closed"
+            return
+        }
+        cfd = socket_tcp_accept(self.fd) or err {
+            fail "{err}"
+            return
+        }
+        TcpStream.{fd: cfd, pending: [], closed: false}
+    }
+
+    /// Close this `TcpListener` and release the underlying resource.
+    close(@self) : bool {
+        if (self.closed) { return false }
+        self.closed = true
+        socket_fd_close(self.fd)
+        true
+    }
+}
+
+/// `TcpStream` is a connected TCP socket.
++TcpStream = {
+    /// Connected socket descriptor. Defaults to `-1`.
+    fd: i64 = -1
+    /// Bytes read from the socket but not yet handed to the caller.
+    pending: _ = []
+    /// True after `close`. Defaults to `false`.
+    closed: bool = false
+
+    /// Connect to `addr`, or fail.
+    connect(addr: str) : TcpStream! {
+        fd = socket_tcp_connect(addr) or err {
+            fail "{err}"
+            return
+        }
+        TcpStream.{fd, pending: [], closed: false}
+    }
+
+    /// Open a TLS connection to `addr`, or fail.
+    connect_tls(addr: str) : TcpStream! {
+        fd = socket_tls_connect(addr) or err {
+            fail "{err}"
+            return
+        }
+        TcpStream.{fd, pending: [], closed: false}
+    }
+
+    /// Go net.DialTimeout analogue: connect then arm read/write deadlines on the stream.
+    connect_timeout(addr: str, timeout_ms: i64) : TcpStream! {
+        fd = socket_tcp_connect(addr) or err {
+            fail "{err}"
+            return
+        }
+        socket_set_timeout(fd, timeout_ms, timeout_ms) or false
+        TcpStream.{fd, pending: [], closed: false}
+    }
+
+    /// Up to `n` bytes: buffered bytes first, otherwise one socket read. Empty bytes mean the peer
+    /// finished sending (EOF).
+    read(@self, n: i64) : _! {
+        ensure !(self.closed) else {
+            fail "stream closed"
+            return
+        }
+        have = socket_buf_len(self.pending)
+        if have > 0 {
+            buffered = self.pending
+            if have <= n {
+                self.pending = []
+                return buffered
+            }
+            self.pending = socket_buf_slice(buffered, n, have)
+            return socket_buf_slice(buffered, 0, n)
+        }
+        data = socket_tcp_read(self.fd, n) or err {
+            fail "{err}"
+            return
+        }
+        data
+    }
+
+    /// Exactly `n` bytes, however the peer split them across packets. Fails on EOF or timeout; the
+    /// bytes gathered so far stay buffered so the stream is not left half-consumed.
+    read_exact(@self, n: i64) : _! {
+        ensure !(self.closed) else {
+            fail "stream closed"
+            return
+        }
+        if n <= 0 { return [] }
+        acc = self.pending
+        self.pending = []
+        for 0..(n + 1) {
+            have = socket_buf_len(acc)
+            if have >= n {
+                if have > n { self.pending = socket_buf_slice(acc, n, have) }
+                return socket_buf_slice(acc, 0, n)
+            }
+            want = n - have
+            if want > TCP_READ_CHUNK { want = TCP_READ_CHUNK }
+            chunk = socket_tcp_read(self.fd, want) or err {
+                self.pending = acc
+                fail "{err}"
+                return
+            }
+            if socket_buf_len(chunk) == 0 {
+                self.pending = acc
+                fail "unexpected eof"
+                return
+            }
+            acc = socket_buf_concat(acc, chunk)
+        }
+        self.pending = acc
+        fail "read_exact limit"
+    }
+
+    /// Text up to and including `needle`. Fails when `max` bytes pass without it, on EOF, or on
+    /// timeout; whatever was read stays buffered. Bytes after the needle stay buffered for the
+    /// next call. Reads in chunks (not byte by byte) and re-scans only the last `needle` bytes.
+    read_until(@self, needle: str, max: i64) : str! {
+        ensure !(self.closed) else {
+            fail "stream closed"
+            return
+        }
+        nlen = socket_text_len(needle)
+        ensure nlen > 0 else {
+            fail "empty delimiter"
+            return
+        }
+        acc = self.pending
+        self.pending = []
+        from = 0
+        for 0..(max + 2) {
+            at = socket_buf_find(acc, needle, from)
+            if at >= 0 {
+                stop = at + nlen
+                total = socket_buf_len(acc)
+                self.pending = socket_buf_slice(acc, stop, total)
+                return socket_buf_text(socket_buf_slice(acc, 0, stop))
+            }
+            have = socket_buf_len(acc)
+            if have >= max {
+                self.pending = acc
+                fail "read_until limit"
+                return
+            }
+            from = have - nlen + 1
+            if from < 0 { from = 0 }
+            want = max - have
+            if want > TCP_READ_CHUNK { want = TCP_READ_CHUNK }
+            chunk = socket_tcp_read(self.fd, want) or err {
+                self.pending = acc
+                fail "{err}"
+                return
+            }
+            if socket_buf_len(chunk) == 0 {
+                self.pending = acc
+                fail "unexpected eof"
+                return
+            }
+            acc = socket_buf_concat(acc, chunk)
+        }
+        self.pending = acc
+        fail "read_until limit"
+    }
+
+    /// One line without its `\n` or `\r\n`; at most `max` bytes including the terminator.
+    read_line(@self, max: i64) : str! {
+        raw = @self.read_until("\n", max) or none
+        ensure raw != none else {
+            fail "read_line failed"
+            return
+        }
+        strip_suffix(strip_suffix(raw, "\n"), "\r")
+    }
+
+    /// Whole `data` (text, bytes or a byte array) is written; returns the byte count.
+    write(@self, data: _) : i64! {
+        ensure !(self.closed) else {
+            fail "stream closed"
+            return
+        }
+        n = socket_tcp_write(self.fd, data) or err {
+            fail "{err}"
+            return
+        }
+        n
+    }
+
+    /// Same as `write` on this `TcpStream`, or fail.
+    write_str(@self, s: str) : i64! => @self.write(s)
+
+    /// Deadlines in milliseconds; `<= 0` clears that direction.
+    set_timeout(self, read_ms: i64, write_ms: i64) : bool! {
+        ok = socket_set_timeout(self.fd, read_ms, write_ms) or err {
+            fail "{err}"
+            return
+        }
+        ok
+    }
+
+    /// Peer addr on this `TcpStream`. Returns `str`, or fails.
+    peer_addr(self) : str! {
+        a = socket_peer_addr(self.fd) or err {
+            fail "{err}"
+            return
+        }
+        a
+    }
+
+    /// Local addr on this `TcpStream`. Returns `str`, or fails.
+    local_addr(self) : str! {
+        a = socket_local_addr(self.fd) or err {
+            fail "{err}"
+            return
+        }
+        a
+    }
+
+    /// Bytes already buffered (readable without touching the socket).
+    buffered(self) : i64 => socket_buf_len(self.pending)
+
+    /// Tell the peer no more data is coming (it reads EOF) while still reading its replies.
+    shutdown_write(self) : bool! {
+        ok = socket_shutdown(self.fd, 1) or err {
+            fail "{err}"
+            return
+        }
+        ok
+    }
+
+    /// Close this `TcpStream` and release the underlying resource.
+    close(@self) : bool {
+        if (self.closed) { return false }
+        self.closed = true
+        self.pending = []
+        socket_fd_close(self.fd)
+        true
+    }
+}
+
+/// Tcp contains (`hay`, `needle`).
++tcp_contains(hay: str, needle: str) : bool {
+    hn = byte_len(hay)
+    nn = byte_len(needle)
+    ensure nn > 0 && hn >= nn else { return false }
+    found = false
+    for 0..(hn - nn + 1) {
+        if hay[it..(it + nn)] == needle { found = true }
+    }
+    found
+}
+
+/// Tcp addr (`host`, `port`). Returns `str`.
++tcp_addr(host: str, port: i64) : str {
+    if byte_len(host) > 0 && host[0] != "[" && tcp_has_colon(host) { return "[{host}]:{port}" }
+    "{host}:{port}"
+}
+
+/// Tcp has colon (`s`).
++tcp_has_colon(s: str) : bool {
+    for 0..byte_len(s) {
+        if s[it] == ":" { return true }
+    }
+    false
+}
+
+/// Port of a `host:port` address, or -1.
++tcp_port_of(addr: str) : i64 {
+    n = byte_len(addr)
+    colon = -1
+    for 0..n {
+        if addr[it] == ":" { colon = it }
+    }
+    if colon < 0 || colon == n - 1 { return -1 }
+    digits = addr[(colon + 1)..n]
+    value = 0
+    for 0..byte_len(digits) {
+        d = ord(digits[it]) - 48
+        if d < 0 || d > 9 { return -1 }
+        value = value * 10 + d
+    }
+    value
+}
+
+/// Host of a `host:port` address (brackets removed from IPv6), or "" without a port.
++tcp_host_of(addr: str) : str {
+    n = byte_len(addr)
+    colon = -1
+    for 0..n {
+        if addr[it] == ":" { colon = it }
+    }
+    if colon < 0 { return "" }
+    host = addr[0..colon]
+    hn = byte_len(host)
+    if hn >= 2 && host[0] == "[" && host[hn - 1] == "]" { return host[1..(hn - 1)] }
+    host
+}
+
+// --- tests -------------------------------------------------------------------------
+
+/// A connected pair on an ephemeral loopback port.
+TcpPair = {
+    /// Ok on `TcpPair` (`bool`). Defaults to `false`.
+    ok: bool = false
+    /// Listener on `TcpPair` (`TcpListener`).
+    listener: TcpListener
+    /// Client on `TcpPair` (`TcpStream`).
+    client: TcpStream
+    /// Server on `TcpPair` (`TcpStream`).
+    server: TcpStream
+}
+
+/// A connected TCP listener, server stream, and client stream for tests.
+tcp_pair() : TcpPair {
+    none_l = TcpListener.{fd: -1, addr: "", closed: true}
+    none_s = TcpStream.{fd: -1, pending: [], closed: true}
+    ln = TcpListener.bind("127.0.0.1:0") or err { return TcpPair.{ok: false, listener: none_l, client: none_s, server: none_s} }
+    c = TcpStream.connect("127.0.0.1:{ln.port()}") or err { return TcpPair.{ok: false, listener: ln, client: none_s, server: none_s} }
+    s = @ln.accept() or err { return TcpPair.{ok: false, listener: ln, client: c, server: none_s} }
+    TcpPair.{ok: true, listener: ln, client: c, server: s}
+}
+
+/// Test that address helpers.
+test "address helpers" {
+    assert_eq(tcp_addr("127.0.0.1", 8080), "127.0.0.1:8080")
+    assert_eq(tcp_addr("::1", 80), "[::1]:80")
+    assert_eq(tcp_addr("example.com", 443), "example.com:443")
+    assert_eq(tcp_port_of("127.0.0.1:8080"), 8080)
+    assert_eq(tcp_port_of("[::1]:99"), 99)
+    assert_eq(tcp_port_of("nohost"), -1)
+    assert_eq(tcp_port_of("host:"), -1)
+    assert_eq(tcp_port_of("host:12x"), -1)
+    assert_eq(tcp_port_of(":0"), 0)
+    assert_eq(tcp_host_of("127.0.0.1:8080"), "127.0.0.1")
+    assert_eq(tcp_host_of("[::1]:99"), "::1")
+    assert_eq(tcp_host_of("nohost"), "")
+    #assert(tcp_contains("hello\r\n", "\r\n"))
+    #assert(!(tcp_contains("hello", "\r\n")))
+    #assert(!(tcp_contains("hello", "")))
+    #assert(!(tcp_contains("ab", "abc")))
+}
+
+/// Test that bind resolves port 0 to a real port.
+test "bind resolves port 0 to a real port" {
+    ln = TcpListener.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    #assert(ln.port() > 0)
+    #assert(ln.port() < 65536)
+    assert_eq(tcp_host_of(ln.local_addr()), "127.0.0.1")
+    a = TcpListener.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    #assert(!(a.port() == ln.port()))
+    #assert(@ln.close())
+    #assert(!(@ln.close()))
+    #assert(@a.close())
+}
+
+/// Test that bind fails on an address that is already taken or malformed.
+test "bind fails on an address that is already taken or malformed" {
+    ln = TcpListener.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    taken_addr = "127.0.0.1:{ln.port()}"
+    clash = TcpListener.bind(taken_addr) or "taken"
+    #assert(clash == "taken")
+    detail = ""
+    _ = TcpListener.bind(taken_addr) or err {
+        detail = "{err}"
+        "x"
+    }
+    #assert(contains(detail, "bind"))
+    #assert(contains(detail, taken_addr))
+    junk = TcpListener.bind("not an address") or "bad"
+    #assert(junk == "bad")
+    @ln.close()
+}
+
+/// Test that echo round trip over loopback.
+test "echo round trip over loopback" {
+    p = tcp_pair()
+    #assert(p.ok)
+    ln = p.listener
+    c = p.client
+    s = p.server
+    assert_eq(@c.write_str("ping") or -1, 4)
+    got = @s.read(16) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(got), "ping")
+    assert_eq(@s.write_str("pong-é") or -1, 7)
+    back = @c.read(16) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(back), "pong-é")
+    #assert(@c.close())
+    #assert(@s.close())
+    #assert(@ln.close())
+}
+
+/// Test that addresses: the accepted side sees the client's local address.
+test "addresses: the accepted side sees the client's local address" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    assert_eq(s.peer_addr() or "?", c.local_addr() or "!")
+    assert_eq(c.peer_addr() or "?", ln.local_addr())
+    assert_eq(tcp_host_of(c.local_addr() or ""), "127.0.0.1")
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that read_exact assembles a message split across several writes.
+test "read_exact assembles a message split across several writes" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    @c.write_str("abc")
+    @c.write_str("defg")
+    @c.write_str("hi")
+    got = @s.read_exact(9) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(got), "abcdefghi")
+    assert_eq(s.buffered(), 0)
+    @c.write_str("0123456789")
+    first = @s.read_exact(4) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(first), "0123")
+    rest = @s.read(100) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(rest), "456789")
+    zero = @s.read_exact(0) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_len(zero), 0)
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that read_exact moves a 64 KiB payload byte for byte.
+test "read_exact moves a 64 KiB payload byte for byte" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    payload = repeat("0123456789abcdef", 4096)
+    assert_eq(@c.write(payload) or -1, 65536)
+    got = @s.read_exact(65536) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_len(got), 65536)
+    #assert(socket_buf_text(got) == payload)
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that read_until and read_line keep the bytes after the delimiter.
+test "read_until and read_line keep the bytes after the delimiter" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    @c.write_str("line1\r\nline2\nHEAD /x\r\n\r\ntail")
+    a = @s.read_line(4096) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(a, "line1")
+    #assert(s.buffered() > 0)
+    b = @s.read_line(4096) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(b, "line2")
+    head = @s.read_until("\r\n\r\n", 4096) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(head, "HEAD /x\r\n\r\n")
+    rest = @s.read(100) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(rest), "tail")
+    assert_eq(s.buffered(), 0)
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that read_until finds a delimiter split across packets and multi-byte text.
+test "read_until finds a delimiter split across packets and multi-byte text" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    @c.write_str("héllo\r")
+    @c.write_str("\n\r")
+    @c.write_str("\nnext")
+    got = @s.read_until("\r\n\r\n", 4096) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(got, "héllo\r\n\r\n")
+    nxt = @s.read(10) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(nxt), "next")
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that read_until enforces its limit without losing data.
+test "read_until enforces its limit without losing data" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    @c.write_str(repeat("x", 100))
+    over = @s.read_until("\n", 10) or "limit"
+    #assert(over == "limit")
+    #assert(s.buffered() >= 10)
+    all = @s.read_exact(100) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_len(all), 100)
+    empty_needle = @s.read_until("", 10) or "bad"
+    #assert(empty_needle == "bad")
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that EOF: read returns empty, exact and until fail, buffered bytes still drain.
+test "EOF: read returns empty, exact and until fail, buffered bytes still drain" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    @c.write_str("tail")
+    #assert(c.shutdown_write() or false)
+    short = @s.read_exact(10) or "eof"
+    #assert(short == "eof")
+    drained = @s.read(10) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(drained), "tail")
+    end = @s.read(10) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_len(end), 0)
+    line = @s.read_line(100) or "eof"
+    #assert(line == "eof")
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that timeouts fail fast and leave the stream usable.
+test "timeouts fail fast and leave the stream usable" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    #assert(s.set_timeout(30, 0) or false)
+    idle = @s.read(8) or "timeout"
+    #assert(idle == "timeout")
+    idle_exact = @s.read_exact(8) or "timeout"
+    #assert(idle_exact == "timeout")
+    idle_line = @s.read_line(8) or "timeout"
+    #assert(idle_line == "timeout")
+    @c.write_str("late")
+    got = @s.read(8) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(got), "late")
+    #assert(s.set_timeout(0, 0) or false)
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that a partial read_exact keeps what arrived.
+test "a partial read_exact keeps what arrived" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    #assert(s.set_timeout(30, 0) or false)
+    @c.write_str("abc")
+    short = @s.read_exact(6) or "timeout"
+    #assert(short == "timeout")
+    assert_eq(s.buffered(), 3)
+    @c.write_str("def")
+    all = @s.read_exact(6) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(all), "abcdef")
+    @c.close()
+    @s.close()
+    @ln.close()
+}
+
+/// Test that closed streams and listeners refuse work.
+test "closed streams and listeners refuse work" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    #assert(@c.close())
+    #assert(!(@c.close()))
+    assert_eq(@c.read(1) or "closed", "closed")
+    assert_eq(@c.write_str("x") or -1, -1)
+    assert_eq(@c.read_exact(1) or "closed", "closed")
+    assert_eq(@c.read_line(1) or "closed", "closed")
+    @s.close()
+    port = ln.port()
+    #assert(@ln.close())
+    assert_eq(@ln.accept() or "closed", "closed")
+    refused = TcpStream.connect("127.0.0.1:{port}") or "refused"
+    #assert(refused == "refused")
+}
+
+/// Test that several clients are accepted in connection order.
+test "several clients are accepted in connection order" {
+    ln = TcpListener.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    port = ln.port()
+    a = TcpStream.connect("127.0.0.1:{port}") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    b = TcpStream.connect("127.0.0.1:{port}") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    d = TcpStream.connect("127.0.0.1:{port}") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    @a.write_str("A")
+    @b.write_str("B")
+    @d.write_str("D")
+    sa = @ln.accept() or err {
+        assert_eq("{err}", "")
+        return
+    }
+    sb = @ln.accept() or err {
+        assert_eq("{err}", "")
+        return
+    }
+    sd = @ln.accept() or err {
+        assert_eq("{err}", "")
+        return
+    }
+    ra = @sa.read(4) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    rb = @sb.read(4) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    rd = @sd.read(4) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(ra), "A")
+    assert_eq(socket_buf_text(rb), "B")
+    assert_eq(socket_buf_text(rd), "D")
+    #assert(!(sa.fd == sb.fd))
+    #assert(!(sb.fd == sd.fd))
+    @a.close()
+    @b.close()
+    @d.close()
+    @sa.close()
+    @sb.close()
+    @sd.close()
+    @ln.close()
+}
+
+/// Test that byte arrays are written verbatim.
+test "byte arrays are written verbatim" {
+    p = tcp_pair()
+    ln = p.listener
+    c = p.client
+    s = p.server
+    assert_eq(@c.write([72, 105, 0, 255]) or -1, 4)
+    got = @s.read_exact(4) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_len(got), 4)
+    assert_eq(host.sys_hex_encode(got), "486900ff")
+    @c.close()
+    @s.close()
+    @ln.close()
+}

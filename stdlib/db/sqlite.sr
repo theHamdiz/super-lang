@@ -1,0 +1,823 @@
+//! std.db.sqlite — embedded-database style connection API over the in-memory fake
+//!
+//! Import with:
+//!   use std.db.sqlite
+//!
+//!   conn = sqlite_memory()
+//!   conn = sqlite_create(conn, "users", ["id", "name"]) or conn
+//!   conn = sqlite_insert_auto(conn, "users", ["Amina"]) or conn   // id assigned like a rowid
+//!   id = sqlite_last_insert_rowid(conn)
+//!   rows = sqlite_find(conn, "users", "name", "Amina")
+//!
+//! Full application surface over SqlDb: `:memory:` / path open, rowid, changes,
+//! `?` params, PRAGMAs (user_version, journal_mode, synchronous, foreign_keys,
+//! cache_size, busy_timeout), BEGIN/COMMIT/ROLLBACK/SAVEPOINT, ATTACH, REPLACE,
+//! UPSERT, LIMIT/OFFSET, vacuum, backup/serialize, FTS match lite, indexes,
+//! table_info, and dump.
+
+use sql
+use std.core.collections
+use std.core.str
+use std.math.core
+/// `SQLITE_MEMORY` is `":memory:"`.
++SQLITE_MEMORY = ":memory:"
+
+/// `SqliteConn` is an in-memory SQLite-style connection with last-insert id and changes.
++SqliteConn = {
+    /// Path on `SqliteConn` (`str`). Defaults to `":memory:"`.
+    path: str = ":memory:"
+    /// Db on `SqliteConn` (`SqlDb`). Defaults to `SqlDb.{tables: []}`.
+    db: SqlDb = SqlDb.{tables: []}
+    /// Snapshot on `SqliteConn` (`SqlDb`). Defaults to `SqlDb.{tables: []}`.
+    snapshot: SqlDb = SqlDb.{tables: []}
+    /// Last id on `SqliteConn` (`i64`). Defaults to `0`.
+    last_id: i64 = 0
+    /// Changes on `SqliteConn` (`i64`). Defaults to `0`.
+    changes: i64 = 0
+    /// User version on `SqliteConn` (`i64`). Defaults to `0`.
+    user_version: i64 = 0
+    /// In tx on `SqliteConn` (`bool`). Defaults to `false`.
+    in_tx: bool = false
+    journal_mode: str = "memory"
+    synchronous: str = "NORMAL"
+    foreign_keys: bool = false
+    cache_size: i64 = -2000
+    busy_timeout: i64 = 0
+    savepoints: _ = []
+    attached: _ = []
+    attached_dbs: _ = []
+    index_names: _ = []
+    index_tables: _ = []
+    fts_tables: _ = []
+}
+
+/// Is memory (`path`).
++sqlite_is_memory(path: str) : bool => path == SQLITE_MEMORY || path == ""
+
++sqlite_blank_meta(c: SqliteConn) : SqliteConn {
+    SqliteConn.{
+        path: c.path, db: c.db, snapshot: c.snapshot, last_id: c.last_id, changes: c.changes,
+        user_version: c.user_version, in_tx: c.in_tx, journal_mode: c.journal_mode,
+        synchronous: c.synchronous, foreign_keys: c.foreign_keys, cache_size: c.cache_size,
+        busy_timeout: c.busy_timeout, savepoints: c.savepoints, attached: c.attached,
+        attached_dbs: c.attached_dbs, index_names: c.index_names, index_tables: c.index_tables,
+        fts_tables: c.fts_tables
+    }
+}
+
+/// Memory. Returns `SqliteConn`.
++sqlite_memory() : SqliteConn => SqliteConn.{
+    path: SQLITE_MEMORY, db: SqlDb.new(), snapshot: SqlDb.new(), last_id: 0, changes: 0,
+    user_version: 0, in_tx: false, journal_mode: "memory", synchronous: "NORMAL",
+    foreign_keys: false, cache_size: -2000, busy_timeout: 0, savepoints: [], attached: [],
+    attached_dbs: [], index_names: [], index_tables: [], fts_tables: []
+}
+
+/// The fake keeps every database in memory; a non-empty path just names it.
++sqlite_open(path: str) : SqliteConn! {
+    ensure sql_len(path) <= 4096 else {
+        fail "sqlite: path too long"
+        return
+    }
+    SqliteConn.{
+        path, db: SqlDb.new(), snapshot: SqlDb.new(), last_id: 0, changes: 0,
+        user_version: 0, in_tx: false, journal_mode: "delete", synchronous: "NORMAL",
+        foreign_keys: false, cache_size: -2000, busy_timeout: 0, savepoints: [], attached: [],
+        attached_dbs: [], index_names: [], index_tables: [], fts_tables: []
+    }
+}
+
+/// Copy of `c` with new database state and counters.
++sqlite_next(c: SqliteConn, db: SqlDb, last_id: i64, changes: i64) : SqliteConn {
+    SqliteConn.{
+        path: c.path, db, snapshot: c.snapshot, last_id, changes,
+        user_version: c.user_version, in_tx: c.in_tx, journal_mode: c.journal_mode,
+        synchronous: c.synchronous, foreign_keys: c.foreign_keys, cache_size: c.cache_size,
+        busy_timeout: c.busy_timeout, savepoints: c.savepoints, attached: c.attached,
+        attached_dbs: c.attached_dbs, index_names: c.index_names, index_tables: c.index_tables,
+        fts_tables: c.fts_tables
+    }
+}
+
+/// To int (`s`). Returns `i64`.
++sqlite_to_int(s: str) : i64 {
+    ensure sql_len(s) > 0 else { return 0 }
+    acc = 0
+    for 0..sql_len(s) {
+        d = sql_digit(s[it])
+        if d >= 0 { acc = acc * 10 + d }
+    }
+    acc
+}
+
+// --- schema and writes ----------------------------------------------------------------------------
+
+/// Create (`c`, `table`, `cols`). Returns `SqliteConn`, or fails.
++sqlite_create(c: SqliteConn, table: str, cols: _) : SqliteConn! {
+    ensure !SqlDb.has_table(c.db, table) else {
+        fail "sqlite: table {table} already exists"
+        return
+    }
+    db = SqlDb.create_table(c.db, table, cols) or c.db
+    ensure SqlDb.has_table(db, table) else {
+        fail "sqlite: cannot create table {table}"
+        return
+    }
+    sqlite_next(c, db, c.last_id, 0)
+}
+
+/// Insert (`c`, `table`, `row`). Returns `SqliteConn`, or fails.
++sqlite_insert(c: SqliteConn, table: str, row: _) : SqliteConn! {
+    before = SqlDb.count(c.db, table)
+    db = SqlDb.insert(c.db, table, row) or c.db
+    ensure SqlDb.count(db, table) > before else {
+        fail "sqlite: insert into {table} failed"
+        return
+    }
+    id = c.last_id
+    ensure sql_count(row) > 0 else { return sqlite_next(c, db, id, 1) }
+    first = row[0]
+    if first != "" { id = sqlite_to_int(first) }
+    sqlite_next(c, db, id, 1)
+}
+
+/// Largest value in column 0 (the rowid column), or 0 for an empty table.
++sqlite_max_rowid(c: SqliteConn, table: str) : i64 {
+    t = SqlDb.table(c.db, table)
+    best = 0
+    rows = t.rows
+    for rows {
+        r = it
+        v = sqlite_to_int(r[0])
+        if v > best { best = v }
+    }
+    best
+}
+
+/// Insert values for every column except the first; column 0 gets max(rowid) + 1.
++sqlite_insert_auto(c: SqliteConn, table: str, vals: _) : SqliteConn! {
+    ensure SqlDb.has_table(c.db, table) else {
+        fail "sqlite: no such table {table}"
+        return
+    }
+    id = sqlite_max_rowid(c, table) + 1
+    row = ["{id}"]
+    for vals { row = arr_push(row, it) }
+    sqlite_insert(c, table, row)
+}
+
+/// Update (`c`, `table`, `col`, `val`, `set_col`, `set_val`). Returns `SqliteConn`, or fails.
++sqlite_update(c: SqliteConn, table: str, col: str, val: str, set_col: str, set_val: str) : SqliteConn! {
+    ensure SqlDb.has_table(c.db, table) else {
+        fail "sqlite: no such table {table}"
+        return
+    }
+    hits = sql_count(SqlDb.rows_where(c.db, table, col, val))
+    db = SqlDb.update_where(c.db, table, col, val, set_col, set_val) or c.db
+    sqlite_next(c, db, c.last_id, hits)
+}
+
+/// Delete (`c`, `table`, `col`, `val`). Returns `SqliteConn`, or fails.
++sqlite_delete(c: SqliteConn, table: str, col: str, val: str) : SqliteConn! {
+    ensure SqlDb.has_table(c.db, table) else {
+        fail "sqlite: no such table {table}"
+        return
+    }
+    hits = sql_count(SqlDb.rows_where(c.db, table, col, val))
+    db = SqlDb.delete_where(c.db, table, col, val) or c.db
+    sqlite_next(c, db, c.last_id, hits)
+}
+
+// --- reads and counters --------------------------------------------------------------------------------
+
+/// Find (`c`, `table`, `col`, `val`).
++sqlite_find(c: SqliteConn, table: str, col: str, val: str) : _ => SqlDb.rows_where(c.db, table, col, val)
+
+/// Count (`c`, `table`). Returns `i64`.
++sqlite_count(c: SqliteConn, table: str) : i64 => SqlDb.count(c.db, table)
+
+/// Last insert rowid (`c`). Returns `i64`.
++sqlite_last_insert_rowid(c: SqliteConn) : i64 => c.last_id
+
+/// Changes (`c`). Returns `i64`.
++sqlite_changes(c: SqliteConn) : i64 => c.changes
+
+// --- pragma user_version -----------------------------------------------------------------------------------
+
+/// Set user version (`c`, `v`). Returns `SqliteConn`.
++sqlite_set_user_version(c: SqliteConn, v: i64) : SqliteConn {
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: v, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
++sqlite_pragma_journal_mode(c: SqliteConn, mode: str) : SqliteConn {
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
++sqlite_pragma_synchronous(c: SqliteConn, mode: str) : SqliteConn {
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: mode,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
++sqlite_pragma_foreign_keys(c: SqliteConn, on: bool) : SqliteConn {
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: on, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
++sqlite_pragma_cache_size(c: SqliteConn, n_pages: i64) : SqliteConn {
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n_pages, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
++sqlite_busy_timeout(c: SqliteConn, ms: i64) : SqliteConn {
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: ms,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+// --- transactions -----------------------------------------------------------------------------------------------
+
+/// Begin (`c`). Returns `SqliteConn`, or fails.
++sqlite_begin(c: SqliteConn) : SqliteConn! {
+    ensure !c.in_tx else {
+        fail "sqlite: cannot start a transaction within a transaction"
+        return
+    }
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.db, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: true, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: [], attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+/// Commit (`c`). Returns `SqliteConn`, or fails.
++sqlite_commit(c: SqliteConn) : SqliteConn! {
+    ensure c.in_tx else {
+        fail "sqlite: cannot commit - no transaction is active"
+        return
+    }
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.db, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: false, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: [], attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+/// Rollback (`c`). Returns `SqliteConn`, or fails.
++sqlite_rollback(c: SqliteConn) : SqliteConn! {
+    ensure c.in_tx else {
+        fail "sqlite: cannot rollback - no transaction is active"
+        return
+    }
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.snapshot, snapshot: n.snapshot, last_id: n.last_id, changes: 0,
+        user_version: n.user_version, in_tx: false, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: [], attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+/// SAVEPOINT name.
++sqlite_savepoint(c: SqliteConn, name: str) : SqliteConn! {
+    ensure c.in_tx else {
+        fail "sqlite: no transaction is active"
+        return
+    }
+    n = sqlite_blank_meta(c)
+    sps = arr_push(n.savepoints, name)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: sps, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+/// RELEASE savepoint.
++sqlite_release(c: SqliteConn, name: str) : SqliteConn! {
+    keep = []
+    found = false
+    sps = c.savepoints
+    for sps {
+        if it == name { found = true } else {
+            if !found { keep = arr_push(keep, it) }
+        }
+    }
+    ensure found else {
+        fail "sqlite: no such savepoint: {name}"
+        return
+    }
+    // keep only savepoints before the released one
+    keep2 = []
+    for sps {
+        if it == name { break }
+        keep2 = arr_push(keep2, it)
+    }
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: keep2, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+/// ROLLBACK TO savepoint (restores snapshot, keeps tx open).
++sqlite_rollback_to(c: SqliteConn, name: str) : SqliteConn! {
+    found = false
+    sps = c.savepoints
+    for sps {
+        if it == name { found = true }
+    }
+    ensure found else {
+        fail "sqlite: no such savepoint: {name}"
+        return
+    }
+    keep2 = []
+    for sps {
+        if it == name {
+            keep2 = arr_push(keep2, it)
+            break
+        }
+        keep2 = arr_push(keep2, it)
+    }
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.snapshot, snapshot: n.snapshot, last_id: n.last_id, changes: 0,
+        user_version: n.user_version, in_tx: true, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: keep2, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+// --- `?` parameters ------------------------------------------------------------------------------------------------
+
+/// Qmark count (`query`). Returns `i64`.
++sqlite_qmark_count(query: str) : i64 {
+    n = 0
+    in_q = false
+    for 0..sql_len(query) {
+        c = query[it]
+        if c == "'" { in_q = !in_q }
+        if c == "?" && !in_q { n += 1 }
+    }
+    n
+}
+
+/// Replace each `?` (outside quoted text) with the next literal.
++sqlite_bind(query: str, params: _) : str! {
+    want = sqlite_qmark_count(query)
+    have = sql_count(params)
+    ensure want == have else {
+        fail "sqlite: {want} parameters expected, {have} supplied"
+        return
+    }
+    out = ""
+    in_q = false
+    next = 0
+    for 0..sql_len(query) {
+        c = query[it]
+        if c == "'" { in_q = !in_q }
+        if c == "?" && !in_q {
+            lit = params[next]
+            out = out + lit
+            next += 1
+        } else {
+            out = out + c
+        }
+    }
+    out
+}
+
+// --- tests -----------------------------------------------------------------------------------------------------------------
+
+/// Test that memory databases.
+test "memory databases" {
+    #assert(sqlite_is_memory(":memory:"))
+    #assert(sqlite_is_memory(""))
+    #assert(!(sqlite_is_memory("app.db")))
+    c = sqlite_memory()
+    assert_eq(c.path, ":memory:")
+    assert_eq(c.last_id, 0)
+    #assert(!(c.in_tx))
+    named = sqlite_open("app.db") or c
+    assert_eq(named.path, "app.db")
+}
+
+/// Test that create and insert with explicit ids.
+test "create and insert with explicit ids" {
+    c = sqlite_memory()
+    c = sqlite_create(c, "users", ["id", "name"]) or c
+    dup = sqlite_create(c, "users", ["id"]) or sqlite_open("dup-failed") or c
+    assert_eq(dup.path, "dup-failed")
+    c = sqlite_insert(c, "users", ["10", "Amina"]) or c
+    assert_eq(sqlite_last_insert_rowid(c), 10)
+    assert_eq(sqlite_changes(c), 1)
+    assert_eq(sqlite_count(c, "users"), 1)
+}
+
+/// Test that rowid auto assignment.
+test "rowid auto assignment" {
+    c = sqlite_memory()
+    c = sqlite_create(c, "t", ["id", "v"]) or c
+    c = sqlite_insert_auto(c, "t", ["a"]) or c
+    assert_eq(sqlite_last_insert_rowid(c), 1)
+    c = sqlite_insert_auto(c, "t", ["b"]) or c
+    c = sqlite_insert_auto(c, "t", ["c"]) or c
+    assert_eq(sqlite_last_insert_rowid(c), 3)
+    rows = sqlite_find(c, "t", "v", "c")
+    first = rows[0]
+    assert_eq(first[0], "3")
+    c = sqlite_delete(c, "t", "id", "3") or c
+    c = sqlite_insert_auto(c, "t", ["d"]) or c
+    assert_eq(sqlite_last_insert_rowid(c), 3)
+    c = sqlite_insert(c, "t", ["50", "e"]) or c
+    c = sqlite_insert_auto(c, "t", ["f"]) or c
+    assert_eq(sqlite_last_insert_rowid(c), 51)
+}
+
+/// Test that auto insert needs a table, arity is checked.
+test "auto insert needs a table, arity is checked" {
+    c = sqlite_memory()
+    missing = sqlite_insert_auto(c, "ghost", ["a"]) or sqlite_open("failed") or c
+    assert_eq(missing.path, "failed")
+    c = sqlite_create(c, "t", ["id", "v"]) or c
+    wrong = sqlite_insert(c, "t", ["only-one"]) or sqlite_open("failed") or c
+    assert_eq(wrong.path, "failed")
+    assert_eq(sqlite_count(c, "t"), 0)
+}
+
+/// Test that update and delete report changes().
+test "update and delete report changes()" {
+    c = sqlite_memory()
+    c = sqlite_create(c, "t", ["id", "grp"]) or c
+    c = sqlite_insert(c, "t", ["1", "x"]) or c
+    c = sqlite_insert(c, "t", ["2", "x"]) or c
+    c = sqlite_insert(c, "t", ["3", "y"]) or c
+    c = sqlite_update(c, "t", "grp", "x", "grp", "z") or c
+    assert_eq(sqlite_changes(c), 2)
+    assert_eq(sql_count(sqlite_find(c, "t", "grp", "z")), 2)
+    c = sqlite_delete(c, "t", "grp", "z") or c
+    assert_eq(sqlite_changes(c), 2)
+    assert_eq(sqlite_count(c, "t"), 1)
+    c = sqlite_delete(c, "t", "grp", "nothing") or c
+    assert_eq(sqlite_changes(c), 0)
+}
+
+/// Test that writes to missing tables fail.
+test "writes to missing tables fail" {
+    c = sqlite_memory()
+    assert_eq((sqlite_update(c, "g", "a", "b", "a", "c") or sqlite_open("failed") or c).path, "failed")
+    assert_eq((sqlite_delete(c, "g", "a", "b") or sqlite_open("failed") or c).path, "failed")
+}
+
+/// Test that transactions roll back and commit.
+test "transactions roll back and commit" {
+    c = sqlite_memory()
+    c = sqlite_create(c, "t", ["id"]) or c
+    c = sqlite_insert(c, "t", ["1"]) or c
+    c = sqlite_begin(c) or c
+    #assert(c.in_tx)
+    c = sqlite_insert(c, "t", ["2"]) or c
+    assert_eq(sqlite_count(c, "t"), 2)
+    c = sqlite_rollback(c) or c
+    #assert(!(c.in_tx))
+    assert_eq(sqlite_count(c, "t"), 1)
+    c = sqlite_begin(c) or c
+    c = sqlite_insert(c, "t", ["3"]) or c
+    c = sqlite_commit(c) or c
+    assert_eq(sqlite_count(c, "t"), 2)
+    #assert(!(c.in_tx))
+}
+
+/// Test that transaction misuse.
+test "transaction misuse" {
+    c = sqlite_memory()
+    started = sqlite_begin(c) or c
+    nested = sqlite_begin(started) or sqlite_open("nested-failed") or c
+    assert_eq(nested.path, "nested-failed")
+    assert_eq((sqlite_commit(c) or sqlite_open("failed") or c).path, "failed")
+    assert_eq((sqlite_rollback(c) or sqlite_open("failed") or c).path, "failed")
+}
+
+/// Test that question-mark parameters.
+test "question-mark parameters" {
+    q = sqlite_bind("SELECT * FROM t WHERE a = ? AND b = ?", [sql_int(1), sql_quote("x?y")]) or "ERR"
+    assert_eq(q, "SELECT * FROM t WHERE a = 1 AND b = 'x?y'")
+    assert_eq(sqlite_bind("SELECT '?' , ?", ["5"]) or "ERR", "SELECT '?' , 5")
+    assert_eq(sqlite_bind("SELECT 1", []) or "ERR", "SELECT 1")
+    assert_eq(sqlite_bind("SELECT ?", []) or "ERR", "ERR")
+    assert_eq(sqlite_bind("SELECT 1", ["x"]) or "ERR", "ERR")
+    assert_eq(sqlite_qmark_count("? '?' ?"), 2)
+}
+
+/// Test that user_version pragma and int parsing.
+test "user_version pragma and int parsing" {
+    c = sqlite_set_user_version(sqlite_memory(), 7)
+    assert_eq(c.user_version, 7)
+    assert_eq(sqlite_to_int("123"), 123)
+    assert_eq(sqlite_to_int(""), 0)
+    assert_eq(sqlite_to_int("007"), 7)
+}
+
+/// ATTACH schema alias to another in-memory catalog.
++sqlite_attach(c: SqliteConn, _path: str, schema: str) : SqliteConn! {
+    ensure schema != "" else {
+        fail "sqlite: empty schema name"
+        return
+    }
+    att = c.attached
+    for att {
+        if it == schema {
+            fail "sqlite: schema {schema} already attached"
+            return
+        }
+    }
+    n = sqlite_blank_meta(c)
+    other = SqlDb.new()
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: arr_push(n.attached, schema),
+        attached_dbs: arr_push(n.attached_dbs, other),
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
++sqlite_detach(c: SqliteConn, schema: str) : SqliteConn! {
+    at = -1
+    att = c.attached
+    for att {
+        if it == schema { at = index }
+    }
+    ensure at >= 0 else {
+        fail "sqlite: no such schema: {schema}"
+        return
+    }
+    names = []
+    dbs = []
+    for att {
+        if index != at {
+            names = arr_push(names, it)
+            dbs = arr_push(dbs, c.attached_dbs[index])
+        }
+    }
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: names, attached_dbs: dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+/// REPLACE INTO.
++sqlite_replace(c: SqliteConn, table: str, key_col: str, row: _) : SqliteConn! {
+    t = SqlDb.table(c.db, table)
+    ci = t.col_index(key_col)
+    ensure ci >= 0 else {
+        fail "sqlite: no such column: {key_col}"
+        return
+    }
+    key = row[ci]
+    db = SqlDb.delete_where(c.db, table, key_col, key) or c.db
+    sqlite_insert(sqlite_next(c, db, c.last_id, 0), table, row)
+}
+
+/// INSERT OR REPLACE / UPSERT by key.
++sqlite_upsert(c: SqliteConn, table: str, key_col: str, row: _) : SqliteConn! => sqlite_replace(c, table, key_col, row)
+
+/// DROP TABLE.
++sqlite_drop(c: SqliteConn, table: str) : SqliteConn! {
+    db = SqlDb.drop_table(c.db, table) or c.db
+    ensure !SqlDb.has_table(db, table) else {
+        fail "sqlite: no such table: {table}"
+        return
+    }
+    sqlite_next(c, db, c.last_id, 0)
+}
+
+/// SELECT with LIMIT/OFFSET over a filtered column.
++sqlite_select_page(c: SqliteConn, table: str, col: str, val: str, limit: i64, offset: i64) : _ {
+    rows = SqlDb.rows_where(c.db, table, col, val)
+    out = []
+    n = 0
+    for rows {
+        if index < offset { continue }
+        if n >= limit { break }
+        out = arr_push(out, it)
+        n += 1
+    }
+    out
+}
+
+/// PRAGMA table_info — column names.
++sqlite_table_info(c: SqliteConn, table: str) : _ {
+    t = SqlDb.table(c.db, table)
+    t.cols
+}
+
+/// CREATE INDEX metadata.
++sqlite_create_index(c: SqliteConn, name: str, table: str) : SqliteConn! {
+    ensure SqlDb.has_table(c.db, table) else {
+        fail "sqlite: no such table: {table}"
+        return
+    }
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: arr_push(n.index_names, name), index_tables: arr_push(n.index_tables, table),
+        fts_tables: n.fts_tables
+    }
+}
+
+/// Register a table as FTS5 virtual table.
++sqlite_create_fts(c: SqliteConn, table: str, cols: _) : SqliteConn! {
+    c2 = sqlite_create(c, table, cols) or c
+    ensure SqlDb.has_table(c2.db, table) else {
+        fail "sqlite: cannot create fts table {table}"
+        return
+    }
+    n = sqlite_blank_meta(c2)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.snapshot, last_id: n.last_id, changes: n.changes,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables,
+        fts_tables: arr_push(n.fts_tables, table)
+    }
+}
+
+/// FTS MATCH lite — rows whose any cell contains needle.
++sqlite_fts_match(c: SqliteConn, table: str, needle: str) : _ {
+    out = []
+    t = SqlDb.table(c.db, table)
+    rows = t.rows
+    for rows {
+        r = it
+        hit = false
+        for r {
+            if contains(it, needle) { hit = true }
+        }
+        if hit { out = arr_push(out, r) }
+    }
+    out
+}
+
+/// VACUUM — no-op compaction that refreshes snapshot.
++sqlite_vacuum(c: SqliteConn) : SqliteConn {
+    n = sqlite_blank_meta(c)
+    SqliteConn.{
+        path: n.path, db: n.db, snapshot: n.db, last_id: n.last_id, changes: 0,
+        user_version: n.user_version, in_tx: n.in_tx, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: n.foreign_keys, cache_size: n.cache_size, busy_timeout: n.busy_timeout,
+        savepoints: n.savepoints, attached: n.attached, attached_dbs: n.attached_dbs,
+        index_names: n.index_names, index_tables: n.index_tables, fts_tables: n.fts_tables
+    }
+}
+
+/// Serialize catalog to SQL dump text.
++sqlite_serialize(c: SqliteConn) : str {
+    out = ""
+    tables = c.db.tables
+    for tables {
+        t = it
+        out = out + "CREATE TABLE {t.name} ("
+        cols = t.cols
+        for cols {
+            if index > 0 { out = out + ", " }
+            out = out + it
+        }
+        out = out + ");\n"
+        rows = t.rows
+        for rows {
+            r = it
+            out = out + "INSERT INTO {t.name} VALUES ("
+            for r {
+                if index > 0 { out = out + ", " }
+                out = out + sql_quote(it)
+            }
+            out = out + ");\n"
+        }
+    }
+    out
+}
+
+/// Backup: clone db into a new connection.
++sqlite_backup(c: SqliteConn) : SqliteConn {
+    n = sqlite_memory()
+    SqliteConn.{
+        path: ":memory:", db: c.db, snapshot: c.db, last_id: c.last_id, changes: 0,
+        user_version: c.user_version, in_tx: false, journal_mode: n.journal_mode, synchronous: n.synchronous,
+        foreign_keys: c.foreign_keys, cache_size: c.cache_size, busy_timeout: c.busy_timeout,
+        savepoints: [], attached: [], attached_dbs: [],
+        index_names: c.index_names, index_tables: c.index_tables, fts_tables: c.fts_tables
+    }
+}
+
+/// List table names.
++sqlite_tables(c: SqliteConn) : _ {
+    out = []
+    tables = c.db.tables
+    for tables { out = arr_push(out, it.name) }
+    out
+}
+
+test "pragmas attach savepoint replace fts dump" {
+    c = sqlite_memory()
+    c = sqlite_pragma_journal_mode(c, "wal")
+    assert_eq(c.journal_mode, "wal")
+    c = sqlite_pragma_synchronous(c, "FULL")
+    c = sqlite_pragma_foreign_keys(c, true)
+    c = sqlite_pragma_cache_size(c, -4000)
+    c = sqlite_busy_timeout(c, 5000)
+    #assert(c.foreign_keys)
+    assert_eq(c.busy_timeout, 5000)
+    c = sqlite_attach(c, ":memory:", "other") or c
+    assert_eq(len(c.attached), 1)
+    c = sqlite_detach(c, "other") or c
+    assert_eq(len(c.attached), 0)
+    c = sqlite_create(c, "t", ["id", "v"]) or c
+    c = sqlite_insert(c, "t", ["1", "a"]) or c
+    c = sqlite_begin(c) or c
+    c = sqlite_savepoint(c, "sp1") or c
+    c = sqlite_insert(c, "t", ["2", "b"]) or c
+    assert_eq(sqlite_count(c, "t"), 2)
+    c = sqlite_rollback_to(c, "sp1") or c
+    assert_eq(sqlite_count(c, "t"), 1)
+    c = sqlite_release(c, "sp1") or c
+    c = sqlite_commit(c) or c
+    c = sqlite_replace(c, "t", "id", ["1", "z"]) or c
+    assert_eq(sql_count(sqlite_find(c, "t", "v", "z")), 1)
+    page = sqlite_select_page(c, "t", "v", "z", 10, 0)
+    assert_eq(sql_count(page), 1)
+    info = sqlite_table_info(c, "t")
+    assert_eq(info[0], "id")
+    c = sqlite_create_index(c, "t_v", "t") or c
+    assert_eq(len(c.index_names), 1)
+    c = sqlite_create_fts(c, "docs", ["id", "body"]) or c
+    c = sqlite_insert(c, "docs", ["1", "hello world"]) or c
+    hits = sqlite_fts_match(c, "docs", "world")
+    assert_eq(sql_count(hits), 1)
+    c = sqlite_vacuum(c)
+    dump = sqlite_serialize(c)
+    #assert(contains(dump, "CREATE TABLE t"))
+    bak = sqlite_backup(c)
+    assert_eq(sqlite_count(bak, "t"), 1)
+    #assert(len(sqlite_tables(c)) >= 2)
+    c = sqlite_drop(c, "docs") or c
+    #assert(!(SqlDb.has_table(c.db, "docs")))
+}

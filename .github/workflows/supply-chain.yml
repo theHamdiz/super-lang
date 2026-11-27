@@ -1,0 +1,50 @@
+# Round 6 — dependency audit, license policy, bounded JSON fuzz, law mutation report.
+name: supply-chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  audit-and-licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.23.0
+      - name: cargo audit
+        run: cargo audit --color never
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version 0.18.9
+      - name: cargo deny (licenses + advisories)
+        run: cargo deny check advisories licenses bans sources
+
+  json-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Bounded JSON/HTTP encode fuzz (~45s)
+        env:
+          SUPER_JSON_FUZZ_SECS: "45"
+        run: python3 scripts/fuzz_json.py
+
+  law-mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build super CLI
+        run: cargo build -p super-cli --release --locked
+      - name: Law mutation injection report
+        run: python3 scripts/law_mutation_check.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: law-mutation-report
+          path: docs/law-mutation-report.md
+          if-no-files-found: error

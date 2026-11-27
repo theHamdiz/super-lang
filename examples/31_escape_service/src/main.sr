@@ -1,0 +1,222 @@
+// 31_escape_service — realistic HTTP fixture for escape-analysis site coverage (Round 9 Item 2).
+//
+// Escape analysis limits (see docs/ESCAPE_ANALYSIS_COUNTS.md):
+//   • interprocedural — in-module `Ident` callees reachable from routes (e.g. `named_handler_mirror`, `stats_json_body`)
+//   • opaque calls — host/stdlib not in the safe list still → Conservative when values flow
+//   • unknown_call — opaque host/stdlib calls → Conservative when values flow out
+//   • durable roots — Promote requires recognized global names (`g_*` on `state` bindings)
+//
+//   super test examples/31_escape_service/
+//   SUPER_ADDR=127.0.0.1:3031 super run examples/31_escape_service/src/main.sr
+
+use std.net.http
+use std.fmt.json
+use std.sys.env
+
+state g_cache_stats = {hits: 0, misses: 0, note: "boot"}
+state g_promote_sink = {note: "init"}
+state g_last_item = {id: 0, title: "", qty: 0}
+
++next_id = 1
+
++CreateItem = {
+    title: str
+    qty: i64
+}
+
++stats_json_body() : str {
+    o = JsonObj.new()
+    @o.int("hits", g_cache_stats.hits)
+    @o.int("misses", g_cache_stats.misses)
+    @o.str("note", g_cache_stats.note)
+    @o.int("last_id", g_last_item.id)
+    @o.str("last_title", g_last_item.title)
+    lines = ["hits", "misses", "note"]
+    ports = {http: 80, https: 443, metrics: 9090}
+    @o.raw("tags", json_encode(lines))
+    @o.raw("ports", json_encode(ports))
+    o.end()
+}
+
++named_handler_mirror(req: Request) : Response {
+    // Births here are invisible to route-lambda site collection (named callee).
+    shadow = {mirror: true, path: req.path, tag: "admin"}
+    ok(shadow)
+}
+
++build_app() : App {
+    app = App.new()
+    app = @app.use(Mw.Recover)
+    app = @app.use(Mw.RequestId)
+    app = @app.use(Mw.Logger)
+    app = @app.use(Mw.StripSlash)
+    app = @app.get("/health", |req| {
+        meta = {ok: true, service: "escape-service", path: req.path}
+        ok(meta)
+    })
+    app = @app.get("/stats", |req| {
+        snap = {
+            hits: g_cache_stats.hits,
+            misses: g_cache_stats.misses,
+            note: g_cache_stats.note,
+            last_id: g_last_item.id,
+            last_title: g_last_item.title,
+            last_qty: g_last_item.qty,
+        }
+        ports = {http: 80, https: 443, metrics: 9090}
+        lines = ["hits", "misses", "note"]
+        ok({snap, ports, tags: lines, path: req.path})
+    })
+    app = @app.get("/metrics", |req| {
+        ok(stats_json_body())
+    })
+    app = @app.post("/items", |req| {
+        raw = req.json(CreateItem) or err {
+            return bad_request({error: "{err}"})
+        }
+        title = json_get_str(raw, "title") or ""
+        qty = json_get_int(raw, "qty") or 0
+        ensure title != "" else {
+            return bad_request({error: "title required"})
+        }
+        id = next_id
+        next_id = id + 1
+        row = {id, title, qty}
+        items = [row, {id: id + 1, title: "shadow", qty: 1}]
+        payload = {ok: true, items, echo: raw, schema: "CreateItem"}
+        durable = {note: "item-{id}", title}
+        g_promote_sink = durable
+        g_last_item = row
+        g_cache_stats = {
+            hits: g_cache_stats.hits,
+            misses: g_cache_stats.misses + 1,
+            note: "ingest",
+        }
+        ok(payload)
+    })
+    app = @app.post("/ingest", |req| {
+        body = req.body
+        ensure body != "" else {
+            return bad_request({error: "empty body"})
+        }
+        key = json_get_str(body, "key") or "default"
+        val = json_get_int(body, "value") or 0
+        batch = [
+            {key, value: val},
+            {key: "shadow", value: val + 1},
+        ]
+        header = "ingest:" + key + ":" + host.sys_to_str(val)
+        wrapped = {batch, header, valid: json_valid(body)}
+        escaped = {note: wrapped.header}
+        g_promote_sink = escaped
+        ok(wrapped)
+    })
+    app = @app.get(r"/lookup/{key}", |req| {
+        key = req.param("key")
+        g_cache_stats = {
+            hits: g_cache_stats.hits + 1,
+            misses: g_cache_stats.misses,
+            note: "lookup-{key}",
+        }
+        item = {id: g_last_item.id, title: g_last_item.title, qty: g_last_item.qty}
+        entry = {key, cached: g_last_item.id > 0, item}
+        ok(entry)
+    })
+    app = @app.post("/alloc", |req| {
+        items = [{id: 1, name: "a"}, {id: 2, name: "b"}]
+        payload = {ok: true, items, echo: req.body, label: "alloc"}
+        escaped = {note: payload.label}
+        g_promote_sink = escaped
+        ok(payload)
+    })
+    app = @app.post("/batch", |req| {
+        raw = req.json(CreateItem) or err {
+            return bad_request({error: "parse"})
+        }
+        title = json_get_str(raw, "title") or "batch"
+        totals = [1, 2, 3, 4]
+        map = {alpha: totals[0], beta: totals[1], gamma: totals[2]}
+        parts = ""
+        for n in totals {
+            parts = parts + "," + host.sys_to_str(n)
+        }
+        record = {title, map, parts, count: len(totals)}
+        ok(record)
+    })
+    app = @app.get("/admin/mirror", |req| { named_handler_mirror(req) })
+    app
+}
+
++main() {
+    addr = env_get_or("SUPER_ADDR", "127.0.0.1:3031")
+    app = build_app()
+    print("listening on {addr}")
+    handled = @app.serve(addr) or err {
+        print("serve failed on {addr}: {err}")
+        return 1
+    }
+    print("shutdown after {handled} requests")
+    0
+}
+
+test "health exposes service name" {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.get("/health")
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, "escape-service"))
+}
+
+test "items require JSON title" {
+    app = build_app()
+    tc = TestClient.new(app)
+    bad = @tc.post("/items", "")
+    assert_eq(bad.status, 400)
+    ok_res = @tc.post("/items", "{\"title\":\"gear\",\"qty\":3}")
+    assert_eq(ok_res.status, 200)
+    #assert(contains(ok_res.body, "gear"))
+}
+
+test "ingest parses key and value" {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.post("/ingest", "{\"key\":\"lane\",\"value\":9}")
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, "lane"))
+}
+
+test "metrics uses JsonObj encoder" {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.get("/metrics")
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, "hits"))
+}
+
+test "lookup bumps hit counter via stats" {
+    app = build_app()
+    tc = TestClient.new(app)
+    _ = @tc.post("/items", "{\"title\":\"x\",\"qty\":1}")
+    before = @tc.get("/stats")
+    _ = @tc.get("/lookup/alpha")
+    after = @tc.get("/stats")
+    assert_eq(before.status, 200)
+    assert_eq(after.status, 200)
+    #assert(contains(after.body, "hits"))
+}
+
+test "batch builds composite record" {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.post("/batch", "{\"title\":\"run\",\"qty\":2}")
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, "alpha"))
+}
+
+test "admin mirror uses named handler" {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.get("/admin/mirror")
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, "mirror"))
+}

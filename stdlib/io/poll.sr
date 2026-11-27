@@ -1,0 +1,198 @@
+//! std.io.poll — high-level TCP/UDP readiness loop over std.sys.epoll
+//!
+//! Import with:
+//!   use std.io.poll
+//!
+//!   loop = PollLoop.new() or err { return }
+//!   @loop.register(stream.fd, POLL_READ, stream.fd)   // also makes the socket non-blocking
+//!   ready = loop.wait(128, 1000) or err { return }
+//!   for ready { if poll_can_read(it.events) { ... it.token ... } }
+//!
+//! For batched submission with completions instead of readiness, use std.sys.io_uring.
+
+use std.sys.epoll
+
+/// `POLL_READ` is `1`.
++POLL_READ = 1
+/// `POLL_WRITE` is `4`.
++POLL_WRITE = 4
+/// `POLL_ERROR` is `8 | 16`.
++POLL_ERROR = 8 | 16
+
+/// `PollLoop` waits on registered sockets and reports readable or writable ones.
++PollLoop = {
+    /// Ep on `PollLoop` (`Epoll`).
+    ep: Epoll
+    /// Registered sockets (handles) so `count` and `has` need no syscall.
+    sockets: _ = []
+
+    /// Create a new `PollLoop!`.
+    new() : PollLoop! {
+        ep = Epoll.new() or err {
+            fail "{err}"
+            return
+        }
+        PollLoop.{ep, sockets: []}
+    }
+
+    /// Register on this `PollLoop` (`socket`, `events`, `token`). Returns `bool`, or fails.
+    register(@self, socket: i64, events: i64, token: i64) : bool! {
+        ensure !self.has(socket) else {
+            fail "poll: socket already registered"
+            return
+        }
+        nb = epoll_set_nonblock(socket, true) or err {
+            fail "{err}"
+            return
+        }
+        added = @self.ep.add(socket, events, token) or err {
+            fail "{err}"
+            return
+        }
+        self.sockets = host.sys_arr_push(self.sockets, socket)
+        nb && added
+    }
+
+    /// Update on this `PollLoop` (`socket`, `events`, `token`). Returns `bool`, or fails.
+    update(@self, socket: i64, events: i64, token: i64) : bool! {
+        @self.ep.modify(socket, events, token) or err { fail "{err}" }
+    }
+
+    /// Unregister on this `PollLoop` (`socket`). Returns `bool`, or fails.
+    unregister(@self, socket: i64) : bool! {
+        removed = @self.ep.remove(socket) or err {
+            fail "{err}"
+            return
+        }
+        kept = []
+        old = self.sockets
+        for old {
+            if it != socket { kept = host.sys_arr_push(kept, it) }
+        }
+        self.sockets = kept
+        removed
+    }
+
+    /// Has on this `PollLoop` (`socket`).
+    has(self, socket: i64) : bool {
+        found = false
+        list = self.sockets
+        for list {
+            if it == socket { found = true }
+        }
+        found
+    }
+
+    /// Count on this `PollLoop`. Returns `i64`.
+    count(self) : i64 => host.sys_arr_len(self.sockets)
+
+    /// Wait up to `timeout_ms` (-1 forever, 0 poll) for readiness events {token, events}.
+    wait(self, max_events: i64, timeout_ms: i64) : _! {
+        self.ep.wait(max_events, timeout_ms) or err { fail "{err}" }
+    }
+
+    /// Close this `PollLoop` and release the underlying resource.
+    close(@self) : bool {
+        @self.sockets = []
+        @self.ep.close()
+    }
+}
+
+/// Poll can read (`events`).
++poll_can_read(events: i64) : bool => (events & POLL_READ) != 0
+/// Poll can write (`events`).
++poll_can_write(events: i64) : bool => (events & POLL_WRITE) != 0
+/// Poll has error (`events`).
++poll_has_error(events: i64) : bool => (events & POLL_ERROR) != 0
+
+/// Test that poll flags classify epoll bits.
+test "poll flags classify epoll bits" {
+    #assert(poll_can_read(POLL_READ))
+    #assert(poll_can_write(POLL_WRITE))
+    #assert(poll_has_error(POLL_ERROR))
+    #assert(!(poll_can_read(POLL_WRITE)))
+    #assert(!(poll_has_error(POLL_READ)))
+    assert_eq(POLL_READ, EPOLL_IN)
+    assert_eq(POLL_WRITE, EPOLL_OUT)
+}
+
+/// Test that poll loop lifecycle.
+test "poll loop lifecycle" {
+    lp = PollLoop.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    listener = host.sys_tcp_listen("127.0.0.1:0") or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(@lp.register(listener, POLL_READ, 99) or false)
+    #assert(lp.has(listener))
+    assert_eq(lp.count(), 1)
+    // duplicate registration is rejected before it reaches the kernel
+    #assert(!(@lp.register(listener, POLL_READ, 99) or false))
+    #assert(@lp.unregister(listener) or false)
+    #assert(!(lp.has(listener)))
+    assert_eq(lp.count(), 0)
+    #assert(!(@lp.unregister(listener) or false))
+    host.sys_fd_close(listener)
+    #assert(@lp.close())
+}
+
+/// Test that poll loop delivers readiness for a new connection and for data.
+test "poll loop delivers readiness for a new connection and for data" {
+    lp = PollLoop.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    listener = host.sys_tcp_listen("127.0.0.1:0") or err {
+        assert_eq(1, 0)
+        return
+    }
+    addr = host.sys_fd_local_addr(listener) or err {
+        assert_eq(1, 0)
+        return
+    }
+    @lp.register(listener, POLL_READ, 1) or err {
+        assert_eq(1, 0)
+        return
+    }
+    idle = lp.wait(8, 0) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(idle), 0)
+    client = host.sys_tcp_connect(addr) or err {
+        assert_eq(1, 0)
+        return
+    }
+    ready = lp.wait(8, 200) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(ready[0].token, 1)
+    #assert(poll_can_read(ready[0].events))
+    conn = host.sys_tcp_accept(listener) or err {
+        assert_eq(1, 0)
+        return
+    }
+    @lp.register(conn, POLL_READ | POLL_WRITE, 2) or err {
+        assert_eq(1, 0)
+        return
+    }
+    host.sys_tcp_write(client, "hi")
+    got = false
+    for 0..20 {
+        events = lp.wait(8, 100) or err { return }
+        for events {
+            if it.token == 2 && poll_can_read(it.events) { got = true }
+        }
+        if got { break }
+    }
+    #assert(got)
+    #assert(@lp.update(conn, POLL_WRITE, 3) or false)
+    host.sys_fd_close(conn)
+    host.sys_fd_close(client)
+    host.sys_fd_close(listener)
+    #assert(@lp.close())
+}

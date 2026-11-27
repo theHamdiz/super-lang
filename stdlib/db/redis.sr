@@ -1,0 +1,686 @@
+//! std.db.redis — Redis-style key/value store with TTLs, lists and hashes (in-memory fake)
+//!
+//! Import with:
+//!   use std.db.redis
+//!
+//!   r = RedisConn.new()
+//!   r = r.set( "session:42", "amina")
+//!   r = r.expire( "session:42", 60)
+//!   who = r.get( "session:42") or "anonymous"
+//!   r = r.tick( 61)                // advance the logical clock (seconds)
+//!   gone = r.exists( "session:42") // false
+//!
+//! Time is a logical clock owned by the connection (`tick`), so expiry is fully
+//! deterministic in tests. Every mutator returns the next `RedisConn`; reads take it
+//! by value. `resp_command` encodes real RESP wire frames for the networked driver.
+
+use std.core.collections
+
+/// `RedisConn` is an in-memory RESP store: strings, lists, hashes, and expirations.
++RedisConn = {
+    /// Keys on `RedisConn`. Defaults to `[]`.
+    keys: _ = []
+    /// Vals on `RedisConn`. Defaults to `[]`.
+    vals: _ = []
+    /// Kinds on `RedisConn`. Defaults to `[]`.
+    kinds: _ = []
+    /// Expires on `RedisConn`. Defaults to `[]`.
+    expires: _ = []
+    /// Now on `RedisConn` (`i64`). Defaults to `0`.
+    now: i64 = 0
+
+    /// Create a fresh `RedisConn`.
+    new() : RedisConn => RedisConn.{keys: [], vals: [], kinds: [], expires: [], now: 0}
+
+    /// Advance the clock used by expirations.
+    tick(self, secs: i64) : RedisConn {
+        RedisConn.{keys: self.keys, vals: self.vals, kinds: self.kinds, expires: self.expires, now: self.now + secs}
+    }
+
+    /// Slot of key `key`, or -1.
+    slot(self, key: str) : i64 {
+        found = -1
+        keys = self.keys
+        exps = self.expires
+        now = self.now
+        for keys {
+            if found < 0 && it == key {
+                e = exps[index]
+                if e == 0 || e > now { found = index }
+            }
+        }
+        found
+    }
+
+    /// True when key `key` is present and not expired.
+    exists(self, key: str) : bool => self.slot(key) >= 0
+
+    /// Run `keys` against this connection.
+    with(self, keys: _, vals: _, kinds: _, expires: _) : RedisConn {
+        RedisConn.{keys, vals, kinds, expires, now: self.now}
+    }
+
+    /// Store `val` under `key`.
+    put(self, key: str, val: _, kind: str, expiry: i64) : RedisConn {
+        // overwrite an existing (possibly expired) slot of the same name
+        at = -1
+        keys = self.keys
+        for keys {
+            if at < 0 && it == key { at = index }
+        }
+        if at >= 0 {
+            return self.with(self.keys, arr_set(self.vals, at, val), arr_set(self.kinds, at, kind), arr_set(self.expires, at, expiry))
+        }
+        self.with( arr_push(self.keys, key), arr_push(self.vals, val), arr_push(self.kinds, kind), arr_push(self.expires, expiry))
+    }
+
+    /// Drop expired keys.
+    purge(self) : RedisConn {
+        keys = []
+        vals = []
+        kinds = []
+        exps = []
+        old_keys = self.keys
+        old_vals = self.vals
+        old_kinds = self.kinds
+        old_exps = self.expires
+        now = self.now
+        for old_keys {
+            e = old_exps[index]
+            if e == 0 || e > now {
+                keys = arr_push(keys, it)
+                vals = arr_push(vals, old_vals[index])
+                kinds = arr_push(kinds, old_kinds[index])
+                exps = arr_push(exps, e)
+            }
+        }
+        self.with( keys, vals, kinds, exps)
+    }
+
+    /// Count non-expired keys (named `key_count` to avoid the `dbsize` token clashing with
+    /// `Set.size` in the same test block when both std.db.redis and std.core.collections import).
+    key_count(self) : i64 {
+        live = 0
+        key_list = self.keys
+        for key_list {
+            if self.slot(it) >= 0 { live += 1 }
+        }
+        live
+    }
+
+    /// How many keys are live.
+    db_size(self) : i64 => self.key_count()
+
+    /// Set key `key` to `val`.
+    set(self, key: str, val: str) : RedisConn => self.put( key, val, REDIS_STRING, 0)
+
+    /// Set key `key` to `secs` with a TTL of `val` seconds.
+    setex(self, key: str, secs: i64, val: str) : RedisConn {
+        deadline = self.now + secs
+        self.put( key, val, REDIS_STRING, deadline)
+    }
+
+    /// Value of key `key`, or fail.
+    get(self, key: str) : str! {
+        at = self.slot(key)
+        ensure at >= 0 else {
+            fail "redis: nil"
+            return
+        }
+        kinds = self.kinds
+        ensure kinds[at] == REDIS_STRING else {
+            fail "redis: WRONGTYPE operation against a key holding the wrong kind of value"
+            return
+        }
+        vals = self.vals
+        vals[at]
+    }
+
+    /// Delete key `key`.
+    delete(self, key: str) : RedisConn {
+        at = self.slot(key)
+        ensure at >= 0 else { return self }
+        keys = []
+        vals = []
+        kinds = []
+        exps = []
+        old_keys = self.keys
+        old_vals = self.vals
+        old_kinds = self.kinds
+        old_exps = self.expires
+        for old_keys {
+            if index != at {
+                keys = arr_push(keys, it)
+                vals = arr_push(vals, old_vals[index])
+                kinds = arr_push(kinds, old_kinds[index])
+                exps = arr_push(exps, old_exps[index])
+            }
+        }
+        self.with( keys, vals, kinds, exps)
+    }
+
+    /// Add `n` to the integer at key `key`, or fail.
+    incr_by(self, key: str, n: i64) : RedisConn! {
+        current = 0
+        at = self.slot(key)
+        keep = 0
+        if at >= 0 {
+            text = self.get(key) or ""
+            ensure text != "" else {
+                fail "redis: value is not an integer or out of range"
+                return
+            }
+            current = redis_parse_int(text) or -4611686018427387904
+            ensure current > -4611686018427387904 else {
+                fail "redis: value is not an integer or out of range"
+                return
+            }
+            exps = self.expires
+            keep = exps[at]
+        }
+        total = current + n
+        self.put( key, "{total}", REDIS_STRING, keep)
+    }
+
+    /// Add 1 to the integer at key `key`, or fail.
+    incr(self, key: str) : RedisConn! => self.incr_by( key, 1)
+
+    /// Integer stored at key `key`.
+    as_int(self, key: str) : i64 {
+        text = self.get(key) or "0"
+        redis_parse_int(text) or 0
+    }
+
+    /// Set the TTL of key `key` to `secs` seconds.
+    expire(self, key: str, secs: i64) : RedisConn {
+        at = self.slot(key)
+        ensure at >= 0 else { return self }
+        deadline = self.now + secs
+        self.with(self.keys, self.vals, self.kinds, arr_set(self.expires, at, deadline))
+    }
+
+    /// Clear the TTL of key `key`.
+    persist(self, key: str) : RedisConn {
+        at = self.slot(key)
+        ensure at >= 0 else { return self }
+        self.with(self.keys, self.vals, self.kinds, arr_set(self.expires, at, 0))
+    }
+
+    /// Remaining TTL of key `key` in seconds, or -1 when it does not expire.
+    ttl(self, key: str) : i64 {
+        at = self.slot(key)
+        ensure at >= 0 else { return -2 }
+        exps = self.expires
+        e = exps[at]
+        if e == 0 { return -1 }
+        e - self.now
+    }
+
+    /// List stored at key `key`.
+    list_of(self, key: str) : _ {
+        at = self.slot(key)
+        ensure at >= 0 else { return [] }
+        kinds = self.kinds
+        ensure kinds[at] == REDIS_LIST else { return [] }
+        vals = self.vals
+        vals[at]
+    }
+
+    /// Replace the list at key `key`.
+    list_save(self, key: str, items: _) : RedisConn {
+        ensure redis_count(items) > 0 else { return self.delete(key) }
+        at = self.slot(key)
+        keep = 0
+        if at >= 0 {
+            exps = self.expires
+            keep = exps[at]
+        }
+        self.put( key, items, REDIS_LIST, keep)
+    }
+
+    /// Append `val` to the list at key `key`, or fail.
+    rpush(self, key: str, val: str) : RedisConn!  {
+        at = self.slot(key)
+        if at >= 0 {
+            kinds = self.kinds
+            ensure kinds[at] == REDIS_LIST else {
+                fail "redis: WRONGTYPE operation against a key holding the wrong kind of value"
+                return
+            }
+        }
+        items = arr_push(self.list_of(key), val)
+        self.list_save( key, items)
+    }
+
+    /// Prepend `val` to the list at key `key`, or fail.
+    lpush(self, key: str, val: str) : RedisConn! {
+        at = self.slot(key)
+        if at >= 0 {
+            kinds = self.kinds
+            ensure kinds[at] == REDIS_LIST else {
+                fail "redis: WRONGTYPE operation against a key holding the wrong kind of value"
+                return
+            }
+        }
+        items = [val]
+        old = self.list_of(key)
+        for old { items = arr_push(items, it) }
+        self.list_save( key, items)
+    }
+
+    /// Length of the list at key `key`.
+    llen(self, key: str) : i64 => redis_count(self.list_of(key))
+
+    /// Element `i` of the list at key `key`, or fail.
+    lindex(self, key: str, i: i64) : str! {
+        items = self.list_of(key)
+        n = redis_count(items)
+        pos = i
+        if i < 0 { pos = n + i }
+        ensure pos >= 0 && pos < n else {
+            fail "redis: nil"
+            return
+        }
+        items[pos]
+    }
+
+    /// Pop the first element of the list at key `key`.
+    lpop(self, key: str) : RedisConn {
+        items = self.list_of(key)
+        rest = []
+        for items {
+            if index > 0 { rest = arr_push(rest, it) }
+        }
+        ensure redis_count(items) > 0 else { return self }
+        self.list_save( key, rest)
+    }
+
+    /// Pop the last element of the list at key `key`.
+    rpop(self, key: str) : RedisConn {
+        items = self.list_of(key)
+        n = redis_count(items)
+        ensure n > 0 else { return self }
+        rest = []
+        for items {
+            if index < n - 1 { rest = arr_push(rest, it) }
+        }
+        self.list_save( key, rest)
+    }
+
+    /// Slice of the list at key `key` from `start` to `stop`.
+    lrange(self, key: str, start: i64, stop: i64) : _ {
+        items = self.list_of(key)
+        n = redis_count(items)
+        lo = start
+        hi = stop
+        if lo < 0 { lo = n + lo }
+        if hi < 0 { hi = n + hi }
+        if lo < 0 { lo = 0 }
+        if hi >= n { hi = n - 1 }
+        out = []
+        for items {
+            if index >= lo && index <= hi { out = arr_push(out, it) }
+        }
+        out
+    }
+
+    /// Hash stored at key `key`.
+    hash_of(self, key: str) : _ {
+        at = self.slot(key)
+        ensure at >= 0 else { return [] }
+        kinds = self.kinds
+        ensure kinds[at] == REDIS_HASH else { return [] }
+        vals = self.vals
+        vals[at]
+    }
+
+    /// Set field `field` of the hash at key `key` to `val`, or fail.
+    hset(self, key: str, field: str, val: str) : RedisConn! {
+        at = self.slot(key)
+        if at >= 0 {
+            kinds = self.kinds
+            ensure kinds[at] == REDIS_HASH else {
+                fail "redis: WRONGTYPE operation against a key holding the wrong kind of value"
+                return
+            }
+        }
+        flat = self.hash_of(key)
+        _n = redis_count(flat)
+        slot = -1
+        for flat {
+            if slot < 0 && index % 2 == 0 && it == field { slot = index }
+        }
+        out = flat
+        if slot >= 0 {
+            out = arr_set(flat, slot + 1, val)
+        } else {
+            out = arr_push(flat, field)
+            out = arr_push(out, val)
+        }
+        keep = 0
+        if at >= 0 {
+            exps = self.expires
+            keep = exps[at]
+        }
+        self.put( key, out, REDIS_HASH, keep)
+    }
+
+    /// Field `field` of the hash at key `key`, or fail.
+    hget(self, key: str, field: str) : str! {
+        flat = self.hash_of(key)
+        found = -1
+        for flat {
+            if found < 0 && index % 2 == 0 && it == field { found = index }
+        }
+        ensure found >= 0 else {
+            fail "redis: nil"
+            return
+        }
+        flat[found + 1]
+    }
+
+    /// Number of fields in the hash at key `key`.
+    hlen(self, key: str) : i64 => redis_count(self.hash_of(key)) / 2
+
+    /// Record one hit against the limiter key `key`.
+    hit(self, key: str, window_secs: i64) : RedisConn {
+        fresh = !self.exists(key)
+        bumped = self.incr(key) or self
+        if fresh { return bumped.expire(key, window_secs) }
+        bumped
+    }
+
+    /// True when key `key` is still under its limit.
+    allow(self, key: str, limit: i64) : bool => self.as_int(key) < limit
+}
+
+/// Kind tags kept per key.
++REDIS_STRING = "string"
+/// `REDIS_LIST` is `"list"`.
++REDIS_LIST = "list"
+/// `REDIS_HASH` is `"hash"`.
++REDIS_HASH = "hash"
+
+/// How many times the value occurs in `a`.
++redis_count(a: _) : i64 {
+    n = 0
+    for a { n += 1 }
+    n
+}
+
+/// Length of `s`.
++redis_len(s: str) : i64 => host.sys_str_len(s)
+
+/// True when `c` is a digit.
++redis_digit(c: str) : i64 {
+    d = "0123456789"
+    found = -1
+    for 0..10 {
+        if found < 0 && d[it] == c { found = it }
+    }
+    found
+}
+
+/// Strict decimal parse of an optionally negative integer.
++redis_parse_int(s: str) : i64! {
+    n = redis_len(s)
+    ensure n > 0 else {
+        fail "redis: value is not an integer"
+        return
+    }
+    neg = s[0] == "-"
+    start = 0
+    if neg { start = 1 }
+    ensure n > start else {
+        fail "redis: value is not an integer"
+        return
+    }
+    acc = 0
+    bad = false
+    for start..n {
+        d = redis_digit(s[it])
+        if d < 0 { bad = true }
+        acc = acc * 10 + d
+    }
+    ensure !bad else {
+        fail "redis: value is not an integer"
+        return
+    }
+    if neg { return -acc }
+    acc
+}
+
+// --- RESP wire frames --------------------------------------------------------------------------------------
+
+/// Encode a command as a RESP array of bulk strings.
++resp_command(args: _) : str {
+    out = "*{redis_count(args)}\r\n"
+    for args {
+        n = redis_len(it)
+        out = out + "$"
+        out = out + "{n}"
+        out = out + "\r\n"
+        out = out + it
+        out = out + "\r\n"
+    }
+    out
+}
+
+/// RESP simple string `+OK`.
++resp_ok() : str => "+OK\r\n"
+/// RESP error whose message is `msg`.
++resp_error(msg: str) : str => "-ERR {msg}\r\n"
+/// RESP integer for `n`.
++resp_integer(n: i64) : str => ":{n}\r\n"
+
+/// RESP bulk string for `s`.
++resp_bulk(s: str) : str {
+    n = redis_len(s)
+    "${n}\r\n{s}\r\n"
+}
+
+/// RESP null bulk string.
++resp_nil() : str => "$-1\r\n"
+
+/// First byte of a reply tells the type: + - : $ *
++resp_kind(reply: str) : str => reply[0]
+
+// --- tests ----------------------------------------------------------------------------------------------------------
+
+/// Test that set / get / del.
+test "set / get / del" {
+    r = RedisConn.new()
+    r = r.set( "a", "1")
+    assert_eq(r.get( "a") or "nil", "1")
+    r = r.set( "a", "2")
+    assert_eq(r.get( "a") or "nil", "2")
+    #assert(r.exists( "a"))
+    assert_eq(r.get( "zzz") or "nil", "nil")
+    r = r.delete( "a")
+    #assert(!(r.exists( "a")))
+    assert_eq(r.key_count(), 0)
+    r = r.delete( "never-existed")
+    assert_eq(r.key_count(), 0)
+}
+
+/// Test that del keeps other keys intact.
+test "del keeps other keys intact" {
+    r = RedisConn.new()
+    r = r.set("a", "1")
+    r = r.set("b", "2")
+    r = r.set("c", "3")
+    r = r.delete( "b")
+    assert_eq(r.get( "a") or "nil", "1")
+    assert_eq(r.get( "b") or "nil", "nil")
+    assert_eq(r.get( "c") or "nil", "3")
+    assert_eq(r.key_count(), 2)
+}
+
+/// Test that expiry with the logical clock.
+test "expiry with the logical clock" {
+    r = RedisConn.new().set("s", "v")
+    assert_eq(r.ttl( "s"), -1)
+    assert_eq(r.ttl( "missing"), -2)
+    r = r.expire( "s", 10)
+    assert_eq(r.ttl( "s"), 10)
+    r = r.tick( 4)
+    assert_eq(r.ttl( "s"), 6)
+    assert_eq(r.get( "s") or "nil", "v")
+    r = r.tick( 6)
+    #assert(!(r.exists( "s")))
+    assert_eq(r.get( "s") or "nil", "nil")
+    assert_eq(r.ttl( "s"), -2)
+}
+
+/// Test that setex, persist and purge.
+test "setex, persist and purge" {
+    r = RedisConn.new().setex("t", 5, "x")
+    assert_eq(r.ttl( "t"), 5)
+    r = r.persist( "t")
+    assert_eq(r.ttl( "t"), -1)
+    r = r.expire( "t", 1)
+    r = r.set( "keep", "y")
+    r = r.tick( 2)
+    assert_eq(r.key_count(), 1)
+    purged = r.purge()
+    assert_eq(redis_count(purged.keys), 1)
+    assert_eq(purged.get( "keep") or "nil", "y")
+}
+
+/// Test that overwriting an expired key revives it.
+test "overwriting an expired key revives it" {
+    r = RedisConn.new().setex("k", 1, "old")
+    r = r.tick( 5)
+    r = r.set( "k", "new")
+    assert_eq(r.get( "k") or "nil", "new")
+    assert_eq(r.ttl( "k"), -1)
+    assert_eq(redis_count(r.keys), 1)
+}
+
+/// Test that counters.
+test "counters" {
+    r = RedisConn.new()
+    r = r.incr( "n") or r
+    r = r.incr( "n") or r
+    r = r.incr_by( "n", 10) or r
+    assert_eq(r.as_int( "n"), 12)
+    r = r.incr_by( "n", -20) or r
+    assert_eq(r.as_int( "n"), -8)
+    r = r.set( "bad", "abc")
+    stuck = r.incr( "bad") or r.set( "marker", "failed")
+    assert_eq(stuck.get( "marker") or "nil", "failed")
+    assert_eq(stuck.get( "bad") or "nil", "abc")
+}
+
+/// Test that incr preserves ttl.
+test "incr preserves ttl" {
+    r = RedisConn.new().setex("c", 30, "5")
+    r = r.incr( "c") or r
+    assert_eq(r.as_int( "c"), 6)
+    assert_eq(r.ttl( "c"), 30)
+}
+
+/// Test that strict integer parsing.
+test "strict integer parsing" {
+    assert_eq(redis_parse_int("42") or -1, 42)
+    assert_eq(redis_parse_int("-7") or 0, -7)
+    assert_eq(redis_parse_int("") or 99, 99)
+    assert_eq(redis_parse_int("-") or 99, 99)
+    assert_eq(redis_parse_int("4x") or 99, 99)
+    assert_eq(redis_parse_int("1.5") or 99, 99)
+}
+
+/// Test that lists behave like deques.
+test "lists behave like deques" {
+    r = RedisConn.new()
+    r = r.rpush( "q", "b") or r
+    r = r.rpush( "q", "c") or r
+    r = r.lpush( "q", "a") or r
+    assert_eq(r.llen( "q"), 3)
+    assert_eq(r.lindex( "q", 0) or "nil", "a")
+    assert_eq(r.lindex( "q", 2) or "nil", "c")
+    assert_eq(r.lindex( "q", -1) or "nil", "c")
+    assert_eq(r.lindex( "q", 3) or "nil", "nil")
+    r = r.lpop( "q")
+    assert_eq(r.lindex( "q", 0) or "nil", "b")
+    r = r.rpop( "q")
+    assert_eq(r.llen( "q"), 1)
+    r = r.lpop( "q")
+    assert_eq(r.llen( "q"), 0)
+    #assert(!(r.exists( "q")))
+    r = r.lpop( "q")
+    assert_eq(r.key_count(), 0)
+}
+
+/// Test that lrange semantics.
+test "lrange semantics" {
+    r = RedisConn.new()
+    for 0..5 { r = r.rpush( "l", "{it}") or r }
+    all = r.lrange( "l", 0, -1)
+    assert_eq(redis_count(all), 5)
+    assert_eq(all[4], "4")
+    mid = r.lrange( "l", 1, 3)
+    assert_eq(redis_count(mid), 3)
+    assert_eq(mid[0], "1")
+    tail = r.lrange( "l", -2, -1)
+    assert_eq(tail[0], "3")
+    assert_eq(redis_count(r.lrange( "l", 10, 20)), 0)
+    assert_eq(redis_count(r.lrange( "l", 3, 1)), 0)
+    assert_eq(redis_count(r.lrange( "none", 0, -1)), 0)
+}
+
+/// Test that hashes.
+test "hashes" {
+    r = RedisConn.new()
+    r = r.hset( "user:1", "name", "Amina") or r
+    r = r.hset( "user:1", "city", "Cairo") or r
+    r = r.hset( "user:1", "name", "Amina K") or r
+    assert_eq(r.hlen( "user:1"), 2)
+    assert_eq(r.hget( "user:1", "name") or "nil", "Amina K")
+    assert_eq(r.hget( "user:1", "city") or "nil", "Cairo")
+    assert_eq(r.hget( "user:1", "zip") or "nil", "nil")
+    assert_eq(r.hget( "ghost", "x") or "nil", "nil")
+    assert_eq(r.hlen( "ghost"), 0)
+}
+
+/// Test that wrong type operations fail.
+test "wrong type operations fail" {
+    r = RedisConn.new().set("s", "v")
+    assert_eq((r.rpush( "s", "x") or r.set( "m", "failed")).keys[1], "m")
+    assert_eq((r.lpush( "s", "x") or r.set( "m", "failed")).keys[1], "m")
+    assert_eq((r.hset( "s", "f", "x") or r.set( "m", "failed")).keys[1], "m")
+    l = RedisConn.new().rpush("list", "x") or r
+    assert_eq(l.get( "list") or "nil", "nil")
+    assert_eq(r.llen( "s"), 0)
+}
+
+/// Test that fixed window rate limiting.
+test "fixed window rate limiting" {
+    r = RedisConn.new()
+    for 0..3 { r = r.hit( "rl:ip", 60) }
+    assert_eq(r.as_int( "rl:ip"), 3)
+    #assert(!(r.allow( "rl:ip", 3)))
+    #assert(r.allow( "rl:ip", 4))
+    assert_eq(r.ttl( "rl:ip"), 60)
+    r = r.tick( 20)
+    r = r.hit( "rl:ip", 60)
+    assert_eq(r.ttl( "rl:ip"), 40)
+    r = r.tick( 41)
+    #assert(r.allow( "rl:ip", 1))
+    r = r.hit( "rl:ip", 60)
+    assert_eq(r.as_int( "rl:ip"), 1)
+}
+
+/// Test that resp frames.
+test "resp frames" {
+    assert_eq(resp_command(["SET", "k", "v"]), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+    assert_eq(resp_command(["PING"]), "*1\r\n$4\r\nPING\r\n")
+    assert_eq(resp_command(["GET", ""]), "*2\r\n$3\r\nGET\r\n$0\r\n\r\n")
+    assert_eq(resp_ok(), "+OK\r\n")
+    assert_eq(resp_error("boom"), "-ERR boom\r\n")
+    assert_eq(resp_integer(42), ":42\r\n")
+    assert_eq(resp_bulk("hello"), "$5\r\nhello\r\n")
+    assert_eq(resp_nil(), "$-1\r\n")
+    assert_eq(resp_kind(resp_bulk("x")), "$")
+    assert_eq(resp_kind(resp_ok()), "+")
+}

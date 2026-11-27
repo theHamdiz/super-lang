@@ -1,0 +1,515 @@
+//! std.sys.fs — filesystem access
+//!
+//! Import with:
+//!   use std.sys.fs
+//!
+//! Thin, failure-aware wrappers over host intrinsics (`sys_read_str`,
+//! `sys_write_str`, `sys_exists`, ...). Every wrapper returns `T!` so callers
+//! pick a policy with `or`:
+//!
+//!   cfg = fs_read_str("app.toml") or "port = 8080"
+//!   saved = fs_write_str("out.txt", body) or err { return }
+//!
+//! `MemFs` is an in-memory fake with the same shape, so code written against
+//! the wrappers can be tested with no disk access.
+
+use std.core.str
+use std.sys.path
+use std.core.collections
+
+/// `FS_MAX_ENTRIES` is `1024`.
++FS_MAX_ENTRIES = 1024
+
+// --- host-backed wrappers ---------------------------------------------------
+
+/// True when a file or directory exists at `path`.
++fs_exists(path: str) : bool {
+    found = host.sys_exists(path) or false
+    found
+}
+
+/// Entire file `path` as text, or fail.
++fs_read_str(path: str) : str! {
+    ensure path != "" else {
+        fail "fs: empty path"
+        return
+    }
+    ensure fs_exists(path) else {
+        fail "fs: no such file: {path}"
+        return
+    }
+    text = host.sys_read_str(path) or err {
+        fail "fs: cannot read {path}"
+        return
+    }
+    text
+}
+
+/// Replace file `path` with the text `text`, or fail.
++fs_write_str(path: str, text: str) : bool! {
+    ensure path != "" else {
+        fail "fs: empty path"
+        return
+    }
+    ok = host.sys_write_str(path, text) or false
+    ensure ok else {
+        fail "fs: cannot write {path}"
+        return
+    }
+    true
+}
+
+/// Append the text `text` to file `path`, or fail.
++fs_append_str(path: str, text: str) : bool! {
+    ensure path != "" else {
+        fail "fs: empty path"
+        return
+    }
+    ok = host.sys_append_str(path, text) or false
+    ensure ok else {
+        fail "fs: cannot append {path}"
+        return
+    }
+    true
+}
+
+/// Delete the file at `path`, or fail.
++fs_remove(path: str) : bool! {
+    ensure fs_exists(path) else {
+        fail "fs: no such file: {path}"
+        return
+    }
+    ok = host.sys_remove(path) or false
+    ensure ok else {
+        fail "fs: cannot remove {path}"
+        return
+    }
+    true
+}
+
+/// Create the directory `path`, or fail.
++fs_mkdir(path: str) : bool! {
+    ok = host.sys_mkdir(path) or false
+    ensure ok else {
+        fail "fs: cannot create directory {path}"
+        return
+    }
+    true
+}
+
+/// True when `path` is a directory.
++fs_is_dir(path: str) : bool {
+    yes = host.sys_is_dir(path) or false
+    yes
+}
+
+/// Size of file `path` in bytes, or fail.
++fs_file_size(path: str) : i64! {
+    ensure fs_exists(path) else {
+        fail "fs: no such file: {path}"
+        return
+    }
+    n = host.sys_file_size(path) or err {
+        fail "fs: cannot stat {path}"
+        return
+    }
+    n
+}
+
+/// Directory entries (names only). Empty when the host cannot list `path`.
++fs_list_dir(path: str) {
+    names = host.sys_list_dir(path) or []
+    names
+}
+
+// --- more host-backed operations ---------------------------------------------
+
+/// Create `path` and any missing parents (like `mkdir -p`; succeeds when it already exists).
++fs_mkdir_all(path: str) : bool! {
+    ensure path != "" else {
+        fail "fs: empty path"
+        return
+    }
+    ok = host.sys_mkdir_all(path) or false
+    ensure ok else {
+        fail "fs: cannot create directory {path}"
+        return
+    }
+    true
+}
+
+/// True when `path` is a regular file.
++fs_is_file(path: str) : bool {
+    yes = host.sys_is_file(path) or false
+    yes
+}
+
+/// Atomic on one filesystem; replaces an existing destination file.
++fs_rename(from: str, to: str) : bool! {
+    ensure from != "" && to != "" else {
+        fail "fs: empty path"
+        return
+    }
+    ok = host.sys_rename(from, to) or false
+    ensure ok else {
+        fail "fs: cannot rename {from}"
+        return
+    }
+    true
+}
+
+/// Copy one file; returns the number of bytes copied.
++fs_copy(from: str, to: str) : i64! {
+    ensure from != "" && to != "" else {
+        fail "fs: empty path"
+        return
+    }
+    n = host.sys_copy_file(from, to) or err {
+        fail "fs: cannot copy {from}"
+        return
+    }
+    n
+}
+
+/// Last modification time in whole seconds since the Unix epoch.
++fs_mtime(path: str) : i64! {
+    t = host.sys_mtime_unix(path) or err {
+        fail "fs: cannot stat {path}"
+        return
+    }
+    t
+}
+
+/// Path of a fresh temporary directory.
++fs_temp_dir() : str {
+    dir = host.sys_temp_dir() or "/tmp"
+    dir
+}
+
+/// Entire file `path` as bytes, or fail.
++fs_read_bytes(path: str) : _! {
+    ensure fs_exists(path) else {
+        fail "fs: no such file: {path}"
+        return
+    }
+    data = host.sys_read_bytes(path) or err {
+        fail "fs: cannot read {path}"
+        return
+    }
+    data
+}
+
+/// Replace file `path` with the bytes `data`, or fail.
++fs_write_bytes(path: str, data: _) : bool! {
+    ensure path != "" else {
+        fail "fs: empty path"
+        return
+    }
+    ok = host.sys_write_bytes(path, data) or false
+    ensure ok else {
+        fail "fs: cannot write {path}"
+        return
+    }
+    true
+}
+
+/// A file as lines (`\n` or `\r\n` separated; a trailing newline yields a final empty line).
++fs_read_lines(path: str) : _! {
+    text = fs_read_str(path) or err {
+        fail "fs: cannot read {path}"
+        return
+    }
+    lines(text)
+}
+
+/// Recursive remove: files, or a directory with everything under it.
++fs_remove_all(path: str) : bool! {
+    ensure path != "" && path != "/" else {
+        fail "fs: refusing to remove {path}"
+        return
+    }
+    fs_remove(path)
+}
+
+/// Every regular file under `root` (breadth first, joined onto `root`), at most FS_MAX_ENTRIES.
+/// One pass over a single work array: no recursion, O(entries).
++fs_walk(root: str) {
+    files = []
+    dirs = [root]
+    head = 0
+    while head < len(dirs) && len(files) < FS_MAX_ENTRIES {
+        dir = dirs[head]
+        head += 1
+        names = fs_list_dir(dir)
+        for names {
+            full = path_join(dir, it)
+            if fs_is_dir(full) {
+                dirs = host.sys_arr_push(dirs, full)
+            } else {
+                files = host.sys_arr_push(files, full)
+            }
+        }
+    }
+    files
+}
+
+// --- in-memory fake -------------------------------------------------------------
+
+/// `MemFs` is an in-memory file tree used by tests and hosts without a disk.
++MemFs = {
+    /// Paths on `MemFs`. Defaults to `[]`.
+    paths: _ = []
+    /// Texts on `MemFs`. Defaults to `[]`.
+    texts: _ = []
+
+    /// Create a fresh `MemFs`.
+    new() : MemFs => MemFs.{paths: [], texts: []}
+
+    /// Slot of the path `path`, or -1.
+    find(self, path: str) : i64 {
+        pos = -1
+        names = self.paths
+        for names {
+            if pos < 0 && it == path { pos = index }
+        }
+        pos
+    }
+
+    /// True when `path` is stored.
+    exists(self, path: str) : bool => self.find(path) >= 0
+
+    /// Store text `text` at path `path`, or fail.
+    write(@self, path: str, text: str) : bool! {
+        ensure path != "" else {
+            fail "memfs: empty path"
+            return
+        }
+        at = self.find(path)
+        if at >= 0 {
+            self.texts = host.sys_arr_set(self.texts, at, text)
+            true
+        } else {
+            ensure self.count() < FS_MAX_ENTRIES else {
+                fail "memfs: full"
+                return
+            }
+            self.paths = host.sys_arr_push(self.paths, path)
+            self.texts = host.sys_arr_push(self.texts, text)
+            true
+        }
+    }
+
+    /// Text stored at `path`, or fail.
+    read(self, path: str) : str! {
+        at = self.find(path)
+        ensure at >= 0 else {
+            fail "memfs: no such file: {path}"
+            return
+        }
+        self.texts[at]
+    }
+
+    /// Delete the stored path `path`, or fail.
+    remove(@self, path: str) : bool! {
+        at = self.find(path)
+        ensure at >= 0 else {
+            fail "memfs: no such file: {path}"
+            return
+        }
+        paths = []
+        texts = []
+        names = self.paths
+        bodies = self.texts
+        for names {
+            if index != at {
+                paths = host.sys_arr_push(paths, it)
+                texts = host.sys_arr_push(texts, bodies[index])
+            }
+        }
+        self.paths = paths
+        self.texts = texts
+        true
+    }
+
+    /// How many paths are stored.
+    count(self) : i64 {
+        n = 0
+        names = self.paths
+        for names { n += 1 }
+        n
+    }
+}
+
+// --- tests ---------------------------------------------------------------------
+
+/// Test that MemFs write / read / overwrite.
+test "MemFs write / read / overwrite" {
+    m = MemFs.new()
+    #assert(@m.write("a.txt", "one") or false)
+    #assert(@m.write("b.txt", "two") or false)
+    assert_eq(m.read("a.txt") or "?", "one")
+    #assert(@m.write("a.txt", "uno") or false)
+    assert_eq(m.read("a.txt") or "?", "uno")
+    assert_eq(m.count(), 2)
+}
+
+/// Test that MemFs missing files fail.
+test "MemFs missing files fail" {
+    m = MemFs.new()
+    assert_eq(m.read("nope") or "missing", "missing")
+    #assert(!(@m.remove("nope") or false))
+    #assert(!(@m.write("", "x") or false))
+    #assert(!(m.exists("nope")))
+}
+
+/// Test that MemFs remove keeps the others aligned.
+test "MemFs remove keeps the others aligned" {
+    m = MemFs.new()
+    @m.write("a", "A")
+    @m.write("b", "B")
+    @m.write("c", "C")
+    #assert(@m.remove("b") or false)
+    #assert(!(m.exists("b")))
+    assert_eq(m.read("a") or "?", "A")
+    assert_eq(m.read("c") or "?", "C")
+    assert_eq(m.count(), 2)
+}
+
+/// Test that host wrappers fail cleanly without a host.
+test "host wrappers fail cleanly without a host" {
+    #assert(!(fs_exists("/definitely/not/here")))
+    assert_eq(fs_read_str("/definitely/not/here") or "fallback", "fallback")
+    assert_eq(fs_read_str("") or "empty", "empty")
+    #assert(!(fs_remove("/definitely/not/here") or false))
+    assert_eq(fs_file_size("/definitely/not/here") or -1, -1)
+}
+
+/// Test that fs_is_dir / fs_list_dir default to empty.
+test "fs_is_dir / fs_list_dir default to empty" {
+    #assert(!(fs_is_dir("/definitely/not/here")))
+    entries = fs_list_dir("/definitely/not/here")
+    n = 0
+    for entries { n += 1 }
+    assert_eq(n, 0)
+}
+
+// --- real-disk tests (each uses its own scratch directory) ----------------------
+
+/// Test that fs_mkdir is single-level; fs_mkdir_all makes parents and is idempotent.
+test "fs_mkdir is single-level; fs_mkdir_all makes parents and is idempotent" {
+    root = "{fs_temp_dir()}/super_fs_mk_{host.sys_unix_ns()}"
+    #assert(fs_mkdir(root) or false)
+    #assert(fs_is_dir(root))
+    #assert(!(fs_mkdir(root) or false))
+    #assert(!(fs_mkdir("{root}/a/b") or false))
+    #assert(fs_mkdir_all("{root}/a/b/c") or false)
+    #assert(fs_mkdir_all("{root}/a/b/c") or false)
+    #assert(fs_is_dir("{root}/a/b/c"))
+    #assert(!(fs_is_file("{root}/a/b/c")))
+    #assert(!(fs_mkdir_all("") or false))
+    #assert(fs_remove_all(root) or false)
+    #assert(!(fs_exists(root)))
+}
+
+/// Test that write, append, read, size and mtime on a real file.
+test "write, append, read, size and mtime on a real file" {
+    root = "{fs_temp_dir()}/super_fs_rw_{host.sys_unix_ns()}"
+    fs_mkdir_all(root)
+    f = "{root}/note.txt"
+    #assert(fs_write_str(f, "héllo") or false)
+    #assert(fs_append_str(f, " wörld\n") or false)
+    #assert(fs_append_str(f, "line2") or false)
+    assert_eq(fs_read_str(f) or "?", "héllo wörld\nline2")
+    assert_eq(fs_file_size(f) or -1, 19)
+    #assert(fs_is_file(f))
+    #assert(!(fs_is_dir(f)))
+    #assert((fs_mtime(f) or 0) > 1600000000)
+    assert_eq(fs_mtime("{root}/missing") or -1, -1)
+    ls = fs_read_lines(f) or []
+    assert_eq(len(ls), 2)
+    assert_eq(ls[0], "héllo wörld")
+    assert_eq(ls[1], "line2")
+    #assert(fs_write_str(f, "") or false)
+    assert_eq(fs_file_size(f) or -1, 0)
+    #assert(!(fs_append_str("", "x") or false))
+    #assert(!(fs_write_str("{root}/no/such/dir/f", "x") or false))
+    #assert(fs_remove(f) or false)
+    #assert(!(fs_exists(f)))
+    #assert(!(fs_remove(f) or false))
+    fs_remove_all(root)
+}
+
+/// Test that binary files round trip byte for byte.
+test "binary files round trip byte for byte" {
+    root = "{fs_temp_dir()}/super_fs_bin_{host.sys_unix_ns()}"
+    fs_mkdir_all(root)
+    f = "{root}/blob.bin"
+    data = host.sys_str_to_bytes("a\x00b\x01\x02")
+    #assert(fs_write_bytes(f, data) or false)
+    back = fs_read_bytes(f) or host.sys_str_to_bytes("")
+    assert_eq(back.len, 5)
+    assert_eq(host.sys_hex_encode(back), "6100620102")
+    assert_eq(fs_file_size(f) or -1, 5)
+    assert_eq(fs_read_bytes("{root}/none") or "missing", "missing")
+    fs_remove_all(root)
+}
+
+/// Test that rename and copy move bytes, replace destinations, and fail on missing sources.
+test "rename and copy move bytes, replace destinations, and fail on missing sources" {
+    root = "{fs_temp_dir()}/super_fs_mv_{host.sys_unix_ns()}"
+    fs_mkdir_all("{root}/sub")
+    fs_write_str("{root}/a.txt", "AAA")
+    assert_eq(fs_copy("{root}/a.txt", "{root}/b.txt") or -1, 3)
+    assert_eq(fs_read_str("{root}/b.txt") or "?", "AAA")
+    fs_write_str("{root}/c.txt", "old")
+    #assert(fs_rename("{root}/a.txt", "{root}/c.txt") or false)
+    #assert(!(fs_exists("{root}/a.txt")))
+    assert_eq(fs_read_str("{root}/c.txt") or "?", "AAA")
+    #assert(fs_rename("{root}/c.txt", "{root}/sub/d.txt") or false)
+    assert_eq(fs_read_str("{root}/sub/d.txt") or "?", "AAA")
+    assert_eq(fs_copy("{root}/nope", "{root}/x") or -1, -1)
+    #assert(!(fs_rename("{root}/nope", "{root}/x") or false))
+    assert_eq(fs_copy("", "x") or -1, -1)
+    #assert(!(fs_rename("x", "") or false))
+    fs_remove_all(root)
+}
+
+/// Test that fs_list_dir and fs_walk see nested trees once, in bounded space.
+test "fs_list_dir and fs_walk see nested trees once, in bounded space" {
+    root = "{fs_temp_dir()}/super_fs_walk_{host.sys_unix_ns()}"
+    fs_mkdir_all("{root}/a/b")
+    fs_mkdir_all("{root}/c")
+    fs_write_str("{root}/top.txt", "1")
+    fs_write_str("{root}/a/mid.txt", "2")
+    fs_write_str("{root}/a/b/deep.txt", "3")
+    fs_write_str("{root}/c/x.txt", "4")
+    top = fs_list_dir(root)
+    assert_eq(len(top), 3)
+    files = fs_walk(root)
+    assert_eq(len(files), 4)
+    seen = 0
+    for files {
+        if it == "{root}/top.txt" || it == "{root}/a/mid.txt" || it == "{root}/a/b/deep.txt" || it == "{root}/c/x.txt" { seen += 1 }
+    }
+    assert_eq(seen, 4)
+    assert_eq(len(fs_walk("{root}/missing")), 0)
+    assert_eq(len(fs_walk("{root}/c")), 1)
+    fs_remove_all(root)
+}
+
+/// Test that fs_remove_all removes trees and refuses dangerous paths.
+test "fs_remove_all removes trees and refuses dangerous paths" {
+    root = "{fs_temp_dir()}/super_fs_rm_{host.sys_unix_ns()}"
+    fs_mkdir_all("{root}/x/y")
+    fs_write_str("{root}/x/y/z.txt", "z")
+    #assert(fs_remove_all(root) or false)
+    #assert(!(fs_exists("{root}/x/y/z.txt")))
+    #assert(!(fs_remove_all("/") or false))
+    #assert(!(fs_remove_all("") or false))
+    #assert(!(fs_remove_all(root) or false))
+}
+
+/// Test that temp dir exists and is a directory.
+test "temp dir exists and is a directory" {
+    #assert(fs_is_dir(fs_temp_dir()))
+}

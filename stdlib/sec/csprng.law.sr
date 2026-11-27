@@ -1,0 +1,18 @@
+//! Laws for std.sec.csprng (pure fill / hex length model).
+//! Implementation: `fill` / `is_err_val` / `fill_hex` in `csprng.sr`.
+
+law_fill_err_tag(n: i64) : bool => n == 0
+
+law_fill_hex_len(n: i64) : i64 => n * 2
+
+#law("zero-length fill is success in the model")
+csprng_is_err_after_fill() {
+    #assert(law_fill_err_tag(0))
+    #assert(!law_fill_err_tag(16))
+}
+
+#law("hex output length is twice byte length")
+csprng_fill_hex_zero() {
+    #assert(law_fill_hex_len(0) == 0)
+    #assert(law_fill_hex_len(8) == 16)
+}

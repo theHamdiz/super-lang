@@ -1,0 +1,47 @@
+//! Laws for std.net.http — header and token helpers.
+
+#law("http_is_token rejects spaces")
+http_token_no_space() {
+    #assert(!http_is_token("bad token"))
+}
+
+#law("http_trim is idempotent")
+http_trim_idempotent() {
+    s = "  GET  "
+    t = http_trim(s)
+    #assert(http_trim(t) == t)
+}
+
+#law("http_is_token_char accepts letters and digits")
+http_token_char_alnum() {
+    #assert(http_is_token_char(65))
+    #assert(http_is_token_char(97))
+    #assert(http_is_token_char(48))
+    #assert(!http_is_token_char(32))
+    #assert(!http_is_token_char(10))
+}
+
+#law("http_is_token_char accepts tchar punctuation")
+http_token_char_punct() {
+    #assert(http_is_token_char(45))
+    #assert(http_is_token_char(95))
+    #assert(!http_is_token_char(34))
+}
+
+#law("http_is_space_tab classifies trim bytes")
+http_space_tab_law() {
+    #assert(http_is_space_tab(" "))
+    #assert(http_is_space_tab("\t"))
+    #assert(!http_is_space_tab("a"))
+}
+
+#law("http_trim_advance_lo skips one leading space")
+http_trim_advance_lo_law() {
+    #assert(http_trim_advance_lo(" x", 0, 2) == 1)
+    #assert(http_trim_advance_lo("x", 0, 1) == 0)
+}
+
+#law("http_trim_rewind_hi skips one trailing tab")
+http_trim_rewind_hi_law() {
+    #assert(http_trim_rewind_hi("x\t", 0, 2) == 1)
+}

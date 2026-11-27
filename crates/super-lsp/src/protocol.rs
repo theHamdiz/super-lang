@@ -1,0 +1,62 @@
+//! Minimal JSON-RPC 2.0 types for LSP.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Deserialize)]
+pub struct Request {
+    pub jsonrpc: String,
+    pub id: Option<Value>,
+    pub method: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Response {
+    pub jsonrpc: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcError {
+    pub code: i64,
+    pub message: String,
+}
+
+impl Response {
+    pub fn result(id: Option<Value>, result: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn error(id: Option<Value>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+
+    pub fn notification(method: &str, params: Value) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        })
+        .to_string()
+    }
+}

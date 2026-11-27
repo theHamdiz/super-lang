@@ -1,0 +1,136 @@
+//! gemini — Google Gemini generateContent (text + multimodal)
+//!
+//!   use gemini
+//!   g = Gemini.new("AIza…")
+//!   res = @g.chat([ai_user("hi")], "gemini-2.0-flash")
+
+use std.ai.client
+use std.core.str
+
++GEMINI_BASE = "https://generativelanguage.googleapis.com"
+
++Gemini = {
+    client: AiClient = AiClient.new("gemini", "", "")
+
+    new(api_key: str) : Gemini {
+        Gemini.{client: AiClient.with_auth("gemini", GEMINI_BASE, api_key, AI_AUTH_QUERY)}
+    }
+
+    set_offline(@self, on: bool) : bool {
+        c = self.client
+        @c.set_offline(on)
+        self.client = c
+        on
+    }
+
+    set_timeout(@self, ms: i64) : i64 {
+        c = self.client
+        @c.set_timeout(ms)
+        self.client = c
+        ms
+    }
+
+    push_mock(@self, body: str) : i64 {
+        c = self.client
+        n = @c.push_mock(body)
+        self.client = c
+        n
+    }
+
+    -run(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        c = self.client
+        res = @c.request(path, req, body)
+        self.client = c
+        res
+    }
+
+    /// Gemini `contents` body (maps system → systemInstruction).
+    contents_body(_self, req: AiRequest) : str {
+        parts = "["
+        ms = req.messages
+        for ms {
+            if index > 0 { parts = parts + "," }
+            role = it.role
+            if role == "assistant" { role = "model" }
+            if role == "system" { role = "user" }
+            parts = parts + "{\"role\":\"" + role + "\",\"parts\":[{\"text\":" + ai_json_str(it.content) + "}]}"
+        }
+        parts = parts + "]"
+        body = "{\"contents\":" + parts
+        if req.system != "" {
+            body = body + ",\"systemInstruction\":{\"parts\":[{\"text\":" + ai_json_str(req.system) + "}]}"
+        }
+        body = body + ",\"generationConfig\":{\"temperature\":" + "{req.temperature}" + ",\"maxOutputTokens\":" + "{req.max_tokens}" + "}"
+        if req.extra_json != "" { body = body + "," + req.extra_json }
+        body + "}"
+    }
+
+    chat_req(@self, req: AiRequest) : AiResponse {
+        body = self.contents_body(req)
+        path = "/v1beta/models/" + req.model + ":generateContent"
+        @self.run(path, req, body)
+    }
+
+    chat(@self, messages: _, model: str) : AiResponse {
+        @self.chat_req(ai_chat_req(model, messages, 1024))
+    }
+
+    chat_system(@self, system: str, messages: _, model: str) : AiResponse {
+        req = ai_chat_req(model, messages, 1024)
+        req.system = system
+        @self.chat_req(req)
+    }
+
+    complete(@self, prompt: str, model: str) : AiResponse {
+        @self.chat([ai_user(prompt)], model)
+    }
+
+    embed(@self, text: str, model: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_EMBED, messages: [], prompt: text, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: "", size: "", duration_s: 0, stop: []
+        }
+        body = "{\"content\":{\"parts\":[{\"text\":" + ai_json_str(text) + "}]}}"
+        @self.run("/v1beta/models/" + model + ":embedContent", req, body)
+    }
+
+    image(@self, prompt: str, model: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_IMAGE, messages: [], prompt, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: "", size: "1024x1024", duration_s: 0, stop: []
+        }
+        body = "{\"contents\":[{\"parts\":[{\"text\":" + ai_json_str(prompt) + "}]}]}"
+        @self.run("/v1beta/models/" + model + ":generateContent", req, body)
+    }
+
+    chat_image(@self, prompt: str, media_url: str, model: str) : AiResponse {
+        req = ai_chat_req(model, [ai_user(prompt)], 1024)
+        req.media_url = media_url
+        body = "{\"contents\":[{\"parts\":["
+        body = body + "{\"text\":" + ai_json_str(prompt) + "},"
+        body = body + "{\"fileData\":{\"fileUri\":" + ai_json_str(media_url) + "}}"
+        body = body + "]}]}"
+        @self.run("/v1beta/models/" + model + ":generateContent", req, body)
+    }
+}
+
+test "gemini generateContent offline" {
+    g = Gemini.new("key")
+    @g.push_mock("{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gem-hi\"}]}}]}")
+    res = @g.chat([ai_user("hi")], "gemini-2.0-flash")
+    assert_eq(res.text, "gem-hi")
+    #assert(contains(g.client.last_url, "generateContent"))
+}
+
+test "gemini systemInstruction and query auth url" {
+    g = Gemini.new("AIza-test")
+    @g.push_mock("{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"x\"}]}}]}")
+    _ = @g.chat_system("brief", [ai_user("hi")], "gemini-2.0-flash")
+    #assert(contains(g.client.last_body, "systemInstruction"))
+    // Offline resolve_url still stamps the key for inspection when request runs live;
+    // request path stores base+path before query only when offline — resolve_url is used.
+    u = g.client.resolve_url("/v1beta/models/m:generateContent")
+    #assert(contains(u, "key=AIza-test"))
+}

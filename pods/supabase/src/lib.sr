@@ -1,0 +1,495 @@
+//! supabase — Supabase client (PostgREST + Auth + Storage + Realtime)
+//!
+//! Import with:
+//!   use supabase
+//!
+//!   sb = Supabase.new("https://xyz.supabase.co", "anon-key")
+//!   sb = @sb.from("todos").insert(["id", "title"], ["1", "Ship"]) or sb
+//!   rows = sb.from("todos").eq("id", "1").select()
+//!
+//! Offline SqlDb-backed PostgREST surface plus Auth (sign_up/sign_in/JWT session),
+//! Storage buckets, Realtime channels, RPC, and URL builders for a live project.
+//! The SQL catalog rides on `supabase` so RLS-shaped filters are plain
+//! equality predicates in offline mode.
+
+use std.db.postgres
+use std.db.sql
+use std.core.collections
+use std.core.str
+use std.sec.hash
+
++SUPABASE_DEFAULT_SCHEMA = "public"
+
+/// Supabase project config.
++SupabaseConfig = {
+    url: str = ""
+    anon_key: str = ""
+    service_role_key: str = ""
+    schema: str = "public"
+}
+
+/// Auth user record.
++SbUser = {
+    id: str = ""
+    email: str = ""
+    password_hash: str = ""
+    role: str = "authenticated"
+    meta: str = "{}"
+}
+
+/// Auth session (access + refresh tokens).
++SbSession = {
+    access_token: str = ""
+    refresh_token: str = ""
+    user_id: str = ""
+    expires_at: i64 = 0
+}
+
+/// Storage object.
++SbObject = {
+    bucket: str = ""
+    path: str = ""
+    body: str = ""
+    content_type: str = "application/octet-stream"
+}
+
+/// Realtime channel subscription.
++SbChannel = {
+    topic: str = ""
+    event: str = "*"
+    payloads: _ = []
+}
+
+/// PostgREST-style query builder (value type; reassign after filters).
++SbQuery = {
+    client: i64 = 0
+    table: str = ""
+    filter_cols: _ = []
+    filter_vals: _ = []
+    limit_n: i64 = 0
+    offset_n: i64 = 0
+    order_col: str = ""
+    ascending: bool = true
+    columns: _ = []
+}
+
+/// Supabase client.
++Supabase = {
+    cfg: SupabaseConfig = SupabaseConfig.{url: "", anon_key: "", service_role_key: "", schema: "public"}
+    pool: PgPool = PgPool.empty()
+    users: _ = []
+    sessions: _ = []
+    buckets: _ = []
+    objects: _ = []
+    channels: _ = []
+    rpc_names: _ = []
+    rpc_results: _ = []
+    offline: bool = true
+    clock: i64 = 0
+    current_user: str = ""
+
+    new(url: str, anon_key: str) : Supabase {
+        base = url
+        if ends_with(base, "/") { base = base[0..(byte_len(base) - 1)] }
+        cfg = SupabaseConfig.{url: base, anon_key, service_role_key: "", schema: SUPABASE_DEFAULT_SCHEMA}
+        // Local offline Postgres catalog (host unused for SqlDb).
+        pool = PgPool.new("postgres://supabase@localhost:5432/postgres", 8) or PgPool.empty()
+        Supabase.{
+            cfg, pool, users: [], sessions: [], buckets: [], objects: [], channels: [],
+            rpc_names: [], rpc_results: [], offline: true, clock: 0, current_user: ""
+        }
+    }
+
+    set_service_role(@self, key: str) : str {
+        c = self.cfg
+        c.service_role_key = key
+        self.cfg = c
+        key
+    }
+
+    set_clock(@self, ms: i64) : i64 {
+        self.clock = ms
+        ms
+    }
+
+    /// Start a PostgREST `from(table)` builder.
+    from(_self, table: str) : SbQuery {
+        SbQuery.{
+            client: 0, table, filter_cols: [], filter_vals: [],
+            limit_n: 0, offset_n: 0, order_col: "", ascending: true, columns: []
+        }
+    }
+
+    ensure_table(@self, table: str, cols: _) : bool! {
+        if SqlDb.has_table(self.pool.store(), table) { return true }
+        next = self.pool.make_table(table, cols) or self.pool
+        ensure SqlDb.has_table(next.store(), table) else {
+            fail "supabase: cannot create table {table}"
+            return
+        }
+        self.pool = next
+        true
+    }
+
+    /// Apply query filters against the offline catalog.
+    select(self, q: SbQuery) : _ {
+        mem = self.pool.store()
+        ensure SqlDb.has_table(mem, q.table) else { return [] }
+        rows = SqlDb.table(mem, q.table).rows
+        // Start with all rows; narrow by eq filters.
+        out = rows
+        fcols = q.filter_cols
+        fvals = q.filter_vals
+        t = SqlDb.table(mem, q.table)
+        for fcols {
+            col = it
+            val = fvals[index]
+            ci = t.col_index(col)
+            if ci < 0 { continue }
+            keep = []
+            for out {
+                r = it
+                if r[ci] == val { keep = arr_push(keep, r) }
+            }
+            out = keep
+        }
+        // offset / limit
+        page = []
+        n = 0
+        for out {
+            if index < q.offset_n { continue }
+            if q.limit_n > 0 && n >= q.limit_n { break }
+            page = arr_push(page, it)
+            n += 1
+        }
+        page
+    }
+
+    /// Insert a row (creates table on first write if cols provided via insert).
+    insert(@self, table: str, cols: _, row: _) : bool! {
+        @self.ensure_table(table, cols) or false
+        next = self.pool.add_row(table, row) or self.pool
+        ensure SqlDb.count(next.store(), table) >= 1 else {
+            fail "supabase: insert failed"
+            return
+        }
+        self.pool = next
+        true
+    }
+
+    /// Update matching rows.
+    update(@self, table: str, col: str, val: str, set_col: str, set_val: str) : bool! {
+        next = self.pool.update(table, col, val, set_col, set_val) or self.pool
+        self.pool = next
+        true
+    }
+
+    /// Delete matching rows.
+    delete(@self, table: str, col: str, val: str) : bool! {
+        next = self.pool.delete(table, col, val) or self.pool
+        self.pool = next
+        true
+    }
+
+    /// Upsert by key column.
+    upsert(@self, table: str, key_col: str, cols: _, row: _) : bool! {
+        @self.ensure_table(table, cols) or false
+        next = self.pool.upsert(table, key_col, row) or self.pool
+        self.pool = next
+        true
+    }
+
+    // --- Auth ---------------------------------------------------------------------------------
+
+    sign_up(@self, email: str, password: str) : SbSession! {
+        ensure email != "" && password != "" else {
+            fail "supabase: email and password required"
+            return
+        }
+        us = self.users
+        for us {
+            if it.email == email {
+                fail "supabase: user already registered"
+                return
+            }
+        }
+        uid = "usr-" + blake3_hex(email)[0..12]
+        u = SbUser.{id: uid, email, password_hash: blake3_hex(password), role: "authenticated", meta: "{}"}
+        self.users = arr_push(self.users, u)
+        @self._issue_session(uid)
+    }
+
+    sign_in(@self, email: str, password: str) : SbSession! {
+        want = blake3_hex(password)
+        us = self.users
+        for us {
+            if it.email == email && it.password_hash == want {
+                return @self._issue_session(it.id)
+            }
+        }
+        fail "supabase: invalid login credentials"
+        return
+    }
+
+    _issue_session(@self, user_id: str) : SbSession! {
+        access = "sb-access-" + blake3_hex("{user_id}:{self.clock}")[0..24]
+        refresh = "sb-refresh-" + blake3_hex("{access}:r")[0..24]
+        s = SbSession.{access_token: access, refresh_token: refresh, user_id, expires_at: self.clock + 3600000}
+        self.sessions = arr_push(self.sessions, s)
+        self.current_user = user_id
+        s
+    }
+
+    sign_out(@self) : bool {
+        self.current_user = ""
+        true
+    }
+
+    get_user(self) : SbUser! {
+        ensure self.current_user != "" else {
+            fail "supabase: not authenticated"
+            return
+        }
+        us = self.users
+        for us {
+            if it.id == self.current_user { return it }
+        }
+        fail "supabase: user not found"
+        return
+    }
+
+    refresh_session(@self, refresh_token: str) : SbSession! {
+        ss = self.sessions
+        for ss {
+            if it.refresh_token == refresh_token {
+                return @self._issue_session(it.user_id)
+            }
+        }
+        fail "supabase: invalid refresh token"
+        return
+    }
+
+    // --- Storage ------------------------------------------------------------------------------
+
+    create_bucket(@self, name: str) : bool! {
+        bs = self.buckets
+        for bs {
+            if it == name {
+                fail "supabase: bucket exists"
+                return
+            }
+        }
+        self.buckets = arr_push(self.buckets, name)
+        true
+    }
+
+    list_buckets(self): _ => self.buckets
+
+    storage_upload(@self, bucket: str, path: str, body: str, content_type: str) : bool! {
+        ok = false
+        bs = self.buckets
+        for bs {
+            if it == bucket { ok = true }
+        }
+        ensure ok else {
+            fail "supabase: bucket not found"
+            return
+        }
+        // replace existing
+        keep = []
+        objs = self.objects
+        for objs {
+            if !(it.bucket == bucket && it.path == path) { keep = arr_push(keep, it) }
+        }
+        keep = arr_push(keep, SbObject.{bucket, path, body, content_type})
+        self.objects = keep
+        true
+    }
+
+    storage_download(self, bucket: str, path: str) : str! {
+        objs = self.objects
+        for objs {
+            if it.bucket == bucket && it.path == path { return it.body }
+        }
+        fail "supabase: object not found"
+        return
+    }
+
+    storage_remove(@self, bucket: str, path: str) : bool! {
+        keep = []
+        found = false
+        objs = self.objects
+        for objs {
+            if it.bucket == bucket && it.path == path {
+                found = true
+            } else {
+                keep = arr_push(keep, it)
+            }
+        }
+        ensure found else {
+            fail "supabase: object not found"
+            return
+        }
+        self.objects = keep
+        true
+    }
+
+    storage_list(self, bucket: str) : _ {
+        out = []
+        objs = self.objects
+        for objs {
+            if it.bucket == bucket { out = arr_push(out, it.path) }
+        }
+        out
+    }
+
+    // --- Realtime -----------------------------------------------------------------------------
+
+    channel(@self, topic: str) : SbChannel {
+        ch = SbChannel.{topic, event: "*", payloads: []}
+        self.channels = arr_push(self.channels, ch)
+        ch
+    }
+
+    broadcast(@self, topic: str, event: str, payload: str) : bool {
+        cs = self.channels
+        for cs {
+            if it.topic == topic {
+                c = it
+                c.payloads = arr_push(c.payloads, "{event}:{payload}")
+                self.channels = arr_set(self.channels, index, c)
+            }
+        }
+        true
+    }
+
+    channel_messages(self, topic: str) : _ {
+        cs = self.channels
+        for cs {
+            if it.topic == topic { return it.payloads }
+        }
+        []
+    }
+
+    // --- RPC ----------------------------------------------------------------------------------
+
+    register_rpc(@self, name: str, result: str) : bool {
+        self.rpc_names = arr_push(self.rpc_names, name)
+        self.rpc_results = arr_push(self.rpc_results, result)
+        true
+    }
+
+    rpc(self, name: str) : str! {
+        ns = self.rpc_names
+        for ns {
+            if it == name { return self.rpc_results[index] }
+        }
+        fail "supabase: function {name} not found"
+        return
+    }
+
+    // --- HTTP path builders -------------------------------------------------------------------
+
+    rest_url(self, table: str): str => "{self.cfg.url}/rest/v1/{table}"
+
+    auth_url(self, path: str): str => "{self.cfg.url}/auth/v1/{path}"
+
+    storage_url(self, bucket: str, path: str): str => "{self.cfg.url}/storage/v1/object/{bucket}/{path}"
+
+    realtime_url(self): str => "{self.cfg.url}/realtime/v1/websocket"
+
+    health(self) : str {
+        off = "true"
+        if !self.offline { off = "false" }
+        "{\"status\":\"ok\",\"offline\":{off}}"
+    }
+}
+
+/// Filter helpers on SbQuery (value-returning).
++sb_eq(q: SbQuery, col: str, val: str) : SbQuery {
+    SbQuery.{
+        client: q.client, table: q.table,
+        filter_cols: arr_push(q.filter_cols, col),
+        filter_vals: arr_push(q.filter_vals, val),
+        limit_n: q.limit_n, offset_n: q.offset_n, order_col: q.order_col,
+        ascending: q.ascending, columns: q.columns
+    }
+}
+
++sb_limit(q: SbQuery, n: i64) : SbQuery {
+    SbQuery.{
+        client: q.client, table: q.table, filter_cols: q.filter_cols, filter_vals: q.filter_vals,
+        limit_n: n, offset_n: q.offset_n, order_col: q.order_col, ascending: q.ascending, columns: q.columns
+    }
+}
+
++sb_range(q: SbQuery, from: i64, to: i64) : SbQuery {
+    SbQuery.{
+        client: q.client, table: q.table, filter_cols: q.filter_cols, filter_vals: q.filter_vals,
+        limit_n: to - from + 1, offset_n: from, order_col: q.order_col, ascending: q.ascending, columns: q.columns
+    }
+}
+
++sb_order(q: SbQuery, col: str, asc: bool) : SbQuery {
+    SbQuery.{
+        client: q.client, table: q.table, filter_cols: q.filter_cols, filter_vals: q.filter_vals,
+        limit_n: q.limit_n, offset_n: q.offset_n, order_col: col, ascending: asc, columns: q.columns
+    }
+}
+
+test "postgrest insert select update delete" {
+    sb = Supabase.new("https://xyz.supabase.co", "anon-key")
+    #assert(@sb.insert("todos", ["id", "title"], ["1", "Ship"]) or false)
+    #assert(@sb.insert("todos", ["id", "title"], ["2", "Test"]) or false)
+    q = sb_eq(sb.from("todos"), "id", "1")
+    rows = sb.select(q)
+    assert_eq(len(rows), 1)
+    assert_eq(rows[0][1], "Ship")
+    #assert(@sb.update("todos", "id", "1", "title", "Shipped") or false)
+    rows2 = sb.select(sb_eq(sb.from("todos"), "id", "1"))
+    assert_eq(rows2[0][1], "Shipped")
+    page = sb.select(sb_limit(sb.from("todos"), 1))
+    assert_eq(len(page), 1)
+    #assert(@sb.delete("todos", "id", "2") or false)
+    assert_eq(len(sb.select(sb.from("todos"))), 1)
+}
+
+test "auth storage realtime rpc urls" {
+    sb = Supabase.new("https://xyz.supabase.co", "anon")
+    @sb.set_clock(1000)
+    sess = @sb.sign_up("a@b.co", "secret") or SbSession.{access_token: "", refresh_token: "", user_id: "", expires_at: 0}
+    #assert(sess.user_id != "")
+    #assert(starts_with(sess.access_token, "sb-access-"))
+    u = sb.get_user() or SbUser.{id: "", email: "", password_hash: "", role: "", meta: ""}
+    assert_eq(u.email, "a@b.co")
+    sess2 = @sb.sign_in("a@b.co", "secret") or SbSession.{access_token: "", refresh_token: "", user_id: "", expires_at: 0}
+    assert_eq(sess2.user_id, sess.user_id)
+    #assert(@sb.create_bucket("avatars") or false)
+    #assert(@sb.storage_upload("avatars", "a.png", "PNGDATA", "image/png") or false)
+    assert_eq(sb.storage_download("avatars", "a.png") or "", "PNGDATA")
+    assert_eq(len(sb.storage_list("avatars")), 1)
+    @sb.channel("room:1")
+    #assert(@sb.broadcast("room:1", "message", "hi"))
+    msgs = sb.channel_messages("room:1")
+    assert_eq(msgs[0], "message:hi")
+    #assert(@sb.register_rpc("hello", "{\"ok\":true}"))
+    assert_eq(sb.rpc("hello") or "", "{\"ok\":true}")
+    assert_eq(sb.rest_url("todos"), "https://xyz.supabase.co/rest/v1/todos")
+    assert_eq(sb.auth_url("token"), "https://xyz.supabase.co/auth/v1/token")
+    assert_eq(sb.storage_url("avatars", "a.png"), "https://xyz.supabase.co/storage/v1/object/avatars/a.png")
+    #assert(starts_with(sb.realtime_url(), "https://xyz.supabase.co/realtime"))
+    #assert(starts_with(sb.health(), "{\"status\":\"ok\""))
+    #assert(@sb.sign_out())
+}
+
+test "upsert and range" {
+    sb = Supabase.new("https://demo.supabase.co", "key")
+    #assert(@sb.upsert("kv", "k", ["k", "v"], ["a", "1"]) or false)
+    #assert(@sb.upsert("kv", "k", ["k", "v"], ["a", "2"]) or false)
+    rows = sb.select(sb.from("kv"))
+    assert_eq(len(rows), 1)
+    assert_eq(rows[0][1], "2")
+    @sb.insert("kv", ["k", "v"], ["b", "3"]) or false
+    q = sb_range(sb.from("kv"), 0, 0)
+    assert_eq(len(sb.select(q)), 1)
+}

@@ -1,0 +1,1027 @@
+{
+  "version": "0.1.0",
+  "generated_at": "2026-11-27T15:25:03+00:00",
+  "stdlib_sr_files": 179,
+  "stdlib_modules": 127,
+  "modules_with_laws": 40,
+  "modules_with_proofs": 11,
+  "laws_total": 102,
+  "modules": [
+    {
+      "module": "ai/client",
+      "path": "stdlib/ai/client.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "ai/embed",
+      "path": "stdlib/ai/embed.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "ai/mcp_client",
+      "path": "stdlib/ai/mcp_client.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "ai/tensor",
+      "path": "stdlib/ai/tensor.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "ai/tokenizer",
+      "path": "stdlib/ai/tokenizer.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "cli/cmd",
+      "path": "stdlib/cli/cmd.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/bitset",
+      "path": "stdlib/core/bitset.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/bytes",
+      "path": "stdlib/core/bytes.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 3,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/collections",
+      "path": "stdlib/core/collections.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 3,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/decimal",
+      "path": "stdlib/core/decimal.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/int",
+      "path": "stdlib/core/int.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/macros",
+      "path": "stdlib/core/macros.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/reduce",
+      "path": "stdlib/core/reduce.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 6,
+      "proof_status": "partial (2/6)"
+    },
+    {
+      "module": "core/regex",
+      "path": "stdlib/core/regex.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/str",
+      "path": "stdlib/core/str.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 3,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/traits",
+      "path": "stdlib/core/traits.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/unicode",
+      "path": "stdlib/core/unicode.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "core/uuid",
+      "path": "stdlib/core/uuid.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "data/column",
+      "path": "stdlib/data/column.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "data/expr",
+      "path": "stdlib/data/expr.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 12,
+      "proof_status": "partial (12/12)"
+    },
+    {
+      "module": "data/frame",
+      "path": "stdlib/data/frame.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "data/io",
+      "path": "stdlib/data/io.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "data/plan",
+      "path": "stdlib/data/plan.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 2,
+      "proof_status": "partial (5/2)"
+    },
+    {
+      "module": "datetime/core",
+      "path": "stdlib/datetime/core.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 4,
+      "proof_status": "partial (2/4)"
+    },
+    {
+      "module": "datetime/cron",
+      "path": "stdlib/datetime/cron.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "db/clickhouse",
+      "path": "stdlib/db/clickhouse.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "db/migrate",
+      "path": "stdlib/db/migrate.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "db/mysql",
+      "path": "stdlib/db/mysql.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "db/postgres",
+      "path": "stdlib/db/postgres.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "db/redis",
+      "path": "stdlib/db/redis.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "db/sql",
+      "path": "stdlib/db/sql.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "db/sqlite",
+      "path": "stdlib/db/sqlite.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "diag/bench",
+      "path": "stdlib/diag/bench.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "diag/log",
+      "path": "stdlib/diag/log.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "diag/metrics",
+      "path": "stdlib/diag/metrics.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "diag/test",
+      "path": "stdlib/diag/test.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/bin",
+      "path": "stdlib/fmt/bin.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/compress",
+      "path": "stdlib/fmt/compress.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/csv",
+      "path": "stdlib/fmt/csv.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/json",
+      "path": "stdlib/fmt/json.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 3,
+      "proof_status": "partial (2/3)"
+    },
+    {
+      "module": "fmt/mime",
+      "path": "stdlib/fmt/mime.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/msgpack",
+      "path": "stdlib/fmt/msgpack.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/protobuf",
+      "path": "stdlib/fmt/protobuf.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 2,
+      "proof_status": "partial (1/2)"
+    },
+    {
+      "module": "fmt/toml",
+      "path": "stdlib/fmt/toml.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/xlsx",
+      "path": "stdlib/fmt/xlsx.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/xml",
+      "path": "stdlib/fmt/xml.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "fmt/yaml",
+      "path": "stdlib/fmt/yaml.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/ai",
+      "path": "stdlib/game/ai.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/app",
+      "path": "stdlib/game/app.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/assets",
+      "path": "stdlib/game/assets.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/audio",
+      "path": "stdlib/game/audio.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/ecs",
+      "path": "stdlib/game/ecs.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/fx",
+      "path": "stdlib/game/fx.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/netcode",
+      "path": "stdlib/game/netcode.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/physics2d",
+      "path": "stdlib/game/physics2d.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "game/tilemap",
+      "path": "stdlib/game/tilemap.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "gui/alias",
+      "path": "stdlib/gui/alias.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "gui/ui",
+      "path": "stdlib/gui/ui.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "gui/widgets",
+      "path": "stdlib/gui/widgets.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "gui/window",
+      "path": "stdlib/gui/window.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "html/core",
+      "path": "stdlib/html/core.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 2,
+      "proof_status": "partial (1/2)"
+    },
+    {
+      "module": "html/parse",
+      "path": "stdlib/html/parse.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "html/template",
+      "path": "stdlib/html/template.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 2,
+      "proof_status": "partial (2/2)"
+    },
+    {
+      "module": "io/archive",
+      "path": "stdlib/io/archive.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "io/buf",
+      "path": "stdlib/io/buf.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "io/console",
+      "path": "stdlib/io/console.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "io/fs",
+      "path": "stdlib/io/fs.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "io/poll",
+      "path": "stdlib/io/poll.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "io/socket",
+      "path": "stdlib/io/socket.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "io/stdio",
+      "path": "stdlib/io/stdio.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/ad",
+      "path": "stdlib/math/ad.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/algebra",
+      "path": "stdlib/math/algebra.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/complex",
+      "path": "stdlib/math/complex.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/core",
+      "path": "stdlib/math/core.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 4,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/fft",
+      "path": "stdlib/math/fft.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/geom",
+      "path": "stdlib/math/geom.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/integrate",
+      "path": "stdlib/math/integrate.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/interp",
+      "path": "stdlib/math/interp.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/linalg",
+      "path": "stdlib/math/linalg.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/noise",
+      "path": "stdlib/math/noise.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/optimize",
+      "path": "stdlib/math/optimize.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/poly",
+      "path": "stdlib/math/poly.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/quat",
+      "path": "stdlib/math/quat.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/rand",
+      "path": "stdlib/math/rand.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/special",
+      "path": "stdlib/math/special.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "math/stats",
+      "path": "stdlib/math/stats.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/dns",
+      "path": "stdlib/net/dns.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/grpc",
+      "path": "stdlib/net/grpc.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/http",
+      "path": "stdlib/net/http.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/ip",
+      "path": "stdlib/net/ip.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/oauth2",
+      "path": "stdlib/net/oauth2.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/quic",
+      "path": "stdlib/net/quic.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/radix",
+      "path": "stdlib/net/radix.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/retry",
+      "path": "stdlib/net/retry.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/smtp",
+      "path": "stdlib/net/smtp.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/sse",
+      "path": "stdlib/net/sse.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/tcp",
+      "path": "stdlib/net/tcp.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/tls",
+      "path": "stdlib/net/tls.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/udp",
+      "path": "stdlib/net/udp.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/url",
+      "path": "stdlib/net/url.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "net/ws",
+      "path": "stdlib/net/ws.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/argon2",
+      "path": "stdlib/sec/argon2.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/crypto",
+      "path": "stdlib/sec/crypto.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/csprng",
+      "path": "stdlib/sec/csprng.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 2,
+      "proof_status": "partial (1/2)"
+    },
+    {
+      "module": "sec/encoding",
+      "path": "stdlib/sec/encoding.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/hash",
+      "path": "stdlib/sec/hash.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/jwt",
+      "path": "stdlib/sec/jwt.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/otp",
+      "path": "stdlib/sec/otp.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/pq",
+      "path": "stdlib/sec/pq.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/secret",
+      "path": "stdlib/sec/secret.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 2,
+      "proof_status": "partial (2/2)"
+    },
+    {
+      "module": "sec/sha2",
+      "path": "stdlib/sec/sha2.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/vault",
+      "path": "stdlib/sec/vault.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sec/x509",
+      "path": "stdlib/sec/x509.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/cli",
+      "path": "stdlib/sys/cli.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/env",
+      "path": "stdlib/sys/env.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/epoll",
+      "path": "stdlib/sys/epoll.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/ffi",
+      "path": "stdlib/sys/ffi.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/fs",
+      "path": "stdlib/sys/fs.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/io_uring",
+      "path": "stdlib/sys/io_uring.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/mmap",
+      "path": "stdlib/sys/mmap.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/path",
+      "path": "stdlib/sys/path.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/platform",
+      "path": "stdlib/sys/platform.sr",
+      "has_law": true,
+      "has_proof": true,
+      "law_count": 2,
+      "proof_status": "partial (2/2)"
+    },
+    {
+      "module": "sys/proc",
+      "path": "stdlib/sys/proc.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/signal",
+      "path": "stdlib/sys/signal.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/sync",
+      "path": "stdlib/sys/sync.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    },
+    {
+      "module": "sys/time",
+      "path": "stdlib/sys/time.sr",
+      "has_law": true,
+      "has_proof": false,
+      "law_count": 2,
+      "proof_status": "none"
+    },
+    {
+      "module": "tui/ui",
+      "path": "stdlib/tui/ui.sr",
+      "has_law": false,
+      "has_proof": false,
+      "law_count": 0,
+      "proof_status": "none"
+    }
+  ]
+}

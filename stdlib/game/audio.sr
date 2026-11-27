@@ -1,0 +1,607 @@
+//! std.game.audio — PCM synthesis, WAV encode/parse, stereo panning and a sample mixer
+//!
+//! Import with:
+//!   use std.game.audio
+//!
+//!   tone  = au_sine(440.0, 8000, 800, 0.5)              // 800 mono 16-bit samples
+//!   wav   = au_wav_encode(tone, 1, 8000)                // 44-byte header + little-endian PCM
+//!   info  = au_wav_parse(wav) or err { return }          // WavInfo{channels, rate, bits, ...}
+//!   back  = au_wav_samples(wav, info)                    // the same samples
+//!   st    = au_pan(tone, 0.5)                            // interleaved stereo, panned right
+//!
+//!   m = AudioMixer.new(2)
+//!   @m.add(st, 0.8)
+//!   @m.add(st, 0.8)                                       // sums, then clips to the 16-bit range
+//!   out = m.render()
+//!
+//! Samples are signed 16-bit values held in `i64` (-32768..32767); multi-channel data is
+//! interleaved (L R L R ...). WAV support is PCM 16-bit: the encoder writes a canonical
+//! RIFF/WAVE `fmt ` + `data` layout and the parser walks chunks, skipping unknown ones such as
+//! `LIST`, so files with extra metadata still load. Panning is equal-power (constant loudness
+//! across the stereo field). `AudioMixer` is an additive bus with hard clipping.
+//! This is complementary to `std.game.assets` (file loaders) and `std.game.fx` (cue
+//! sequencing): it only produces and transforms sample data. Public helpers are prefixed
+//! `au_` (modules merge flat).
+
+/// `AU_PI` is pi.
++AU_PI = 3.141592653589793
+/// `AU_MAX` is the largest 16-bit sample (`32767`).
++AU_MAX = 32767
+/// `AU_MIN` is the smallest 16-bit sample (`-32768`).
++AU_MIN = -32768
+/// `AU_HEADER_LEN` is the canonical WAV header size (`44`).
++AU_HEADER_LEN = 44
+
+/// Clamp `v` into the signed 16-bit range.
++au_clip(v: i64) : i64 {
+    if v > AU_MAX { return AU_MAX }
+    if v < AU_MIN { return AU_MIN }
+    v
+}
+
+// --- synthesis -------------------------------------------------------------------------------
+
+/// `n` mono samples of a sine at `freq` Hz for `rate` samples/second, scaled by `amp` (0.0..1.0).
++au_sine(freq: f64, rate: i64, n: i64, amp: f64) {
+    out = []
+    ensure rate > 0 else { return out }
+    step = 2.0 * AU_PI * freq / host.sys_to_float(rate)
+    peak = amp * host.sys_to_float(AU_MAX)
+    for 0..n {
+        out = host.sys_arr_push(out, au_clip(host.sys_to_int(host.sys_round(peak * host.sys_sin(step * host.sys_to_float(it))))))
+    }
+    out
+}
+
+/// Square wave at `freq` Hz (positive half then negative half), scaled by `amp`.
++au_square(freq: f64, rate: i64, n: i64, amp: f64) {
+    out = []
+    ensure rate > 0 else { return out }
+    peak = au_clip(host.sys_to_int(host.sys_round(amp * host.sys_to_float(AU_MAX))))
+    for 0..n {
+        phase = host.sys_fmod(freq * host.sys_to_float(it) / host.sys_to_float(rate), 1.0)
+        if phase < 0.5 { out = host.sys_arr_push(out, peak) } else { out = host.sys_arr_push(out, 0 - peak) }
+    }
+    out
+}
+
+/// Samples of silence.
++au_silence(n: i64) {
+    out = []
+    for 0..n { out = host.sys_arr_push(out, 0) }
+    out
+}
+
+/// Largest absolute sample.
++au_peak(samples: _) : i64 {
+    m = 0
+    for samples {
+        a = it
+        if a < 0 { a = 0 - a }
+        if a > m { m = a }
+    }
+    m
+}
+
+/// Root-mean-square level.
++au_rms(samples: _) : f64 {
+    n = host.sys_arr_len(samples)
+    ensure n > 0 else { return 0.0 }
+    acc = 0.0
+    for samples {
+        f = host.sys_to_float(it)
+        acc += f * f
+    }
+    host.sys_sqrt(acc / host.sys_to_float(n))
+}
+
+/// Number of sign changes between consecutive samples (about 2 x frequency x seconds for a sine).
++au_zero_crossings(samples: _) : i64 {
+    n = host.sys_arr_len(samples)
+    c = 0
+    for 1..n {
+        a = samples[it - 1]
+        b = samples[it]
+        if a < 0 && b >= 0 { c += 1 }
+        if a >= 0 && b < 0 { c += 1 }
+    }
+    c
+}
+
+/// Copy of `samples` scaled by `gain` and clipped.
++au_gain(samples: _, gain: f64) {
+    out = []
+    for samples { out = host.sys_arr_push(out, au_clip(host.sys_to_int(host.sys_round(host.sys_to_float(it) * gain)))) }
+    out
+}
+
+/// Linear fade-in then fade-out over `fade` samples at each end.
++au_fade(samples: _, fade: i64) {
+    n = host.sys_arr_len(samples)
+    out = []
+    for 0..n {
+        g = 1.0
+        if fade > 0 && it < fade { g = host.sys_to_float(it) / host.sys_to_float(fade) }
+        tail = n - 1 - it
+        if fade > 0 && tail < fade {
+            t = host.sys_to_float(tail) / host.sys_to_float(fade)
+            if t < g { g = t }
+        }
+        out = host.sys_arr_push(out, host.sys_to_int(host.sys_round(host.sys_to_float(samples[it]) * g)))
+    }
+    out
+}
+
+// --- panning -----------------------------------------------------------------------------------
+
+/// Equal-power left gain for `pan` in -1.0 (left) .. 1.0 (right); out-of-range pans clamp.
++au_pan_left(pan: f64) : f64 {
+    p = pan
+    if p < 0.0 - 1.0 { p = 0.0 - 1.0 }
+    if p > 1.0 { p = 1.0 }
+    host.sys_cos((p + 1.0) * AU_PI / 4.0)
+}
+
+/// Equal-power right gain for `pan` in -1.0 .. 1.0.
++au_pan_right(pan: f64) : f64 {
+    p = pan
+    if p < 0.0 - 1.0 { p = 0.0 - 1.0 }
+    if p > 1.0 { p = 1.0 }
+    host.sys_sin((p + 1.0) * AU_PI / 4.0)
+}
+
+/// Interleaved stereo (L R L R ...) from mono `samples` at the given `pan`.
++au_pan(samples: _, pan: f64) {
+    gl = au_pan_left(pan)
+    gr = au_pan_right(pan)
+    out = []
+    for samples {
+        f = host.sys_to_float(it)
+        out = host.sys_arr_push(out, au_clip(host.sys_to_int(host.sys_round(f * gl))))
+        out = host.sys_arr_push(out, au_clip(host.sys_to_int(host.sys_round(f * gr))))
+    }
+    out
+}
+
+/// Mono mix-down of interleaved stereo (average of each L/R pair).
++au_to_mono(stereo: _) {
+    n = host.sys_arr_len(stereo) / 2
+    out = []
+    for 0..n { out = host.sys_arr_push(out, (stereo[it * 2] + stereo[it * 2 + 1]) / 2) }
+    out
+}
+
+// --- WAV ------------------------------------------------------------------------------------------
+
+/// Append `v` as an unsigned little-endian 16-bit value.
++au_put_u16(out: _, v: i64) {
+    a = host.sys_arr_push(out, v % 256)
+    host.sys_arr_push(a, (v / 256) % 256)
+}
+
+/// Append `v` as an unsigned little-endian 32-bit value.
++au_put_u32(out: _, v: i64) {
+    a = au_put_u16(out, v % 65536)
+    au_put_u16(a, (v / 65536) % 65536)
+}
+
+/// Append the four ASCII bytes of `tag`.
++au_put_tag(out: _, tag: str) {
+    a = out
+    for 0..4 { a = host.sys_arr_push(a, host.sys_ord(tag[it])) }
+    a
+}
+
+/// 44-byte canonical PCM WAV header for `data_len` bytes of sample data.
++au_wav_header(channels: i64, rate: i64, bits: i64, data_len: i64) {
+    block = channels * bits / 8
+    h = au_put_tag([], "RIFF")
+    h = au_put_u32(h, 36 + data_len)
+    h = au_put_tag(h, "WAVE")
+    h = au_put_tag(h, "fmt ")
+    h = au_put_u32(h, 16)
+    h = au_put_u16(h, 1)
+    h = au_put_u16(h, channels)
+    h = au_put_u32(h, rate)
+    h = au_put_u32(h, rate * block)
+    h = au_put_u16(h, block)
+    h = au_put_u16(h, bits)
+    h = au_put_tag(h, "data")
+    au_put_u32(h, data_len)
+}
+
+/// A complete 16-bit PCM WAV file (header + little-endian samples) as bytes.
++au_wav_encode(samples: _, channels: i64, rate: i64) {
+    n = host.sys_arr_len(samples)
+    out = au_wav_header(channels, rate, 16, n * 2)
+    for samples {
+        v = au_clip(it)
+        if v < 0 { v = v + 65536 }
+        out = au_put_u16(out, v)
+    }
+    out
+}
+
+/// `WavInfo` describes a parsed PCM WAV file.
++WavInfo = {
+    /// Channel count. Defaults to `1`.
+    channels: i64 = 1
+    /// Sample rate in Hz. Defaults to `0`.
+    rate: i64 = 0
+    /// Bits per sample. Defaults to `16`.
+    bits: i64 = 16
+    /// Byte length of the data chunk. Defaults to `0`.
+    data_len: i64 = 0
+    /// Byte offset of the first sample. Defaults to `0`.
+    data_offset: i64 = 0
+
+    /// Zeroed info, used as the `or` fallback when a parse fails.
+    empty() : WavInfo => WavInfo.{channels: 0, rate: 0, bits: 0, data_len: 0, data_offset: 0}
+
+    /// Frames (samples per channel).
+    frames(self) : i64 {
+        ensure self.channels > 0 && self.bits > 0 else { return 0 }
+        self.data_len / (self.channels * self.bits / 8)
+    }
+
+    /// Duration in seconds.
+    seconds(self) : f64 {
+        ensure self.rate > 0 else { return 0.0 }
+        host.sys_to_float(self.frames()) / host.sys_to_float(self.rate)
+    }
+}
+
+/// Unsigned little-endian 16-bit value at `at`.
++au_get_u16(b: _, at: i64) : i64 => b[at] + b[at + 1] * 256
+
+/// Unsigned little-endian 32-bit value at `at`.
++au_get_u32(b: _, at: i64) : i64 => au_get_u16(b, at) + au_get_u16(b, at + 2) * 65536
+
+/// True when the four bytes at `at` spell `tag`.
++au_tag_at(b: _, at: i64, tag: str) : bool {
+    ensure at >= 0 && at + 4 <= host.sys_arr_len(b) else { return false }
+    ok = true
+    for 0..4 {
+        if b[at + it] != host.sys_ord(tag[it]) { ok = false }
+    }
+    ok
+}
+
+/// Parse a PCM WAV: validates RIFF/WAVE, reads `fmt `, finds `data` (skipping other chunks).
++au_wav_parse(b: _) : WavInfo! {
+    n = host.sys_arr_len(b)
+    ensure n >= 12 else {
+        fail "wav: file too short"
+        return
+    }
+    ensure au_tag_at(b, 0, "RIFF") && au_tag_at(b, 8, "WAVE") else {
+        fail "wav: not a RIFF/WAVE file"
+        return
+    }
+    pos = 12
+    channels = 0
+    rate = 0
+    bits = 0
+    fmt_seen = false
+    data_at = -1
+    data_len = 0
+    while pos + 8 <= n && data_at < 0 {
+        size = au_get_u32(b, pos + 4)
+        if au_tag_at(b, pos, "fmt ") {
+            ensure size >= 16 && pos + 8 + 16 <= n else {
+                fail "wav: truncated fmt chunk"
+                return
+            }
+            ensure au_get_u16(b, pos + 8) == 1 else {
+                fail "wav: only PCM is supported"
+                return
+            }
+            channels = au_get_u16(b, pos + 10)
+            rate = au_get_u32(b, pos + 12)
+            bits = au_get_u16(b, pos + 22)
+            fmt_seen = true
+        }
+        if au_tag_at(b, pos, "data") {
+            data_at = pos + 8
+            data_len = size
+        }
+        pos = pos + 8 + size + size % 2
+    }
+    ensure fmt_seen else {
+        fail "wav: missing fmt chunk"
+        return
+    }
+    ensure data_at >= 0 else {
+        fail "wav: missing data chunk"
+        return
+    }
+    ensure channels > 0 && bits == 16 else {
+        fail "wav: only 16-bit PCM is supported"
+        return
+    }
+    if data_at + data_len > n { data_len = n - data_at }
+    WavInfo.{channels, rate, bits, data_len, data_offset: data_at}
+}
+
+/// Signed 16-bit samples of a parsed WAV (interleaved for multi-channel files).
++au_wav_samples(b: _, info: WavInfo) {
+    count = info.data_len / 2
+    out = []
+    for 0..count {
+        v = au_get_u16(b, info.data_offset + it * 2)
+        if v >= 32768 { v = v - 65536 }
+        out = host.sys_arr_push(out, v)
+    }
+    out
+}
+
+// --- mixer ------------------------------------------------------------------------------------------
+
+/// `AudioMixer` is an additive sample bus with hard clipping on render.
++AudioMixer = {
+    /// Accumulated (unclipped) interleaved samples. Defaults to `[]`.
+    buf: _ = []
+    /// Channel count of the bus. Defaults to `1`.
+    channels: i64 = 1
+
+    /// An empty mixer for `channels` interleaved channels (at least 1).
+    new(channels: i64) : AudioMixer {
+        c = channels
+        if c < 1 { c = 1 }
+        AudioMixer.{buf: [], channels: c}
+    }
+
+    /// Samples currently buffered (all channels).
+    sample_count(self) : i64 => host.sys_arr_len(self.buf)
+
+    /// Frames currently buffered.
+    frames(self) : i64 => host.sys_arr_len(self.buf) / self.channels
+
+    /// Add `samples` scaled by `gain` starting at sample `at`, growing the bus as needed. Returns the new length.
+    add_at(@self, samples: _, gain: f64, at: i64) : i64 {
+        start = at
+        if start < 0 { start = 0 }
+        n = host.sys_arr_len(samples)
+        while host.sys_arr_len(self.buf) < start + n {
+            self.buf = host.sys_arr_push(self.buf, 0)
+        }
+        for 0..n {
+            scaled = host.sys_to_int(host.sys_round(host.sys_to_float(samples[it]) * gain))
+            self.buf = host.sys_arr_set(self.buf, start + it, self.buf[start + it] + scaled)
+        }
+        host.sys_arr_len(self.buf)
+    }
+
+    /// Add `samples` scaled by `gain` from the start of the bus.
+    add(@self, samples: _, gain: f64) : i64 => @self.add_at(samples, gain, 0)
+
+    /// The mix clipped to 16 bits.
+    render(self) {
+        out = []
+        for self.buf { out = host.sys_arr_push(out, au_clip(it)) }
+        out
+    }
+
+    /// True when the unclipped mix exceeds the 16-bit range anywhere.
+    clips(self) : bool {
+        over = false
+        for self.buf {
+            if it > AU_MAX || it < AU_MIN { over = true }
+        }
+        over
+    }
+
+    /// Drop every buffered sample.
+    clear(@self) {
+        self.buf = []
+    }
+}
+
+// --- tests ----------------------------------------------------------------------------------------------
+
+/// Test that a sine has the requested pitch and level.
+test "a sine has the requested pitch and level" {
+    tone = au_sine(440.0, 8000, 8000, 0.5)
+    assert_eq(host.sys_arr_len(tone), 8000)
+    assert_eq(tone[0], 0)
+    zc = au_zero_crossings(tone)
+    #assert(zc >= 878 && zc <= 882)
+    #assert(au_peak(tone) >= 16300 && au_peak(tone) <= 16384)
+    #assert(host.sys_abs(au_rms(tone) - 16383.5 * 0.7071) < 60.0)
+    assert_eq(host.sys_arr_len(au_sine(440.0, 0, 10, 1.0)), 0)
+    full = au_sine(100.0, 8000, 80, 1.0)
+    #assert(au_peak(full) <= 32767)
+}
+
+/// Test that square, silence and gain behave.
+test "square, silence and gain behave" {
+    sq = au_square(1000.0, 8000, 16, 0.5)
+    assert_eq(sq[0], 16384)
+    assert_eq(sq[3], 16384)
+    assert_eq(sq[4], -16384)
+    assert_eq(sq[7], -16384)
+    assert_eq(sq[8], 16384)
+    assert_eq(au_peak(au_silence(10)), 0)
+    assert_eq(host.sys_arr_len(au_silence(0)), 0)
+    g = au_gain([1000, -1000, 30000], 2.0)
+    assert_eq(g[0], 2000)
+    assert_eq(g[1], -2000)
+    assert_eq(g[2], 32767)
+    assert_eq(au_gain([-30000], 2.0)[0], -32768)
+    assert_eq(au_rms([]), 0.0)
+}
+
+/// Test that fades ramp the ends.
+test "fades ramp the ends" {
+    f = au_fade([1000, 1000, 1000, 1000, 1000, 1000], 2)
+    assert_eq(f[0], 0)
+    assert_eq(f[1], 500)
+    assert_eq(f[2], 1000)
+    assert_eq(f[3], 1000)
+    assert_eq(f[4], 500)
+    assert_eq(f[5], 0)
+    same = au_fade([7, 8], 0)
+    assert_eq(same[0], 7)
+    assert_eq(same[1], 8)
+}
+
+/// Test that equal-power pan keeps loudness constant.
+test "equal-power pan keeps loudness constant" {
+    for [-1.0, -0.5, 0.0, 0.5, 1.0] {
+        l = au_pan_left(it)
+        r = au_pan_right(it)
+        #assert(host.sys_abs(l * l + r * r - 1.0) < 0.000001)
+    }
+    #assert(host.sys_abs(au_pan_left(-1.0) - 1.0) < 0.000001)
+    #assert(host.sys_abs(au_pan_right(-1.0)) < 0.000001)
+    #assert(host.sys_abs(au_pan_right(1.0) - 1.0) < 0.000001)
+    #assert(host.sys_abs(au_pan_left(9.0)) < 0.000001)
+    #assert(host.sys_abs(au_pan_left(0.0) - 0.7071067811865476) < 0.000001)
+}
+
+/// Test that panning interleaves stereo and mono folds back.
+test "panning interleaves stereo and mono folds back" {
+    left = au_pan([10000, -10000], -1.0)
+    assert_eq(host.sys_arr_len(left), 4)
+    assert_eq(left[0], 10000)
+    assert_eq(left[1], 0)
+    assert_eq(left[2], -10000)
+    right = au_pan([10000], 1.0)
+    assert_eq(right[0], 0)
+    assert_eq(right[1], 10000)
+    center = au_pan([10000], 0.0)
+    assert_eq(center[0], center[1])
+    assert_eq(center[0], 7071)
+    mono = au_to_mono([100, 300, -50, 50])
+    assert_eq(mono[0], 200)
+    assert_eq(mono[1], 0)
+    assert_eq(host.sys_arr_len(mono), 2)
+}
+
+/// Test that the WAV header has the canonical layout.
+test "the WAV header has the canonical layout" {
+    h = au_wav_header(2, 44100, 16, 1000)
+    assert_eq(host.sys_arr_len(h), 44)
+    #assert(au_tag_at(h, 0, "RIFF"))
+    #assert(au_tag_at(h, 8, "WAVE"))
+    #assert(au_tag_at(h, 12, "fmt "))
+    #assert(au_tag_at(h, 36, "data"))
+    assert_eq(au_get_u32(h, 4), 1036)
+    assert_eq(au_get_u32(h, 16), 16)
+    assert_eq(au_get_u16(h, 20), 1)
+    assert_eq(au_get_u16(h, 22), 2)
+    assert_eq(au_get_u32(h, 24), 44100)
+    assert_eq(au_get_u32(h, 28), 176400)
+    assert_eq(au_get_u16(h, 32), 4)
+    assert_eq(au_get_u16(h, 34), 16)
+    assert_eq(au_get_u32(h, 40), 1000)
+    assert_eq(h[24], 68)
+    assert_eq(h[25], 172)
+    #assert(!(au_tag_at(h, 42, "data")))
+    #assert(!(au_tag_at(h, -1, "RIFF")))
+}
+
+/// Test that WAV encode and parse round trip including negatives.
+test "WAV encode and parse round trip including negatives" {
+    samples = [0, 1, -1, 32767, -32768, 1234, -4321, 70000]
+    wav = au_wav_encode(samples, 1, 22050)
+    assert_eq(host.sys_arr_len(wav), 44 + 16)
+    info = au_wav_parse(wav) or WavInfo.empty()
+    assert_eq(info.channels, 1)
+    assert_eq(info.rate, 22050)
+    assert_eq(info.bits, 16)
+    assert_eq(info.data_len, 16)
+    assert_eq(info.data_offset, 44)
+    assert_eq(info.frames(), 8)
+    back = au_wav_samples(wav, info)
+    assert_eq(host.sys_arr_len(back), 8)
+    assert_eq(back[0], 0)
+    assert_eq(back[2], -1)
+    assert_eq(back[3], 32767)
+    assert_eq(back[4], -32768)
+    assert_eq(back[6], -4321)
+    assert_eq(back[7], 32767)
+    #assert(host.sys_abs(info.seconds() - 8.0 / 22050.0) < 0.0000001)
+}
+
+/// Test that stereo tones survive a WAV round trip.
+test "stereo tones survive a WAV round trip" {
+    tone = au_sine(440.0, 8000, 400, 0.4)
+    st = au_pan(tone, 0.25)
+    wav = au_wav_encode(st, 2, 8000)
+    info = au_wav_parse(wav) or WavInfo.empty()
+    assert_eq(info.channels, 2)
+    assert_eq(info.frames(), 400)
+    back = au_wav_samples(wav, info)
+    assert_eq(host.sys_arr_len(back), 800)
+    ok = true
+    for 0..800 {
+        if back[it] != st[it] { ok = false }
+    }
+    #assert(ok)
+}
+
+/// Test that the parser skips unknown chunks and rejects bad files.
+test "the parser skips unknown chunks and rejects bad files" {
+    plain = au_wav_encode([5, -5], 1, 8000)
+    head = []
+    for 0..36 { head = host.sys_arr_push(head, plain[it]) }
+    extra = au_put_tag([], "LIST")
+    extra = au_put_u32(extra, 3)
+    extra = host.sys_arr_push(extra, 1)
+    extra = host.sys_arr_push(extra, 2)
+    extra = host.sys_arr_push(extra, 3)
+    extra = host.sys_arr_push(extra, 0)
+    padded = []
+    for 0..12 { padded = host.sys_arr_push(padded, plain[it]) }
+    fmt_chunk = []
+    for 12..36 { fmt_chunk = host.sys_arr_push(fmt_chunk, plain[it]) }
+    for fmt_chunk { padded = host.sys_arr_push(padded, it) }
+    for extra { padded = host.sys_arr_push(padded, it) }
+    for 36..48 { padded = host.sys_arr_push(padded, plain[it]) }
+    info = au_wav_parse(padded) or WavInfo.empty()
+    assert_eq(info.rate, 8000)
+    assert_eq(info.data_offset, 12 + 24 + 12 + 8)
+    back = au_wav_samples(padded, info)
+    assert_eq(back[0], 5)
+    assert_eq(back[1], -5)
+    assert_eq(host.sys_arr_len(head), 36)
+    assert_eq(info.channels, 1)
+    bad_magic = au_wav_encode([1], 1, 8000)
+    bad_magic = host.sys_arr_set(bad_magic, 0, 88)
+    assert_eq((au_wav_parse(bad_magic) or WavInfo.empty()).channels, 0)
+    assert_eq((au_wav_parse([1, 2, 3]) or WavInfo.empty()).channels, 0)
+    no_data = []
+    for 0..36 { no_data = host.sys_arr_push(no_data, plain[it]) }
+    assert_eq((au_wav_parse(no_data) or WavInfo.empty()).channels, 0)
+    eight_bit = au_wav_header(1, 8000, 8, 0)
+    assert_eq((au_wav_parse(eight_bit) or WavInfo.empty()).channels, 0)
+}
+
+/// Test that the mixer sums and clips.
+test "the mixer sums and clips" {
+    m = AudioMixer.new(2)
+    assert_eq(m.sample_count(), 0)
+    assert_eq(@m.add([1000, 2000, 3000, 4000], 1.0), 4)
+    assert_eq(@m.add([1000, 1000], 0.5), 4)
+    assert_eq(m.frames(), 2)
+    out = m.render()
+    assert_eq(out[0], 1500)
+    assert_eq(out[1], 2500)
+    assert_eq(out[2], 3000)
+    #assert(!(m.clips()))
+    assert_eq(@m.add_at([30000, 30000], 1.0, 2), 4)
+    #assert(m.clips())
+    loud = m.render()
+    assert_eq(loud[2], 32767)
+    assert_eq(loud[3], 32767)
+    assert_eq(@m.add_at([-40000], 1.0, 9), 10)
+    tail = m.render()
+    assert_eq(tail[9], -32768)
+    assert_eq(tail[5], 0)
+    @m.clear()
+    assert_eq(m.sample_count(), 0)
+    assert_eq(AudioMixer.new(0).channels, 1)
+    assert_eq(@m.add_at([7], 1.0, -5), 1)
+    assert_eq(m.render()[0], 7)
+}

@@ -1,0 +1,16 @@
+name = "Super"
+grammar = "super"
+path_suffixes = ["sr", "sup", "law.sr", "proof.sr"]
+line_comments = ["// ", "/// "]
+block_comment = ["/*", "*/"]
+tab_size = 4
+hard_tabs = false
+brackets = [
+    { start = "{", end = "}", close = true, newline = true },
+    { start = "[", end = "]", close = true, newline = true },
+    { start = "(", end = ")", close = true, newline = true },
+    { start = "\"", end = "\"", close = true, newline = false, not_in = ["comment", "string"] },
+]
+autoclose_before = ";:.,=}])>"
+increase_indent_pattern = "[{(\\[]\\s*$"
+decrease_indent_pattern = "^\\s*[})\\]]"

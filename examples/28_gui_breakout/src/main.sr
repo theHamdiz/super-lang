@@ -1,0 +1,110 @@
+// Breakout. Bricks, a paddle, a sprite ball, and bounce cues.
+//
+// Run: super test examples/28_gui_breakout/
+
+use std.game.fx
+use std.core.str
+use std.gui.window
+use std.sys.time
+
++Breakout: Widget = {
+    paddle_x: i64 = 80
+    ball_x: i64 = 90
+    ball_y: i64 = 100
+    ball_vx: i64 = 4
+    ball_vy: i64 = -4
+    bricks: i64 = 8
+    frame_n: i64 = 0
+    sound: str = ""
+    width: i64 = 240
+    height: i64 = 180
+
+    tick(@self) : str {
+        self.frame_n = self.frame_n + 1
+        self.ball_x = self.ball_x + self.ball_vx
+        self.ball_y = self.ball_y + self.ball_vy
+        self.sound = ""
+        if self.ball_x < 0 || self.ball_x > 200 {
+            self.ball_vx = 0 - self.ball_vx
+            self.sound = "bounce"
+        }
+        if self.ball_y < 20 {
+            self.ball_vy = 0 - self.ball_vy
+            if self.sound == "" { self.sound = "bounce" }
+        }
+        if self.ball_y >= 140 && self.ball_x >= self.paddle_x && self.ball_x <= self.paddle_x + 40 {
+            self.ball_vy = 0 - 4
+            self.sound = "bounce"
+        }
+        if self.ball_y < 40 && self.bricks > 0 {
+            self.bricks = self.bricks - 1
+            self.ball_vy = 4
+            self.sound = "break"
+        }
+        self.sound
+    }
+
+    steer(@self, key: str, mouse_x: i64) : i64 {
+        if key == "left" || key == "a" { self.paddle_x = self.paddle_x - 10 }
+        if key == "right" || key == "d" { self.paddle_x = self.paddle_x + 10 }
+        if mouse_x > 0 { self.paddle_x = mouse_x - 20 }
+        if self.paddle_x < 0 { self.paddle_x = 0 }
+        if self.paddle_x > 200 { self.paddle_x = 200 }
+        self.paddle_x
+    }
+
+    paint(self) : str {
+        ball = Sprite{name: "ball", x: self.ball_x, y: self.ball_y, w: 8, h: 8, frame: self.frame_n % 2, frames: 2}
+        brick_w = self.bricks * 12
+        brick = Sprite{name: "brick", x: 8, y: 24, w: brick_w, h: 10, frame: 0, frames: 1}
+        heard = ""
+        if self.sound != "" {
+            cue = Cue{name: self.sound, gain: 80}
+            heard = cue.play()
+        }
+        "fill 0 0 {self.width} {self.height} 12 14 28\n{ball.paint()}{brick.paint()}fill {self.paddle_x} 150 40 8 200 200 210\n{heard}"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, 0, 0, self.width, self.height)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.width)
+}
+
++main() {
+    game = Breakout{}
+    opened = window_open(game.width, game.height, "Breakout")
+    gui_open(game.width, game.height, "Breakout")
+    frames = 0
+    quit = false
+    while quit == false {
+        key = gui_key()
+        if key == "esc" || key == "q" { quit = true }
+        @game.steer(key, gui_mouse_x())
+        @game.tick()
+        gui_present(game.width, game.height, game.paint())
+        poll = window_poll()
+        if poll.quit || gui_quit() || opened.headless { quit = true }
+        if quit == false { sleep_ms(16) }
+        frames = frames + 1
+    }
+}
+
+test "the ball bounces off a wall and breaks a brick" {
+    wall = Breakout{ball_x: 198, ball_vx: 4, ball_y: 80, ball_vy: 4, bricks: 4}
+    assert_eq(@wall.tick(), "bounce")
+    #assert(wall.ball_vx < 0)
+    #assert(contains(wall.paint(), "sound bounce 80"))
+    #assert(contains(wall.paint(), "sprite"))
+    brick = Breakout{ball_x: 40, ball_y: 30, ball_vx: 0, ball_vy: -4, bricks: 3}
+    assert_eq(@brick.tick(), "break")
+    assert_eq(brick.bricks, 2)
+    #assert(contains(brick.paint(), "sound break 80"))
+    #assert(contains(brick.paint(), "ball 1"))
+}
+
+test "the table is a Widget" {
+    game = Breakout{}
+    #assert(game.hit(10, 10))
+    #assert(!(game.hit(300, 10)))
+    assert_eq(game.measure(80), 80)
+}

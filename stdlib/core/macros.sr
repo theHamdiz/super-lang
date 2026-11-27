@@ -1,0 +1,241 @@
+//! Core macros, in scope in every module without `use`.
+//!
+//! These are ordinary pattern macros (`+#name { (pattern) => { template } }`);
+//! the compiler only provides the token intrinsics they use (`#stringify`,
+//! `#concat`, `#location`, `#error`, …).
+//!
+//! | Macro | Expands to |
+//! |-------|------------|
+//! | `#assert(cond)` / `#assert(cond, msg)` | check `cond` once; on failure print the call site, the source of `cond`, and operand values |
+//! | `#assert_err(value)` / `#assert_err(value, text)` | check that `value` is an error (with message `text`) |
+//! | `#todo` / `#todo(msg)` | `panic "not yet implemented"` |
+//! | `#unimplemented` / `#unimplemented(msg)` | `panic "not implemented"` |
+//! | `#unreachable` / `#unreachable(msg)` | `panic "entered unreachable code"` |
+//! | `#dbg(expr)` | print `expr`, then yield it |
+//!
+//! `#assert` and `#assert_err` record failures through `assert_eq`, so the test
+//! runner counts them and keeps running. `panic` aborts.
+
+/// Default message used by bare `#todo`.
++TODO_MSG = "not yet implemented"
+
+/// Default message used by bare `#unimplemented`.
++UNIMPLEMENTED_MSG = "not implemented"
+
+/// Default message used by bare `#unreachable`.
++UNREACHABLE_MSG = "entered unreachable code"
+
+/// Prefix of every `#assert` failure report.
++ASSERT_MSG = "assertion failed"
+
+/// Assert that a condition holds. Every operand is evaluated exactly once.
+///
+/// A comparison of two operands (paths or literals) prints both values on
+/// failure; so does a call whose arguments are all operands. Any other
+/// condition prints its source text. Yields `true`.
++#assert {
+    ($l:operand == $r:operand) => {
+        $lv = $l
+        $rv = $r
+        $ok = $lv == $rv
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($l == $r), ")\n  ", #stringify($l == $r), " = false"))
+            print(#concat("    ", #stringify($l), " ="))
+            print($lv)
+            print(#concat("    ", #stringify($r), " ="))
+            print($rv)
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($l:operand != $r:operand) => {
+        $lv = $l
+        $rv = $r
+        $ok = $lv != $rv
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($l != $r), ")\n  ", #stringify($l != $r), " = false"))
+            print(#concat("    ", #stringify($l), " ="))
+            print($lv)
+            print(#concat("    ", #stringify($r), " ="))
+            print($rv)
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($l:operand < $r:operand) => {
+        $lv = $l
+        $rv = $r
+        $ok = $lv < $rv
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($l < $r), ")\n  ", #stringify($l < $r), " = false"))
+            print(#concat("    ", #stringify($l), " ="))
+            print($lv)
+            print(#concat("    ", #stringify($r), " ="))
+            print($rv)
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($l:operand <= $r:operand) => {
+        $lv = $l
+        $rv = $r
+        $ok = $lv <= $rv
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($l <= $r), ")\n  ", #stringify($l <= $r), " = false"))
+            print(#concat("    ", #stringify($l), " ="))
+            print($lv)
+            print(#concat("    ", #stringify($r), " ="))
+            print($rv)
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($l:operand > $r:operand) => {
+        $lv = $l
+        $rv = $r
+        $ok = $lv > $rv
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($l > $r), ")\n  ", #stringify($l > $r), " = false"))
+            print(#concat("    ", #stringify($l), " ="))
+            print($lv)
+            print(#concat("    ", #stringify($r), " ="))
+            print($rv)
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($l:operand >= $r:operand) => {
+        $lv = $l
+        $rv = $r
+        $ok = $lv >= $rv
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($l >= $r), ")\n  ", #stringify($l >= $r), " = false"))
+            print(#concat("    ", #stringify($l), " ="))
+            print($lv)
+            print(#concat("    ", #stringify($r), " ="))
+            print($rv)
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($recv:ident.$method:ident($($arg:operand),*)) => {
+        $ok = $recv.$method($($arg),*)
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($recv.$method($($arg),*)), ")\n  ", #stringify($recv.$method($($arg),*)), " = false"))
+            print(#concat("    ", #stringify($recv), " ="))
+            print($recv)
+            $(
+                print(#concat("    ", #stringify($arg), " ="))
+                print($arg)
+            )*
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($f:path($($arg:operand),*)) => {
+        $ok = $f($($arg),*)
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($f($($arg),*)), ")\n  ", #stringify($f($($arg),*)), " = false"))
+            $(
+                print(#concat("    ", #stringify($arg), " ="))
+                print($arg)
+            )*
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($cond:expr) => {
+        $ok = $cond
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($cond), ")\n  ", #stringify($cond), " = false"))
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($cond:expr, $msg:expr) => {
+        $ok = $cond
+        ensure $ok else {
+            print(#concat("assertion failed at ", #location, "\n  #assert(", #stringify($cond), ")"))
+            print($msg)
+        }
+        assert_eq($ok, true)
+        true
+    }
+}
+
+/// Assert that `value` is an error, optionally with exactly the message
+/// `text`. On failure prints the source of `value` and the value itself.
+/// Yields `true`.
++#assert_err {
+    ($value:expr) => {
+        $actual = $value
+        $ok = host.__is_err($actual)
+        ensure $ok else {
+            print(#concat("assertion failed: expected error at ", #stringify($value)))
+            print($actual)
+        }
+        assert_eq($ok, true)
+        true
+    }
+    ($value:expr, $text:expr) => {
+        $actual = $value
+        $ok = host.__is_err($actual) && host.__err_text($actual) == $text
+        ensure $ok else {
+            print(#concat("assertion failed: expected error at ", #stringify($value)))
+            print($actual)
+        }
+        assert_eq($ok, true)
+        true
+    }
+}
+
+/// Unfinished code: aborts with "not yet implemented" or `msg`.
++#todo {
+    () => { panic "not yet implemented" }
+    ($msg:expr) => { panic $msg }
+}
+
+/// Code deliberately not provided: aborts with "not implemented" or `msg`.
++#unimplemented {
+    () => { panic "not implemented" }
+    ($msg:expr) => { panic $msg }
+}
+
+/// Code that must never run: aborts with "entered unreachable code" or `msg`.
++#unreachable {
+    () => { panic "entered unreachable code" }
+    ($msg:expr) => { panic $msg }
+}
+
+/// Print `value`, then yield it (evaluated once).
++#dbg {
+    ($value:expr) => {
+        $v = $value
+        print($v)
+        $v
+    }
+}
+
+test "macro message constants are non-empty" {
+    #assert(TODO_MSG != "")
+    #assert(UNIMPLEMENTED_MSG != "")
+    #assert(UNREACHABLE_MSG != "")
+    #assert(ASSERT_MSG != "")
+}
+
+bump(@k: i64) : i64 {
+    k += 1
+    k
+}
+
+test "assert yields true and evaluates its operands once" {
+    n = 0
+    ok = #assert(bump(@n) == 1)
+    assert_eq(ok, true)
+    assert_eq(n, 1)
+}
+
+test "dbg yields its value" {
+    x = #dbg(2 + 3)
+    assert_eq(x, 5)
+}

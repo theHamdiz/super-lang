@@ -1,0 +1,24 @@
+[pod]
+name = "gemini"
+version = "0.1.0"
+kind = "lib"
+
+[build]
+profile = "dev"
+backend = "c23"
+mode = "aot"
+
+[profile.dev]
+opt = "0"
+lto = "off"
+debug-info = true
+
+[profile.test]
+opt = "2"
+lto = "off"
+debug-info = true
+
+[profile.release]
+opt = "3"
+lto = "fat"
+strip = true

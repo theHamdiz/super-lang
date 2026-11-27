@@ -1,0 +1,441 @@
+//! std.sec.encoding — base64 / base64url and percent-encoding
+//!
+//! Import with:
+//!   use std.sec.encoding
+//!
+//!   token = base64url_encode("{\"alg\":\"HS256\"}")    // no padding, URL-safe alphabet
+//!   text = base64_decode("Zm9vYmFy") or ""             // foobar
+//!   q = url_encode("a b&c")                            // a%20b%26c
+//!   v = url_decode("a%20b%26c") or ""
+//!
+//! Text helpers operate on ASCII (any other character encodes as '?'); the `_bytes`
+//! variants take and return byte arrays (i64 in 0..255) and are fully binary-safe.
+//! Decoders are strict: bad characters, bad padding and impossible lengths all fail.
+
+/// `ENC_B64` is `"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"`.
++ENC_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+/// `ENC_UNRESERVED` is `"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"`.
++ENC_UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+/// `ENC_HEX` is `"0123456789ABCDEF"`.
++ENC_HEX = "0123456789ABCDEF"
+/// `ENC_ERR` is `"<enc-error>"`.
++ENC_ERR = "<enc-error>"
+
+/// Printable ASCII 32..126; `¤` marks the four characters a literal cannot hold directly.
++ENC_ASCII = " !¤#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[¤]^_`abcdefghijklmnopqrstuvwxyz¤|¤~"
+
+/// Enc len (`s`). Returns `i64`.
++enc_len(s: str) : i64 => host.sys_str_len(s)
+
+/// Enc count (`a`). Returns `i64`.
++enc_count(a: _) : i64 {
+    n = 0
+    for a { n += 1 }
+    n
+}
+
+// --- ASCII text <-> bytes --------------------------------------------------------------------------
+
+/// Enc byte of (`c`). Returns `i64`.
++enc_byte_of(c: str) : i64 {
+    if c == "\"" { return 34 }
+    if c == "\\" { return 92 }
+    if c == "\n" { return 10 }
+    if c == "\r" { return 13 }
+    if c == "\t" { return 9 }
+    if c == host.sys_chr(123) { return 123 }
+    if c == host.sys_chr(125) { return 125 }
+    ensure c != "¤" else { return 63 }
+    code = 63
+    for 0..95 {
+        if ENC_ASCII[it] == c { code = it + 32 }
+    }
+    code
+}
+
+/// Enc char of (`b`). Returns `str`.
++enc_char_of(b: i64) : str {
+    if b == 10 { return "\n" }
+    if b == 13 { return "\r" }
+    if b == 9 { return "\t" }
+    if b >= 32 && b <= 126 && b != 34 && b != 92 && b != 123 && b != 125 { return ENC_ASCII[b - 32] }
+    host.sys_chr(b)
+}
+
+/// Enc bytes of (`s`).
++enc_bytes_of(s: str) : _ {
+    out = []
+    for 0..enc_len(s) { out = host.sys_arr_push(out, enc_byte_of(s[it])) }
+    out
+}
+
+/// Enc str of (`bytes`). Returns `str`.
++enc_str_of(bytes: _) : str {
+    out = ""
+    for bytes {
+        c = enc_char_of(it)
+        out = "{out}{c}"
+    }
+    out
+}
+
+// --- base64 -------------------------------------------------------------------------------------------------
+
+/// Alphabet index of a base64 or base64url character, or -1.
++enc_b64_value(c: str) : i64 {
+    if c == "-" { return 62 }
+    if c == "_" { return 63 }
+    found = -1
+    for 0..64 {
+        if found < 0 && ENC_B64[it] == c { found = it }
+    }
+    found
+}
+
+/// Enc b64 char (`v`, `url`). Returns `str`.
++enc_b64_char(v: i64, url: bool) : str {
+    if url && v == 62 { return "-" }
+    if url && v == 63 { return "_" }
+    ENC_B64[v]
+}
+
+/// Enc b64 encode (`bytes`, `url`, `pad`). Returns `str`.
++enc_b64_encode(bytes: _, url: bool, pad: bool) : str {
+    n = enc_count(bytes)
+    out = ""
+    full = n / 3
+    for 0..full {
+        i = it * 3
+        v = (bytes[i] * 256 + bytes[i + 1]) * 256 + bytes[i + 2]
+        c0 = enc_b64_char(v / 262144, url)
+        c1 = enc_b64_char((v / 4096) % 64, url)
+        c2 = enc_b64_char((v / 64) % 64, url)
+        c3 = enc_b64_char(v % 64, url)
+        out = "{out}{c0}{c1}{c2}{c3}"
+    }
+    rest = n % 3
+    i = full * 3
+    if rest == 1 {
+        v = bytes[i] * 65536
+        c0 = enc_b64_char(v / 262144, url)
+        c1 = enc_b64_char((v / 4096) % 64, url)
+        out = "{out}{c0}{c1}"
+        if pad { out = "{out}==" }
+    }
+    if rest == 2 {
+        v = (bytes[i] * 256 + bytes[i + 1]) * 256
+        c0 = enc_b64_char(v / 262144, url)
+        c1 = enc_b64_char((v / 4096) % 64, url)
+        c2 = enc_b64_char((v / 64) % 64, url)
+        out = "{out}{c0}{c1}{c2}"
+        if pad { out = "{out}=" }
+    }
+    out
+}
+
+/// Standard base64 of `bytes`.
++base64_encode_bytes(bytes: _) : str => enc_b64_encode(bytes, false, true)
+/// URL-safe base64 of `bytes`, without padding.
++base64url_encode_bytes(bytes: _) : str => enc_b64_encode(bytes, true, false)
+/// Standard base64 of `s`.
++base64_encode(s: str) : str => enc_b64_encode(enc_bytes_of(s), false, true)
+/// URL-safe base64 of `s`, without padding.
++base64url_encode(s: str) : str => enc_b64_encode(enc_bytes_of(s), true, false)
+
+/// Accepts either alphabet; padding is optional but, when present, must be exact.
++base64_decode_bytes(s: str) : _! {
+    n = enc_len(s)
+    data = n
+    for 0..2 {
+        if data > 0 && s[data - 1] == "=" { data -= 1 }
+    }
+    ensure n - data <= 2 else {
+        fail "base64: too much padding"
+        return
+    }
+    ensure n == data || n % 4 == 0 else {
+        fail "base64: bad padding length"
+        return
+    }
+    ensure data % 4 != 1 else {
+        fail "base64: impossible length"
+        return
+    }
+    out = []
+    acc = 0
+    got = 0
+    bad = false
+    for 0..data {
+        v = enc_b64_value(s[it])
+        if v < 0 { bad = true }
+        acc = acc * 64 + v
+        got += 1
+        if got == 4 {
+            out = host.sys_arr_push(out, (acc / 65536) % 256)
+            out = host.sys_arr_push(out, (acc / 256) % 256)
+            out = host.sys_arr_push(out, acc % 256)
+            acc = 0
+            got = 0
+        }
+    }
+    ensure !bad else {
+        fail "base64: invalid character"
+        return
+    }
+    if got == 2 { out = host.sys_arr_push(out, (acc / 16) % 256) }
+    if got == 3 {
+        out = host.sys_arr_push(out, (acc / 1024) % 256)
+        out = host.sys_arr_push(out, (acc / 4) % 256)
+    }
+    out
+}
+
+/// Bytes decoded from the base64 text `s`, or fail.
++base64_decode(s: str) : str! {
+    bytes = base64_decode_bytes(s) or []
+    ensure enc_count(bytes) > 0 || s == "" else {
+        fail "base64: invalid input"
+        return
+    }
+    enc_str_of(bytes)
+}
+
+// --- percent-encoding --------------------------------------------------------------------------------------
+
+/// Enc unreserved (`c`).
++enc_unreserved(c: str) : bool {
+    found = false
+    for 0..66 {
+        if ENC_UNRESERVED[it] == c { found = true }
+    }
+    found
+}
+
+/// RFC 3986: everything except A-Z a-z -9 - . _ ~ becomes %XX (uppercase hex).
++url_encode(s: str) : str {
+    out = ""
+    for 0..enc_len(s) {
+        c = s[it]
+        if enc_unreserved(c) {
+            out = "{out}{c}"
+        } else {
+            b = enc_byte_of(c)
+            hi = ENC_HEX[b / 16]
+            lo = ENC_HEX[b % 16]
+            out = "{out}%{hi}{lo}"
+        }
+    }
+    out
+}
+
+/// Enc hex value (`c`). Returns `i64`.
++enc_hex_value(c: str) : i64 {
+    found = -1
+    for 0..16 {
+        if found < 0 && ENC_HEX[it] == c { found = it }
+    }
+    if found < 0 {
+        low = "abcdef"
+        for 0..6 {
+            if found < 0 && low[it] == c { found = it + 10 }
+        }
+    }
+    found
+}
+
+/// Percent-decoded form of `s`, or fail.
++enc_percent_decode(s: str, plus_is_space: bool) : str! {
+    n = enc_len(s)
+    out = ""
+    skip = 0
+    bad = false
+    for 0..n {
+        if skip > 0 {
+            skip -= 1
+        } else {
+            c = s[it]
+            if c == "%" {
+                if it + 2 < n {
+                    hi = enc_hex_value(s[it + 1])
+                    lo = enc_hex_value(s[it + 2])
+                    if hi < 0 || lo < 0 { bad = true }
+                    ch = enc_char_of(hi * 16 + lo)
+                    out = "{out}{ch}"
+                    skip = 2
+                } else {
+                    bad = true
+                }
+            } else {
+                if c == "+" && plus_is_space {
+                    out = "{out} "
+                } else {
+                    out = "{out}{c}"
+                }
+            }
+        }
+    }
+    ensure !bad else {
+        fail "url: malformed percent escape"
+        return
+    }
+    out
+}
+
+/// Percent-decoded form of `s`, or fail.
++url_decode(s: str) : str! {
+    out = enc_percent_decode(s, false) or ENC_ERR
+    ensure out != ENC_ERR else {
+        fail "url: malformed percent escape"
+        return
+    }
+    out
+}
+
+/// application/x-www-form-urlencoded values: `+` is a space.
++form_decode(s: str) : str! {
+    out = enc_percent_decode(s, true) or ENC_ERR
+    ensure out != ENC_ERR else {
+        fail "url: malformed percent escape"
+        return
+    }
+    out
+}
+
+/// key=value&key=value from parallel arrays, each side percent-encoded.
++query_encode(keys: _, vals: _) : str {
+    out = ""
+    for keys {
+        k = url_encode(it)
+        v = url_encode(vals[index])
+        if index == 0 {
+            out = "{k}={v}"
+        } else {
+            out = "{out}&{k}={v}"
+        }
+    }
+    out
+}
+
+// --- tests ---------------------------------------------------------------------------------------------------
+
+/// Test that base64 RFC 4648 vectors.
+test "base64 RFC 4648 vectors" {
+    assert_eq(base64_encode(""), "")
+    assert_eq(base64_encode("f"), "Zg==")
+    assert_eq(base64_encode("fo"), "Zm8=")
+    assert_eq(base64_encode("foo"), "Zm9v")
+    assert_eq(base64_encode("foob"), "Zm9vYg==")
+    assert_eq(base64_encode("fooba"), "Zm9vYmE=")
+    assert_eq(base64_encode("foobar"), "Zm9vYmFy")
+}
+
+/// Test that base64 decode vectors.
+test "base64 decode vectors" {
+    assert_eq(base64_decode("") or "ERR", "")
+    assert_eq(base64_decode("Zg==") or "ERR", "f")
+    assert_eq(base64_decode("Zm8=") or "ERR", "fo")
+    assert_eq(base64_decode("Zm9vYmFy") or "ERR", "foobar")
+    assert_eq(base64_decode("Zm9vYg==") or "ERR", "foob")
+    assert_eq(base64_decode("Zm9vYmE=") or "ERR", "fooba")
+}
+
+/// Test that base64 decode tolerates missing padding and url alphabet.
+test "base64 decode tolerates missing padding and url alphabet" {
+    assert_eq(base64_decode("Zg") or "ERR", "f")
+    assert_eq(base64_decode("Zm8") or "ERR", "fo")
+    d = base64_decode_bytes("-_-_") or [0]
+    assert_eq(d[0], 251)
+    assert_eq(d[1], 255)
+    assert_eq(d[2], 191)
+    s = base64_decode_bytes("+/+/") or [0]
+    assert_eq(s[0], 251)
+}
+
+/// Test that base64 strictness.
+test "base64 strictness" {
+    assert_eq(base64_decode("Z") or "ERR", "ERR")
+    assert_eq(base64_decode("Zg=") or "ERR", "ERR")
+    assert_eq(base64_decode("Zg===") or "ERR", "ERR")
+    assert_eq(base64_decode("Zm9!") or "ERR", "ERR")
+    assert_eq(base64_decode("====") or "ERR", "ERR")
+    assert_eq(base64_decode("Zm9vY") or "ERR", "ERR")
+}
+
+/// Test that base64url output has no padding and no + /.
+test "base64url output has no padding and no + /" {
+    assert_eq(base64url_encode_bytes([251, 255, 191]), "-_-_")
+    assert_eq(base64_encode_bytes([251, 255, 191]), "+/+/")
+    assert_eq(base64url_encode("f"), "Zg")
+    assert_eq(base64url_encode("fo"), "Zm8")
+    assert_eq(base64url_encode(""), "")
+}
+
+/// Test that binary round trips.
+test "binary round trips" {
+    bytes = []
+    for 0..256 { bytes = host.sys_arr_push(bytes, it) }
+    enc = base64_encode_bytes(bytes)
+    back = base64_decode_bytes(enc) or []
+    assert_eq(enc_count(back), 256)
+    assert_eq(back[0], 0)
+    assert_eq(back[200], 200)
+    assert_eq(back[255], 255)
+    enc_url = base64url_encode_bytes(bytes)
+    back_url = base64_decode_bytes(enc_url) or []
+    assert_eq(enc_count(back_url), 256)
+    assert_eq(back_url[255], 255)
+}
+
+/// Test that text with quotes and braces survives.
+test "text with quotes and braces survives" {
+    q = "x\"y\\z"
+    assert_eq(base64_decode(base64_encode(q)) or "ERR", q)
+    json = "[1,2,3]"
+    assert_eq(base64_decode(base64url_encode(json)) or "ERR", json)
+}
+
+/// Test that url_encode reserves everything but unreserved.
+test "url_encode reserves everything but unreserved" {
+    assert_eq(url_encode("abc-._~XYZ019"), "abc-._~XYZ019")
+    assert_eq(url_encode("a b"), "a%20b")
+    assert_eq(url_encode("a&b=c/d?e"), "a%26b%3Dc%2Fd%3Fe")
+    assert_eq(url_encode("100%"), "100%25")
+    assert_eq(url_encode(""), "")
+    assert_eq(url_encode("é"), "%3F")
+}
+
+/// Test that url_decode.
+test "url_decode" {
+    assert_eq(url_decode("a%20b%26c") or "ERR", "a b&c")
+    assert_eq(url_decode("plain") or "ERR", "plain")
+    assert_eq(url_decode("a+b") or "ERR", "a+b")
+    assert_eq(url_decode("%41%7a") or "ERR", "Az")
+    assert_eq(url_decode("100%25") or "ERR", "100%")
+    assert_eq(url_decode("") or "ERR", "")
+}
+
+/// Test that form_decode turns plus into space.
+test "form_decode turns plus into space" {
+    assert_eq(form_decode("a+b%2Bc") or "ERR", "a b+c")
+}
+
+/// Test that malformed escapes are errors.
+test "malformed escapes are errors" {
+    assert_eq(url_decode("%") or "ERR", "ERR")
+    assert_eq(url_decode("%4") or "ERR", "ERR")
+    assert_eq(url_decode("%zz") or "ERR", "ERR")
+    assert_eq(url_decode("ok%2") or "ERR", "ERR")
+}
+
+/// Test that url round trip.
+test "url round trip" {
+    s = "user name&role=admin/100% ~ok"
+    assert_eq(url_decode(url_encode(s)) or "ERR", s)
+}
+
+/// Test that query_encode.
+test "query_encode" {
+    assert_eq(query_encode([], []), "")
+    assert_eq(query_encode(["q"], ["a b"]), "q=a%20b")
+    assert_eq(query_encode(["a", "b c"], ["1", "x&y"]), "a=1&b%20c=x%26y")
+}

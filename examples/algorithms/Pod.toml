@@ -1,0 +1,16 @@
+[pod]
+name = "algorithms"
+version = "0.1.0"
+kind = "bin"
+
+[build]
+profile = "dev"
+backend = "c23"
+mode = "aot"
+
+[profile.test]
+opt = "2"
+lto = "off"
+debug-info = true
+
+[dependencies]

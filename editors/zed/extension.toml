@@ -1,0 +1,33 @@
+id = "super"
+name = "Super"
+version = "0.1.1795807398"
+schema_version = 1
+description = "Super language support — Tree-sitter highlighting, brackets, outline, super-lsp, and .sr file icons"
+repository = "https://github.com/theHamdiz/super-lang"
+authors = ["Super Contributors"]
+themes = []
+icon_themes = ["icon_themes/super-icons.json"]
+languages = ["languages/super"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+# Prebuilt grammars/super.wasm ships in dist/. The repository/rev metadata is
+# for Zed's optional rebuild path; day-to-day reload uses the wasm on disk.
+[grammars.super]
+repository = "file:///home/hamdiz/projects/Personal/super/editors/tree-sitter-super"
+rev = "c85f328cb42e6acbb4f136bc9f3d97e5a8ac5ba4"
+
+[language_servers.super-lsp]
+language = "Super"
+languages = ["Super"]
+
+[language_servers.super-lsp.language_ids]
+
+[context_servers]
+
+[agent_servers]
+
+[slash_commands]

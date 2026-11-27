@@ -1,0 +1,273 @@
+//! Super standard library manifest
+//!
+//! Lists every stdlib module by import path, with its layer. Vendor SaaS clients
+//! live under `pods/` (openai, claude, supabase, …). Raw OS polling is under
+//! `std.sys.epoll` / `std.sys.io_uring`; `std.io.poll` is the unified readiness API.
+//! Windowing is `std.gui.window`; game UDP netcode is `std.game.netcode`.
+
+/// `STDLIB_VERSION` is `"0.1.0"`.
++STDLIB_VERSION = "0.1.0"
+
+/// Flat [path, layer, summary, ...] triples. File count including this manifest grows with shipped modules.
++stdlib_table()  => [
+    "core.bitset", "core", "dense bitsets, Bloom filters, sparse bitmaps",
+    "core.bytes", "core", "byte arrays, hex, endianness, bit helpers",
+    "core.collections", "core", "stack, queue, set, map-like helpers over arrays",
+    "core.decimal", "core", "fixed-point Decimal with Display/Eq/Ord/Hash/Add",
+    "core.int", "core", "fixed-width u8/u16/u32/u64/i8/i16/i32/i128 helpers",
+    "core.macros", "core", "docs for global #todo/#unimplemented/#assert/#dbg and panic",
+    "core.reduce", "core", "AssociativeReducer witnesses, Welford merge, reduce_with",
+    "core.regex", "core", "backtracking regular expressions",
+    "core.str", "core", "string slicing, search, case, padding, splitting",
+    "core.traits", "core", "Display, Debug, Eq, Ord, Hash, Iterable, AssociativeReducer",
+    "core.unicode", "core", "UTF-8 validation, scalars/graphemes, case fold, wcwidth",
+    "core.uuid", "core", "UUID v4 / v7, parse and format",
+    "fmt.bin", "fmt", "binary pack and unpack",
+    "fmt.compress", "fmt", "LZ4 block compress plus Adler-32 and CRC-32",
+    "fmt.csv", "fmt", "CSV rows with quoting",
+    "fmt.json", "fmt", "JSON parse and stringify",
+    "fmt.mime", "fmt", "media types, TypeByExtension, ParseMediaType",
+    "fmt.msgpack", "fmt", "MessagePack encoder/decoder on scoped stacks",
+    "fmt.protobuf", "fmt", "Protobuf wire-format encode/decode for gRPC",
+    "fmt.toml", "fmt", "TOML subset parser",
+    "fmt.xlsx", "fmt", "Office Open XML workbooks: reader, writer, DEFLATE inflate",
+    "fmt.xml", "fmt", "streaming XML/SVG/RSS pull-parser and builder",
+    "fmt.yaml", "fmt", "YAML 1.2 parser and serializer",
+    "sys.cli", "sys", "argv tokenizer implementation (apps: use std.cli.cmd)",
+    "sys.env", "sys", "environment variables",
+    "sys.epoll", "sys", "Linux epoll readiness (raw OS polling)",
+    "sys.ffi", "sys", "dlopen/dlsym helpers, CStr views, C23 ABI pointers",
+    "sys.fs", "sys", "raw OS filesystem operations and descriptors",
+    "sys.io_uring", "sys", "Linux io_uring SQ/CQ rings with epoll fallback",
+    "sys.mmap", "sys", "memory-mapped files and shared memory regions",
+    "sys.path", "sys", "path join, split, normalise",
+    "sys.platform", "sys", "compile-time readiness and io_uring capability selection",
+    "sys.proc", "sys", "child processes",
+    "sys.signal", "sys", "SIGINT/SIGTERM notify pipe for graceful shutdown",
+    "sys.sync", "sys", "spin mutex, once, shared atomics",
+    "sys.time", "sys", "Instant, Duration, DateTime, sleep",
+    "datetime.core", "datetime", "civil dates, IANA TZ, ISO 8601 (separate from sys.time)",
+    "datetime.cron", "datetime", "one-shot, interval, cron schedules with TZ",
+    "io.archive", "io", "tar/zip archive header helpers",
+    "io.buf", "io", "fixed-capacity zero-copy ring reader/writer buffers",
+    "io.console", "io", "CLI-matching colored stdout/stderr",
+    "io.fs", "io", "buffered high-level file readers/writers",
+    "io.poll", "io", "unified cross-platform readiness abstraction",
+    "io.socket", "io", "TCP/UDP/DNS socket host primitives",
+    "io.stdio", "io", "process stdin, stdout, stderr and line I/O",
+    "net.dns", "net", "hostname DNS lookup",
+    "net.grpc", "net", "HTTP/2 framing and Protobuf wire codec for RPCs",
+    "net.http", "net", "responses, typed routes, App.serve, cookies, middleware",
+    "net.ip", "net", "IPv4/IPv6 parse, CIDR, private ranges",
+    "net.oauth2", "net", "OAuth2/OIDC PKCE flows",
+    "net.quic", "net", "multiplexed low-latency UDP/QUIC streams",
+    "net.radix", "net", "compact radix path router (static/param/wildcard)",
+    "net.retry", "net", "exponential backoff and circuit breaker",
+    "net.smtp", "net", "SMTP + STARTTLS email client helpers",
+    "net.sse", "net", "Server-Sent Events framing",
+    "net.tcp", "net", "TCP listen, connect, read, write",
+    "net.tls", "net", "TLS 1.3 client/server streams, ALPN, SNI, PEM",
+    "net.udp", "net", "UDP bind, send_to, recv_from",
+    "net.url", "net", "URL parse, build, query encode/decode",
+    "net.ws", "net", "WebSocket framing and handshake",
+    "db.clickhouse", "db", "ClickHouse HTTP client and offline columnar store",
+    "db.migrate", "db", "transactional schema migration runner",
+    "db.mysql", "db", "MySQL pool, ? params, AUTO_INCREMENT, REPLACE",
+    "db.postgres", "db", "PostgreSQL pool, SQLSTATE, schemas, COPY, LISTEN/NOTIFY",
+    "db.redis", "db", "RESP protocol and in-memory store",
+    "db.sql", "db", "SQL builder and in-memory tables",
+    "db.sqlite", "db", "SQLite pragmas, FTS, savepoints, attach, dump",
+    "sec.argon2", "sec", "Argon2id password hashing (PHC strings)",
+    "sec.crypto", "sec", "hashes, HMAC, PBKDF2, TOTP",
+    "sec.csprng", "sec", "OS-backed CSPRNG (getrandom); hard-fail on entropy loss",
+    "sec.secret", "sec", "in-memory Secret (redact/zeroize) + local AEAD FileKeyring",
+    "sec.encoding", "sec", "base64, base32, hex, url encoding",
+    "sec.hash", "sec", "BLAKE2/3, SHA-3, SHAKE, Keccak, CRC32, FNV; host digests",
+    "sec.jwt", "sec", "HS256 JSON Web Tokens",
+    "sec.otp", "sec", "HOTP/TOTP and WebAuthn/Passkey helpers",
+    "sec.pq", "sec", "ML-KEM, ML-DSA, hybrid X25519+ML-KEM, HBS-OTS",
+    "sec.sha2", "sec", "pure-Super SHA-256 and HMAC-SHA256 (offline twin)",
+    "sec.vault", "sec", "HashiCorp Vault-shaped named storage; put_secret/get_secret",
+    "sec.x509", "sec", "X.509 parsing, CSR helpers, ASN.1 DER",
+    "math.ad", "math", "dual, hyper-dual and reverse-mode automatic differentiation",
+    "math.algebra", "math", "Ring/AlgField/Matrix traits, compensated sums, ModP, distributions",
+    "math.complex", "math", "complex arithmetic",
+    "math.core", "math", "scalar math, trig, logs, number theory",
+    "math.fft", "math", "radix-2 and Bluestein FFT (any length), real FFT, convolution",
+    "math.geom", "math", "2D AABB, circles, segments",
+    "math.integrate", "math", "Gauss-Kronrod, tanh-sinh, Simpson quadrature; RK4, DOPRI5, Rosenbrock4 and BDF2 ODEs",
+    "math.interp", "math", "linear, cubic spline, PCHIP, Hermite and barycentric interpolation",
+    "math.linalg", "math", "dense/diagonal/CSR matrices, LU, Cholesky, QR, CG, GMRES, BiCGSTAB",
+    "math.noise", "math", "value, Perlin, fractal and Worley noise",
+    "math.optimize", "math", "Brent, Newton, Nelder-Mead, BFGS, L-BFGS, AdamW, simplex LP, active-set QP",
+    "math.poly", "math", "polynomial arithmetic, roots and Chebyshev series fitting",
+    "math.quat", "math", "unit quaternions for 3D orientation",
+    "math.rand", "math", "seeded MRG32k3a, counter-based Philox4x32 streams, Halton and Sobol sequences",
+    "math.special", "math", "gamma, beta, erf, Bessel J/Y/I/K, zeta, Lambert W",
+    "math.stats", "math", "mean, variance, percentiles, correlation",
+    "data.column", "data", "typed, null-aware int/float/bool/str columns",
+    "data.expr", "data", "filter/projection expression parser and Kleene evaluator",
+    "data.frame", "data", "in-memory data frames: filter, group_by, join, sort",
+    "data.io", "data", "frames from and to CSV and xlsx files",
+    "data.plan", "data", "lazy query plans with a result-preserving optimizer",
+    "game.ai", "game", "A*, steering, state machines, behavior trees",
+    "game.app", "game", "fixed timestep, scenes, input actions",
+    "game.assets", "game", "hot-reload asset cache, PNG/WAV loaders",
+    "game.audio", "game", "PCM synthesis, WAV/OGG helpers, spatial mixer",
+    "game.ecs", "game", "sparse-set entity component system",
+    "game.fx", "game", "sprites, frame clips, and sound cues",
+    "game.netcode", "game", "UDP game netcode sequence/ACK packets",
+    "game.physics2d", "game", "circles, boxes, impulse resolution",
+    "game.tilemap", "game", "CSV/JSON tilemaps with AI pathfinding",
+    "cli.cmd", "cli", "structured commands; re-exports cli_args/cli_parse",
+    "ai.client", "ai", "shared offline/live generative AI HTTP/SSE client",
+    "ai.embed", "ai", "local vector similarity, flat/HNSW search, BPE helpers",
+    "ai.mcp_client", "ai", "MCP client (stdio/HTTP-SSE/mock) JSON-RPC tools/resources",
+    "ai.tokenizer", "ai", "BPE token counts + approximate counter",
+    "ai.tensor", "ai", "strided N-D tensor views, INT8/FP16 quant, matmul",
+    "tui.ui", "tui", "cell buffer, layout, widgets, and terminal keys",
+    "gui.alias", "gui", "short aliases for gui surface",
+    "gui.ui", "gui", "retained desktop widgets, layout, and a window presenter",
+    "gui.widgets", "gui", "Widget trait and controls: toggle, dialog, toast, chrome",
+    "gui.window", "gui", "native window open and event poll",
+    "html.core", "html", "XSS-safe HTML node builders with context-aware escaping",
+    "html.parse", "html", "tolerant HTML to text/Markdown parser and selectors",
+    "html.template", "html", "Html/Text string templates with comptime T001–T004 diagnostics",
+    "diag.bench", "diag", "micro-benchmark harness with warmup and timing",
+    "diag.log", "diag", "structured logging with color, sinks, remote ingest",
+    "diag.metrics", "diag", "counters, gauges, histograms, stats",
+    "diag.test", "diag", "assertion helpers and soft reports",
+]
+
+/// How many modules the manifest lists.
++stdlib_count() : i64 => host.sys_arr_len(stdlib_table()) / 3
+
+/// Import path of module `i` (0-based).
++stdlib_path(i: i64) : str => stdlib_table()[i * 3]
+
+/// Layer name of module `i`.
++stdlib_layer(i: i64) : str => stdlib_table()[i * 3 + 1]
+
+/// One-line summary of module `i`.
++stdlib_summary(i: i64) : str => stdlib_table()[i * 3 + 2]
+
+/// Index of a module by dotted path, or -1.
++stdlib_find(path: str) : i64 {
+    t = stdlib_table()
+    n = host.sys_arr_len(t) / 3
+    pos = -1
+    for 0..n {
+        if pos < 0 && t[it * 3] == path { pos = it }
+    }
+    pos
+}
+
+/// True when the manifest lists the module path `path`.
++stdlib_has(path: str) : bool => stdlib_find(path) >= 0
+
+/// Number of modules in a layer.
++stdlib_layer_count(layer: str) : i64 {
+    t = stdlib_table()
+    n = host.sys_arr_len(t) / 3
+    c = 0
+    for 0..n {
+        if t[it * 3 + 1] == layer { c += 1 }
+    }
+    c
+}
+
+/// `use` line for the manifest path `path`.
++stdlib_import_line(path: str) : str => "use std." + path
+
+test "manifest lists all shipped modules" {
+    assert_eq(stdlib_count(), host.sys_arr_len(stdlib_table()) / 3)
+    assert_eq(stdlib_path(0), "core.bitset")
+    assert_eq(stdlib_layer(0), "core")
+    #assert(stdlib_has("cli.cmd"))
+    #assert(stdlib_has("tui.ui"))
+    #assert(stdlib_has("gui.ui"))
+    #assert(stdlib_has("gui.window"))
+    #assert(stdlib_has("game.netcode"))
+    #assert(stdlib_has("sys.epoll"))
+    #assert(stdlib_has("datetime.core"))
+    #assert(stdlib_has("core.int"))
+    #assert(stdlib_has("html.core"))
+    #assert(stdlib_has("html.template"))
+    #assert(stdlib_has("sec.csprng"))
+    #assert(stdlib_has("fmt.protobuf"))
+    #assert(stdlib_has("io.poll"))
+    #assert(stdlib_has("net.tls"))
+    #assert(!(stdlib_has("ai.openai")))
+    #assert(!(stdlib_has("db.supabase")))
+    assert_eq(host.sys_arr_len(stdlib_table()) % 3, 0)
+    assert_eq(stdlib_count(), 127)
+}
+
+test "lookup by path" {
+    #assert(stdlib_has("game.ecs"))
+    #assert(stdlib_has("net.url"))
+    #assert(stdlib_has("math.fft"))
+    #assert(stdlib_has("sys.ffi"))
+    #assert(stdlib_has("core.unicode"))
+    #assert(stdlib_has("fmt.yaml"))
+    #assert(stdlib_has("fmt.xlsx"))
+    #assert(stdlib_has("data.frame"))
+    #assert(stdlib_has("data.plan"))
+    #assert(stdlib_has("math.special"))
+    #assert(stdlib_has("math.integrate"))
+    #assert(stdlib_has("sec.x509"))
+    #assert(!(stdlib_has("io.uring")))
+    #assert(!(stdlib_has("io.epoll")))
+    #assert(!(stdlib_has("net.poll")))
+    assert_eq(stdlib_import_line("sys.io_uring"), "use std.sys.io_uring")
+    assert_eq(stdlib_find("x"), -1)
+    assert_eq(stdlib_summary(stdlib_find("sec.jwt")), "HS256 JSON Web Tokens")
+}
+
+test "layers partition the table" {
+    assert_eq(stdlib_layer_count("core"), 12)
+    assert_eq(stdlib_layer_count("fmt"), 11)
+    assert_eq(stdlib_layer_count("sys"), 13)
+    assert_eq(stdlib_layer_count("datetime"), 2)
+    assert_eq(stdlib_layer_count("io"), 7)
+    assert_eq(stdlib_layer_count("net"), 15)
+    assert_eq(stdlib_layer_count("db"), 7)
+    assert_eq(stdlib_layer_count("sec"), 12)
+    assert_eq(stdlib_layer_count("math"), 16)
+    assert_eq(stdlib_layer_count("data"), 5)
+    assert_eq(stdlib_layer_count("game"), 9)
+    assert_eq(stdlib_layer_count("cli"), 1)
+    assert_eq(stdlib_layer_count("ai"), 5)
+    assert_eq(stdlib_layer_count("tui"), 1)
+    assert_eq(stdlib_layer_count("gui"), 4)
+    assert_eq(stdlib_layer_count("html"), 3)
+    assert_eq(stdlib_layer_count("diag"), 4)
+    assert_eq(stdlib_layer_count("other"), 0)
+    total = 0
+    for ["core", "fmt", "sys", "datetime", "io", "net", "db", "sec", "math", "data", "game", "cli", "ai", "tui", "gui", "html", "diag"] {
+        total += stdlib_layer_count(it)
+    }
+    assert_eq(total, stdlib_count())
+}
+test "import lines" {
+    assert_eq(stdlib_import_line("game.ecs"), "use std.game.ecs")
+    assert_eq(STDLIB_VERSION, "0.1.0")
+}
+
+test "every listed module has a source file when run from the repo" {
+    n = stdlib_count()
+    present = 0
+    for 0..n {
+        rel = "stdlib/" + stdlib_path(it)
+        parts = ""
+        for 0..(host.sys_str_len(rel)) {
+            ch = rel[it]
+            if ch == "." { parts = parts + "/" } else { parts = parts + ch }
+        }
+        if host.sys_exists(parts + ".sr") { present += 1 }
+    }
+    if host.sys_exists("stdlib/mod.sr") {
+        return assert_eq(present, n)
+    }
+    #assert(present >= 0)
+}

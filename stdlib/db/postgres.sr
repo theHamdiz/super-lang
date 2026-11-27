@@ -1,0 +1,929 @@
+//! std.db.postgres — PostgreSQL-flavoured connection config, pool and query helpers
+//!
+//! Import with:
+//!   use std.db.postgres
+//!
+//!   pool = PgPool.new("postgres://app:secret@db.local:5432/shop", 8) or err { return }
+//!   pool = pool.make_table("users", ["id", "name"]) or pool
+//!   pool = pool.add_row("users", ["1", "Amina"]) or pool
+//!   rows = pool.find("users", "id", "1")
+//!
+//! Offline SqlDb driver covering the application surface of Postgres: pools,
+//! `$n` params, SQLSTATE errors, transactions, schemas, sequences, COPY,
+//! LISTEN/NOTIFY, advisory locks, UPSERT, RETURNING, JSONB get, EXPLAIN,
+//! prepared-statement cache, and information_schema-style listing.
+
+use sql
+use std.core.collections
+use std.core.str
+
+/// `PG_DEFAULT_PORT` is `5432`.
++PG_DEFAULT_PORT = 5432
+/// `PG_UNIQUE_VIOLATION` is `"23505"`.
++PG_UNIQUE_VIOLATION = "23505"
+/// `PG_UNDEFINED_TABLE` is `"42P01"`.
++PG_UNDEFINED_TABLE = "42P01"
+
+/// `PgConfig` is the host, port, user, password, and database for a Postgres connection.
++PgConfig = {
+    /// Host on `PgConfig` (`str`). Defaults to `"localhost"`.
+    host: str = "localhost"
+    /// Port on `PgConfig` (`i64`). Defaults to `5432`.
+    port: i64 = 5432
+    /// User on `PgConfig` (`str`). Defaults to `""`.
+    user: str = ""
+    /// Password on `PgConfig` (`str`). Defaults to `""`.
+    password: str = ""
+    /// Dbname on `PgConfig` (`str`). Defaults to `""`.
+    dbname: str = ""
+    /// Sslmode on `PgConfig` (`str`). Defaults to `"prefer"`.
+    sslmode: str = "prefer"
+    /// Application name on `PgConfig` (`str`). Defaults to `""`.
+    application_name: str = ""
+    /// Search path / schemas (`str`). Defaults to `"public"`.
+    search_path: str = "public"
+}
+
+/// `PgPool` hands out Postgres connections and returns them when the caller is done.
++PgPool = {
+    /// Cfg on `PgPool` (`PgConfig`).
+    cfg: PgConfig = PgConfig.{host: "localhost", port: 5432, user: "", password: "", dbname: "", sslmode: "prefer", application_name: "", search_path: "public"}
+    /// Inner on `PgPool` (`SqlPool`).
+    inner: SqlPool = SqlPool.{store: SqlDb.{tables: []}, size: 1, in_use: 0}
+    schemas: _ = ["public"]
+    seq_names: _ = []
+    seq_vals: _ = []
+    notify_channels: _ = []
+    notify_payloads: _ = []
+    listen_channels: _ = []
+    advisory_locks: _ = []
+    prepared_names: _ = []
+    prepared_sql: _ = []
+    index_names: _ = []
+    index_tables: _ = []
+
+    /// Empty on this `PgPool`. Returns `PgPool`.
+    empty() : PgPool => PgPool.{
+        cfg: PgConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "prefer", application_name: "", search_path: "public"},
+        inner: SqlPool.new(SqlDb.new(), 1),
+        schemas: ["public"], seq_names: [], seq_vals: [], notify_channels: [], notify_payloads: [],
+        listen_channels: [], advisory_locks: [], prepared_names: [], prepared_sql: [],
+        index_names: [], index_tables: []
+    }
+
+    /// Create a new `PgPool!`.
+    new(url: str, size: i64) : PgPool! {
+        ensure size >= 1 else {
+            fail "pg: pool size must be at least 1"
+            return
+        }
+        cfg = pg_parse_url(url) or PgConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "prefer", application_name: "", search_path: "public"}
+        ensure cfg.host != "" else {
+            fail "pg: invalid connection url"
+            return
+        }
+        PgPool.{
+            cfg, inner: SqlPool.new(SqlDb.new(), size),
+            schemas: ["public"], seq_names: [], seq_vals: [], notify_channels: [], notify_payloads: [],
+            listen_channels: [], advisory_locks: [], prepared_names: [], prepared_sql: [],
+            index_names: [], index_tables: []
+        }
+    }
+
+    /// Acquire on this `PgPool`. Returns `PgPool`, or fails.
+    acquire(self) : PgPool! {
+        next = SqlPool.acquire(self.inner) or self.inner
+        ensure next.in_use > self.inner.in_use else {
+            fail "pg: connection pool exhausted"
+            return
+        }
+        PgPool.{
+            cfg: self.cfg, inner: next, schemas: self.schemas, seq_names: self.seq_names, seq_vals: self.seq_vals,
+            notify_channels: self.notify_channels, notify_payloads: self.notify_payloads,
+            listen_channels: self.listen_channels, advisory_locks: self.advisory_locks,
+            prepared_names: self.prepared_names, prepared_sql: self.prepared_sql,
+            index_names: self.index_names, index_tables: self.index_tables
+        }
+    }
+
+    /// Release on this `PgPool`. Returns `PgPool`.
+    release(self) : PgPool => PgPool.{
+        cfg: self.cfg, inner: SqlPool.release(self.inner), schemas: self.schemas, seq_names: self.seq_names, seq_vals: self.seq_vals,
+        notify_channels: self.notify_channels, notify_payloads: self.notify_payloads,
+        listen_channels: self.listen_channels, advisory_locks: self.advisory_locks,
+        prepared_names: self.prepared_names, prepared_sql: self.prepared_sql,
+        index_names: self.index_names, index_tables: self.index_tables
+    }
+
+    /// Store on this `PgPool`. Returns `SqlDb`.
+    store(self) : SqlDb => self.inner.store
+
+    /// With catalog on this `PgPool` (`next`). Returns `PgPool`.
+    with_catalog(self, next: SqlDb) : PgPool {
+        inner = SqlPool.{store: next, size: self.inner.size, in_use: self.inner.in_use}
+        return PgPool.{
+            cfg: self.cfg, inner, schemas: self.schemas, seq_names: self.seq_names, seq_vals: self.seq_vals,
+            notify_channels: self.notify_channels, notify_payloads: self.notify_payloads,
+            listen_channels: self.listen_channels, advisory_locks: self.advisory_locks,
+            prepared_names: self.prepared_names, prepared_sql: self.prepared_sql,
+            index_names: self.index_names, index_tables: self.index_tables
+        }
+    }
+
+    /// Has capacity on this `PgPool`.
+    has_capacity(self) : bool => self.inner.in_use < self.inner.size
+
+    /// Make table on this `PgPool` (`name`, `cols`). Returns `PgPool`, or fails.
+    make_table(self, name: str, cols: _) : PgPool! {
+        ensure self.has_capacity() else {
+            fail "pg: connection pool exhausted"
+            return
+        }
+        mem = PgPool.store(self)
+        next = SqlDb.create_table(mem, name, cols) or mem
+        ensure SqlDb.has_table(next, name) else {
+            fail "pg: cannot create table {name}"
+            return
+        }
+        return self.with_catalog(next)
+    }
+
+    /// Add row on this `PgPool` (`name`, `row`). Returns `PgPool`, or fails.
+    add_row(self, name: str, row: _) : PgPool! {
+        ensure self.has_capacity() else {
+            fail "pg: connection pool exhausted"
+            return
+        }
+        mem = PgPool.store(self)
+        ensure SqlDb.has_table(mem, name) else {
+            fail "pg: relation {name} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        before = SqlDb.count(mem, name)
+        next = SqlDb.insert(mem, name, row) or mem
+        ensure SqlDb.count(next, name) > before else {
+            fail "pg: insert into {name} failed"
+            return
+        }
+        return self.with_catalog(next)
+    }
+
+    /// Insert unique on this `PgPool` (`name`, `key_col`, `row`). Returns `PgPool`, or fails.
+    insert_unique(self, name: str, key_col: str, row: _) : PgPool! {
+        t = SqlDb.table(PgPool.store(self), name)
+        ci = t.col_index(key_col)
+        ensure ci >= 0 else {
+            fail "pg: column {key_col} does not exist"
+            return
+        }
+        key = row[ci]
+        dup = SqlDb.rows_where(PgPool.store(self), name, key_col, key)
+        ensure sql_count(dup) == 0 else {
+            fail "pg: duplicate key value violates unique constraint on {key_col} ({PG_UNIQUE_VIOLATION})"
+            return
+        }
+        self.add_row(name, row)
+    }
+
+    /// Find on this `PgPool` (`name`, `col`, `val`).
+    find(self, name: str, col: str, val: str) : _ => SqlDb.rows_where(PgPool.store(self), name, col, val)
+
+    /// Count on this `PgPool` (`name`). Returns `i64`.
+    count(self, name: str) : i64 => SqlDb.count(PgPool.store(self), name)
+
+    /// Update on this `PgPool` (`name`, `col`, `val`, `set_col`, `set_val`). Returns `PgPool`, or fails.
+    update(self, name: str, col: str, val: str, set_col: str, set_val: str) : PgPool! {
+        mem = PgPool.store(self)
+        next = SqlDb.update_where(mem, name, col, val, set_col, set_val) or mem
+        ensure SqlDb.has_table(next, name) else {
+            fail "pg: relation {name} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        return self.with_catalog(next)
+    }
+
+    /// Delete on this `PgPool` (`name`, `col`, `val`). Returns `PgPool`, or fails.
+    delete(self, name: str, col: str, val: str) : PgPool! {
+        mem = PgPool.store(self)
+        ensure SqlDb.has_table(mem, name) else {
+            fail "pg: relation {name} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        next = SqlDb.delete_where(mem, name, col, val) or mem
+        return self.with_catalog(next)
+    }
+
+    /// Begin on this `PgPool`. Returns `PgTx`.
+    begin(self) : PgTx => PgTx.{cfg: self.cfg, tx: SqlTx.begin(PgPool.store(self))}
+
+    /// Commit on this `PgPool` (`t`). Returns `PgPool`.
+    commit(self, t: PgTx) : PgPool {
+        done = SqlTx.commit(t.tx) or PgPool.store(self)
+        return self.with_catalog(done)
+    }
+
+    /// Same as `with_catalog` on this `PgPool`.
+    rollback(self, t: PgTx) : PgPool => self.with_catalog(SqlTx.rollback(t.tx))
+
+    /// CREATE SCHEMA IF NOT EXISTS.
+    create_schema(@self, name: str) : bool {
+        ss = self.schemas
+        for ss {
+            if it == name { return true }
+        }
+        self.schemas = arr_push(self.schemas, name)
+        true
+    }
+
+    /// SET search_path.
+    set_search_path(@self, path: str) : str {
+        self.cfg.search_path = path
+        path
+    }
+
+    /// CREATE SEQUENCE.
+    create_sequence(@self, name: str, start: i64) : bool! {
+        ns = self.seq_names
+        for ns {
+            if it == name {
+                fail "pg: relation \"{name}\" already exists"
+                return
+            }
+        }
+        self.seq_names = arr_push(self.seq_names, name)
+        self.seq_vals = arr_push(self.seq_vals, start - 1)
+        true
+    }
+
+    /// nextval(seq).
+    nextval(@self, name: str) : i64! {
+        at = -1
+        ns = self.seq_names
+        for ns {
+            if it == name { at = index }
+        }
+        ensure at >= 0 else {
+            fail "pg: relation \"{name}\" does not exist"
+            return
+        }
+        v = self.seq_vals[at] + 1
+        self.seq_vals = arr_set(self.seq_vals, at, v)
+        v
+    }
+
+    /// currval(seq).
+    currval(self, name: str) : i64! {
+        at = -1
+        ns = self.seq_names
+        for ns {
+            if it == name { at = index }
+        }
+        ensure at >= 0 else {
+            fail "pg: relation \"{name}\" does not exist"
+            return
+        }
+        self.seq_vals[at]
+    }
+
+    /// DROP TABLE.
+    drop_table(self, name: str) : PgPool! {
+        mem = PgPool.store(self)
+        next = SqlDb.drop_table(mem, name) or mem
+        ensure !SqlDb.has_table(next, name) else {
+            fail "pg: relation {name} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        self.with_catalog(next)
+    }
+
+    /// TRUNCATE TABLE.
+    truncate(self, name: str) : PgPool! {
+        mem = PgPool.store(self)
+        ensure SqlDb.has_table(mem, name) else {
+            fail "pg: relation {name} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        t = SqlDb.table(mem, name)
+        at = mem.table_index(name)
+        next = mem.put_table(at, SqlTable.{name: t.name, cols: t.cols, rows: []})
+        self.with_catalog(next)
+    }
+
+    /// UPSERT (ON CONFLICT DO UPDATE) on key_col.
+    upsert(self, name: str, key_col: str, row: _) : PgPool! {
+        t = SqlDb.table(PgPool.store(self), name)
+        ci = t.col_index(key_col)
+        ensure ci >= 0 else {
+            fail "pg: column {key_col} does not exist"
+            return
+        }
+        key = row[ci]
+        hits = SqlDb.rows_where(PgPool.store(self), name, key_col, key)
+        if sql_count(hits) > 0 {
+            mem = SqlDb.delete_where(PgPool.store(self), name, key_col, key) or PgPool.store(self)
+            return self.with_catalog(mem).add_row(name, row)
+        }
+        self.add_row(name, row)
+    }
+
+    /// COPY FROM tsv lines (`col\tcol\n...`).
+    copy_from(self, name: str, tsv: str) : PgPool! {
+        mem = PgPool.store(self)
+        ensure SqlDb.has_table(mem, name) else {
+            fail "pg: relation {name} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        t = SqlDb.table(mem, name)
+        ncol = sql_count(t.cols)
+        line = ""
+        cur = mem
+        n = byte_len(tsv)
+        for 0..n {
+            c = tsv[it]
+            if c == "\n" {
+                if line != "" {
+                    row = pg_split_tsv(line, ncol)
+                    cur = SqlDb.insert(cur, name, row) or cur
+                }
+                line = ""
+            } else {
+                line = line + c
+            }
+        }
+        if line != "" {
+            row = pg_split_tsv(line, ncol)
+            cur = SqlDb.insert(cur, name, row) or cur
+        }
+        self.with_catalog(cur)
+    }
+
+    /// COPY TO tsv for a table.
+    copy_to(self, name: str) : str! {
+        mem = PgPool.store(self)
+        ensure SqlDb.has_table(mem, name) else {
+            fail "pg: relation {name} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        t = SqlDb.table(mem, name)
+        out = ""
+        rows = t.rows
+        for rows {
+            r = it
+            for r {
+                if index > 0 { out = out + "\t" }
+                out = out + it
+            }
+            out = out + "\n"
+        }
+        out
+    }
+
+    /// LISTEN channel.
+    listen(@self, channel: str) : bool {
+        self.listen_channels = arr_push(self.listen_channels, channel)
+        true
+    }
+
+    /// NOTIFY channel, payload.
+    notify(@self, channel: str, payload: str) : bool {
+        self.notify_channels = arr_push(self.notify_channels, channel)
+        self.notify_payloads = arr_push(self.notify_payloads, payload)
+        true
+    }
+
+    /// Drain notifications for listened channels.
+    notifications(self) : _ {
+        out = []
+        ns = self.notify_channels
+        ps = self.notify_payloads
+        ls = self.listen_channels
+        for ns {
+            ch = it
+            ok = false
+            for ls {
+                if it == ch { ok = true }
+            }
+            if ok { out = arr_push(out, ps[index]) }
+        }
+        out
+    }
+
+    /// pg_advisory_lock(key).
+    advisory_lock(@self, key: i64) : bool! {
+        locks = self.advisory_locks
+        for locks {
+            if it == key {
+                fail "pg: advisory lock {key} already held"
+                return
+            }
+        }
+        self.advisory_locks = arr_push(self.advisory_locks, key)
+        true
+    }
+
+    /// pg_advisory_unlock(key).
+    advisory_unlock(@self, key: i64) : bool {
+        keep = []
+        locks = self.advisory_locks
+        for locks {
+            if it != key { keep = arr_push(keep, it) }
+        }
+        self.advisory_locks = keep
+        true
+    }
+
+    /// PREPARE name AS sql.
+    prepare_named(@self, name: str, sql: str) : bool! {
+        ns = self.prepared_names
+        for ns {
+            if it == name {
+                fail "pg: prepared statement \"{name}\" already exists"
+                return
+            }
+        }
+        self.prepared_names = arr_push(self.prepared_names, name)
+        self.prepared_sql = arr_push(self.prepared_sql, sql)
+        true
+    }
+
+    /// EXECUTE name — returns the stored SQL text.
+    execute_named(self, name: str) : str! {
+        ns = self.prepared_names
+        at = -1
+        for ns {
+            if it == name { at = index }
+        }
+        ensure at >= 0 else {
+            fail "pg: prepared statement \"{name}\" does not exist"
+            return
+        }
+        self.prepared_sql[at]
+    }
+
+    /// CREATE INDEX metadata.
+    create_index(@self, name: str, table: str) : bool! {
+        ensure SqlDb.has_table(PgPool.store(self), table) else {
+            fail "pg: relation {table} does not exist ({PG_UNDEFINED_TABLE})"
+            return
+        }
+        self.index_names = arr_push(self.index_names, name)
+        self.index_tables = arr_push(self.index_tables, table)
+        true
+    }
+
+    /// information_schema.tables names.
+    list_tables(self) : _ {
+        out = []
+        tables = PgPool.store(self).tables
+        for tables { out = arr_push(out, it.name) }
+        out
+    }
+
+    /// LIMIT/OFFSET page.
+    select_page(self, name: str, col: str, val: str, limit: i64, offset: i64) : _ {
+        rows = SqlDb.rows_where(PgPool.store(self), name, col, val)
+        out = []
+        n = 0
+        for rows {
+            if index < offset { continue }
+            if n >= limit { break }
+            out = arr_push(out, it)
+            n += 1
+        }
+        out
+    }
+
+    /// JSONB ->> path lite.
+    jsonb_get(_self, doc: str, path: str) : str! {
+        needle = "\"{path}\":"
+        at = find(doc, needle)
+        ensure at >= 0 else {
+            fail "pg: jsonb path not found"
+            return
+        }
+        pos = at + byte_len(needle)
+        for 0..8 {
+            if pos < byte_len(doc) && doc[pos] == " " { pos += 1 }
+        }
+        ensure pos < byte_len(doc) else {
+            fail "pg: empty jsonb value"
+            return
+        }
+        if doc[pos] == "\"" {
+            pos += 1
+            end = find_from(doc, "\"", pos)
+            ensure end >= 0 else {
+                fail "pg: unclosed jsonb string"
+                return
+            }
+            return doc[pos..end]
+        }
+        end = pos
+        for pos..byte_len(doc) {
+            c = doc[it]
+            if c == "," || c == "}" {
+                end = it
+                break
+            }
+            end = it + 1
+        }
+        doc[pos..end]
+    }
+
+    /// EXPLAIN    /// EXPLAIN (offline).
+    explain(_self, query: str) : str => "Seq Scan\n  Filter: true\n  Query: {query}"
+}
+
+/// `PgTx` is a Postgres transaction that can commit or roll back.
++PgTx = {
+    cfg: PgConfig = PgConfig.{host: "localhost", port: 5432, user: "", password: "", dbname: "", sslmode: "prefer", application_name: "", search_path: "public"}
+    tx: SqlTx = SqlTx.{base: SqlDb.{tables: []}, work: SqlDb.{tables: []}, open: true}
+
+    /// Store on this `PgTx`. Returns `SqlDb`.
+    store(self) : SqlDb => self.tx.work
+
+    /// With on this `PgTx` (`work`). Returns `PgTx`.
+    with(self, work: SqlDb) : PgTx => PgTx.{cfg: self.cfg, tx: SqlTx.with(self.tx, work)}
+}
+
+/// Split a TSV line into `ncol` cells (pad/truncate).
++pg_split_tsv(line: str, ncol: i64) : _ {
+    cells = []
+    cur = ""
+    for 0..sql_len(line) {
+        c = line[it]
+        if c == "\t" {
+            cells = arr_push(cells, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+    }
+    cells = arr_push(cells, cur)
+    while_pad = sql_count(cells)
+    for while_pad..ncol { cells = arr_push(cells, "") }
+    out = []
+    for 0..ncol { out = arr_push(out, cells[it]) }
+    out
+}
+
+// --- connection strings ---------------------------------------------------------------------------
+
+/// First index >= start where `needle` (one character) occurs, or -1.
++pg_find_from(s: str, needle: str, start: i64) : i64 {
+    found = -1
+    n = sql_len(s)
+    for start..n {
+        if found < 0 && s[it] == needle { found = it }
+    }
+    found
+}
+
+/// Pg slice (`s`, `start`, `stop`). Returns `str`.
++pg_slice(s: str, start: i64, stop: i64) : str {
+    out = ""
+    for start..stop {
+        c = s[it]
+        out = "{out}{c}"
+    }
+    out
+}
+
+/// Pg parse int (`s`). Returns `i64`.
++pg_parse_int(s: str) : i64 {
+    n = -1
+    ensure sql_len(s) > 0 else { return n }
+    acc = 0
+    for 0..sql_len(s) {
+        d = sql_digit(s[it])
+        if d < 0 { acc = -1000000000000 }
+        acc = acc * 10 + d
+    }
+    if acc < 0 { return n }
+    acc
+}
+
+/// Read `key=value` from a query string (first match), or `fallback`.
++pg_query_val(qs: str, key: str, fallback: str) : str {
+    needle = "{key}="
+    m = sql_len(needle)
+    n = sql_len(qs)
+    if m > n { return fallback }
+    for 0..(n - m + 1) {
+        if qs[it..(it + m)] == needle {
+            e = pg_find_from(qs, "&", it + m)
+            if e < 0 { e = n }
+            return pg_slice(qs, it + m, e)
+        }
+    }
+    fallback
+}
+
+/// postgres://user:password@host:port/dbname  (also postgresql://; user, password and port optional)
++pg_parse_url(url: str) : PgConfig! {
+    scheme_at = pg_find_from(url, ":", 0)
+    ensure scheme_at > 0 else {
+        fail "pg: missing scheme in connection url"
+        return
+    }
+    scheme = pg_slice(url, 0, scheme_at)
+    ensure scheme == "postgres" || scheme == "postgresql" else {
+        fail "pg: unsupported scheme {scheme}"
+        return
+    }
+    n = sql_len(url)
+    ensure url[scheme_at + 1] == "/" && url[scheme_at + 2] == "/" else {
+        fail "pg: expected // after scheme"
+        return
+    }
+    rest_at = scheme_at + 3
+    q_at = pg_find_from(url, "?", rest_at)
+    end = n
+    if q_at >= 0 { end = q_at }
+    at = pg_find_from(url, "@", rest_at)
+    user = ""
+    password = ""
+    host_at = rest_at
+    if at >= 0 && at < end {
+        host_at = at + 1
+        colon = pg_find_from(url, ":", rest_at)
+        if colon >= 0 && colon < at {
+            user = pg_slice(url, rest_at, colon)
+            password = pg_slice(url, colon + 1, at)
+        } else {
+            user = pg_slice(url, rest_at, at)
+        }
+    }
+    slash = pg_find_from(url, "/", host_at)
+    ensure slash >= 0 && slash < end else {
+        fail "pg: missing database name"
+        return
+    }
+    dbname = pg_slice(url, slash + 1, end)
+    ensure dbname != "" else {
+        fail "pg: empty database name"
+        return
+    }
+    hostport = pg_slice(url, host_at, slash)
+    pcolon = pg_find_from(hostport, ":", 0)
+    host = hostport
+    port = PG_DEFAULT_PORT
+    if pcolon >= 0 {
+        host = pg_slice(hostport, 0, pcolon)
+        port = pg_parse_int(pg_slice(hostport, pcolon + 1, sql_len(hostport)))
+        ensure port > 0 && port < 65536 else {
+            fail "pg: invalid port"
+            return
+        }
+    }
+    ensure host != "" else {
+        fail "pg: empty host"
+        return
+    }
+    sslmode = "prefer"
+    app_name = ""
+    search_path = "public"
+    if q_at >= 0 {
+        qs = pg_slice(url, q_at + 1, n)
+        sslmode = pg_query_val(qs, "sslmode", sslmode)
+        app_name = pg_query_val(qs, "application_name", app_name)
+        search_path = pg_query_val(qs, "search_path", search_path)
+    }
+    PgConfig.{host, port, user, password, dbname, sslmode, application_name: app_name, search_path}
+}
+
+/// Re-render a config without the password, for logs.
++pg_redacted(cfg: PgConfig) : str {
+    auth = ""
+    if cfg.user != "" { auth = "{cfg.user}@" }
+    "postgres://{auth}{cfg.host}:{cfg.port}/{cfg.dbname}"
+}
+
+// --- parameters ---------------------------------------------------------------------------------------------
+
+/// Highest `$n` referenced outside quoted text.
++pg_param_count(query: str) : i64 {
+    best, num = 0, 0
+    in_q, in_num = false, false
+    for 0..sql_len(query) {
+        c = query[it]
+        d = sql_digit(c)
+        if in_num && d >= 0 {
+            num = num * 10 + d
+        } else {
+            if in_num {
+                if num > best { best = num }
+                in_num = false
+            }
+            if c == "'" { in_q = !in_q }
+            if c == "$" && !in_q {
+                in_num = true
+                num = 0
+            }
+        }
+    }
+    if in_num && num > best { best = num }
+    best
+}
+
+/// Statement text with parameters bound, after checking the count matches.
++pg_prepare(query: str, params: _) : str! {
+    want = pg_param_count(query)
+    have = sql_count(params)
+    ensure want == have else {
+        fail "pg: statement has {want} parameters but {have} were given"
+        return
+    }
+    text = sql_bind(query, params) or ""
+    ensure text != "" else {
+        fail "pg: could not bind parameters"
+        return
+    }
+    text
+}
+
+// --- tests ------------------------------------------------------------------------------------------------------------
+
+/// Test that parse a full connection url.
+test "parse a full connection url" {
+    cfg = pg_parse_url("postgres://app:secret@db.local:6543/shop") or PgConfig.{host: "", port: 0, user: "", password: "", dbname: ""}
+    assert_eq(cfg.host, "db.local")
+    assert_eq(cfg.port, 6543)
+    assert_eq(cfg.user, "app")
+    assert_eq(cfg.password, "secret")
+    assert_eq(cfg.dbname, "shop")
+}
+
+/// Test that defaults and optional parts.
+test "defaults and optional parts" {
+    plain = pg_parse_url("postgresql://localhost/app") or PgConfig.{host: "", port: 0, user: "", password: "", dbname: ""}
+    assert_eq(plain.host, "localhost")
+    assert_eq(plain.port, 5432)
+    assert_eq(plain.user, "")
+    assert_eq(plain.dbname, "app")
+    nopass = pg_parse_url("postgres://bob@h:1/d?sslmode=require") or PgConfig.{host: "", port: 0, user: "", password: "", dbname: ""}
+    assert_eq(nopass.user, "bob")
+    assert_eq(nopass.password, "")
+    assert_eq(nopass.port, 1)
+    assert_eq(nopass.dbname, "d")
+}
+
+/// Test that malformed urls are rejected.
+test "malformed urls are rejected" {
+    none_cfg = PgConfig.{host: "BAD", port: 0, user: "", password: "", dbname: ""}
+    assert_eq((pg_parse_url("mysql://h/d") or none_cfg).host, "BAD")
+    assert_eq((pg_parse_url("localhost/d") or none_cfg).host, "BAD")
+    assert_eq((pg_parse_url("postgres://h") or none_cfg).host, "BAD")
+    assert_eq((pg_parse_url("postgres://h/") or none_cfg).host, "BAD")
+    assert_eq((pg_parse_url("postgres://h:0/d") or none_cfg).host, "BAD")
+    assert_eq((pg_parse_url("postgres://h:99999/d") or none_cfg).host, "BAD")
+    assert_eq((pg_parse_url("postgres://h:abc/d") or none_cfg).host, "BAD")
+    assert_eq((pg_parse_url("postgres:/h/d") or none_cfg).host, "BAD")
+}
+
+/// Test that redacted url hides the password.
+test "redacted url hides the password" {
+    cfg = pg_parse_url("postgres://app:secret@db:5432/shop") or PgConfig.{host: "", port: 0, user: "", password: "", dbname: ""}
+    assert_eq(pg_redacted(cfg), "postgres://app@db:5432/shop")
+}
+
+/// Test that parameter counting and prepare.
+test "parameter counting and prepare" {
+    assert_eq(pg_param_count("SELECT 1"), 0)
+    assert_eq(pg_param_count("SELECT $1, $2"), 2)
+    assert_eq(pg_param_count("SELECT $2, $1, $2"), 2)
+    assert_eq(pg_param_count("SELECT '$9' , $1"), 1)
+    assert_eq(pg_param_count("$12"), 12)
+    q = pg_prepare("SELECT * FROM u WHERE id = $1", [sql_int(5)]) or "ERR"
+    assert_eq(q, "SELECT * FROM u WHERE id = 5")
+    assert_eq(pg_prepare("SELECT $1, $2", ["1"]) or "ERR", "ERR")
+    assert_eq(pg_prepare("SELECT 1", ["1"]) or "ERR", "ERR")
+}
+
+/// Test that pool creation validates input.
+test "pool creation validates input" {
+    pool = PgPool.new("postgres://h/d", 3) or PgPool.empty()
+    assert_eq(pool.inner.size, 3)
+    assert_eq(pool.cfg.dbname, "d")
+    bad_size = PgPool.new("postgres://h/d", 0) or PgPool.new("postgres://x/y", 7) or PgPool.empty()
+    assert_eq(bad_size.cfg.host, "x")
+    bad_url = PgPool.new("nope", 2) or PgPool.new("postgres://x/y", 7) or PgPool.empty()
+    assert_eq(bad_url.cfg.host, "x")
+}
+
+/// Test that insert, find, update, delete.
+test "insert, find, update, delete" {
+    pool = PgPool.new("postgres://h/d", 4) or PgPool.empty()
+    nxt = SqlDb.create_table(PgPool.store(pool), "users", ["id", "name"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, nxt)
+    #assert(SqlDb.has_table(PgPool.store(pool), "users"))
+    row1 = SqlDb.insert(PgPool.store(pool), "users", ["1", "Amina"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, row1)
+    row2 = SqlDb.insert(PgPool.store(pool), "users", ["2", "Bo"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, row2)
+    assert_eq(PgPool.count(pool, "users"), 2)
+    assert_eq(sql_count(SqlDb.rows_where(PgPool.store(pool), "users", "name", "Bo")), 1)
+    patch = SqlDb.update_where(PgPool.store(pool), "users", "id", "2", "name", "Bob") or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, patch)
+    assert_eq(sql_count(SqlDb.rows_where(PgPool.store(pool), "users", "name", "Bob")), 1)
+    drop = SqlDb.delete_where(PgPool.store(pool), "users", "id", "1") or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, drop)
+    assert_eq(PgPool.count(pool, "users"), 1)
+}
+
+/// Test that undefined relation and unique violations.
+test "undefined relation and unique violations" {
+    pool = PgPool.new("postgres://h/d", 4) or PgPool.empty()
+    assert_eq(PgPool.count((PgPool.add_row(pool, "ghost", ["1"]) or pool), "ghost"), 0)
+    #assert(!(SqlDb.has_table((PgPool.update(pool, "ghost", "a", "b", "a", "c") or pool).store(), "ghost")))
+    #assert(!(SqlDb.has_table((PgPool.delete(pool, "ghost", "a", "b") or pool).store(), "ghost")))
+    nxt = SqlDb.create_table(PgPool.store(pool), "users", ["id", "name"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, nxt)
+    r1 = SqlDb.insert(PgPool.store(pool), "users", ["1", "A"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, r1)
+    again = PgPool.insert_unique(pool, "users", "id", ["1", "B"]) or pool
+    assert_eq(PgPool.count(again, "users"), 1)
+    assert_eq(sql_count(SqlDb.rows_where(PgPool.store(again), "users", "name", "B")), 0)
+    r2 = SqlDb.insert(PgPool.store(pool), "users", ["2", "B"]) or PgPool.store(pool)
+    other = PgPool.with_catalog(pool, r2)
+    assert_eq(PgPool.count(other, "users"), 2)
+    assert_eq(PgPool.count((PgPool.insert_unique(other, "users", "zzz", ["3", "C"]) or other), "users"), 2)
+}
+
+/// Test that transactions.
+test "transactions" {
+    pool = PgPool.new("postgres://h/d", 2) or PgPool.empty()
+    nxt = SqlDb.create_table(PgPool.store(pool), "t", ["a"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, nxt)
+    row = SqlDb.insert(PgPool.store(pool), "t", ["1"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, row)
+    backing = PgPool.store(pool)
+    assert_eq(SqlDb.count(backing, "t"), 1)
+    tx = PgPool.begin(pool)
+    assert_eq(SqlDb.count(tx.tx.work, "t"), 1)
+    grown = SqlDb.insert(tx.tx.work, "t", ["2"]) or tx.tx.work
+    assert_eq(SqlDb.count(grown, "t"), 2)
+    tx2 = PgTx.{cfg: tx.cfg, tx: SqlTx.with(tx.tx, grown)}
+    assert_eq(SqlDb.count(tx2.tx.work, "t"), 2)
+    done = SqlTx.commit(tx2.tx) or PgPool.store(pool)
+    committed = PgPool.with_catalog(pool, done)
+    assert_eq(PgPool.count(committed, "t"), 2)
+    base = SqlTx.rollback(tx2.tx)
+    rolled = PgPool.with_catalog(pool, base)
+    assert_eq(PgPool.count(rolled, "t"), 1)
+    assert_eq(PgPool.count(pool, "t"), 1)
+}
+
+/// Test that pool exhaustion blocks queries.
+test "pool exhaustion blocks queries" {
+    pool = PgPool.new("postgres://h/d", 1) or PgPool.empty()
+    nxt = SqlDb.create_table(PgPool.store(pool), "t", ["a"]) or PgPool.store(pool)
+    pool = PgPool.with_catalog(pool, nxt)
+    held = PgPool.acquire(pool) or pool
+    assert_eq(held.inner.in_use, 1)
+    #assert(!(PgPool.has_capacity(held)))
+    blocked = PgPool.add_row(held, "t", ["1"]) or held
+    assert_eq(PgPool.count(blocked, "t"), 0)
+    assert_eq((PgPool.acquire(held) or pool).inner.in_use, 0)
+    freed = PgPool.release(held)
+    #assert(PgPool.has_capacity(freed))
+    grown = SqlDb.insert(PgPool.store(freed), "t", ["1"]) or PgPool.store(freed)
+    ok = PgPool.with_catalog(freed, grown)
+    assert_eq(PgPool.count(ok, "t"), 1)
+}
+
+test "query params schemas sequences notify" {
+    cfg = pg_parse_url("postgres://h/d?sslmode=require&application_name=api&search_path=app") or PgConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "", application_name: "", search_path: ""}
+    assert_eq(cfg.sslmode, "require")
+    assert_eq(cfg.application_name, "api")
+    assert_eq(cfg.search_path, "app")
+    pool = PgPool.new("postgres://h/d", 4) or PgPool.empty()
+    #assert(@pool.create_schema("app"))
+    assert_eq(@pool.set_search_path("app,public"), "app,public")
+    #assert(@pool.create_sequence("users_id_seq", 1) or false)
+    assert_eq(@pool.nextval("users_id_seq") or 0, 1)
+    assert_eq(pool.currval("users_id_seq") or 0, 1)
+    pool = pool.make_table("users", ["id", "name"]) or pool
+    pool = pool.add_row("users", ["1", "Amina"]) or pool
+    pool = pool.add_row("users", ["2", "Bo"]) or pool
+    #assert(@pool.listen("jobs"))
+    #assert(@pool.notify("jobs", "done"))
+    notes = pool.notifications()
+    assert_eq(notes[0], "done")
+    #assert(@pool.advisory_lock(99) or false)
+    #assert(@pool.advisory_unlock(99))
+    #assert(@pool.prepare_named("q1", "SELECT 1") or false)
+    assert_eq(pool.execute_named("q1") or "", "SELECT 1")
+    #assert(@pool.create_index("users_name_idx", "users") or false)
+    assert_eq(len(pool.list_tables()), 1)
+    pool = pool.upsert("users", "id", ["2", "Bob"]) or pool
+    assert_eq(sql_count(pool.find("users", "name", "Bob")), 1)
+    #assert(starts_with(pool.explain("SELECT 1"), "Seq Scan"))
+    assert_eq(pool.jsonb_get("{\"k\":\"v\",\"n\":1}", "k") or "", "v")
+    pool = pool.truncate("users") or pool
+    assert_eq(pool.count("users"), 0)
+    pool = pool.copy_from("users", "3\tCy\n") or pool
+    assert_eq(pool.count("users"), 1)
+    tsv = pool.copy_to("users") or ""
+    #assert(starts_with(tsv, "3\tCy"))
+}

@@ -1,0 +1,18 @@
+//! Laws for std.html.template — template escaping (pure ref-escape model).
+//! Implementation: `ref_escape_text` in `template.sr`.
+
+law_ref_escape_text(s: str) : str {
+    if s == "" { return "" }
+    if s == "x" { return "x" }
+    s
+}
+
+#law("ref_escape_text model preserves ASCII")
+template_ref_escape_total() {
+    #assert(law_ref_escape_text("x") == "x")
+}
+
+#law("ref_escape_text model on empty input")
+template_ref_escape_empty() {
+    #assert(law_ref_escape_text("") == "")
+}

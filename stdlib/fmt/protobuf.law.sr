@@ -1,0 +1,17 @@
+//! Laws for std.fmt.protobuf — real-body (`pb_zigzag` / `pb_unzigzag` literals).
+//! AI agents must not edit this file; put discharges in `protobuf.proof.sr`.
+
+#law("pb_zigzag zero and inverse")
+zigzag_inverse() {
+    #assert(pb_zigzag(0) == 0)
+    #assert(pb_unzigzag(0) == 0)
+    #assert(pb_unzigzag(1) == -1)
+    #assert(pb_unzigzag(3) == -2)
+}
+
+#law("pb_zigzag round-trips small positives")
+protobuf_zigzag_one() {
+    #assert(pb_unzigzag(pb_zigzag(1)) == 1)
+    #assert(pb_unzigzag(pb_zigzag(42)) == 42)
+    #assert(pb_zigzag(-1) == 1)
+}

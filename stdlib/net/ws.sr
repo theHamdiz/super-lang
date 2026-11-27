@@ -1,0 +1,569 @@
+//! std.net.ws — WebSocket (RFC 6455) frames and handshake helpers
+//!
+//! Import with:
+//!   use std.net.ws
+//!
+//!   wire = ws_encode(ws_text("hello"), 0)        // server -> client, unmasked
+//!   frame = ws_decode(wire) or err { return }
+//!   reply = ws_pong_for(ws_ping([1, 2]))
+//!
+//! Frames carry their payload as a byte array (i64 values 0..255). Masking uses
+//! a 32-bit key given as an integer; pass 0 to send unmasked (server frames).
+//! Accept digests use `sha1_base64` from std.sec.hash; offline tests use
+//! `ws_upgrade_response_with` with a precomputed digest.
+
+use std.core.str
+use std.core.collections
+use std.sec.hash
+
+/// `WS_CONTINUATION` is `0`.
++WS_CONTINUATION = 0
+/// `WS_TEXT` is `1`.
++WS_TEXT = 1
+/// `WS_BINARY` is `2`.
++WS_BINARY = 2
+/// `WS_CLOSE` is `8`.
++WS_CLOSE = 8
+/// `WS_PING` is `9`.
++WS_PING = 9
+/// `WS_PONG` is `10`.
++WS_PONG = 10
+
+/// `WS_GUID` is `"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"`.
++WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+/// `WS_VERSION` is `"13"`.
++WS_VERSION = "13"
+/// `WS_MAX_CONTROL_PAYLOAD` is `125`.
++WS_MAX_CONTROL_PAYLOAD = 125
+
+/// `WS_CLOSE_NORMAL` is `1000`.
++WS_CLOSE_NORMAL = 1000
+/// `WS_CLOSE_GOING_AWAY` is `1001`.
++WS_CLOSE_GOING_AWAY = 1001
+/// `WS_CLOSE_PROTOCOL_ERROR` is `1002`.
++WS_CLOSE_PROTOCOL_ERROR = 1002
+/// `WS_CLOSE_UNSUPPORTED` is `1003`.
++WS_CLOSE_UNSUPPORTED = 1003
+/// `WS_CLOSE_TOO_BIG` is `1009`.
++WS_CLOSE_TOO_BIG = 1009
+
+/// Printable ASCII 32..126 indexed by code - 32; `¤` marks the four characters
+/// that need escaping in a literal (34, 92, 123, 125) and come from sys_chr.
++WS_ASCII = " !¤#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[¤]^_`abcdefghijklmnopqrstuvwxyz¤|¤~"
+
+/// `WsFrame` is one WebSocket frame (fin, opcode, mask, payload).
++WsFrame = {
+    /// Fin on `WsFrame` (`bool`). Defaults to `true`.
+    fin: bool = true
+    /// Opcode on `WsFrame` (`i64`). Defaults to `1`.
+    opcode: i64 = 1
+    /// Masked on `WsFrame` (`bool`). Defaults to `false`.
+    masked: bool = false
+    /// Payload on `WsFrame`. Defaults to `[]`.
+    payload: _ = []
+}
+
+/// Same as `len`.
++ws_count(a: _) : i64 => len(a)
+
+/// Same as `byte_len`.
++ws_len(s: str) : i64 => byte_len(s)
+
+/// Ws pow (`base`, `n`). Returns `i64`.
++ws_pow(base: i64, n: i64) : i64 {
+    acc = 1
+    for 0..n { acc = acc * base }
+    acc
+}
+
+/// Ws xor8 (`a`, `b`). Returns `i64`.
++ws_xor8(a: i64, b: i64) : i64 {
+    (a ^ b) & 255
+}
+
+/// In-place word-XOR masking — mutates `@payload` without building a new buffer.
++ws_unmask_inplace(@payload, key: _) {
+    n = len(payload)
+    for 0..n {
+        payload[it] = ws_xor8(payload[it], key[it & 3])
+    }
+}
+
+/// Ws unmask words (`payload`, `key`).
++ws_unmask_words(payload: _, key: _) : _ {
+    out = arr_new(len(payload), 0)
+    n = len(payload)
+    for 0..n {
+        out = arr_set(out, it, ws_xor8(payload[it], key[it & 3]))
+    }
+    out
+}
+
+/// Ws byte of (`c`). Returns `i64`.
++ws_byte_of(c: str) : i64 {
+    pos = -1
+    for 0..95 {
+        if pos < 0 && WS_ASCII[it] == c { pos = it }
+    }
+    if c == "¤" { return 63 }
+    if pos >= 0 { return pos + 32 }
+    if c == "\"" { return 34 }
+    if c == "\\" { return 92 }
+    63
+}
+
+/// Ws char of (`b`). Returns `str`.
++ws_char_of(b: i64) : str {
+    if b >= 32 && b <= 126 && b != 34 && b != 92 && b != 123 && b != 125 { return WS_ASCII[b - 32] }
+    chr(b)
+}
+
+// --- frame construction ------------------------------------------------------------------
+
+/// Encode one WebSocket frame.
++ws_frame(opcode: i64, payload: _) : WsFrame => WsFrame.{fin: true, opcode, masked: false, payload}
+
+/// WebSocket text frame whose payload is `s`.
++ws_text(s: str) : WsFrame {
+    n = byte_len(s)
+    bytes = arr_new(n, 0)
+    for 0..n { bytes = arr_set(bytes, it, ws_byte_of(s[it])) }
+    ws_frame(WS_TEXT, bytes)
+}
+
+/// WebSocket binary frame whose payload is `payload`.
++ws_binary(payload: _) : WsFrame => ws_frame(WS_BINARY, payload)
+/// WebSocket ping frame.
++ws_ping(payload: _) : WsFrame => ws_frame(WS_PING, payload)
+/// WebSocket pong frame.
++ws_pong(payload: _) : WsFrame => ws_frame(WS_PONG, payload)
+
+/// The pong a peer must answer a ping with: same payload.
++ws_pong_for(ping: WsFrame) : WsFrame => ws_frame(WS_PONG, ping.payload)
+
+/// WebSocket close frame.
++ws_close(code: i64, reason: str) : WsFrame {
+    rn = byte_len(reason)
+    bytes = arr_new(2 + rn, 0)
+    bytes = arr_set(bytes, 0, code / 256)
+    bytes = arr_set(bytes, 1, code % 256)
+    for 0..rn { bytes = arr_set(bytes, 2 + it, ws_byte_of(reason[it])) }
+    ws_frame(WS_CLOSE, bytes)
+}
+
+/// True when this frame is close, ping, or pong.
++ws_is_control(f: WsFrame) : bool => f.opcode >= 8
+
+/// Ws text of (`f`). Returns `str`.
++ws_text_of(f: WsFrame) : str {
+    out = ""
+    bytes = f.payload
+    for bytes {
+        ch = ws_char_of(it)
+        out = "{out}{ch}"
+    }
+    out
+}
+
+/// Status code of a close frame, or -1 when the frame carries none.
++ws_close_code(f: WsFrame) : i64 {
+    ensure f.opcode == WS_CLOSE else { return -1 }
+    bytes = f.payload
+    ensure ws_count(bytes) >= 2 else { return -1 }
+    bytes[0] * 256 + bytes[1]
+}
+
+// --- encoding ---------------------------------------------------------------------------------
+
+/// Serialize one frame. `mask_key` 0 means unmasked; otherwise the 32-bit key
+/// is written big-endian and the payload is XOR-masked with it.
++ws_encode(f: WsFrame, mask_key: i64) : _! {
+    n = len(f.payload)
+    ensure !ws_is_control(f) || n <= WS_MAX_CONTROL_PAYLOAD else {
+        fail "ws: control frame payload too large"
+        return
+    }
+    ensure !ws_is_control(f) || f.fin else {
+        fail "ws: control frames cannot be fragmented"
+        return
+    }
+    masked = mask_key != 0
+    head = 2
+    if n >= 126 { head = 4 }
+    if n >= 65536 { head = 10 }
+    if masked { head += 4 }
+    out = arr_new(head + n, 0)
+    b0 = f.opcode
+    if (f.fin) { b0 += 128 }
+    out = arr_set(out, 0, b0)
+    mbit = 0
+    if masked { mbit = 128 }
+    at = 1
+    if n < 126 {
+        out = arr_set(out, at, mbit + n)
+        at += 1
+    } else {
+        if n < 65536 {
+            out = arr_set(out, at, mbit + 126)
+            out = arr_set(out, at + 1, n / 256)
+            out = arr_set(out, at + 2, n % 256)
+            at += 3
+        } else {
+            out = arr_set(out, at, mbit + 127)
+            at += 1
+            for 0..8 {
+                out = arr_set(out, at + it, (n / ws_pow(256, 7 - it)) % 256)
+            }
+            at += 8
+        }
+    }
+    key = arr_new(4, 0)
+    if masked {
+        for 0..4 {
+            kb = (mask_key / ws_pow(256, 3 - it)) % 256
+            key = arr_set(key, it, kb)
+            out = arr_set(out, at + it, kb)
+        }
+        at += 4
+    }
+    bytes = f.payload
+    if masked { bytes = ws_unmask_words(bytes, key) }
+    for 0..n {
+        out = arr_set(out, at + it, bytes[it])
+    }
+    out
+}
+
+/// Total encoded size of the frame whose header starts `wire`, or -1 if the
+/// header itself is incomplete.
++ws_frame_size(wire: _) : i64 {
+    total = ws_count(wire)
+    ensure total >= 2 else { return -1 }
+    len7 = wire[1] % 128
+    masked = wire[1] >= 128
+    head = 2
+    plen = len7
+    if len7 == 126 {
+        ensure total >= 4 else { return -1 }
+        head = 4
+        plen = wire[2] * 256 + wire[3]
+    }
+    if len7 == 127 {
+        ensure total >= 10 else { return -1 }
+        head = 10
+        plen = 0
+        for 0..8 { plen = plen * 256 + wire[2 + it] }
+    }
+    if masked { head += 4 }
+    head + plen
+}
+
+/// Frame parsed from the bytes `wire`, or fail.
++ws_decode(wire: _) : WsFrame! {
+    size = ws_frame_size(wire)
+    ensure size >= 0 else {
+        fail "ws: incomplete header"
+        return
+    }
+    ensure len(wire) >= size else {
+        fail "ws: incomplete payload"
+        return
+    }
+    fin = wire[0] >= 128
+    opcode = wire[0] % 16
+    masked = wire[1] >= 128
+    len7 = wire[1] % 128
+    head = 2
+    if len7 == 126 { head = 4 }
+    if len7 == 127 { head = 10 }
+    key_at = head
+    if masked { head += 4 }
+    plen = size - head
+    payload = arr_new(plen, 0)
+    for 0..plen {
+        payload = arr_set(payload, it, wire[head + it])
+    }
+    if masked {
+        key = [wire[key_at], wire[key_at + 1], wire[key_at + 2], wire[key_at + 3]]
+        ws_unmask_inplace(@payload, key)
+    }
+    WsFrame.{fin, opcode, masked, payload}
+}
+
+// --- fixed-capacity rooms / pubsub -----------------------------------------------------------
+
+/// `WsRoom` is a set of WebSocket clients that share broadcasts.
++WsRoom = {
+    /// Clients on `WsRoom`. Defaults to `[]`.
+    clients: _ = []
+    /// Head on `WsRoom` (`i64`). Defaults to `0`.
+    head: i64 = 0
+    /// Count on `WsRoom` (`i64`). Defaults to `0`.
+    count: i64 = 0
+    /// Cap on `WsRoom` (`i64`). Defaults to `0`.
+    cap: i64 = 0
+
+    /// Create a fresh `WsRoom`.
+    new(cap: i64) : WsRoom {
+        n = cap
+        if n < 1 { n = 1 }
+        WsRoom.{clients: arr_new(n, -1), head: 0, count: 0, cap: n}
+    }
+
+    /// Has on this `WsRoom` (`client`).
+    has(self, client: i64) : bool {
+        n = self.count
+        for 0..n {
+            if self.clients[(self.head + it) % self.cap] == client { return true }
+        }
+        false
+    }
+
+    /// Join on this `WsRoom` (`client`).
+    join(@self, client: i64) : bool {
+        ensure self.has(client) == false && self.count < self.cap else { return false }
+        tail = (self.head + self.count) % self.cap
+        self.clients = arr_set(self.clients, tail, client)
+        self.count += 1
+        true
+    }
+
+    /// O(1) swap-remove: swap with last occupied slot, then shrink.
+    leave(@self, client: i64) : bool {
+        at = -1
+        n = self.count
+        for 0..n {
+            if at < 0 && self.clients[(self.head + it) % self.cap] == client { at = it }
+        }
+        ensure at >= 0 else { return false }
+        last = (self.head + self.count - 1) % self.cap
+        slot = (self.head + at) % self.cap
+        self.clients = arr_set(self.clients, slot, self.clients[last])
+        self.clients = arr_set(self.clients, last, -1)
+        self.count -= 1
+        true
+    }
+
+    /// Subscribers on this `WsRoom`.
+    subscribers(self) : _ {
+        out = arr_new(self.count, -1)
+        n = self.count
+        for 0..n {
+            out = arr_set(out, it, self.clients[(self.head + it) % self.cap])
+        }
+        out
+    }
+}
+
+// --- handshake -----------------------------------------------------------------------------------
+
+/// Validate the client's upgrade request headers (values as received).
++ws_check_upgrade(upgrade: str, connection: str, key: str, version: str) : bool {
+    ok_upgrade = upgrade == "websocket" || upgrade == "WebSocket" || upgrade == "Websocket"
+    ok_conn = connection == "Upgrade" || connection == "upgrade" || connection == "keep-alive, Upgrade"
+    ok_upgrade && ok_conn && ws_len(key) == 24 && version == WS_VERSION
+}
+
+/// Sec-WebSocket-Accept value for the client key `client_key`, or fail.
++ws_accept_key(client_key: str) : str! {
+    digest = sha1_base64("{client_key}{WS_GUID}") or ""
+    ensure digest != "" else {
+        fail "ws: sha1_base64 unavailable"
+        return
+    }
+    digest
+}
+
+/// HTTP 101 response that completes a WebSocket handshake.
++ws_upgrade_response_with(accept: str) : str {
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+}
+
+/// HTTP 101 response that completes a WebSocket handshake, or fail.
++ws_upgrade_response(client_key: str) : str! {
+    accept = ws_accept_key(client_key) or ""
+    ensure accept != "" else {
+        fail "ws: cannot compute accept key"
+        return
+    }
+    ws_upgrade_response_with(accept)
+}
+
+// --- tests ------------------------------------------------------------------------------------------
+
+/// Test that opcode and close-code constants.
+test "opcode and close-code constants" {
+    assert_eq(WS_TEXT, 1)
+    assert_eq(WS_BINARY, 2)
+    assert_eq(WS_CLOSE, 8)
+    assert_eq(WS_PING, 9)
+    assert_eq(WS_PONG, 10)
+    assert_eq(WS_CLOSE_NORMAL, 1000)
+    assert_eq(WS_VERSION, "13")
+}
+
+/// Test that xor8.
+test "xor8" {
+    assert_eq(ws_xor8(104, 1), 105)
+    assert_eq(ws_xor8(255, 255), 0)
+    assert_eq(ws_xor8(0, 77), 77)
+    assert_eq(ws_xor8(170, 85), 255)
+}
+
+/// Test that word masking handles full words and tails.
+test "word masking handles full words and tails" {
+    masked = ws_unmask_words([1, 2, 3, 4, 5, 6], [255, 0, 255, 0])
+    assert_eq(masked[0], 254)
+    assert_eq(masked[1], 2)
+    assert_eq(masked[4], 250)
+    assert_eq(masked[5], 6)
+}
+
+/// Test that unmasked text frame.
+test "unmasked text frame" {
+    wire = ws_encode(ws_text("hi"), 0) or []
+    assert_eq(ws_count(wire), 4)
+    assert_eq(wire[0], 129)
+    assert_eq(wire[1], 2)
+    assert_eq(wire[2], 104)
+    assert_eq(wire[3], 105)
+}
+
+/// Test that masked text frame uses the key.
+test "masked text frame uses the key" {
+    wire = ws_encode(ws_text("hi"), 16909060) or []
+    assert_eq(ws_count(wire), 8)
+    assert_eq(wire[1], 130)
+    assert_eq(wire[2], 1)
+    assert_eq(wire[3], 2)
+    assert_eq(wire[4], 3)
+    assert_eq(wire[5], 4)
+    assert_eq(wire[6], 105)
+    assert_eq(wire[7], 107)
+}
+
+/// Test that decode inverts encode (masked and unmasked).
+test "decode inverts encode (masked and unmasked)" {
+    plain = ws_decode(ws_encode(ws_text("hello"), 0) or []) or ws_close(1, "")
+    assert_eq(plain.opcode, WS_TEXT)
+    #assert(plain.fin)
+    #assert(!(plain.masked))
+    assert_eq(ws_text_of(plain), "hello")
+    masked = ws_decode(ws_encode(ws_text("hello"), 3735928559) or []) or ws_close(1, "")
+    #assert(masked.masked)
+    assert_eq(ws_text_of(masked), "hello")
+}
+
+/// Test that extended 16-bit length.
+test "extended 16-bit length" {
+    body = []
+    for 0..200 { body = arr_push(body, 7) }
+    wire = ws_encode(ws_binary(body), 0) or []
+    assert_eq(wire[1], 126)
+    assert_eq(wire[2], 0)
+    assert_eq(wire[3], 200)
+    assert_eq(ws_count(wire), 204)
+    assert_eq(ws_frame_size(wire), 204)
+    back = ws_decode(wire) or ws_close(1, "")
+    assert_eq(ws_count(back.payload), 200)
+    assert_eq(back.opcode, WS_BINARY)
+}
+
+/// Test that extended 64-bit length header sizing.
+test "extended 64-bit length header sizing" {
+    // 10-byte header announcing a 65536-byte unmasked payload
+    head = [130, 127, 0, 0, 0, 0, 0, 1, 0, 0]
+    assert_eq(ws_frame_size(head), 65546)
+    assert_eq(ws_frame_size([130, 127, 0, 0]), -1)
+    // masked: +4 key bytes
+    assert_eq(ws_frame_size([130, 254, 1, 0]), 4 + 4 + 256)
+}
+
+/// Test that ping / pong.
+test "ping / pong" {
+    ping = ws_ping([9, 8, 7])
+    #assert(ws_is_control(ping))
+    pong = ws_pong_for(ping)
+    assert_eq(pong.opcode, WS_PONG)
+    assert_eq(ws_count(pong.payload), 3)
+    assert_eq(pong.payload[2], 7)
+    wire = ws_encode(pong, 0) or []
+    assert_eq(wire[0], 138)
+}
+
+/// Test that close frames carry a status code.
+test "close frames carry a status code" {
+    f = ws_close(WS_CLOSE_NORMAL, "bye")
+    assert_eq(f.opcode, WS_CLOSE)
+    assert_eq(f.payload[0], 3)
+    assert_eq(f.payload[1], 232)
+    assert_eq(ws_close_code(f), 1000)
+    assert_eq(ws_close_code(ws_text("x")), -1)
+    assert_eq(ws_close_code(ws_frame(WS_CLOSE, [])), -1)
+}
+
+/// Test that control frame rules.
+test "control frame rules" {
+    big = []
+    for 0..126 { big = arr_push(big, 0) }
+    assert_eq(ws_count(ws_encode(ws_ping(big), 0) or []), 0)
+    frag = WsFrame.{fin: false, opcode: WS_PING, masked: false, payload: []}
+    assert_eq(ws_count(ws_encode(frag, 0) or []), 0)
+    cont = WsFrame.{fin: false, opcode: WS_TEXT, masked: false, payload: [65]}
+    assert_eq(ws_count(ws_encode(cont, 0) or []), 3)
+}
+
+/// Test that decode rejects truncated input.
+test "decode rejects truncated input" {
+    assert_eq(ws_frame_size([]), -1)
+    assert_eq(ws_frame_size([129]), -1)
+    assert_eq(ws_frame_size([129, 126, 0]), -1)
+    assert_eq(ws_frame_size([129, 2, 104, 105]), 4)
+    nothing = WsFrame.{fin: true, opcode: 99, masked: false, payload: []}
+    assert_eq((ws_decode([129, 5, 104]) or nothing).opcode, 99)
+    assert_eq((ws_decode([129]) or nothing).opcode, 99)
+}
+
+/// Test that fragmented frame flags survive a round trip.
+test "fragmented frame flags survive a round trip" {
+    f = WsFrame.{fin: false, opcode: WS_TEXT, masked: false, payload: [97, 98]}
+    back = ws_decode(ws_encode(f, 0) or []) or ws_close(1, "")
+    #assert(!(back.fin))
+    assert_eq(back.opcode, WS_TEXT)
+    assert_eq(ws_text_of(back), "ab")
+}
+
+/// Test that handshake validation.
+test "handshake validation" {
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    #assert(ws_check_upgrade("websocket", "Upgrade", key, "13"))
+    #assert(ws_check_upgrade("websocket", "keep-alive, Upgrade", key, "13"))
+    #assert(!(ws_check_upgrade("h2c", "Upgrade", key, "13")))
+    #assert(!(ws_check_upgrade("websocket", "close", key, "13")))
+    #assert(!(ws_check_upgrade("websocket", "Upgrade", "short", "13")))
+    #assert(!(ws_check_upgrade("websocket", "Upgrade", key, "8")))
+}
+
+/// Test that upgrade response layout.
+test "upgrade response layout" {
+    assert_eq(ws_upgrade_response_with("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+    assert_eq(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==") or "no-host", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+    assert_eq(ws_upgrade_response("dGhlIHNhbXBsZSBub25jZQ==") or "no-host", "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+}
+
+/// Test that rooms keep fixed-capacity publish order.
+test "rooms keep fixed-capacity publish order" {
+    room = WsRoom.new(3)
+    #assert(@room.join(10))
+    #assert(@room.join(20))
+    #assert(!(@room.join(10)))
+    #assert(@room.join(30))
+    #assert(!(@room.join(40)))
+    #assert(@room.leave(20))
+    #assert(@room.join(40))
+    ids = room.subscribers()
+    assert_eq(ws_count(ids), 3)
+    assert_eq(ids[0], 10)
+    assert_eq(ids[1], 30)
+    assert_eq(ids[2], 40)
+}

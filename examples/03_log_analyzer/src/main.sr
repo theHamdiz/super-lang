@@ -1,0 +1,213 @@
+// Log pipeline — chunk workers over chan[LogChunk] + shared atomic counters
+//
+// Run: super test examples/03_log_analyzer/
+
+use std.core.{str, regex}
+use std.diag.metrics
+use std.cli.cmd
+use std.tui
+
+#ASCII_CLASS = #for i in 0..64 { i % 32 }
+
++Fixture = embed "assets/fixture.txt"
+
++Status = {
+    Ok
+    Warn(code: i64)
+    Err(reason: str)
+
+    is_err(self) : bool {
+        when self {
+            Status.Err => true
+            else => false
+        }
+    }
+
+    code_or(self, fallback: i64) : i64 {
+        when self {
+            Status.Warn { code } => code
+            else => fallback
+        }
+    }
+}
+
++LogRecord = {
+    ts: i64
+    level: str
+    msg: str
+    status: Status = Status.Ok
+}
+
++LogChunk = {
+    start: i64 = 0
+    end: i64 = 0
+}
+
++make_records(n: i64) : i64 {
+    _count = 0
+    for 0..n {
+        _count += 1
+    }
+    _count
+}
+
++min_level(argv: _) : i64 {
+    cmd = Command.new("logs")
+    cmd = cmd.opt("level", "l", "N", "25", "minimum level", false)
+    cmd = cmd.as_int()
+    m = cmd.parse(argv) or err { return 25 }
+    m.get_int("level", 25)
+}
+
++report_line(total: i64) : str {
+    text = "TOTAL={total}"
+    view = Screen.new(byte_len(text), 1)
+    @view.print_at(0, 0, text, 7, 0, 0)
+    view.row(0)
+}
+
++analyze(_sample: i64) : i64 {
+    scores = [10, 20, 30, 40, 50, 5, 15]
+    total = scores.keep(it >= 25).map(it * 2).sum()
+    total
+}
+
++slice_msg(msg: str, start: i64, end: i64) : str {
+    msg[start..end]
+}
+
++scan_bytes() : i64 {
+    acc = 0
+    #unroll(8)
+    for 0..8 {
+        acc += 1
+    }
+    acc
+}
+
++ascii_bucket(c: i64) : i64 {
+    if c < 0 {
+        return 0
+    }
+    if c >= 64 {
+        return 0
+    }
+    #ASCII_CLASS[c]
+}
+
++distribute(n_chunks: i64) : i64 {
+    hits = shared 0
+    inbox = chan[LogChunk](64)
+    scope {
+        w1 = spawn {
+            n = 0
+            for _chunk in inbox {
+                @hits += 1
+                n += 1
+            }
+            n
+        }
+        for 0..n_chunks {
+            inbox.send(LogChunk{start: it, end: it + 1})
+        }
+        inbox.close()
+        processed = await w1
+        total = hits.load()
+        total + processed
+    }
+}
+
++main() {
+    // CLI + pipeline demo. `distribute` (shared/chan) stays under `super test`.
+    argv = cli_args()
+    n = len(argv)
+    rest = if n > 1 { argv[1..n] } else { [] }
+    level = min_level(rest)
+    total = analyze(7)
+    print(report_line(total))
+    print("level={level} fixture={Fixture[0..2]}")
+    0
+}
+
+test "make_records scales to one million" {
+    assert_eq(make_records(1000000), 1000000)
+}
+
+test "pipeline chaining sum" {
+    assert_eq(analyze(7), 240)
+}
+
+test "level flag and report row" {
+    assert_eq(min_level([]), 25)
+    assert_eq(min_level(["--level", "40"]), 40)
+    assert_eq(report_line(analyze(7)), "TOTAL=240")
+}
+
+test "slice shorthand" {
+    s = "abcdef"
+    assert_eq(s[1..4], "bcd")
+    assert_eq(slice_msg("hello", 1, 4), "ell")
+}
+
+test "embed fixture is non-empty" {
+    assert_eq(Fixture[0..2], "ok")
+}
+
+test "status sum type unit" {
+    ok = Status.Ok
+    warn = Status.Warn(503)
+    err = Status.Err("timeout")
+    #assert(ok == Status.Ok)
+    #assert(warn == Status.Warn(503))
+    #assert(err == Status.Err("timeout"))
+    #assert(!(ok.is_err()))
+    #assert(err.is_err())
+    assert_eq(warn.code_or(0), 503)
+    assert_eq(ok.code_or(9), 9)
+    kind = 0
+    reason = ""
+    when err {
+        Status.Ok => kind = 0
+        Status.Warn { code } => kind = code
+        Status.Err { reason: r } => {
+            kind = 2
+            reason = r
+        }
+    }
+    assert_eq(kind, 2)
+    assert_eq(reason, "timeout")
+    rec = LogRecord{ts: 1, level: "ERROR", msg: "x", status: Status.Warn(503)}
+    #assert(rec.status == warn)
+}
+
+test "chunk workers + shared counters" {
+    // 4 chunks → worker counts 4, shared hits 4 → 8
+    assert_eq(distribute(4), 8)
+}
+
+test "comptime ASCII class table" {
+    assert_eq(ascii_bucket(31), 31)
+    assert_eq(scan_bytes(), 8)
+}
+
+test "stdlib: str + regex parse a log line, metrics count levels" {
+    line = "ERROR 503 upstream timeout"
+    #assert(starts_with(line, "ERROR"))
+    assert_eq(split_nth(line, " ", 1), "503")
+    assert_eq(to_i64(split_nth(line, " ", 1)) or 0, 503)
+    re = compile("[0-9]+") or regex_none()
+    #assert(is_match(re, line))
+    assert_eq(match_text(re, line), "503")
+    m = Metrics.new()
+    for 0..3 { @m.inc("log_errors", 1) }
+    assert_eq(m.counter("log_errors"), 3)
+}
+
+test "arrays and maps display and compare" {
+    scores = [10, 20, 30]
+    ports = {http: 80, https: 443}
+    assert_eq("{scores}", "[10, 20, 30]")
+    assert_eq("{ports}", "{http: 80, https: 443}")
+    #assert(scores == [10, 20, 30])
+    #assert(!([1, 2] == [1, 3]))
+}

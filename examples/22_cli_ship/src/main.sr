@@ -1,0 +1,99 @@
+// CLI — cut a release. The plan is a method on the ship, not a free function.
+//
+// Run: super test examples/22_cli_ship/
+
+use std.cli.cmd
+use std.sys.fs
+use std.core.{collections, str}
+use std.diag.log
+
++Release = {
+    version: str
+    channel: str
+
+    tag(self) : str => "{self.channel}-{self.version}"
+
+    note(self) : str => "ship {self.tag()}"
+}
+
++Ship = {
+    app: str
+
+    command(self) : Command {
+        cmd = Command.new(self.app)
+        cmd = cmd.about("cut and publish a build")
+        cmd = cmd.version("2.4")
+        cmd = cmd.author("Super")
+        cmd = cmd.flag("dry-run", "n", "print the plan and stop")
+        rel = Command.new("release")
+        rel = rel.about("cut a release")
+        rel = rel.pos("version", true, "version tag")
+        rel = rel.opt("channel", "c", "NAME", "stable", "release channel", false)
+        cmd = @cmd.sub(rel)
+        cmd = cmd.after_help("The tag is channel-version. Flags work before or after the command. A dry run writes nothing.")
+        cmd
+    }
+
+    help_page(self) : str => self.command().help()
+
+    plan(self, argv: _) : str {
+        cmd = self.command()
+        m = cmd.parse(argv) or err { return "ship: {err}" }
+        if m.help || m.child().help { return self.help_page() }
+        if m.show_ver || m.child().show_ver { return cmd.version_line() }
+        if m.sub_name != "release" { return self.help_page() }
+        child = m.child()
+        fallback = "0.0.0"
+        built = Release{version: child.pos(0, fallback), channel: child.get("channel")}
+        mode = "live"
+        if m.flag("dry-run") { mode = "dry-run" }
+        "{self.app} {built.note()} {mode}"
+    }
+
+    /// Live releases write `harbor.release`. A dry run only returns the plan.
+    cut(self, argv: _) : str {
+        line = self.plan(argv)
+        if ends_with(line, " live") == false { return line }
+        body = "{line}\n"
+        saved = fs_write_str("harbor.release", body) or err { return "ship: {err}" }
+        if saved { return "{line}\nwrote harbor.release" }
+        line
+    }
+}
+
++main() {
+    lg = Logger.console("ship")
+    tool = Ship{app: "harbor"}
+    argv = cli_args()
+    rest = []
+    n = len(argv)
+    for 1..n { rest = arr_push(rest, argv[it]) }
+    if len(rest) == 0 {
+        @lg.info(tool.help_page())
+        return
+    }
+    @lg.info(tool.cut(rest))
+}
+
+test "a release names its own tag" {
+    rel = Release{version: "1.4.0", channel: "canary"}
+    assert_eq(rel.tag(), "canary-1.4.0")
+    assert_eq(rel.note(), "ship canary-1.4.0")
+}
+
+test "the ship plans a dry run from arguments" {
+    tool = Ship{app: "harbor"}
+    assert_eq(tool.plan(["release", "1.4.0"]), "harbor ship stable-1.4.0 live")
+    assert_eq(tool.plan(["-n", "release", "-c", "canary", "1.4.0"]), "harbor ship canary-1.4.0 dry-run")
+    assert_eq(tool.plan(["release", "-n", "1.4.0"]), "harbor ship stable-1.4.0 dry-run")
+    assert_eq(tool.plan(["release", "-c", "canary", "1.4.0", "-n"]), "harbor ship canary-1.4.0 dry-run")
+    assert_eq(tool.plan(["release", "--version"]), "harbor 2.4")
+}
+
+test "help lists the release subcommand" {
+    tool = Ship{app: "harbor"}
+    text = tool.help_page()
+    #assert(contains(text, "Usage: harbor"))
+    #assert(contains(text, "release"))
+    #assert(contains(text, "dry run"))
+}

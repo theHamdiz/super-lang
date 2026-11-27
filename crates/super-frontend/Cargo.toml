@@ -1,0 +1,14 @@
+[package]
+name = "super-frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lexer, Pratt/RD parser, and single-pass type inference for Super"
+
+[dependencies]
+super-core.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

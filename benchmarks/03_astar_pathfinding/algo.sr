@@ -1,0 +1,114 @@
+// 03_astar — 64×64, 40 queries; reused dense buffers + #inline heap
+use std.core.collections
++S = 64
++CELLS = 4096
++QUERIES = 40
++INF = 0x3FFF_FFFF
+// Module-level direction tables (once) — comptime `#` literals were rematerialized
+// as fresh arena arrays on every neighbor step.
+DIRS_DX = [1, -1, 0, 0]
+DIRS_DY = [0, 0, 1, -1]
+
+#inline
++lcg(@rng): i64 {
+    v = (rng[0] * 1103515245 + 12345) % 2147483648
+    rng[0] = v
+    v
+}
+
+#inline
++abs(x: i64): i64 => x < 0 ? -x : x
+
+#inline
++heur(a: i64, b: i64): i64 => abs(a % S - b % S) + abs(a / S - b / S)
+
+#inline
++heap_push(@heap, @hprio, @hn, node: i64, prio: i64) {
+    i = hn[0]
+    heap[i] = node
+    hprio[i] = prio
+    hn[0] = i + 1
+    while i > 0 {
+        p = (i - 1) / 2
+        if hprio[i] >= hprio[p] { return }
+        heap[i], heap[p] = heap[p], heap[i]
+        hprio[i], hprio[p] = hprio[p], hprio[i]
+        i = p
+    }
+}
+
+#inline
++heap_pop(@heap, @hprio, @hn): i64 {
+    top = heap[0]
+    n = hn[0] - 1
+    hn[0] = n
+    heap[0] = heap[n]
+    hprio[0] = hprio[n]
+    i = 0
+    loop {
+        l = 2 * i + 1
+        r = l + 1
+        sm = i
+        if l < hn[0] { sm = hprio[l] < hprio[sm] ? l : sm }
+        if r < hn[0] { sm = hprio[r] < hprio[sm] ? r : sm }
+        if sm == i { return top }
+        heap[i], heap[sm] = heap[sm], heap[i]
+        hprio[i], hprio[sm] = hprio[sm], hprio[i]
+        i = sm
+    }
+    top
+}
+
+#inline
++astar(@gscore, @came, @heap, @hprio, @hn, walkable, start: i64, goal: i64): i64 {
+    // Bulk fill — avoid per-cell store loops on every query.
+    gscore = arr_memset(gscore, CELLS, INF)
+    came = arr_memset(came, CELLS, 0 - 1)
+    hn[0] = 0
+    gscore[start] = 0
+    heap_push(@heap, @hprio, @hn, start, heur(start, goal))
+    while hn[0] > 0 {
+        cur = heap_pop(@heap, @hprio, @hn)
+        if cur == goal {
+            len, c = 0, goal
+            while c != start && c >= 0 {
+                len += 1
+                c = came[c]
+            }
+            return len
+        }
+        cx, cy = cur % S, cur / S
+        for d in 0..4 {
+            nx, ny = cx + DIRS_DX[d], cy + DIRS_DY[d]
+            if nx >= 0 && ny >= 0 && nx < S && ny < S {
+                ni = ny * S + nx
+                if walkable[ni] == 1 {
+                    tent = gscore[cur] + 1
+                    if tent < gscore[ni] {
+                        came[ni] = cur
+                        gscore[ni] = tent
+                        heap_push(@heap, @hprio, @hn, ni, tent + heur(ni, goal))
+                    }
+                }
+            }
+        }
+    }
+    -1
+}
+
++main() {
+    rng = [10846167]
+    walkable, gscore, came, heap, hprio, hn = [1; 4096], [INF; 4096], [-1; 4096], [0; 4096], [0; 4096], [0]
+    for 0..(CELLS / 5) {
+        cell = lcg(@rng) % CELLS
+        if cell != 0 && cell != CELLS - 1 { walkable[cell] = 0 }
+    }
+    cs = 0
+    for 0..QUERIES {
+        a, b = lcg(@rng) % CELLS, lcg(@rng) % CELLS
+        while walkable[a] == 0 { a = lcg(@rng) % CELLS }
+        while walkable[b] == 0 { b = lcg(@rng) % CELLS }
+        cs += astar(@gscore, @came, @heap, @hprio, @hn, walkable, a, b)
+    }
+    print("CHECKSUM={cs}")
+}

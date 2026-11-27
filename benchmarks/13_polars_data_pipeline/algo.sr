@@ -1,0 +1,67 @@
+// 13_polars_data_pipeline — 64k orders: filter → join → group_by → rolling-mean (fused pass).
+// Pure Super — same algorithm shape as algo.zig (LAW-BENCH-001: no `host`).
+use std.math.core
+use std.core.collections
+
++ROWS = 64000
++CUSTOMERS = 2000
++KNOWN = 1800
++REGIONS = 16
++WINDOW = 8
++AMT_FLOOR = 20.0
++QTY_FLOOR = 1
++ROLL_SCALE = 1024.0
+
++main() {
+    rng = LcgGlibc.{s: 130013}
+    cust, qty, amtq, amt = [0; ROWS], [0; ROWS], [0; ROWS], [0.0; ROWS]
+    for i in 0..ROWS {
+        c = @rng.pick(CUSTOMERS)
+        q = 1 + @rng.pick(9)
+        p = @rng.pick(400)
+        cust[i], qty[i], amtq[i], amt[i] = c, q, q * p, q * p * 0.25
+    }
+    region_of = [0 - 1; CUSTOMERS]
+    for c in 0..KNOWN { region_of[c] = @rng.pick(REGIONS) }
+
+    // Per-region aggregates + ring buffer (flat: region * WINDOW + slot).
+    tot, nn, mx, seen = [0; REGIONS], [0; REGIONS], [0; REGIONS], [0; REGIONS]
+    sum_amt = [0.0; REGIONS]
+    ring = [0.0; REGIONS * WINDOW]
+
+    big, joined, roll_sum, roll_cnt = 0, 0, 0, 0
+    for i in 0..ROWS {
+        if amt[i] >= AMT_FLOOR && qty[i] > QTY_FLOOR {
+            big += 1
+            r = region_of[cust[i]]
+            if r >= 0 {
+                joined += 1
+                tot[r] += amtq[i]
+                nn[r] += 1
+                sum_amt[r] += amt[i]
+                if nn[r] == 1 || amtq[i] > mx[r] { mx[r] = amtq[i] }
+                slot = seen[r] % WINDOW
+                ring[r * WINDOW + slot] = amt[i]
+                seen[r] += 1
+                if seen[r] >= WINDOW {
+                    s = 0.0
+                    base = seen[r] - WINDOW
+                    for k in 0..WINDOW {
+                        s += ring[r * WINDOW + ((base + k) % WINDOW)]
+                    }
+                    roll_sum += to_int(floor(s / 8.0 * ROLL_SCALE))
+                    roll_cnt += 1
+                }
+            }
+        }
+    }
+    cs = big + joined * 3
+    for r in 0..REGIONS {
+        if nn[r] > 0 {
+            avg = sum_amt[r] / nn[r]
+            cs += (r + 1) * (tot[r] + 7 * nn[r] + to_int(floor(avg * ROLL_SCALE)) + 13 * mx[r])
+        }
+    }
+    cs += roll_sum + 5 * roll_cnt
+    print("CHECKSUM={cs}")
+}

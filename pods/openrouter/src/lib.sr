@@ -1,0 +1,102 @@
+//! openrouter — OpenRouter OpenAI-compatible gateway
+//!
+//!   use openrouter
+//!   r = OpenRouter.new("sk-or-…")
+//!   res = @r.chat([ai_user("hi")], "anthropic/claude-sonnet-4")
+
+use std.ai.client
+use std.core.str
+
++OPENROUTER_BASE = "https://openrouter.ai/api"
+
++OpenRouter = {
+    client: AiClient = AiClient.new("openrouter", "", "")
+    site_url: str = ""
+    app_name: str = "super"
+
+    new(api_key: str) : OpenRouter {
+        c = AiClient.new("openrouter", OPENROUTER_BASE, api_key)
+        @c.set_headers(["HTTP-Referer", "https://github.com/super-lang/super", "X-Title", "super"])
+        OpenRouter.{client: c, site_url: "", app_name: "super"}
+    }
+
+    set_offline(@self, on: bool) : bool {
+        c = self.client
+        @c.set_offline(on)
+        self.client = c
+        on
+    }
+
+    set_timeout(@self, ms: i64) : i64 {
+        c = self.client
+        @c.set_timeout(ms)
+        self.client = c
+        ms
+    }
+
+    push_mock(@self, body: str) : i64 {
+        c = self.client
+        n = @c.push_mock(body)
+        self.client = c
+        n
+    }
+
+    -run(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        c = self.client
+        res = @c.request(path, req, body)
+        self.client = c
+        res
+    }
+
+    set_site(@self, url: str, name: str) : str {
+        self.site_url = url
+        self.app_name = name
+        c = self.client
+        @c.set_headers(["HTTP-Referer", url, "X-Title", name])
+        self.client = c
+        name
+    }
+
+    chat_req(@self, req: AiRequest) : AiResponse {
+        body = self.client.chat_body(req)
+        @self.run("/v1/chat/completions", req, body)
+    }
+
+    chat(@self, messages: _, model: str) : AiResponse {
+        @self.chat_req(ai_chat_req(model, messages, 1024))
+    }
+
+    chat_system(@self, system: str, messages: _, model: str) : AiResponse {
+        req = ai_chat_req(model, messages, 1024)
+        req.system = system
+        @self.chat_req(req)
+    }
+
+    complete(@self, prompt: str, model: str) : AiResponse {
+        @self.chat([ai_user(prompt)], model)
+    }
+
+    chat_tools(@self, messages: _, model: str, tools: _) : AiResponse {
+        req = ai_chat_req(model, messages, 2048)
+        req.tools = tools
+        @self.chat_req(req)
+    }
+}
+
+test "openrouter chat offline" {
+    r = OpenRouter.new("sk-or-test")
+    @r.push_mock("{\"choices\":[{\"message\":{\"content\":\"via-router\"}}]}")
+    res = @r.chat([ai_user("hi")], "openai/gpt-4o-mini")
+    assert_eq(res.text, "via-router")
+    #assert(contains(r.client.last_url, "openrouter.ai"))
+}
+
+test "openrouter site headers" {
+    r = OpenRouter.new("k")
+    @r.set_site("https://example.com", "demo")
+    hs = r.client.extra_headers
+    joined = ""
+    for hs { joined = joined + it + "|" }
+    #assert(contains(joined, "https://example.com"))
+    #assert(contains(joined, "demo"))
+}

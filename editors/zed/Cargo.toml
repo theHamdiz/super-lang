@@ -1,0 +1,16 @@
+[package]
+name = "zed_super"
+version = "0.1.7"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Standalone crate — not part of the Super compiler workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+zed_extension_api = "0.7.0"

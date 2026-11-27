@@ -1,0 +1,239 @@
+//! std.html -- context-aware XSS-safe HTML templating
+//!
+//! Escaping is the default. Raw HTML only through unsafe_raw (greppable).
+//! Import: use std.html
+//!
+//!   page = html_document("Hi", p([text("Hello")]))
+//!   s = render(page)
+
+use std.core.str
+use std.core.collections
+
++escape_text_entity_amp() : str => "&amp;"
++escape_text_entity_lt() : str => "&lt;"
++escape_text_entity_gt() : str => "&gt;"
++escape_text_entity_quot() : str => "&quot;"
++escape_text_entity_apos() : str => "&#39;"
+
+/// Map one input character to its HTML text entity (or passthrough).
++escape_text_entity(c: str) : str {
+    if c == "&" { return escape_text_entity_amp() }
+    if c == "<" { return escape_text_entity_lt() }
+    if c == ">" { return escape_text_entity_gt() }
+    if c == "\"" { return escape_text_entity_quot() }
+    if c == "'" { return escape_text_entity_apos() }
+    c
+}
+
+/// Append escaped entity for character `c` onto `acc`.
++escape_text_append(acc: str, c: str) : str {
+    ent = escape_text_entity(c)
+    if acc == "" && ent == escape_text_entity_amp() { return escape_text_entity_amp() }
+    if acc == "" && ent == escape_text_entity_lt() { return escape_text_entity_lt() }
+    if acc == "" && ent == escape_text_entity_gt() { return escape_text_entity_gt() }
+    acc + ent
+}
+
+/// Escape for HTML text nodes (& < > " ').
++escape_text(s: str) : str {
+    out = ""
+    n = byte_len(s)
+    for 0..n {
+        out = escape_text_append(out, s[it])
+    }
+    out
+}
+
+/// Escape for double-quoted HTML attribute values.
++escape_attr(s: str) : str => escape_text(s)
+
+/// Escape for URL contexts; reject dangerous schemes.
++escape_url(s: str) : str! {
+    low = ""
+    n = host.sys_str_len(s)
+    lim = n
+    if lim > 16 { lim = 16 }
+    for 0..lim {
+        cp = host.sys_ord(s[it])
+        if cp >= 65 && cp <= 90 { cp = cp + 32 }
+        low = low + host.sys_chr(cp)
+    }
+    ensure !starts_with(low, "javascript:") else {
+        fail "html: javascript: URLs are blocked"
+        return
+    }
+    ensure !starts_with(low, "data:text/html") else {
+        fail "html: data:text/html URLs are blocked"
+        return
+    }
+    ensure !starts_with(low, "vbscript:") else {
+        fail "html: vbscript: URLs are blocked"
+        return
+    }
+    out = ""
+    for 0..n {
+        cp = host.sys_ord(s[it])
+        ok = (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122)
+        ok = ok || cp == 45 || cp == 46 || cp == 95 || cp == 126 || cp == 47 || cp == 58 || cp == 63 || cp == 61 || cp == 38
+        if ok {
+            out = out + s[it]
+        } else {
+            out = out + "%" + html_hex2(cp)
+        }
+    }
+    out
+}
+
+/// Escape for JS string literals inside script tags / event handlers.
++escape_js(s: str) : str {
+    out = ""
+    n = host.sys_str_len(s)
+    for 0..n {
+        c = s[it]
+        cp = host.sys_ord(c)
+        when c {
+            "\\" => out = out + "\\\\"
+            "\"" => out = out + "\\\""
+            "'" => out = out + "\\'"
+            "<" => out = out + "\\u003c"
+            ">" => out = out + "\\u003e"
+            "&" => out = out + "\\u0026"
+            "/" => out = out + "\\/"
+            else => {
+                if cp < 32 {
+                    out = out + "\\u" + html_hex4(cp)
+                } else {
+                    out = out + c
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Escape for CSS string contexts.
++escape_css(s: str) : str {
+    out = ""
+    n = host.sys_str_len(s)
+    for 0..n {
+        cp = host.sys_ord(s[it])
+        ok = (cp >= 48 && cp <= 57) || (cp >= 65 && cp <= 90) || (cp >= 97 && cp <= 122) || cp == 45 || cp == 95
+        if ok {
+            out = out + s[it]
+        } else {
+            out = out + "\\" + html_hex6(cp) + " "
+        }
+    }
+    out
+}
+
++HTML_HEX = "0123456789ABCDEF"
+
++html_hex2(v: i64) : str => HTML_HEX[(v / 16) % 16] + HTML_HEX[v % 16]
++html_hex4(v: i64) : str => html_hex2((v / 256) % 256) + html_hex2(v % 256)
++html_hex6(v: i64) : str => html_hex2((v / 65536) % 256) + html_hex4(v % 65536)
+
+/// HTML node kinds. Attributes are flat `[key, value, …]` pairs.
+Html = {
+    Text(s: str)
+    /// Greppable unsafe path -- caller asserts the payload is already trusted.
+    UnsafeRaw(s: str)
+    Elem(tag: str, attrs: _, children: _)
+}
+
+/// Text node (escaped on render).
++text(s: str) : Html => Html.Text(s)
+
+/// Explicit unsafe raw HTML injection (search for `unsafe_raw` / `UnsafeRaw`).
++unsafe_raw(s: str) : Html => Html.UnsafeRaw(s)
+
+/// Element with flat attribute pairs and child list.
++elem(tag: str, attrs: _, children: _) : Html => Html.Elem(tag, attrs, children)
+
++p(children: _) : Html => elem("p", [], children)
++div(children: _) : Html => elem("div", [], children)
++span(children: _) : Html => elem("span", [], children)
+
++a(href: str, children: _) : Html! {
+    safe = escape_url(href) or err {
+        fail err
+        return
+    }
+    elem("a", ["href", safe], children)
+}
+
+/// Render a node tree to an HTML string (XSS-safe by default).
++render(node: Html) : str {
+    when node {
+        Html.Text { s } => escape_text(s)
+        Html.UnsafeRaw { s } => s
+        Html.Elem { tag, attrs, children } => {
+            out = "<" + tag
+            an = host.sys_arr_len(attrs)
+            i = 0
+            for 0..(an / 2) {
+                k = attrs[i]
+                v = attrs[i + 1]
+                out = out + " " + k + "=\"" + escape_attr("{v}") + "\""
+                i = i + 2
+            }
+            out = out + ">"
+            cn = host.sys_arr_len(children)
+            for 0..cn {
+                out = out + render(children[it])
+            }
+            out + "</" + tag + ">"
+        }
+        else => ""
+    }
+}
+
+/// Minimal HTML5 document shell.
++html_document(title: str, body: Html) : str => "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" + escape_text(title) + "</title></head><body>" + render(body) + "</body></html>"
+
+test "text context escapes angle brackets and ampersands" {
+    assert_eq(escape_text("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;")
+    assert_eq(escape_text("a&b"), "a&amp;b")
+    assert_eq(escape_text("\"q\""), "&quot;q&quot;")
+}
+
+test "attr context escapes quotes" {
+    s = render(elem("div", ["title", "x\" onmouseover=\"alert(1)"], []))
+    // Escaped quotes mean the handler cannot break out of the attribute.
+    #assert(contains(s, "&quot;"))
+    #assert(!(contains(s, "title=\"x\" onmouseover")))
+}
+
+test "url context blocks javascript scheme" {
+    bad = false
+    _ = escape_url("javascript:alert(1)") or err {
+        bad = true
+        ""
+    }
+    #assert(bad)
+    ok = escape_url("https://example.com/a?b=1") or ""
+    assert_eq(ok, "https://example.com/a?b=1")
+}
+
+test "js context escapes line terminators and tags" {
+    s = escape_js("</script>")
+    #assert(!(contains(s, "<")))
+    #assert(contains(s, "\\u003c"))
+}
+
+test "css context escapes quotes and parens" {
+    s = escape_css("x); background:url(evil)")
+    #assert(!(contains(s, ")")))
+}
+
+test "unsafe_raw is greppable and unescaped" {
+    s = render(unsafe_raw("<b>ok</b>"))
+    assert_eq(s, "<b>ok</b>")
+}
+
+test "document render escapes title" {
+    page = html_document("<hi>", text("body&"))
+    #assert(!(contains(page, "<hi>")))
+    #assert(contains(page, "&lt;hi&gt;"))
+    #assert(contains(page, "body&amp;"))
+}

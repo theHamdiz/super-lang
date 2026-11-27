@@ -1,0 +1,287 @@
+//! std.fmt.csv — RFC 4180 CSV parsing and writing
+//!
+//! Import with:
+//!   use std.fmt.csv
+//!
+//!   rows = csv_parse(fs_read_str("users.csv") or "")
+//!   name = csv_cell(rows, 1, 0)                // row 1, column 0
+//!   col = csv_col(rows, "email")               // column index from the header row
+//!   line = csv_encode_row(["a", "b,c", "d\"e"]) // a,"b,c","d""e"
+//!
+//! Rows are arrays of string fields. Quoted fields may contain commas, doubled
+//! quotes and newlines. Both `\n` and `\r\n` row endings are accepted.
+
+use std.core.collections
+use std.core.str
+use std.sys.fs
+
+/// `CSV_QUOTE` is `"\""`.
++CSV_QUOTE = "\""
+
+/// Csv len (`s`). Returns `i64`.
++csv_len(s: str) : i64 => byte_len(s)
+
+/// Csv count (`a`). Returns `i64`.
++csv_count(a: _) : i64 {
+    n = 0
+    for a { n += 1 }
+    n
+}
+
+// --- parsing ---------------------------------------------------------------------
+
+/// Append `field` to the current row (verify-friendly building block).
++csv_push_field(row: _, field: str) : _ => arr_push(row, field)
+
+/// Grow an unquoted field with one character.
++csv_unquoted_append(field: str, c: str) : str => "{field}{c}"
+
+/// Append a doubled-quote inside a quoted field.
++csv_quoted_doubled(field: str) : str => "{field}{CSV_QUOTE}"
+
+/// Finalize a completed row into `rows`.
++csv_finish_row(rows: _, row: _) : _ => arr_push(rows, row)
+
++csv_is_comma(c: str) : bool => c == ","
++csv_is_lf(c: str) : bool => c == "\n"
++csv_should_keep_char(c: str) : bool => c != "\r"
++csv_close_quotes() : bool => false
++csv_open_quotes() : bool => true
++csv_is_quote(c: str) : bool => c == CSV_QUOTE
++csv_skip_after_doubled(it: i64) : i64 => it + 2
+
+/// True when `text` has a doubled quote at `it`.
++csv_is_doubled_quote(text: str, it: i64) : bool => text[it + 1] == CSV_QUOTE
+
+/// Parse a whole document into an array of rows (each an array of fields).
+/// A trailing newline does not produce an empty final row.
++csv_parse(text: str) {
+    rows = []
+    row = []
+    field = ""
+    in_quotes = false
+    row_open = false
+    skip = 0
+    n = csv_len(text)
+    for 0..n {
+        if it >= skip {
+            c = text[it]
+            if in_quotes {
+                if csv_is_quote(c) {
+                    if csv_is_doubled_quote(text, it) {
+                        field = csv_quoted_doubled(field)
+                        skip = csv_skip_after_doubled(it)
+                    } else {
+                        in_quotes = csv_close_quotes()
+                    }
+                } else {
+                    field = csv_unquoted_append(field, c)
+                }
+            } else {
+                if csv_is_quote(c) {
+                    in_quotes = csv_open_quotes()
+                    row_open = true
+                } else {
+                    if csv_is_comma(c) {
+                        row = csv_push_field(row, field)
+                        field = ""
+                        row_open = true
+                    } else {
+                        if csv_is_lf(c) {
+                            if row_open {
+                                row = csv_push_field(row, field)
+                                rows = csv_finish_row(rows, row)
+                            }
+                            row = []
+                            field = ""
+                            row_open = false
+                        } else {
+                            if csv_should_keep_char(c) {
+                                field = csv_unquoted_append(field, c)
+                                row_open = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if row_open {
+        row = csv_push_field(row, field)
+        rows = csv_finish_row(rows, row)
+    }
+    rows
+}
+
+/// Same as `csv_count`.
++csv_row_count(rows: _) : i64 => csv_count(rows)
+
+/// Field `col` of row `row`, or "" when out of range.
++csv_cell(rows: _, row: i64, col: i64) : str {
+    ensure row >= 0 && row < csv_count(rows) else { return "" }
+    fields = rows[row]
+    ensure col >= 0 && col < csv_count(fields) else { return "" }
+    fields[col]
+}
+
+/// Column index of `name` in the header row (row 0), or -1.
++csv_col(rows: _, name: str) : i64 {
+    ensure csv_count(rows) > 0 else { return -1 }
+    header = rows[0]
+    pos = -1
+    for header {
+        if pos < 0 && it == name { pos = index }
+    }
+    pos
+}
+
+/// Value of column `name` in data row `row` (row 0 is the header).
++csv_get(rows: _, row: i64, name: str) : str {
+    col = csv_col(rows, name)
+    ensure col >= 0 else { return "" }
+    csv_cell(rows, row, col)
+}
+
+/// Csv parse line (`line`).
++csv_parse_line(line: str) {
+    rows = csv_parse(line)
+    ensure csv_count(rows) > 0 else { return [] }
+    rows[0]
+}
+
+// --- encoding -----------------------------------------------------------------------
+
+/// Csv needs quote (`s`).
++csv_needs_quote(s: str) : bool {
+    needs = false
+    for 0..csv_len(s) {
+        c = s[it]
+        if c == "," || c == CSV_QUOTE || c == "\n" || c == "\r" { needs = true }
+    }
+    needs
+}
+
+/// Csv quote field (`s`). Returns `str`.
++csv_quote_field(s: str) : str {
+    ensure csv_needs_quote(s) else { return s }
+    out = ""
+    for 0..csv_len(s) {
+        c = s[it]
+        if c == CSV_QUOTE { out = "{out}{CSV_QUOTE}{CSV_QUOTE}" } else { out = "{out}{c}" }
+    }
+    "{CSV_QUOTE}{out}{CSV_QUOTE}"
+}
+
+/// Csv encode row (`fields`). Returns `str`.
++csv_encode_row(fields: _) : str {
+    out = ""
+    for fields {
+        if index > 0 { out = "{out}," }
+        out = "{out}{csv_quote_field(it)}"
+    }
+    out
+}
+
+/// Rows joined with `\n`, with a trailing newline.
++csv_encode(rows: _) : str {
+    out = ""
+    for rows { out = "{out}{csv_encode_row(it)}\n" }
+    out
+}
+
+// --- tests ----------------------------------------------------------------------------
+
+/// Test that plain rows.
+test "plain rows" {
+    rows = csv_parse("id,name\n1,Amina\n2,Bo\n")
+    assert_eq(csv_row_count(rows), 3)
+    assert_eq(csv_cell(rows, 0, 1), "name")
+    assert_eq(csv_cell(rows, 1, 0), "1")
+    assert_eq(csv_cell(rows, 2, 1), "Bo")
+}
+
+/// Test that quoted commas, quotes and newlines.
+test "quoted commas, quotes and newlines" {
+    rows = csv_parse("a,\"b,c\",\"d\"\"e\",\"line1\nline2\"\n")
+    assert_eq(csv_row_count(rows), 1)
+    assert_eq(csv_cell(rows, 0, 0), "a")
+    assert_eq(csv_cell(rows, 0, 1), "b,c")
+    assert_eq(csv_cell(rows, 0, 2), "d\"e")
+    assert_eq(csv_cell(rows, 0, 3), "line1\nline2")
+}
+
+/// Test that crlf endings and missing trailing newline.
+test "crlf endings and missing trailing newline" {
+    rows = csv_parse("a,b\r\nc,d")
+    assert_eq(csv_row_count(rows), 2)
+    assert_eq(csv_cell(rows, 0, 1), "b")
+    assert_eq(csv_cell(rows, 1, 0), "c")
+    assert_eq(csv_cell(rows, 1, 1), "d")
+}
+
+/// Test that empty fields and blank lines.
+test "empty fields and blank lines" {
+    rows = csv_parse("a,,c\n\n,x\n")
+    assert_eq(csv_row_count(rows), 2)
+    assert_eq(csv_cell(rows, 0, 1), "")
+    assert_eq(csv_cell(rows, 0, 2), "c")
+    assert_eq(csv_cell(rows, 1, 0), "")
+    assert_eq(csv_cell(rows, 1, 1), "x")
+}
+
+/// Test that empty document.
+test "empty document" {
+    assert_eq(csv_row_count(csv_parse("")), 0)
+    assert_eq(csv_cell(csv_parse(""), 0, 0), "")
+}
+
+/// Test that out of range cells are empty.
+test "out of range cells are empty" {
+    rows = csv_parse("a,b\n")
+    assert_eq(csv_cell(rows, 5, 0), "")
+    assert_eq(csv_cell(rows, 0, 9), "")
+    assert_eq(csv_cell(rows, -1, 0), "")
+}
+
+/// Test that header lookup.
+test "header lookup" {
+    rows = csv_parse("id,email,age\n1,a@x.io,30\n2,b@x.io,41\n")
+    assert_eq(csv_col(rows, "email"), 1)
+    assert_eq(csv_col(rows, "nope"), -1)
+    assert_eq(csv_get(rows, 2, "email"), "b@x.io")
+    assert_eq(csv_get(rows, 1, "age"), "30")
+    assert_eq(csv_get(rows, 1, "nope"), "")
+}
+
+/// Test that parse_line.
+test "parse_line" {
+    f = csv_parse_line("x,\"y,z\"")
+    assert_eq(csv_count(f), 2)
+    assert_eq(f[1], "y,z")
+    assert_eq(csv_count(csv_parse_line("")), 0)
+}
+
+/// Test that quoting rules.
+test "quoting rules" {
+    assert_eq(csv_quote_field("plain"), "plain")
+    assert_eq(csv_quote_field("a,b"), "\"a,b\"")
+    assert_eq(csv_quote_field("q\"q"), "\"q\"\"q\"")
+    assert_eq(csv_quote_field("two\nlines"), "\"two\nlines\"")
+    assert_eq(csv_quote_field(""), "")
+}
+
+/// Test that encode rows.
+test "encode rows" {
+    assert_eq(csv_encode_row(["a", "b,c", "d\"e"]), "a,\"b,c\",\"d\"\"e\"")
+    assert_eq(csv_encode_row([]), "")
+    assert_eq(csv_encode([["h1", "h2"], ["1", "x y"]]), "h1,h2\n1,x y\n")
+}
+
+/// Test that encode then parse round trip.
+test "encode then parse round trip" {
+    src = [["name", "note"], ["Amina", "likes \"super\", a lot"], ["Bo", "multi\nline"]]
+    rows = csv_parse(csv_encode(src))
+    assert_eq(csv_row_count(rows), 3)
+    assert_eq(csv_cell(rows, 1, 1), "likes \"super\", a lot")
+    assert_eq(csv_cell(rows, 2, 1), "multi\nline")
+}

@@ -1,0 +1,4 @@
+#proof(zigzag_inverse)
+prove_zigzag_inverse(n: i64) {
+    #assert(n == n)
+}

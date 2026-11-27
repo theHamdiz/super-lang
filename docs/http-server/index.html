@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/http-server/"/>
+<meta name="description" content="Typed routes and the App.serve path."/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="Super · HTTP server"/>
+<meta property="og:description" content="Typed routes and the App.serve path."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/http-server/"/>
+<link rel="stylesheet" href="../site.css"/>
+<title>Super · HTTP server</title>
+</head>
+<body>
+<header class="site-nav">
+  <a class="mark" href="../">Super</a>
+  <nav><a href="../">Home</a><a href="../quickstart/">Quickstart</a><a href="../docs-hub/" aria-current="page">Docs</a><a href="../spec/">Spec</a><a href="../benchmarks/">Benchmarks</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a></nav>
+  <a class="cta" href="../quickstart/">Quickstart</a>
+</header>
+<section class="section">
+<h1>Build an HTTP server</h1>
+<p>Route handlers have the static type <code>Fn[http.Request, http.Response]</code>. A route with the wrong arity or return type is rejected before the server starts.</p>
+<pre class="sr-block"><code class="language-sr">use std.net.http
+
+app = #routes {
+  get "/health" {
+    http.ok({status: "ok"})
+  }
+}
+
+@app.serve("127.0.0.1:8080")</code></pre>
+<p><code>#routes { ... }</code> builds an <code>App</code> through typed calls and rejects duplicate method/path pairs. The clean route methods are <code>get</code>, <code>post</code>, <code>put</code>, <code>patch</code>, and <code>delete</code>.</p>
+<p><code>App.serve(address)</code> is the normal serving path. It installs graceful signal handling and uses the default server limits. Use <code>serve_with(address, ServeConfig)</code> to override limits. Applications that need direct lifecycle control may use <code>http.Server</code> and <code>sys.signal.Notify</code>.</p>
+<p>This path is not allocation-free yet. Measured on the C23 AOT build, the hello server makes 256 heap allocations per request and frees 7 of them, so memory grows with the number of requests served. A test pins these counts. Request-scoped reclamation is not implemented; see the 0.1.0 changelog.</p>
+<p><strong>Windows C23 AOT sockets: Winsock2 (WSAPoll) in 0.1.0.</strong> Treat production HTTP on Windows as Rust-hosted VM only until native Windows AOT socket CI is green.</p>
+<p><strong>Next:</strong> <a href="../testing/">Test the API</a> · <strong>Related:</strong> <a href="../api-style/">API style</a> · <a href="../platform/">Platform support</a></p>
+</section>
+<footer class="site-footer"><p>Super 0.1.0 · <a href="../">Home</a></p></footer>
+</body>
+</html>

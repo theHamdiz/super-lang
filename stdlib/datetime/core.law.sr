@@ -1,0 +1,31 @@
+//! Laws for std.datetime.core — real-body leap / month / civil day counts.
+//! AI agents must not edit this file; put discharges in `core.proof.sr`.
+
+#law("leap year 2000 via is_leap_year")
+datetime_leap_2000() {
+    #assert(is_leap_year(2000))
+    #assert(!is_leap_year(1900))
+    #assert(is_leap_year(2004))
+    #assert(!is_leap_year(2001))
+}
+
+#law("January always has 31 days")
+datetime_days_january() {
+    #assert(days_in_month(2024, 1) == 31)
+}
+
+#law("February length follows leap rule")
+datetime_feb_leap() {
+    #assert(days_in_month(2000, 2) == 29)
+    #assert(days_in_month(1900, 2) == 28)
+    #assert(days_in_month(2024, 2) == 29)
+    #assert(days_in_month(2023, 2) == 28)
+}
+
+#law("days_from_civil epoch day zero is 1970-01-01")
+datetime_epoch_day0() {
+    #assert(days_from_civil(1970, 1, 1) == 0)
+    // March exercises the `m > 2` / `m - 3` branch (kills flip_sub survivors).
+    #assert(days_from_civil(1970, 3, 1) == 59)
+    #assert(days_from_civil(1970, 2, 1) == 31)
+}

@@ -1,0 +1,283 @@
+//! std.net.udp — blocking UDP bind / send_to / recv_from
+//!
+//! Import with:
+//!   use std.net.udp
+//!
+//!   s = UdpSocket.bind("127.0.0.1:0") or err { return }
+//!   @s.send_to("hi", "127.0.0.1:9000")
+//!   msg = @s.recv(2048) or err { return }
+//!   // msg.data (bytes), msg.addr ("ip:port" of the sender)
+//!
+//! Datagram boundaries are preserved: one `recv` returns one datagram, truncated to `max`
+//! bytes when it is larger. Give a socket a deadline with `set_timeout` (a `recv` that
+//! exceeds it returns an error value and the socket stays usable).
+//!
+//! Game-oriented sequenced packets live in `use std.game.netcode`.
+
+use std.io.socket
+use std.net.tcp
+
+/// `UdpSocket` is a bound UDP socket.
++UdpSocket = {
+    /// Bound socket descriptor. Defaults to `-1`.
+    fd: i64 = -1
+    /// The address actually bound (`127.0.0.1:0` resolves to the real port).
+    addr: str = ""
+    /// True after `close`. Defaults to `false`.
+    closed: bool = false
+
+    /// Bind to `addr` and return the listening socket, or fail.
+    bind(addr: str) : UdpSocket! {
+        fd = socket_udp_bind(addr) or err {
+            fail "{err}"
+            return
+        }
+        bound = socket_local_addr(fd) or addr
+        UdpSocket.{fd, addr: bound, closed: false}
+    }
+
+    /// Same as `tcp_port_of`.
+    port(self) : i64 => tcp_port_of(self.addr)
+
+    /// Local addr on this `UdpSocket`. Returns `str`.
+    local_addr(self) : str => self.addr
+
+    /// `data` is text, bytes or a byte array; returns the byte count sent.
+    send_to(@self, data: _, addr: str) : i64! {
+        ensure !(self.closed) else {
+            fail "socket closed"
+            return
+        }
+        n = socket_udp_send_to(self.fd, data, addr) or err {
+            fail "{err}"
+            return
+        }
+        n
+    }
+
+    /// One datagram as a struct `{data, addr}`.
+    recv(@self, max: i64) : _! {
+        ensure !(self.closed) else {
+            fail "socket closed"
+            return
+        }
+        msg = socket_udp_recv_from(self.fd, max) or err {
+            fail "{err}"
+            return
+        }
+        msg
+    }
+
+    /// One datagram's payload as text (the sender address is dropped).
+    recv_text(@self, max: i64) : str! {
+        msg = @self.recv(max) or none
+        ensure msg != none else {
+            fail "recv failed"
+            return
+        }
+        socket_buf_text(msg.data)
+    }
+
+    /// Deadlines in milliseconds; `<= 0` clears that direction.
+    set_timeout(self, read_ms: i64, write_ms: i64) : bool! {
+        ok = socket_set_timeout(self.fd, read_ms, write_ms) or err {
+            fail "{err}"
+            return
+        }
+        ok
+    }
+
+    /// Close this `UdpSocket` and release the underlying resource.
+    close(@self) : bool {
+        if (self.closed) { return false }
+        self.closed = true
+        socket_fd_close(self.fd)
+        true
+    }
+}
+
+/// Same as `tcp_addr`.
++udp_addr(host: str, port: i64) : str => tcp_addr(host, port)
+
+// --- tests -------------------------------------------------------------------------
+
+/// Test that addr helper.
+test "addr helper" {
+    assert_eq(udp_addr("0.0.0.0", 53), "0.0.0.0:53")
+    assert_eq(udp_addr("::1", 53), "[::1]:53")
+}
+
+/// Test that bind resolves port 0 and refuses a taken or malformed address.
+test "bind resolves port 0 and refuses a taken or malformed address" {
+    a = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    #assert(a.port() > 0)
+    assert_eq(tcp_host_of(a.local_addr()), "127.0.0.1")
+    b = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    #assert(!(a.port() == b.port()))
+    clash = UdpSocket.bind("127.0.0.1:{a.port()}") or "taken"
+    #assert(clash == "taken")
+    junk = UdpSocket.bind("not an address") or "bad"
+    #assert(junk == "bad")
+    @a.close()
+    @b.close()
+}
+
+/// Test that datagram round trip reports the sender and replies reach it.
+test "datagram round trip reports the sender and replies reach it" {
+    a = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    b = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(@a.send_to("super-é", "127.0.0.1:{b.port()}") or -1, 8)
+    msg = @b.recv(64) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(msg.data), "super-é")
+    assert_eq(msg.addr, a.local_addr())
+    assert_eq(@b.send_to("ack", msg.addr) or -1, 3)
+    back = @a.recv_text(64) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(back, "ack")
+    @a.close()
+    @b.close()
+}
+
+/// Test that message boundaries are preserved and order holds on loopback.
+test "message boundaries are preserved and order holds on loopback" {
+    a = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    b = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    to = "127.0.0.1:{b.port()}"
+    @a.send_to("one", to)
+    @a.send_to("two-two", to)
+    @a.send_to("3", to)
+    assert_eq(@b.recv_text(64) or "?", "one")
+    assert_eq(@b.recv_text(64) or "?", "two-two")
+    assert_eq(@b.recv_text(64) or "?", "3")
+    for 0..20 { @a.send_to("seq-{it}", to) }
+    for 0..20 {
+        n = it
+        assert_eq(@b.recv_text(64) or "?", "seq-{n}")
+    }
+    @a.close()
+    @b.close()
+}
+
+/// Test that a datagram larger than max is truncated and the rest dropped.
+test "a datagram larger than max is truncated and the rest dropped" {
+    a = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    b = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    to = "127.0.0.1:{b.port()}"
+    @a.send_to("0123456789", to)
+    @a.send_to("next", to)
+    assert_eq(@b.recv_text(4) or "?", "0123")
+    assert_eq(@b.recv_text(64) or "?", "next")
+    @a.close()
+    @b.close()
+}
+
+/// Test that empty and binary datagrams survive intact.
+test "empty and binary datagrams survive intact" {
+    a = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    b = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    to = "127.0.0.1:{b.port()}"
+    assert_eq(@a.send_to("", to) or -1, 0)
+    empty = @b.recv(64) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_len(empty.data), 0)
+    assert_eq(@a.send_to([0, 1, 254, 255], to) or -1, 4)
+    bin = @b.recv(64) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(host.sys_hex_encode(bin.data), "0001feff")
+    @a.close()
+    @b.close()
+}
+
+/// Test that recv honours its deadline and recovers.
+test "recv honours its deadline and recovers" {
+    a = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    b = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    #assert(b.set_timeout(30, 0) or false)
+    idle = @b.recv_text(8) or "timeout"
+    #assert(idle == "timeout")
+    @a.send_to("late", "127.0.0.1:{b.port()}")
+    assert_eq(@b.recv_text(8) or "?", "late")
+    #assert(b.set_timeout(0, 0) or false)
+    @a.close()
+    @b.close()
+}
+
+/// Test that closed sockets refuse work.
+test "closed sockets refuse work" {
+    a = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    #assert(@a.close())
+    #assert(!(@a.close()))
+    assert_eq(@a.send_to("x", "127.0.0.1:9") or -1, -1)
+    assert_eq(@a.recv(8) or "closed", "closed")
+}
+
+/// Test that many sockets keep independent queues.
+test "many sockets keep independent queues" {
+    hub = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    x = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    y = UdpSocket.bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    @hub.send_to("for-x", "127.0.0.1:{x.port()}")
+    @hub.send_to("for-y", "127.0.0.1:{y.port()}")
+    assert_eq(@y.recv_text(16) or "?", "for-y")
+    assert_eq(@x.recv_text(16) or "?", "for-x")
+    @hub.close()
+    @x.close()
+    @y.close()
+}

@@ -1,0 +1,144 @@
+// 17_log_ingest_pipeline — chunked synthetic ingestion and streaming aggregates.
+
+use std.diag.log
+
++RECORD_COUNT = 200000
++SERVICE_COUNT = 16
++STATUS_COUNT = 4
++CHUNK_SIZE = 1000
+
+Status = {
+    Accepted
+    Retried(delay_ms: i64)
+    Rejected(reason: str)
+}
+
++LogRecord = {
+    timestamp: i64 = 0
+    service: i64 = 0
+    status: i64 = 0
+    latency_ms: i64 = 0
+    bytes: i64 = 0
+}
+
++make_record(index: i64) : LogRecord {
+    status = 0
+    if index % 97 == 0 {
+        status = 3
+    }
+    if index % 97 != 0 && index % 19 == 0 {
+        status = 2
+    }
+    if index % 97 != 0 && index % 19 != 0 && index % 7 == 0 {
+        status = 1
+    }
+    LogRecord{
+        timestamp: 1700000000 + index,
+        service: index % SERVICE_COUNT,
+        status,
+        latency_ms: (index * 37) % 500,
+        bytes: 80 + (index * 13) % 1400,
+    }
+}
+
++classify_latency(latency_ms: i64) : i64 {
+    return 0 if latency_ms < 100
+    return 1 if latency_ms < 250
+    return 2 if latency_ms < 400
+    3
+}
+
++ingest_chunk(start: i64, end: i64, @service_hits, @status_hits, @latency_buckets) : i64 {
+    byte_sum = 0
+    for index in start..end {
+        record = make_record(index)
+        service_hits[record.service] += 1
+        status_hits[record.status] += 1
+        latency_buckets[classify_latency(record.latency_ms)] += 1
+        byte_sum += record.bytes
+    }
+    byte_sum
+}
+
++pipeline_example() : i64 {
+    latencies = [10, 220, 15, 410, 90, 330, 40, 170]
+    latencies.keep(it >= 100).map(it / 10).sum()
+}
+
++group_key(service: i64, status: i64) : i64 {
+    service * STATUS_COUNT + status
+}
+
++run_pipeline(records: i64) : i64 {
+    service_hits = [0; SERVICE_COUNT]
+    status_hits = [0; STATUS_COUNT]
+    latency_buckets = [0; STATUS_COUNT]
+    byte_sum = 0
+    chunks = records / CHUNK_SIZE
+    for chunk in 0..chunks {
+        start = chunk * CHUNK_SIZE
+        byte_sum += ingest_chunk(
+            start,
+            start + CHUNK_SIZE,
+            @service_hits,
+            @status_hits,
+            @latency_buckets,
+        )
+    }
+    remainder = chunks * CHUNK_SIZE
+    if remainder < records {
+        byte_sum += ingest_chunk(
+            remainder,
+            records,
+            @service_hits,
+            @status_hits,
+            @latency_buckets,
+        )
+    }
+    hot_services = service_hits.keep(it > 0).map(it * 3).sum()
+    byte_sum + hot_services + (status_hits.sum()) * 17 + (latency_buckets.sum()) * 31
+}
+
++main() {
+    lg = Logger.console("log_ingest")
+    checksum = run_pipeline(RECORD_COUNT)
+    @lg.info("CHECKSUM={checksum}")
+}
+
+test "synthetic records are stable" {
+    record = make_record(97)
+    assert_eq(record.service, 1)
+    assert_eq(record.status, 3)
+    assert_eq(record.bytes, 80 + (97 * 13) % 1400)
+}
+
+test "latency classes cover boundaries" {
+    assert_eq(classify_latency(99), 0)
+    assert_eq(classify_latency(100), 1)
+    assert_eq(classify_latency(250), 2)
+    assert_eq(classify_latency(400), 3)
+}
+
+test "chunk aggregation preserves counts" {
+    services = [0; SERVICE_COUNT]
+    statuses = [0; STATUS_COUNT]
+    latencies = [0; STATUS_COUNT]
+    bytes = ingest_chunk(0, 100, @services, @statuses, @latencies)
+    assert_eq(services.sum(), 100)
+    assert_eq(statuses.sum(), 100)
+    assert_eq(latencies.sum(), 100)
+    #assert(bytes > 0)
+}
+
+test "UFCS pipeline filters and maps" {
+    assert_eq(pipeline_example(), 113)
+}
+
+test "group key is collision free" {
+    assert_eq(group_key(3, 2), 14)
+    #assert(group_key(3, 2) != group_key(2, 3))
+}
+
+test "large pipeline deterministic" {
+    assert_eq(run_pipeline(10000), run_pipeline(10000))
+}

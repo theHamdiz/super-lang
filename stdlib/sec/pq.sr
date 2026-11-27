@@ -1,0 +1,237 @@
+//! std.sec.pq — post-quantum cryptography (beyond classical / quantum-vulnerable schemes)
+//!
+//! Import: use std.sec.pq
+//!
+//! Algorithms (Tier-1 host, FIPS-aligned where noted):
+//!   ML-KEM-768 (FIPS 203 / Kyber)          — pq_kem_keygen / encaps / decaps
+//!   Hybrid X25519 + ML-KEM-768             — pq_hybrid_* (classical + PQ)
+//!   ML-DSA-65 (FIPS 204 / Dilithium)       — pq_sign_keygen / sign / verify
+//!   Winternitz W=16 HBS-OTS (SPHINCS+ fam) — pq_hbs_*
+//!   SHA3-KDF                               — pq_kdf
+//!
+//! Shared secrets and keys travel as hex. ML-KEM keygen returns "seed:ek".
+
+/// `PQ_MLKEM_SS_BYTES` is `32`.
++PQ_MLKEM_SS_BYTES = 32
+/// `PQ_MLKEM_SEED_BYTES` is `64`.
++PQ_MLKEM_SEED_BYTES = 64
+/// `PQ_HBS_W` is `16`.
++PQ_HBS_W = 16
+
+/// `PqKem` is an ML-KEM key pair (seed and encapsulation key).
++PqKem = {
+    /// Seed on `PqKem` (`str`). Defaults to `""`.
+    seed: str = ""
+    /// Ek on `PqKem` (`str`). Defaults to `""`.
+    ek: str = ""
+}
+
+/// `PqEncaps` is an ML-KEM ciphertext and shared secret.
++PqEncaps = {
+    /// Ct on `PqEncaps` (`str`). Defaults to `""`.
+    ct: str = ""
+    /// Ss on `PqEncaps` (`str`). Defaults to `""`.
+    ss: str = ""
+}
+
+/// `PqHybridKeys` is an X25519 key pair plus an ML-KEM key pair.
++PqHybridKeys = {
+    /// X sk on `PqHybridKeys` (`str`). Defaults to `""`.
+    x_sk: str = ""
+    /// X pk on `PqHybridKeys` (`str`). Defaults to `""`.
+    x_pk: str = ""
+    /// Pq seed on `PqHybridKeys` (`str`). Defaults to `""`.
+    pq_seed: str = ""
+    /// Pq ek on `PqHybridKeys` (`str`). Defaults to `""`.
+    pq_ek: str = ""
+}
+
+/// `PqHybridEncaps` is a hybrid encapsulation (ephemeral key, ciphertext, shared secret).
++PqHybridEncaps = {
+    /// Eph pk on `PqHybridEncaps` (`str`). Defaults to `""`.
+    eph_pk: str = ""
+    /// Pq ct on `PqHybridEncaps` (`str`). Defaults to `""`.
+    pq_ct: str = ""
+    /// Ss on `PqHybridEncaps` (`str`). Defaults to `""`.
+    ss: str = ""
+}
+
+/// `PqSignKeys` is an ML-DSA signing key and verifying key.
++PqSignKeys = {
+    /// Id on `PqSignKeys` (`i64`). Defaults to `0`.
+    id: i64 = 0
+    /// Vk on `PqSignKeys` (`str`). Defaults to `""`.
+    vk: str = ""
+}
+
+/// `PqHbsKeys` is a hash-based one-time signature key pair.
++PqHbsKeys = {
+    /// Sk on `PqHbsKeys` (`str`). Defaults to `""`.
+    sk: str = ""
+    /// Pk on `PqHbsKeys` (`str`). Defaults to `""`.
+    pk: str = ""
+}
+
+/// Pq split2 (`blob`).
++pq_split2(blob: str) {
+    // First ':' separator → [left, right]
+    n = host.sys_str_len(blob)
+    cut = -1
+    for 0..n {
+        if cut < 0 && blob[it] == ":" { cut = it }
+    }
+    left = ""
+    right = ""
+    if cut >= 0 {
+        for 0..cut { left = left + blob[it] }
+        for (cut + 1)..n { right = right + blob[it] }
+    }
+    out = []
+    out = host.sys_arr_push(out, left)
+    out = host.sys_arr_push(out, right)
+    out
+}
+
+/// Pq split4 (`blob`).
++pq_split4(blob: str) {
+    // Four ':'-separated fields packed into an array.
+    parts = ["", "", "", ""]
+    idx = 0
+    n = host.sys_str_len(blob)
+    for 0..n {
+        if blob[it] == ":" {
+            if idx < 3 { idx = idx + 1 }
+        } else {
+            parts = host.sys_arr_set(parts, idx, parts[idx] + blob[it])
+        }
+    }
+    parts
+}
+
+/// Generate an ML-KEM key pair.
++pq_kem_keygen() : PqKem {
+    #inline
+    blob = host.sys_mlkem768_keygen()
+    parts = pq_split2(blob)
+    PqKem{seed: parts[0], ek: parts[1]}
+}
+
+/// Encapsulate a shared secret to the public key `ek`.
++pq_kem_encaps(ek: str) : PqEncaps {
+    blob = host.sys_mlkem768_encaps(ek)
+    parts = pq_split2(blob)
+    PqEncaps{ct: parts[0], ss: parts[1]}
+}
+
+/// Decapsulate ciphertext `ct` with the secret seed `seed`.
++pq_kem_decaps(seed: str, ct: str) : str => host.sys_mlkem768_decaps(seed, ct)
+
+/// Generate an X25519 key pair and an ML-KEM key pair.
++pq_hybrid_keygen() : PqHybridKeys {
+    blob = host.sys_hybrid_kem_keygen()
+    p = pq_split4(blob)
+    PqHybridKeys{x_sk: p[0], x_pk: p[1], pq_seed: p[2], pq_ek: p[3]}
+}
+
+/// Encapsulate a hybrid shared secret to `x_pk`.
++pq_hybrid_encaps(x_pk: str, pq_ek: str) : PqHybridEncaps {
+    blob = host.sys_hybrid_kem_encaps(x_pk, pq_ek)
+    // eph:ct:ss — three fields; reuse split by finding separators
+    n = host.sys_str_len(blob)
+    c1 = -1
+    c2 = -1
+    for 0..n {
+        if blob[it] == ":" {
+            if c1 < 0 { c1 = it } else {
+                if c2 < 0 { c2 = it }
+            }
+        }
+    }
+    eph = ""
+    ct = ""
+    ss = ""
+    for 0..c1 { eph = eph + blob[it] }
+    for (c1 + 1)..c2 { ct = ct + blob[it] }
+    for (c2 + 1)..n { ss = ss + blob[it] }
+    PqHybridEncaps{eph_pk: eph, pq_ct: ct, ss}
+}
+
+/// Decapsulate the hybrid ciphertext with `x_sk`.
++pq_hybrid_decaps(x_sk: str, pq_seed: str, eph_pk: str, pq_ct: str) : str {
+    host.sys_hybrid_kem_decaps(x_sk, pq_seed, eph_pk, pq_ct)
+}
+
+/// Generate an ML-DSA signing key.
++pq_sign_keygen() : PqSignKeys {
+    blob = host.sys_mldsa65_keygen()
+    parts = pq_split2(blob)
+    id = 0
+    // parse decimal id
+    for 0..host.sys_str_len(parts[0]) {
+        id = id * 10 + host.sys_ord(parts[0][it]) - 48
+    }
+    PqSignKeys{id, vk: parts[1]}
+}
+
+/// ML-DSA signature of `msg` under `id`.
++pq_sign(id: i64, msg: str) : str => host.sys_mldsa65_sign(id, msg)
+
+/// True when `sig` is a valid signature of `msg` under `vk`.
++pq_verify(vk: str, msg: str, sig: str) : bool => host.sys_mldsa65_verify(vk, msg, sig)
+
+/// Generate a hash-based one-time signature key pair.
++pq_hbs_keygen() : PqHbsKeys {
+    blob = host.sys_hbs_keygen()
+    parts = pq_split2(blob)
+    PqHbsKeys{sk: parts[0], pk: parts[1]}
+}
+
+/// One-time signature of `msg` under `sk`.
++pq_hbs_sign(sk: str, msg: str) : str => host.sys_hbs_sign(sk, msg)
+
+/// True when `sig` is a valid one-time signature of `msg` under `pk`.
++pq_hbs_verify(pk: str, msg: str, sig: str) : bool => host.sys_hbs_verify(pk, msg, sig)
+
+/// Key derived from the shared secret `ikm`.
++pq_kdf(ikm: str, info: str, n: i64) : str => host.sys_kdf_sha3(ikm, info, n)
+
+/// How many bytes a post-quantum shared secret occupies.
++pq_ss_bytes() : i64 => PQ_MLKEM_SS_BYTES
+
+/// Test that stdlib.pq ml-kem-768 roundtrip.
+test "stdlib.pq ml-kem-768 roundtrip" {
+    kp = pq_kem_keygen()
+    enc = pq_kem_encaps(kp.ek)
+    ss2 = pq_kem_decaps(kp.seed, enc.ct)
+    assert_eq(enc.ss, ss2)
+    assert_eq(host.sys_str_len(enc.ss), 64)
+}
+
+/// Test that stdlib.pq hybrid x25519+mlkem roundtrip.
+test "stdlib.pq hybrid x25519+mlkem roundtrip" {
+    kp = pq_hybrid_keygen()
+    enc = pq_hybrid_encaps(kp.x_pk, kp.pq_ek)
+    ss2 = pq_hybrid_decaps(kp.x_sk, kp.pq_seed, enc.eph_pk, enc.pq_ct)
+    assert_eq(enc.ss, ss2)
+}
+
+/// Test that stdlib.pq mldsa65 sign verify.
+test "stdlib.pq mldsa65 sign verify" {
+    keys = pq_sign_keygen()
+    sig = pq_sign(keys.id, "hello pq")
+    #assert(pq_verify(keys.vk, "hello pq", sig))
+    #assert(!(pq_verify(keys.vk, "tampered", sig)))
+}
+
+/// Test that stdlib.pq hbs ots.
+test "stdlib.pq hbs ots" {
+    keys = pq_hbs_keygen()
+    sig = pq_hbs_sign(keys.sk, "once")
+    #assert(pq_hbs_verify(keys.pk, "once", sig))
+    #assert(!(pq_hbs_verify(keys.pk, "twice", sig)))
+}
+
+/// Test that stdlib.pq kdf length.
+test "stdlib.pq kdf length" {
+    assert_eq(host.sys_str_len(pq_kdf("ikm", "info", 32)), 64)
+}

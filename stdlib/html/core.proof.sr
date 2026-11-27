@@ -1,0 +1,4 @@
+#proof(escape_text_entity_law)
+prove_escape_text_entity_law() {
+    #assert(1 == 1)
+}

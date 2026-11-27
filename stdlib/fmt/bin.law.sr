@@ -1,0 +1,15 @@
+//! Laws for std.fmt.bin — real-body (`be32_get`).
+//! `bin_len` over array literals is not reliably evaluated under `super verify`
+//! today (limit); covered by AOT/module tests instead.
+//! AI agents must not edit this file; put discharges in `bin.proof.sr`.
+
+#law("be32_get big-endian u32 read")
+bin_be32_one() {
+    #assert(be32_get([0, 0, 0, 1], 0) == 1)
+    #assert(be32_get([0, 0, 1, 0], 0) == 256)
+}
+
+#law("be32_get reads high byte")
+bin_be32_high() {
+    #assert(be32_get([1, 0, 0, 0], 0) == 16777216)
+}

@@ -1,0 +1,9 @@
+//! Frame-local collections (scoped data stack allocation path).
+//! Run: super run examples/doc_data_stack/main.sr
+
++main() {
+    items = [10, 20, 30]
+    acc = 0
+    for items { acc += it * 2 }
+    print("acc={acc}")
+}

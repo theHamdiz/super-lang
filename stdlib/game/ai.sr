@@ -1,0 +1,843 @@
+//! std.game.ai — grid pathfinding, steering, state machines, utility scoring, behavior trees
+//!
+//! Import with:
+//!   use std.game.ai
+//!
+//!   g = Grid.from_rows(["....#", "..#.#", "....."])        // '#' = blocked
+//!   path = g.astar(0, 0, 4, 2, true)                    // cell indices (y * w + x)
+//!   cx = path[1] % g.w
+//!
+//!   v = ai_arrive(px, py, tx, ty, 5.0, 3.0)                // Steer{x, y} desired velocity
+//!
+//!   f = Fsm.new("idle")
+//!   @f.on("idle", "see_player", "chase")
+//!   @f.fire("see_player")                               // f.cur == "chase"
+//!
+//! Everything is deterministic and allocation-light: A* uses a packed-int binary heap
+//! (`f * 1048576 + cell`, so grids may hold up to 1,048,575 cells), flood fills and
+//! line-of-sight are plain loops, and behavior trees are data (`Bt`) ticked against a
+//! results array so no closures are needed: the host fills `results[leaf_id]` with
+//! `BT_FAIL` / `BT_OK` / `BT_RUN`, then `bt_tick` walks the tree.
+//!
+//! Pathfinding helpers use the `ai_` prefix; `Grid`, `Fsm`, and `Bt` own their operations.
+
+// --- grid ----------------------------------------------------------------------------------------
+
+use std.core.collections
+use std.core.str
+use std.math.core
+
+/// `Grid` is a walkable 2D cell map for pathfinding.
++Grid = {
+    /// W on `Grid` (`i64`).
+    w: i64
+    /// H on `Grid` (`i64`).
+    h: i64
+    /// Cells on `Grid`. Defaults to `[]`.
+    cells: _ = []
+
+    /// Create a fresh `Grid`.
+    new(w: i64, h: i64) : Grid => Grid.{w, h, cells: arr_new(w * h, 0)}
+
+    /// In bounds on this `Grid` (`x`, `y`).
+    in_bounds(self, x: i64, y: i64) : bool {
+        if x < 0 { return false }
+        if y < 0 { return false }
+        if x >= (self.w) { return false }
+        if y >= (self.h) { return false }
+        true
+    }
+
+    /// Free on this `Grid` (`x`, `y`).
+    free(self, x: i64, y: i64) : bool {
+        ensure self.in_bounds(x, y) else { return false }
+        self.cells[y * self.w + x] == 0
+    }
+
+    /// Set on this `Grid` (`x`, `y`, `wall`).
+    set(@self, x: i64, y: i64, wall: bool) : bool {
+        ensure self.in_bounds(x, y) else { return false }
+        v = 0
+        if wall { v = 1 }
+        self.cells = arr_set(self.cells, y * self.w + x, v)
+        true
+    }
+
+    /// Same as `set` on this `Grid`.
+    block(@self, x: i64, y: i64) : bool => @self.set(x, y, true)
+
+    /// Build a grid from equally long rows; '#' marks a wall, anything else is open.
+    from_rows(rows: _) : Grid {
+        h = len(rows)
+        w = 0
+        if h > 0 { w = byte_len(rows[0]) }
+        g = Grid.new(w, h)
+        for 0..h {
+            y = it
+            row = rows[y]
+            for 0..w {
+                if row[it] == "#" { @g.set(it, y, true) }
+            }
+        }
+        g
+    }
+
+    /// Walls on this `Grid`. Returns `i64`.
+    walls(self) : i64 {
+        n = 0
+        cs = self.cells
+        for cs { n += it }
+        n
+    }
+
+    /// Shortest path as cell indices (y * w + x) from start to goal inclusive, or [] when
+    /// either end is blocked or no route exists.
+    astar(self, sx: i64, sy: i64, gx: i64, gy: i64, diag: bool) : _ {
+        ensure self.free(sx, sy) else { return [] }
+        ensure self.free(gx, gy) else { return [] }
+        w = self.w
+        n = w * self.h
+        start = sy * w + sx
+        goal = gy * w + gx
+        dxs = [1, -1, 0, 0, 1, 1, -1, -1]
+        dys = [0, 0, 1, -1, 1, -1, 1, -1]
+        nd = 4
+        if diag { nd = 8 }
+        gs = arr_set(arr_new(n, -1), start, 0)
+        came = arr_new(n, -1)
+        closed = arr_new(n, 0)
+        heap = ai_hp_push([], ai_heur(sx, sy, gx, gy, diag) * 1048576 + start)
+        found = false
+        for 0..(n * 8 + 2) {
+            if found == false && len(heap) > 0 {
+                cur = heap[0] % 1048576
+                heap = ai_hp_pop(heap)
+                if closed[cur] == 0 {
+                    closed = arr_set(closed, cur, 1)
+                    if cur == goal {
+                        found = true
+                    } else {
+                        cx = cur % w
+                        cy = cur / w
+                        for 0..nd {
+                            d = it
+                            nx = cx + dxs[d]
+                            ny = cy + dys[d]
+                            ok = self.free(nx, ny)
+                            if ok && d >= 4 {
+                                if self.free(nx, cy) == false { ok = false }
+                                if self.free(cx, ny) == false { ok = false }
+                            }
+                            if ok {
+                                nb = ny * w + nx
+                                step = 10
+                                if d >= 4 { step = 14 }
+                                ng = gs[cur] + step
+                                if closed[nb] == 0 && (gs[nb] < 0 || ng < gs[nb]) {
+                                    gs = arr_set(gs, nb, ng)
+                                    came = arr_set(came, nb, cur)
+                                    f = ng + ai_heur(nx, ny, gx, gy, diag)
+                                    heap = ai_hp_push(heap, f * 1048576 + nb)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ensure found else { return [] }
+        path = []
+        c = goal
+        for 0..n {
+            if c >= 0 {
+                path = [c] + path
+                c = came[c]
+            }
+        }
+        path
+    }
+
+    /// Cost on this `Grid` (`path`). Returns `i64`.
+    path_cost(self, path: _) : i64 {
+        n = len(path)
+        total = 0
+        for 1..n {
+            a = path[it - 1]
+            b = path[it]
+            dx = ai_iabs(b % self.w - a % self.w)
+            dy = ai_iabs(b / self.w - a / self.w)
+            if dx + dy == 2 { total += 14 } else { total += 10 }
+        }
+        total
+    }
+
+    /// Walking distance (4-neighbour, in cells) from (sx, sy) to every cell; -1 = unreachable.
+    flood(self, sx: i64, sy: i64) : _ {
+        w = self.w
+        n = w * self.h
+        dist = arr_new(n, -1)
+        ensure self.free(sx, sy) else { return dist }
+        dxs = [1, -1, 0, 0]
+        dys = [0, 0, 1, -1]
+        start = sy * w + sx
+        dist = arr_set(dist, start, 0)
+        queue = [start]
+        head = 0
+        for 0..n {
+            if head < len(queue) {
+                cur = queue[head]
+                head += 1
+                cx = cur % w
+                cy = cur / w
+                for 0..4 {
+                    nx = cx + dxs[it]
+                    ny = cy + dys[it]
+                    if self.free(nx, ny) {
+                        nb = ny * w + nx
+                        if dist[nb] < 0 {
+                            dist = arr_set(dist, nb, dist[cur] + 1)
+                            queue = arr_push(queue, nb)
+                        }
+                    }
+                }
+            }
+        }
+        dist
+    }
+
+    /// Bresenham line of sight: every cell from (x0, y0) to (x1, y1) must be open.
+    los(self, x0: i64, y0: i64, x1: i64, y1: i64) : bool {
+        dx = ai_iabs(x1 - x0)
+        dy = ai_iabs(y1 - y0)
+        sx = ai_isign(x1 - x0)
+        sy = ai_isign(y1 - y0)
+        dev = dx - dy
+        x = x0
+        y = y0
+        clear = true
+        arrived = false
+        for 0..(dx + dy + 2) {
+            if clear && arrived == false {
+                if self.free(x, y) == false { clear = false }
+                if x == x1 && y == y1 {
+                    arrived = true
+                } else {
+                    e2 = 2 * dev
+                    if e2 > -dy {
+                        dev -= dy
+                        x += sx
+                    }
+                    if e2 < dx {
+                        dev += dx
+                        y += sy
+                    }
+                }
+            }
+        }
+        clear
+    }
+}
+
+// --- integer helpers -------------------------------------------------------------------------------
+
+/// Ai iabs (`v`). Returns `i64`.
++ai_iabs(v: i64) : i64 {
+    if v < 0 { return -v }
+    v
+}
+
+/// Ai isign (`v`). Returns `i64`.
++ai_isign(v: i64) : i64 {
+    if v < 0 { return -1 }
+    if v > 0 { return 1 }
+    0
+}
+
+// --- min-heap of packed ints -----------------------------------------------------------------------
+
+/// Ai hp swap (`h`, `a`, `b`).
++ai_hp_swap(h: _, a: i64, b: i64) : _ {
+    va = h[a]
+    vb = h[b]
+    arr_set(arr_set(h, a, vb), b, va)
+}
+
+/// Ai hp up (`h`, `i`).
++ai_hp_up(h: _, i: i64) : _ {
+    ensure i > 0 else { return h }
+    p = (i - 1) / 2
+    ensure h[p] > h[i] else { return h }
+    ai_hp_up(ai_hp_swap(h, p, i), p)
+}
+
+/// Ai hp push (`h`, `v`).
++ai_hp_push(h: _, v: i64) : _ {
+    n = len(h)
+    ai_hp_up(arr_push(h, v), n)
+}
+
+/// Ai hp down (`h`, `i`).
++ai_hp_down(h: _, i: i64) : _ {
+    n = len(h)
+    l = 2 * i + 1
+    r = l + 1
+    m = i
+    if l < n {
+        if h[l] < h[m] { m = l }
+    }
+    if r < n {
+        if h[r] < h[m] { m = r }
+    }
+    ensure m != i else { return h }
+    ai_hp_down(ai_hp_swap(h, i, m), m)
+}
+
+/// Ai hp pop (`h`).
++ai_hp_pop(h: _) : _ {
+    n = len(h)
+    ensure n > 1 else { return [] }
+    moved = arr_set(h, 0, h[n - 1])
+    ai_hp_down(moved[0..(n - 1)], 0)
+}
+
+// --- A* ------------------------------------------------------------------------------------------------------
+
+/// Octile (diagonal) or Manhattan distance, in tenths of a cell.
++ai_heur(x: i64, y: i64, gx: i64, gy: i64, diag: bool) : i64 {
+    dx = ai_iabs(gx - x)
+    dy = ai_iabs(gy - y)
+    if diag == false { return 10 * (dx + dy) }
+    if dx > dy { return 10 * dx + 4 * dy }
+    10 * dy + 4 * dx
+}
+
+// --- steering ----------------------------------------------------------------------------------------------------
+
+/// `Steer` is a 2D steering vector.
++Steer = {
+    /// X on `Steer` (`f64`). Defaults to `0.0`.
+    x: f64 = 0.0
+    /// Y on `Steer` (`f64`). Defaults to `0.0`.
+    y: f64 = 0.0
+}
+
+/// Same as `sqrt`.
++ai_len(x: f64, y: f64) : f64 => sqrt(x * x + y * y)
+
+/// Scale a vector down to at most `max` length.
++ai_limit(x: f64, y: f64, limit: f64) : Steer {
+    l = ai_len(x, y)
+    if l <= limit { return Steer.{x, y} }
+    Steer.{x: x / l * limit, y: y / l * limit}
+}
+
+/// Desired velocity toward the target at full speed.
++ai_seek(px: f64, py: f64, tx: f64, ty: f64, speed: f64) : Steer {
+    dx = tx - px
+    dy = ty - py
+    l = ai_len(dx, dy)
+    if l == 0.0 { return Steer.{x: 0.0, y: 0.0} }
+    Steer.{x: dx / l * speed, y: dy / l * speed}
+}
+
+/// Ai flee (`px`, `py`, `tx`, `ty`, `speed`). Returns `Steer`.
++ai_flee(px: f64, py: f64, tx: f64, ty: f64, speed: f64) : Steer {
+    s = ai_seek(px, py, tx, ty, speed)
+    Steer.{x: 0.0 - s.x, y: 0.0 - s.y}
+}
+
+/// Like seek, but ramps speed down linearly inside `slow` distance of the target.
++ai_arrive(px: f64, py: f64, tx: f64, ty: f64, speed: f64, slow: f64) : Steer {
+    dx = tx - px
+    dy = ty - py
+    l = ai_len(dx, dy)
+    if l == 0.0 { return Steer.{x: 0.0, y: 0.0} }
+    v = speed
+    if l < slow { v = speed * l / slow }
+    Steer.{x: dx / l * v, y: dy / l * v}
+}
+
+/// Ai separate (`px`, `py`, `others`, `radius`). Returns `Steer`.
++ai_separate(px: f64, py: f64, others: _, radius: f64) : Steer {
+    n = len(others) / 2
+    sx = 0.0
+    sy = 0.0
+    for 0..n {
+        dx = px - others[it * 2]
+        dy = py - others[it * 2 + 1]
+        d = ai_len(dx, dy)
+        if d > 0.0 && d < radius {
+            k = (radius - d) / radius / d
+            sx += dx * k
+            sy += dy * k
+        }
+    }
+    Steer.{x: sx, y: sy}
+}
+
+/// Lead the target: seek where it will be after dist/speed seconds.
++ai_pursue(px: f64, py: f64, tx: f64, ty: f64, tvx: f64, tvy: f64, speed: f64) : Steer {
+    d = ai_len(tx - px, ty - py)
+    t = 0.0
+    if speed > 0.0 { t = d / speed }
+    ai_seek(px, py, tx + tvx * t, ty + tvy * t, speed)
+}
+
+// --- finite state machine -----------------------------------------------------------------------------------------
+
+/// `Fsm` is a finite state machine of named transitions.
++Fsm = {
+    /// Cur on `Fsm` (`str`).
+    cur: str
+    /// Froms on `Fsm`. Defaults to `[]`.
+    froms: _ = []
+    /// Events on `Fsm`. Defaults to `[]`.
+    events: _ = []
+    /// Tos on `Fsm`. Defaults to `[]`.
+    tos: _ = []
+    /// Changes on `Fsm` (`i64`). Defaults to `0`.
+    changes: i64 = 0
+
+    /// Create a fresh `Fsm`.
+    new(start: str) : Fsm => Fsm.{cur: start, froms: [], events: [], tos: [], changes: 0}
+
+    /// Declare a transition `from --event--> to`.
+    on(@self, from: str, event: str, to: str) : i64 {
+        self.froms = arr_push(self.froms, from)
+        self.events = arr_push(self.events, event)
+        self.tos = arr_push(self.tos, to)
+        len(self.froms)
+    }
+
+    /// Find on this `Fsm` (`event`). Returns `i64`.
+    find(self, event: str) : i64 {
+        pos = -1
+        n = len(self.froms)
+        for 0..n {
+            if pos < 0 && self.froms[it] == self.cur && self.events[it] == event { pos = it }
+        }
+        pos
+    }
+
+    /// Can on this `Fsm` (`event`).
+    can(self, event: str) : bool => self.find(event) >= 0
+
+    /// Fire an event; returns true when the machine changed state.
+    fire(@self, event: str) : bool {
+        at = self.find(event)
+        ensure at >= 0 else { return false }
+        self.cur = self.tos[at]
+        self.changes = self.changes + 1
+        true
+    }
+}
+
+// --- utility scoring --------------------------------------------------------------------------------------------------
+
+/// Ai clamp01 (`v`). Returns `f64`.
++ai_clamp01(v: f64) : f64 {
+    if v < 0.0 { return 0.0 }
+    if v > 1.0 { return 1.0 }
+    v
+}
+
+/// Normalise x from [lo, hi] to [0, 1].
++ai_curve_linear(x: f64, lo: f64, hi: f64) : f64 {
+    if hi == lo { return 0.0 }
+    ai_clamp01((x - lo) / (hi - lo))
+}
+
+/// Ai curve inverse (`x`, `lo`, `hi`). Returns `f64`.
++ai_curve_inverse(x: f64, lo: f64, hi: f64) : f64 => 1.0 - ai_curve_linear(x, lo, hi)
+
+/// Ai curve quad (`x`, `lo`, `hi`). Returns `f64`.
++ai_curve_quad(x: f64, lo: f64, hi: f64) : f64 {
+    t = ai_curve_linear(x, lo, hi)
+    t * t
+}
+
+/// Multiply consideration scores (each in [0, 1]) into one action score.
++ai_score(considerations: _) : f64 {
+    s = 1.0
+    for considerations { s = s * it }
+    s
+}
+
+/// Index of the highest score (first on ties), or -1 for an empty list.
++ai_best(scores: _) : i64 {
+    n = len(scores)
+    ensure n > 0 else { return -1 }
+    best = 0
+    for 1..n {
+        if scores[it] > scores[best] { best = it }
+    }
+    best
+}
+
+/// Weighted choice: `roll` in [0, 1) selects by cumulative weight. -1 when all weights are 0.
++ai_pick_weighted(weights: _, roll: f64) : i64 {
+    total = weights.sum()
+    ensure total > 0.0 else { return -1 }
+    target = roll * total
+    acc, pick, last = 0.0, -1, -1
+    n = len(weights)
+    for 0..n {
+        acc += weights[it]
+        if weights[it] > 0.0 { last = it }
+        if pick < 0 && target < acc { pick = it }
+    }
+    if pick < 0 { return last }
+    pick
+}
+
+// --- behavior trees ---------------------------------------------------------------------------------------------------------
+
+/// `BT_FAIL` is `0`.
++BT_FAIL = 0
+/// `BT_OK` is `1`.
++BT_OK = 1
+/// `BT_RUN` is `2`.
++BT_RUN = 2
+
+/// `BT_SEQ` is `0`.
++BT_SEQ = 0
+/// `BT_SEL` is `1`.
++BT_SEL = 1
+/// `BT_LEAF` is `2`.
++BT_LEAF = 2
+/// `BT_NOT` is `3`.
++BT_NOT = 3
+
+/// `Bt` is a behavior tree of sequence, selector, and leaf nodes.
++Bt = {
+    /// Kinds on `Bt`. Defaults to `[]`.
+    kinds: _ = []
+    /// Kids on `Bt`. Defaults to `[]`.
+    kids: _ = []
+    /// Leaves on `Bt`. Defaults to `[]`.
+    leaves: _ = []
+
+    /// Create a fresh `Bt`.
+    new() : Bt => Bt.{kinds: [], kids: [], leaves: []}
+
+    /// Add on this `Bt` (`kind`, `kids`, `leaf`). Returns `i64`.
+    add(@self, kind: i64, kids: _, leaf: i64) : i64 {
+        self.kinds = arr_push(self.kinds, kind)
+        self.kids = arr_push(self.kids, kids)
+        self.leaves = arr_push(self.leaves, leaf)
+        len(self.kinds) - 1
+    }
+
+    /// A leaf reads `results[leaf_id]` at tick time.
+    leaf(@self, leaf_id: i64) : i64 => @self.add(2, [], leaf_id)
+
+    /// Runs children in order until one does not succeed.
+    seq(@self, kids: _) : i64 => @self.add(0, kids, -1)
+
+    /// Runs children in order until one does not fail.
+    sel(@self, kids: _) : i64 => @self.add(1, kids, -1)
+
+    /// Inverts OK/FAIL; RUN passes through.
+    not(@self, child: i64) : i64 => @self.add(3, [child], -1)
+
+    /// Seq from on this `Bt` (`kids`, `i`, `results`). Returns `i64`.
+    seq_from(self, kids: _, i: i64, results: _) : i64 {
+        ensure i < len(kids) else { return 1 }
+        s = self.tick(kids[i], results)
+        ensure s == 1 else { return s }
+        self.seq_from(kids, i + 1, results)
+    }
+
+    /// Sel from on this `Bt` (`kids`, `i`, `results`). Returns `i64`.
+    sel_from(self, kids: _, i: i64, results: _) : i64 {
+        ensure i < len(kids) else { return 0 }
+        s = self.tick(kids[i], results)
+        ensure s == 0 else { return s }
+        self.sel_from(kids, i + 1, results)
+    }
+
+    /// Tick on this `Bt` (`node`, `results`). Returns `i64`.
+    tick(self, node: i64, results: _) : i64 {
+        kind = self.kinds[node]
+        if kind == 2 { return results[self.leaves[node]] }
+        kids = self.kids[node]
+        if kind == 0 { return self.seq_from(kids, 0, results) }
+        if kind == 1 { return self.sel_from(kids, 0, results) }
+        s = self.tick(kids[0], results)
+        if s == 2 { return 2 }
+        if s == 1 { return 0 }
+        1
+    }
+}
+
+// --- tests -----------------------------------------------------------------------------------------------------------------
+
+/// Test that grid bounds, walls and rows.
+test "grid bounds, walls and rows" {
+    g = Grid.new(4, 3)
+    #assert(g.free(0, 0))
+    #assert(g.free(3, 2))
+    #assert(!(g.free(4, 0)))
+    #assert(!(g.free(-1, 0)))
+    #assert(!(g.free(0, 3)))
+    #assert(@g.block(1, 1))
+    #assert(!(g.free(1, 1)))
+    #assert(!(@g.block(9, 9)))
+    #assert(@g.set(1, 1, false))
+    #assert(g.free(1, 1))
+    r = Grid.from_rows(["..#.", "#...", "...."])
+    assert_eq(r.w, 4)
+    assert_eq(r.h, 3)
+    assert_eq(r.walls(), 2)
+    #assert(!(r.free(2, 0)))
+    #assert(!(r.free(0, 1)))
+    assert_eq(Grid.from_rows([]).walls(), 0)
+}
+
+/// Test that heap pops in ascending order.
+test "heap pops in ascending order" {
+    h = []
+    for [50, 10, 40, 20, 30, 10, 60, 5] { h = ai_hp_push(h, it) }
+    assert_eq(len(h), 8)
+    out = []
+    for 0..8 {
+        out = out + [h[0]]
+        h = ai_hp_pop(h)
+    }
+    expect = [5, 10, 10, 20, 30, 40, 50, 60]
+    ok = true
+    for expect { if out[index] != it { ok = false } }
+    #assert(ok)
+    assert_eq(len(h), 0)
+}
+
+/// Test that astar walks a straight corridor.
+test "astar walks a straight corridor" {
+    g = Grid.new(6, 1)
+    p = g.astar(0, 0, 5, 0, false)
+    assert_eq(len(p), 6)
+    assert_eq(p[0], 0)
+    assert_eq(p[5], 5)
+    assert_eq(g.path_cost(p), 50)
+    same = g.astar(2, 0, 2, 0, true)
+    assert_eq(len(same), 1)
+    assert_eq(same[0], 2)
+}
+
+/// Test that astar routes around a wall.
+test "astar routes around a wall" {
+    g = Grid.from_rows([".....", "..#..", "..#..", "..#..", "....."])
+    p = g.astar(0, 2, 4, 2, false)
+    assert_eq(len(p), 9)
+    assert_eq(p[0], 10)
+    assert_eq(p[8], 14)
+    clear = true
+    for p {
+        if g.free(it % 5, it / 5) == false { clear = false }
+    }
+    #assert(clear)
+    assert_eq(g.path_cost(p), 80)
+}
+
+/// Test that astar returns nothing when sealed off or endpoints blocked.
+test "astar returns nothing when sealed off or endpoints blocked" {
+    g = Grid.from_rows([".#.", ".#.", ".#."])
+    assert_eq(len(g.astar(0, 0, 2, 0, true)), 0)
+    assert_eq(len(g.astar(1, 0, 2, 0, true)), 0)
+    assert_eq(len(g.astar(0, 0, 1, 1, true)), 0)
+    assert_eq(len(g.astar(9, 9, 0, 0, true)), 0)
+}
+
+/// Test that diagonal moves are cheaper but never cut corners.
+test "diagonal moves are cheaper but never cut corners" {
+    open = Grid.new(5, 5)
+    d = open.astar(0, 0, 4, 4, true)
+    assert_eq(len(d), 5)
+    assert_eq(open.path_cost(d), 56)
+    m = open.astar(0, 0, 4, 4, false)
+    assert_eq(len(m), 9)
+    assert_eq(open.path_cost(m), 80)
+    corner = Grid.from_rows([".#", "#."])
+    assert_eq(len(corner.astar(0, 0, 1, 1, true)), 0)
+    half = Grid.from_rows([".#.", "...", "..."])
+    p = half.astar(0, 0, 1, 1, true)
+    assert_eq(len(p), 3)
+}
+
+/// Test that astar on a maze finds the unique route.
+test "astar on a maze finds the unique route" {
+    g = Grid.from_rows(["..#.....", ".##.###.", "....#...", "###.#.##", "....#..."])
+    p = g.astar(0, 0, 7, 4, false)
+    #assert(len(p) > 0)
+    assert_eq(p[0], 0)
+    assert_eq(p[len(p) - 1], 4 * 8 + 7)
+    legal = true
+    n = len(p)
+    for 1..n {
+        a = p[it - 1]
+        b = p[it]
+        step = ai_iabs(b % 8 - a % 8) + ai_iabs(b / 8 - a / 8)
+        if step != 1 { legal = false }
+        if g.free(b % 8, b / 8) == false { legal = false }
+    }
+    #assert(legal)
+}
+
+/// Test that flood fill measures walking distance.
+test "flood fill measures walking distance" {
+    g = Grid.from_rows(["...", ".#.", "..."])
+    d = g.flood(0, 0)
+    assert_eq(d[0], 0)
+    assert_eq(d[2], 2)
+    assert_eq(d[4], -1)
+    assert_eq(d[8], 4)
+    sealed = Grid.from_rows([".#.", ".#."])
+    s = sealed.flood(0, 0)
+    assert_eq(s[2], -1)
+    assert_eq(s[3], 1)
+    blocked = sealed.flood(1, 0)
+    assert_eq(blocked[0], -1)
+}
+
+/// Test that line of sight stops at walls.
+test "line of sight stops at walls" {
+    g = Grid.from_rows(["......", "..#...", "......", "......"])
+    #assert(g.los(0, 0, 5, 0))
+    #assert(!(g.los(0, 1, 5, 1)))
+    #assert(g.los(0, 3, 5, 3))
+    #assert(!(g.los(0, 0, 5, 3)))
+    #assert(g.los(3, 1, 5, 3))
+    #assert(!(g.los(1, 0, 3, 2)))
+    #assert(g.los(3, 3, 3, 3))
+    #assert(!(g.los(2, 1, 2, 1)))
+    #assert(g.los(5, 0, 0, 0))
+}
+
+/// Test that seek flee and limit.
+test "seek flee and limit" {
+    s = ai_seek(0.0, 0.0, 3.0, 4.0, 10.0)
+    assert_eq(s.x, 6.0)
+    assert_eq(s.y, 8.0)
+    f = ai_flee(0.0, 0.0, 3.0, 4.0, 10.0)
+    assert_eq(f.x, -6.0)
+    assert_eq(f.y, -8.0)
+    z = ai_seek(1.0, 1.0, 1.0, 1.0, 5.0)
+    assert_eq(z.x, 0.0)
+    assert_eq(z.y, 0.0)
+    l = ai_limit(6.0, 8.0, 5.0)
+    assert_eq(l.x, 3.0)
+    assert_eq(l.y, 4.0)
+    keep = ai_limit(1.0, 1.0, 5.0)
+    assert_eq(keep.x, 1.0)
+}
+
+/// Test that arrive slows inside the radius.
+test "arrive slows inside the radius" {
+    far = ai_arrive(0.0, 0.0, 10.0, 0.0, 4.0, 2.0)
+    assert_eq(far.x, 4.0)
+    near = ai_arrive(0.0, 0.0, 1.0, 0.0, 4.0, 2.0)
+    assert_eq(near.x, 2.0)
+    here = ai_arrive(5.0, 5.0, 5.0, 5.0, 4.0, 2.0)
+    assert_eq(here.x, 0.0)
+    assert_eq(here.y, 0.0)
+}
+
+/// Test that separation pushes away from close neighbours only.
+test "separation pushes away from close neighbours only" {
+    s = ai_separate(0.0, 0.0, [1.0, 0.0, 10.0, 10.0], 2.0)
+    #assert(s.x < 0.0)
+    assert_eq(s.y, 0.0)
+    none_near = ai_separate(0.0, 0.0, [5.0, 5.0], 2.0)
+    assert_eq(none_near.x, 0.0)
+    both = ai_separate(0.0, 0.0, [1.0, 0.0, -1.0, 0.0], 2.0)
+    assert_eq(both.x, 0.0)
+    ontop = ai_separate(1.0, 1.0, [1.0, 1.0], 2.0)
+    assert_eq(ontop.x, 0.0)
+}
+
+/// Test that pursue leads a moving target.
+test "pursue leads a moving target" {
+    p = ai_pursue(0.0, 0.0, 10.0, 0.0, 0.0, 5.0, 10.0)
+    #assert(p.x > 0.0)
+    #assert(p.y > 0.0)
+    still = ai_pursue(0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0)
+    assert_eq(still.x, 10.0)
+    assert_eq(still.y, 0.0)
+    stopped = ai_pursue(0.0, 0.0, 10.0, 0.0, 0.0, 5.0, 0.0)
+    assert_eq(stopped.x, 0.0)
+}
+
+/// Test that state machine follows declared transitions only.
+test "state machine follows declared transitions only" {
+    f = Fsm.new("idle")
+    assert_eq(@f.on("idle", "see", "chase"), 1)
+    assert_eq(@f.on("chase", "lost", "idle"), 2)
+    @f.on("chase", "near", "attack")
+    #assert(f.can("see"))
+    #assert(!(f.can("near")))
+    #assert(!(@f.fire("near")))
+    assert_eq(f.cur, "idle")
+    #assert(@f.fire("see"))
+    assert_eq(f.cur, "chase")
+    #assert(@f.fire("near"))
+    assert_eq(f.cur, "attack")
+    #assert(!(@f.fire("lost")))
+    assert_eq(f.changes, 2)
+}
+
+/// Test that utility curves and scoring.
+test "utility curves and scoring" {
+    assert_eq(ai_clamp01(2.0), 1.0)
+    assert_eq(ai_clamp01(-1.0), 0.0)
+    assert_eq(ai_curve_linear(5.0, 0.0, 10.0), 0.5)
+    assert_eq(ai_curve_linear(20.0, 0.0, 10.0), 1.0)
+    assert_eq(ai_curve_linear(1.0, 3.0, 3.0), 0.0)
+    assert_eq(ai_curve_inverse(2.5, 0.0, 10.0), 0.75)
+    assert_eq(ai_curve_quad(5.0, 0.0, 10.0), 0.25)
+    assert_eq(ai_score([0.5, 0.5, 1.0]), 0.25)
+    assert_eq(ai_score([]), 1.0)
+    assert_eq(ai_score([0.9, 0.0]), 0.0)
+}
+
+/// Test that best and weighted picks.
+test "best and weighted picks" {
+    assert_eq(ai_best([0.1, 0.9, 0.5]), 1)
+    assert_eq(ai_best([0.5, 0.5]), 0)
+    assert_eq(ai_best([]), -1)
+    w = [1.0, 2.0, 1.0]
+    assert_eq(ai_pick_weighted(w, 0.0), 0)
+    assert_eq(ai_pick_weighted(w, 0.24), 0)
+    assert_eq(ai_pick_weighted(w, 0.25), 1)
+    assert_eq(ai_pick_weighted(w, 0.7), 1)
+    assert_eq(ai_pick_weighted(w, 0.75), 2)
+    assert_eq(ai_pick_weighted(w, 0.999), 2)
+    assert_eq(ai_pick_weighted([0.0, 0.0], 0.5), -1)
+    assert_eq(ai_pick_weighted([0.0, 3.0, 0.0], 0.99), 1)
+}
+
+/// Test that behavior tree sequences, selectors and inverters.
+test "behavior tree sequences, selectors and inverters" {
+    t = Bt.new()
+    see = @t.leaf(0)
+    near = @t.leaf(1)
+    shoot = @t.leaf(2)
+    chase = @t.leaf(3)
+    patrol = @t.leaf(4)
+    attack = @t.seq([see, near, shoot])
+    pursue = @t.seq([see, chase])
+    root = @t.sel([attack, pursue, patrol])
+    assert_eq(t.tick(root, [1, 1, 1, 1, 1]), 1)
+    assert_eq(t.tick(root, [1, 1, 2, 1, 1]), 2)
+    assert_eq(t.tick(root, [1, 0, 1, 2, 1]), 2)
+    assert_eq(t.tick(root, [1, 0, 1, 0, 1]), 1)
+    assert_eq(t.tick(root, [0, 0, 0, 0, 0]), 0)
+    assert_eq(t.tick(root, [0, 0, 0, 0, 2]), 2)
+    blind = @t.not(see)
+    assert_eq(t.tick(blind, [1, 0, 0, 0, 0]), 0)
+    assert_eq(t.tick(blind, [0, 0, 0, 0, 0]), 1)
+    assert_eq(t.tick(blind, [2, 0, 0, 0, 0]), 2)
+    empty_seq = @t.seq([])
+    empty_sel = @t.sel([])
+    assert_eq(t.tick(empty_seq, []), 1)
+    assert_eq(t.tick(empty_sel, []), 0)
+}

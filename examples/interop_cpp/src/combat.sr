@@ -1,0 +1,43 @@
+//! Super combat script for the C++20 host.
+//!
+//! 1. Host → Super: zero-copy `entities` span + `host.apply_damage` callback.
+//! 2. Super → C++: `host.damage_apply_hit` bound to `native/damage.cpp` (extern "C").
+
++Entity = {
+    id: i64
+    hp: f32
+    dps: f32
+    x: f32
+    y: f32
+}
+
+entities = []
+
++compute_dps(base: f32, mult: f32) : f32 => base * mult
+
++apply_ai(dt: f64) {
+    for @entities {
+        it.x += (0.0 - it.x) * 0.01 * dt
+        it.y += (0.0 - it.y) * 0.01 * dt
+        if it.hp < 20.0 {
+            host.apply_damage(it.id, 1.0)
+        }
+    }
+}
+
+/// Hit through the C++ damage library (armor mitigation).
++hit_through_cpp(hp: f64, armor: f64, raw: f64) : f64 => host.damage_apply_hit(hp, armor, raw)
+
++alive_count() : i64 {
+    n = 0
+    for entities {
+        if it.hp > 0.0 {
+            n += 1
+        }
+    }
+    n
+}
+
+test "dps math" {
+    assert_eq(compute_dps(10.0, 1.5), 15.0)
+}

@@ -1,0 +1,252 @@
+//! std.db.clickhouse — ClickHouse HTTP/native client (offline-capable)
+//!
+//! Import with:
+//!   use std.db.clickhouse
+//!
+//!   ch = ChClient.new("http://localhost:8123", "default", "")
+//!   ch = @ch.exec("CREATE TABLE IF NOT EXISTS hits (d Date, v UInt64) ENGINE=Memory")
+//!   rows = ch.query("SELECT 1 AS x")
+//!
+//! The default backend is an in-memory columnar store so tests and AOT demos
+//! run without a live ClickHouse. Point `ChClient` at a real URL and call
+//! `http_exec` / `http_query` when the network is available.
+
+use std.core.collections
+use std.core.str
+use std.fmt.json
+
+/// Default HTTP interface port.
++CH_DEFAULT_PORT = 8123
+
+/// One columnar table in the offline store.
++ChTable = {
+    name: str = ""
+    columns: _ = []
+    types: _ = []
+    rows: _ = []
+}
+
+/// Offline ClickHouse-shaped catalog.
++ChStore = {
+    tables: _ = []
+
+    new() : ChStore => ChStore.{tables: []}
+
+    find(self, name: str) : i64 {
+        pos = -1
+        ts = self.tables
+        for ts {
+            if it.name == name { pos = index }
+        }
+        pos
+    }
+
+    ensure_table(@self, name: str, columns: _, types: _) : ChTable {
+        at = self.find(name)
+        if at >= 0 { return self.tables[at] }
+        t = ChTable.{name, columns, types, rows: []}
+        self.tables = arr_push(self.tables, t)
+        t
+    }
+
+    insert(@self, name: str, row: _) : i64! {
+        at = self.find(name)
+        ensure at >= 0 else {
+            fail "clickhouse: unknown table {name}"
+            return
+        }
+        t = self.tables[at]
+        t.rows = arr_push(t.rows, row)
+        self.tables = arr_set(self.tables, at, t)
+        len(t.rows)
+    }
+
+    select_all(self, name: str) : _! {
+        at = self.find(name)
+        ensure at >= 0 else {
+            fail "clickhouse: unknown table {name}"
+            return
+        }
+        self.tables[at].rows
+    }
+
+    count(self, name: str) : i64 {
+        at = self.find(name)
+        ensure at >= 0 else { return 0 }
+        len(self.tables[at].rows)
+    }
+}
+
+/// Connection settings for ClickHouse HTTP.
++ChConfig = {
+    host: str = "localhost"
+    port: i64 = 8123
+    user: str = "default"
+    password: str = ""
+    database: str = "default"
+    /// True when using the offline in-memory engine.
+    offline: bool = true
+}
+
+/// Client: offline store by default; HTTP helpers for live clusters.
++ChClient = {
+    cfg: ChConfig = ChConfig.{}
+    store: ChStore = ChStore.new()
+    last_sql: str = ""
+    last_rows: i64 = 0
+
+    new(url: str, user: str, password: str) : ChClient {
+        cfg = ch_parse_url(url)
+        cfg.user = user
+        cfg.password = password
+        cfg.offline = true
+        ChClient.{cfg, store: ChStore.new(), last_sql: "", last_rows: 0}
+    }
+
+    offline() : ChClient => ChClient.new("http://127.0.0.1:8123", "default", "")
+
+    /// Create a Memory table offline.
+    create_table(@self, name: str, columns: _, types: _) : bool {
+        s = self.store
+        @s.ensure_table(name, columns, types)
+        self.store = s
+        self.last_sql = "CREATE TABLE {name}"
+        true
+    }
+
+    /// Insert one row (array of string cells) offline.
+    insert(@self, name: str, row: _) : i64! {
+        s = self.store
+        n = @s.insert(name, row) or err { return }
+        self.store = s
+        self.last_rows = n
+        self.last_sql = "INSERT INTO {name}"
+        n
+    }
+
+    /// Select all rows from an offline table.
+    query(@self, name: str) : _! {
+        self.last_sql = "SELECT * FROM {name}"
+        rows = self.store.select_all(name) or err { return }
+        self.last_rows = len(rows)
+        rows
+    }
+
+    /// Row count for an offline table.
+    count(self, name: str) : i64 => self.store.count(name)
+
+    /// Build a JSONEachRow line for HTTP insert bodies.
+    encode_json_row(_self, columns: _, row: _) : str {
+        out = "{"
+        i = 0
+        for columns {
+            if i > 0 { out = out + "," }
+            out = out + "\"" + it + "\":"
+            cell = ch_cell_at(row, i)
+            out = out + ch_json_quote(cell)
+            i += 1
+        }
+        out + "}"
+    }
+
+    /// Render a native-style TabSeparated row.
+    encode_tsv(_self, row: _) : str {
+        out = ""
+        for row {
+            if index > 0 { out = out + "\t" }
+            out = out + "{it}"
+        }
+        out
+    }
+
+    /// Parse a TSV response body into rows of cells.
+    parse_tsv(_self, body: str) : _ {
+        rows = []
+        for split(body, "\n") {
+            if it == "" { continue }
+            rows = arr_push(rows, split(it, "\t"))
+        }
+        rows
+    }
+
+    /// HTTP query URL for a live server (does not perform I/O).
+    http_query_url(self, sql: str) : str {
+        "http://{self.cfg.host}:{self.cfg.port}/?database={self.cfg.database}&query={sql}"
+    }
+
+    /// Mark the client as live (callers then use HTTP themselves).
+    set_live(@self) : bool {
+        self.cfg.offline = false
+        true
+    }
+}
+
+/// Index into a row without relying on `row[i]` for open arrays.
++ch_cell_at(row: _, i: i64) : str {
+    j = 0
+    hit = ""
+    for row {
+        if j == i { hit = it }
+        j += 1
+    }
+    hit
+}
+
+/// Parse `http://host:port` or `clickhouse://host:port/db`.
++ch_parse_url(url: str) : ChConfig {
+    cfg = ChConfig.{host: "localhost", port: CH_DEFAULT_PORT, user: "default", password: "", database: "default", offline: true}
+    s = url
+    if starts_with(s, "http://") { s = s[7..byte_len(s)] }
+    if starts_with(s, "https://") { s = s[8..byte_len(s)] }
+    if starts_with(s, "clickhouse://") { s = s[13..byte_len(s)] }
+    slash = find(s, "/")
+    hostport = s
+    if slash >= 0 {
+        cfg.database = s[(slash + 1)..byte_len(s)]
+        hostport = s[0..slash]
+    }
+    colon = find(hostport, ":")
+    if colon >= 0 {
+        cfg.host = hostport[0..colon]
+        cfg.port = to_i64(hostport[(colon + 1)..byte_len(hostport)]) or CH_DEFAULT_PORT
+    } else {
+        if hostport != "" { cfg.host = hostport }
+    }
+    cfg
+}
+
++ch_json_quote(s: str) : str => "\"" + replace(replace(s, "\\", "\\\\"), "\"", "\\\"") + "\""
+
+test "parse clickhouse url" {
+    c = ch_parse_url("http://ch.local:9000/analytics")
+    assert_eq(c.host, "ch.local")
+    assert_eq(c.port, 9000)
+    assert_eq(c.database, "analytics")
+}
+
+test "offline create insert query" {
+    ch = ChClient.offline()
+    #assert(@ch.create_table("hits", ["d", "v"], ["Date", "UInt64"]))
+    assert_eq(@ch.insert("hits", ["2024-01-01", "3"]) or 0, 1)
+    assert_eq(@ch.insert("hits", ["2024-01-02", "5"]) or 0, 2)
+    rows = @ch.query("hits") or []
+    assert_eq(len(rows), 2)
+    assert_eq(ch.count("hits"), 2)
+}
+
+test "tsv and json each row codecs" {
+    ch = ChClient.offline()
+    line = ch.encode_tsv(["a", "b", "c"])
+    assert_eq(line, "a\tb\tc")
+    parsed = ch.parse_tsv("1\t2\n3\t4\n")
+    assert_eq(len(parsed), 2)
+    j = ch.encode_json_row(["d", "v"], ["2024-01-01", "9"])
+    assert_eq(j, "{\"d\":\"2024-01-01\",\"v\":\"9\"}")
+}
+
+test "http query url builder" {
+    ch = ChClient.new("http://127.0.0.1:8123", "default", "")
+    u = ch.http_query_url("SELECT 1")
+    #assert(contains(u, "8123"))
+    #assert(contains(u, "SELECT 1"))
+}

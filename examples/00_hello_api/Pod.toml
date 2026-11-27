@@ -1,0 +1,16 @@
+[pod]
+name = "super-hello-api"
+version = "0.1.0"
+
+[build]
+profile = "dev"
+backend = "c23"
+mode = "aot"
+
+[profile.dev]
+opt = "0"
+debug-info = true
+
+[profile.release]
+opt = "2"
+strip = true

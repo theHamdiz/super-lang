@@ -1,0 +1,1155 @@
+//! std.math.rand — deterministic, seedable random numbers (MRG32k3a, Philox4x32-10) and
+//! low-discrepancy sequences (Halton, Sobol)
+//!
+//! Import with:
+//!   use std.math.rand
+//!
+//! Then:  r = Rng.new(42)
+//!        @r.range(1, 7)        // die roll, 1..6
+//!        @r.float()            // [0, 1)
+//!        deck = @r.shuffle(deck)
+//!
+//! The generator is L'Ecuyer's combined multiple-recursive MRG32k3a: six 32-bit
+//! words of state, period ~2^191, and every intermediate product fits an i64 so
+//! it is exact on every host. Same seed => same sequence on every platform,
+//! which is what replays, procedural worlds and tests need. `Rng.from_clock`
+//! seeds from the wall clock for the non-deterministic case.
+//!
+//! Every draw mutates the generator, so call sites use `@r.xxx(...)`.
+//!
+//! `Philox4x32` is the counter-based Philox4x32-10 generator (Salmon et al., Random123): output
+//! block `n` of stream `s` under key `seed` is a pure function of `(seed, s, n)`, so parallel
+//! workers get independent deterministic streams (`Philox4x32.with_stream(seed, worker_id)`),
+//! any position is reachable in O(1) (`@g.seek(n)`), and results never depend on thread order.
+//! `philox_float(seed, stream, j)` draws the j-th float of a stream with no generator state.
+//!
+//!        g = Philox4x32.with_stream(42, worker_id)
+//!        @g.float()
+//!        @g.range(1, 7)
+//!
+//! `Halton` and `Sobol` are quasi-random point sets for integration and sampling: `Sobol.new(d)`
+//! (Joe-Kuo direction numbers, up to 12 dimensions) and `Halton.new(d)` (first 16 primes) yield
+//! points in [0, 1)^d with far lower discrepancy than pseudo-random draws.
+
+//!
+//! **Not for cryptography.** Tokens, nonces, keys, and session ids must use
+//! `std.sec.csprng` (OS entropy). This module is for simulation, games, tests,
+//! and Monte Carlo -- never as a silent entropy fallback.
+/// `RNG_M1` is `4294967087`.
++RNG_M1 = 4294967087
+/// `RNG_M2` is `4294944443`.
++RNG_M2 = 4294944443
+/// `RNG_NORM` is `0.0000000002328306549295728`.
++RNG_NORM = 0.0000000002328306549295728
+
+/// `Rng` is a seeded pseudo-random number generator.
++Rng: Iter = {
+    /// A0 on `Rng` (`i64`). Defaults to `12345`.
+    a0: i64 = 12345
+    /// A1 on `Rng` (`i64`). Defaults to `12345`.
+    a1: i64 = 12345
+    /// A2 on `Rng` (`i64`). Defaults to `12345`.
+    a2: i64 = 12345
+    /// B0 on `Rng` (`i64`). Defaults to `12345`.
+    b0: i64 = 12345
+    /// B1 on `Rng` (`i64`). Defaults to `12345`.
+    b1: i64 = 12345
+    /// B2 on `Rng` (`i64`). Defaults to `12345`.
+    b2: i64 = 12345
+
+    /// Reference state of the published MRG32k3a test vector (all words 12345).
+    reference() : Rng => Rng.{a0: 12345, a1: 12345, a2: 12345, b0: 12345, b1: 12345, b2: 12345}
+
+    /// Expand `seed` into a valid six-word state (never all zero, words in range).
+    new(seed: i64) : Rng {
+        s = seed % 2147483647
+        if s < 0 { s = -s }
+        s = s + 1
+        w0 = (s * 48271) % 2147483647 + 1
+        w1 = (w0 * 48271) % 2147483647 + 1
+        w2 = (w1 * 48271) % 2147483647 + 1
+        w3 = (w2 * 48271) % 2147483647 + 1
+        w4 = (w3 * 48271) % 2147483647 + 1
+        w5 = (w4 * 48271) % 2147483647 + 1
+        Rng.{a0: w0, a1: w1, a2: w2, b0: w3, b1: w4, b2: w5}
+    }
+
+    /// Generator seeded from the monotonic clock.
+    from_clock() : Rng => Rng.new(host.sys_unix_ns() % 2147483647)
+
+    /// Next raw output in [0, RNG_M1].
+    next(@self) : i64 {
+        p1 = (1403580 * self.a1 - 810728 * self.a0) % RNG_M1
+        if p1 < 0 { p1 += RNG_M1 }
+        self.a0 = self.a1
+        self.a1 = self.a2
+        self.a2 = p1
+        p2 = (527612 * self.b2 - 1370589 * self.b0) % RNG_M2
+        if p2 < 0 { p2 += RNG_M2 }
+        self.b0 = self.b1
+        self.b1 = self.b2
+        self.b2 = p2
+        if p1 > p2 { return p1 - p2 }
+        p1 - p2 + RNG_M1
+    }
+
+    /// Uniform float in [0, 1).
+    float(@self) : f64 {
+        v = @self.next()
+        v * RNG_NORM
+    }
+
+    /// Uniform integer in [lo, hi). Returns `lo` for an empty range.
+    range(@self, lo: i64, hi: i64) : i64 {
+        ensure hi > lo else { return lo }
+        span = hi - lo
+        v = @self.next()
+        lo + v % span
+    }
+
+    /// true with probability `p`.
+    chance(@self, p: f64) : bool {
+        v = @self.float()
+        v < p
+    }
+
+    /// Uniform float in [lo, hi).
+    float_range(@self, lo: f64, hi: f64) : f64 {
+        v = @self.float()
+        lo + (hi - lo) * v
+    }
+
+    /// Sum of `n` dice with `sides` faces.
+    roll(@self, n: i64, sides: i64) : i64 {
+        total = 0
+        for 0..n {
+            total += @self.range(1, sides + 1)
+        }
+        total
+    }
+
+    /// Standard-normal sample (Box-Muller).
+    gauss(@self) : f64 {
+        u1 = @self.float()
+        u2 = @self.float()
+        if u1 < 0.0000000001 { u1 = 0.0000000001 }
+        mag = host.sys_sqrt(0.0 - 2.0 * host.sys_ln(u1))
+        mag * host.sys_cos(6.283185307179586 * u2)
+    }
+
+    /// Sample from a normal distribution with mean `mean` and standard deviation `sd`.
+    normal(@self, mean: f64, sd: f64) : f64 {
+        g = @self.gauss()
+        mean + sd * g
+    }
+
+    /// Random element of a non-empty array (`none` when empty).
+    pick(@self, items: _) {
+        n = host.sys_arr_len(items)
+        ensure n > 0 else { return none }
+        k = @self.range(0, n)
+        items[k]
+    }
+
+    /// Fisher-Yates shuffle; returns a new array.
+    shuffle(@self, items: _) {
+        out = items
+        n = host.sys_arr_len(items)
+        for 0..n {
+            i = n - 1 - it
+            j = @self.range(0, i + 1)
+            t = out[i]
+            out = host.sys_arr_set(out, i, out[j])
+            out = host.sys_arr_set(out, j, t)
+        }
+        out
+    }
+
+    /// Weighted pick: index drawn with probability weights[i] / sum(weights).
+    /// Returns -1 when the total weight is not positive.
+    weighted(@self, weights: _) : i64 {
+        total = weights.sum()
+        ensure total > 0.0 else { return -1 }
+        x = @self.float()
+        target = x * total
+        acc = 0.0
+        chosen = -1
+        for weights {
+            acc += it
+            if chosen < 0 && target < acc { chosen = index }
+        }
+        if chosen < 0 { chosen = host.sys_arr_len(weights) - 1 }
+        chosen
+    }
+
+    /// Sample `k` distinct indices from 0..n (as a shuffled prefix).
+    sample(@self, n: i64, k: i64) {
+        idx = []
+        for 0..n { idx = host.sys_arr_push(idx, it) }
+        mixed = @self.shuffle(idx)
+        out = []
+        take = k
+        if take > n { take = n }
+        for 0..take { out = host.sys_arr_push(out, mixed[it]) }
+        out
+    }
+}
+
+// --- Philox4x32-10 (counter-based) ---------------------------------------------------
+
+/// `PHILOX_M0` is the Philox4x32 round multiplier for lane 0.
++PHILOX_M0 = 0xD2511F53
+/// `PHILOX_M1` is the Philox4x32 round multiplier for lane 2.
++PHILOX_M1 = 0xCD9E8D57
+/// `PHILOX_W0` is the golden-ratio key increment for key word 0.
++PHILOX_W0 = 0x9E3779B9
+/// `PHILOX_W1` is the key increment for key word 1 (sqrt(3) - 1).
++PHILOX_W1 = 0xBB67AE85
+/// `PHILOX_MASK` keeps the low 32 bits of an `i64`.
++PHILOX_MASK = 0xFFFFFFFF
+
+/// High 32 bits of the 64-bit product of two 32-bit words, computed without `i64` overflow.
++philox_mulhi(a: i64, b: i64) : i64 {
+    x = a * (b >>> 16)
+    s = (x & 65535) * 65536 + a * (b & 65535)
+    (x >>> 16) + (s >>> 32)
+}
+
+/// Low 32 bits of the 64-bit product of two 32-bit words, computed without `i64` overflow.
++philox_mullo(a: i64, b: i64) : i64 {
+    x = a * (b >>> 16)
+    ((x & 65535) * 65536 + a * (b & 65535)) & PHILOX_MASK
+}
+
+/// One Philox4x32-10 block: ten rounds over the 128-bit counter `(c0, c1, c2, c3)` and the 64-bit
+/// key `(k0, k1)`; every word is a 32-bit value in an `i64`. Returns the four output words.
++philox4x32_10(c0: i64, c1: i64, c2: i64, c3: i64, k0: i64, k1: i64) {
+    a0 = c0
+    a1 = c1
+    a2 = c2
+    a3 = c3
+    key0 = k0
+    key1 = k1
+    for 0..10 {
+        hi0 = philox_mulhi(PHILOX_M0, a0)
+        lo0 = philox_mullo(PHILOX_M0, a0)
+        hi1 = philox_mulhi(PHILOX_M1, a2)
+        lo1 = philox_mullo(PHILOX_M1, a2)
+        a0 = hi1 ^ a1 ^ key0
+        a1 = lo1
+        a2 = hi0 ^ a3 ^ key1
+        a3 = lo0
+        key0 = (key0 + PHILOX_W0) & PHILOX_MASK
+        key1 = (key1 + PHILOX_W1) & PHILOX_MASK
+    }
+    out = [a0, a1, a2, a3]
+    out
+}
+
+/// Output block `counter` of `stream` under `seed`: four 32-bit words, a pure function of its arguments.
++philox_block(seed: i64, stream: i64, counter: i64) {
+    philox4x32_10(counter & PHILOX_MASK, (counter >>> 32) & PHILOX_MASK, stream & PHILOX_MASK, (stream >>> 32) & PHILOX_MASK, seed & PHILOX_MASK, (seed >>> 32) & PHILOX_MASK)
+}
+
+/// The `j`-th uniform float in [0, 1) of `stream` under `seed`, with no generator state. Equals the
+/// `j`-th `float()` of `Philox4x32.with_stream(seed, stream)`; each float uses two 32-bit words (53 bits).
++philox_float(seed: i64, stream: i64, j: i64) : f64 {
+    w = philox_block(seed, stream, j / 2)
+    base = (j % 2) * 2
+    a = w[base] >>> 5
+    b = w[base + 1] >>> 6
+    host.sys_to_float(a * 67108864 + b) / 9007199254740992.0
+}
+
+/// `Philox4x32` is a counter-based generator: stream `(s0, s1)` under key `(k0, k1)` is a
+/// sequence of 4-word blocks indexed by a 63-bit block counter.
++Philox4x32: Iter = {
+    /// Key word 0. Defaults to `0`.
+    k0: i64 = 0
+    /// Key word 1. Defaults to `0`.
+    k1: i64 = 0
+    /// Stream id, low word (counter word 2). Defaults to `0`.
+    s0: i64 = 0
+    /// Stream id, high word (counter word 3). Defaults to `0`.
+    s1: i64 = 0
+    /// Next block counter to generate. Defaults to `0`.
+    block: i64 = 0
+    /// Index of the next buffered word; `4` means the buffer is empty. Defaults to `4`.
+    pos: i64 = 4
+    /// Buffered output words of the current block. Defaults to `[]`.
+    buf: _ = []
+
+    /// Generator on stream 0 keyed by the 64-bit `seed`.
+    new(seed: i64) : Philox4x32 => Philox4x32.{k0: seed & PHILOX_MASK, k1: (seed >>> 32) & PHILOX_MASK}
+
+    /// Generator keyed by `seed` on the independent stream `stream` (e.g. one per worker or entity).
+    with_stream(seed: i64, stream: i64) : Philox4x32 {
+        Philox4x32.{k0: seed & PHILOX_MASK, k1: (seed >>> 32) & PHILOX_MASK, s0: stream & PHILOX_MASK, s1: (stream >>> 32) & PHILOX_MASK}
+    }
+
+    /// Fresh generator at position 0 with the same key on stream `id`.
+    substream(self, id: i64) : Philox4x32 {
+        Philox4x32.{k0: self.k0, k1: self.k1, s0: id & PHILOX_MASK, s1: (id >>> 32) & PHILOX_MASK}
+    }
+
+    -refill(@self) {
+        self.buf = philox4x32_10(self.block & PHILOX_MASK, (self.block >>> 32) & PHILOX_MASK, self.s0, self.s1, self.k0, self.k1)
+        self.block += 1
+        self.pos = 0
+    }
+
+    /// Next uniform 32-bit word in [0, 2^32).
+    next(@self) : i64 {
+        if self.pos >= 4 { @self.refill() }
+        v = self.buf[self.pos]
+        self.pos += 1
+        v
+    }
+
+    /// Index of the next 32-bit word drawn from this stream.
+    position(self) : i64 => (self.block - 1) * 4 + self.pos
+
+    /// Jump so the next word drawn is word `n` of the stream, in O(1).
+    seek(@self, n: i64) {
+        q = n / 4
+        r = n % 4
+        self.block = q
+        if r == 0 {
+            self.pos = 4
+        } else {
+            @self.refill()
+            self.pos = r
+        }
+    }
+
+    /// Discard the next `n` words, in O(1).
+    skip(@self, n: i64) {
+        at = self.position()
+        @self.seek(at + n)
+    }
+
+    /// Uniform 63-bit non-negative integer from two words.
+    wide(@self) : i64 {
+        hi = @self.next()
+        lo = @self.next()
+        (hi << 31) | (lo >>> 1)
+    }
+
+    /// Uniform float in [0, 1) with 53 random bits (two words).
+    float(@self) : f64 {
+        a = @self.next()
+        b = @self.next()
+        host.sys_to_float((a >>> 5) * 67108864 + (b >>> 6)) / 9007199254740992.0
+    }
+
+    /// Unbiased uniform integer in [lo, hi) by rejection sampling. Returns `lo` for an empty range.
+    range(@self, lo: i64, hi: i64) : i64 {
+        ensure hi > lo else { return lo }
+        span = hi - lo
+        if span <= 4294967296 {
+            limit = 4294967296 - 4294967296 % span
+            v = @self.next()
+            while v >= limit { v = @self.next() }
+            return lo + v % span
+        }
+        top = 9223372036854775807
+        v = @self.wide()
+        r = v % span
+        while v - r > top - (span - 1) {
+            v = @self.wide()
+            r = v % span
+        }
+        lo + r
+    }
+
+    /// true with probability `p`.
+    chance(@self, p: f64) : bool {
+        v = @self.float()
+        v < p
+    }
+
+    /// Uniform float in [lo, hi).
+    float_range(@self, lo: f64, hi: f64) : f64 {
+        v = @self.float()
+        lo + (hi - lo) * v
+    }
+
+    /// Standard-normal sample (Box-Muller, two floats per sample).
+    gauss(@self) : f64 {
+        u1 = 1.0 - @self.float()
+        u2 = @self.float()
+        mag = host.sys_sqrt(0.0 - 2.0 * host.sys_ln(u1))
+        mag * host.sys_cos(6.283185307179586 * u2)
+    }
+
+    /// Sample from a normal distribution with mean `mean` and standard deviation `sd`.
+    normal(@self, mean: f64, sd: f64) : f64 {
+        g = @self.gauss()
+        mean + sd * g
+    }
+
+    /// Fisher-Yates shuffle; returns a new array.
+    shuffle(@self, items: _) {
+        out = items
+        n = host.sys_arr_len(items)
+        for 0..n {
+            i = n - 1 - it
+            j = @self.range(0, i + 1)
+            t = out[i]
+            out = host.sys_arr_set(out, i, out[j])
+            out = host.sys_arr_set(out, j, t)
+        }
+        out
+    }
+}
+
+/// `n` independent generators keyed by `seed` on streams `0..n`, e.g. one per worker thread. Annotate
+/// the element type when drawing (`g: Philox4x32 = gens[i]`) so `@g.next()` resolves to `Philox4x32`.
++philox_streams(seed: i64, n: i64) {
+    out = []
+    for 0..n { out = host.sys_arr_push(out, Philox4x32.with_stream(seed, it)) }
+    out
+}
+
+// --- low-discrepancy sequences -------------------------------------------------------
+
+/// The first 16 primes: the Halton bases for dimensions 1..16.
++HALTON_PRIMES = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53]
+
+/// Degrees `s` of the Joe-Kuo primitive polynomials for Sobol dimensions 2..12.
++SOBOL_S = [1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 5]
+/// Polynomial coefficient bits `a` of the Joe-Kuo polynomials for Sobol dimensions 2..12.
++SOBOL_A = [0, 1, 1, 2, 1, 4, 2, 4, 7, 11, 13]
+/// Initial direction numbers `m_1..m_s` of the Joe-Kuo parameters for Sobol dimensions 2..12.
++SOBOL_M = [[1], [1, 3], [1, 3, 1], [1, 1, 1], [1, 1, 3, 3], [1, 3, 5, 13], [1, 1, 5, 5, 17], [1, 1, 5, 5, 5], [1, 1, 7, 11, 19], [1, 1, 5, 1, 1], [1, 1, 1, 3, 11]]
+
+/// Largest supported Sobol dimension.
++SOBOL_MAX_DIM = 12
+
+/// Radical inverse of `i` in `base`: the digits of `i` mirrored about the radix point, in [0, 1).
++halton_radical_inverse(i: i64, base: i64) : f64 {
+    bf = host.sys_to_float(base)
+    f = 1.0
+    r = 0.0
+    n = i
+    while n > 0 {
+        f = f / bf
+        r += f * host.sys_to_float(n % base)
+        n = n / base
+    }
+    r
+}
+
+/// `Halton` is a Halton point-set generator in `dim` dimensions (base = k-th prime per axis).
++Halton: Iter = {
+    /// Number of dimensions. Defaults to `1`.
+    dim: i64 = 1
+    /// Index of the last emitted point (the next is `index + 1`; point 0 is the origin and is skipped). Defaults to `0`.
+    index: i64 = 0
+
+    /// Generator for `dim` in 1..=16; fails otherwise.
+    new(dim: i64) : Halton! {
+        ensure dim >= 1 && dim <= 16 else {
+            fail "halton: dimension must be in 1..=16"
+            return
+        }
+        Halton.{dim, index: 0}
+    }
+
+    /// Point number `i` as an array of `dim` coordinates in [0, 1).
+    at(self, i: i64) {
+        out = []
+        for 0..self.dim { out = host.sys_arr_push(out, halton_radical_inverse(i, HALTON_PRIMES[it])) }
+        out
+    }
+
+    /// Next point of the sequence (starting at point 1).
+    next(@self) {
+        self.index += 1
+        self.at(self.index)
+    }
+
+    /// Discard the next `n` points.
+    skip(@self, n: i64) {
+        self.index += n
+    }
+}
+
+/// Sobol direction numbers for one dimension: 32 words `V_1..V_32`, each a 32-bit fraction.
+sobol_directions(d: i64) {
+    v = host.sys_arr_new(32, 0)
+    if d == 0 {
+        for 0..32 { v = host.sys_arr_set(v, it, 1 << (31 - it)) }
+        return v
+    }
+    s = SOBOL_S[d - 1]
+    a = SOBOL_A[d - 1]
+    ms = SOBOL_M[d - 1]
+    for 0..s { v = host.sys_arr_set(v, it, ms[it] << (31 - it)) }
+    for s..32 {
+        i = it
+        w = v[i - s] ^ (v[i - s] >>> s)
+        for 1..s {
+            k = it
+            if ((a >>> (s - 1 - k)) & 1) == 1 { w = w ^ v[i - k] }
+        }
+        v = host.sys_arr_set(v, i, w)
+    }
+    v
+}
+
+/// `Sobol` is a Sobol low-discrepancy generator (Gray-code order, Joe-Kuo direction numbers).
++Sobol: Iter = {
+    /// Number of dimensions. Defaults to `1`.
+    dim: i64 = 1
+    /// Direction numbers, 32 per dimension (flat). Defaults to `[]`.
+    v: _ = []
+    /// Raw 32-bit state of the last emitted point, one word per dimension. Defaults to `[]`.
+    x: _ = []
+    /// Number of points emitted so far. Defaults to `0`.
+    index: i64 = 0
+
+    /// Generator for `dim` in 1..=12 (`SOBOL_MAX_DIM`); fails otherwise. The first point is the origin.
+    new(dim: i64) : Sobol! {
+        ensure dim >= 1 && dim <= SOBOL_MAX_DIM else {
+            fail "sobol: dimension must be in 1..=12"
+            return
+        }
+        v = []
+        for 0..dim {
+            dv = sobol_directions(it)
+            for dv { v = host.sys_arr_push(v, it) }
+        }
+        Sobol.{dim, v, x: host.sys_arr_new(dim, 0), index: 0}
+    }
+
+    /// Raw 32-bit words of point number `i`, computed directly from its Gray code.
+    -raw_at(self, i: i64) {
+        gray = i ^ (i >>> 1)
+        out = host.sys_arr_new(self.dim, 0)
+        for 0..self.dim {
+            d = it
+            acc = 0
+            for 0..32 {
+                if ((gray >>> it) & 1) == 1 { acc = acc ^ self.v[d * 32 + it] }
+            }
+            out = host.sys_arr_set(out, d, acc)
+        }
+        out
+    }
+
+    /// Point number `i` (0-based) as an array of `dim` coordinates in [0, 1).
+    at(self, i: i64) {
+        raw = self.raw_at(i)
+        out = []
+        for raw { out = host.sys_arr_push(out, host.sys_to_float(it) / 4294967296.0) }
+        out
+    }
+
+    /// Next point of the sequence (the first call returns the origin).
+    next(@self) {
+        if self.index > 0 {
+            c = 0
+            t = self.index - 1
+            while (t & 1) == 1 {
+                t = t >>> 1
+                c += 1
+            }
+            for 0..self.dim { self.x = host.sys_arr_set(self.x, it, self.x[it] ^ self.v[it * 32 + c]) }
+        }
+        self.index += 1
+        out = []
+        for self.x { out = host.sys_arr_push(out, host.sys_to_float(it) / 4294967296.0) }
+        out
+    }
+
+    /// Discard the next `n` points in O(dim * 32).
+    skip(@self, n: i64) {
+        target = self.index + n
+        if target > 0 { self.x = self.raw_at(target - 1) }
+        self.index = target
+    }
+}
+
+// --- tests ---------------------------------------------------------------------
+
+/// Test that MRG32k3a reference vector.
+test "MRG32k3a reference vector" {
+    r = Rng.reference()
+    u = @r.float()
+    #assert(u > 0.12701)
+    #assert(u < 0.12702)
+    v = @r.float()
+    #assert(v > 0.318)
+    #assert(v < 0.319)
+}
+
+/// Test that same seed gives the same sequence.
+test "same seed gives the same sequence" {
+    a = Rng.new(1234)
+    b = Rng.new(1234)
+    same = true
+    for 0..50 {
+        x = @a.next()
+        y = @b.next()
+        if x != y { same = false }
+    }
+    #assert(same)
+}
+
+/// Test that different seeds diverge.
+test "different seeds diverge" {
+    a = Rng.new(1)
+    b = Rng.new(2)
+    differ = 0
+    for 0..20 {
+        x = @a.next()
+        y = @b.next()
+        if x != y { differ += 1 }
+    }
+    #assert(differ > 15)
+}
+
+/// Test that seeding is valid for zero and negative seeds.
+test "seeding is valid for zero and negative seeds" {
+    z = Rng.new(0)
+    n = Rng.new(-99)
+    #assert(z.a0 > 0)
+    #assert(n.b2 > 0)
+    x = @z.range(0, 10)
+    #assert(x >= 0 && x < 10)
+    y = @n.range(0, 10)
+    #assert(y >= 0 && y < 10)
+}
+
+/// Test that float is in the unit interval with sane mean.
+test "float is in the unit interval with sane mean" {
+    r = Rng.new(7)
+    lo = 1.0
+    hi = 0.0
+    sum = 0.0
+    for 0..2000 {
+        f = @r.float()
+        if f < lo { lo = f }
+        if f > hi { hi = f }
+        sum += f
+    }
+    #assert(lo >= 0.0)
+    #assert(hi < 1.0)
+    mean = sum / 2000.0
+    #assert(mean > 0.45 && mean < 0.55)
+}
+
+/// Test that range bounds and coverage.
+test "range bounds and coverage" {
+    r = Rng.new(99)
+    seen = host.sys_arr_new(6, 0)
+    ok = true
+    for 0..600 {
+        v = @r.range(1, 7)
+        if v < 1 || v > 6 { ok = false }
+        if v >= 1 && v <= 6 { seen = host.sys_arr_set(seen, v - 1, seen[v - 1] + 1) }
+    }
+    #assert(ok)
+    covered = 0
+    for seen { if it > 40 { covered += 1 } }
+    assert_eq(covered, 6)
+    assert_eq(@r.range(5, 5), 5)
+    assert_eq(@r.range(9, 3), 9)
+    neg = @r.range(-5, -2)
+    #assert(neg >= -5 && neg < -2)
+}
+
+/// Test that float range chance and roll.
+test "float range chance and roll" {
+    r = Rng.new(3)
+    f = @r.float_range(10.0, 20.0)
+    #assert(f >= 10.0 && f < 20.0)
+    hits = 0
+    for 0..1000 {
+        if @r.chance(0.25) { hits += 1 }
+    }
+    #assert(hits > 180 && hits < 320)
+    #assert(!(@r.chance(0.0)))
+    #assert(@r.chance(1.0))
+    total = @r.roll(3, 6)
+    #assert(total >= 3 && total <= 18)
+    assert_eq(@r.roll(0, 6), 0)
+}
+
+/// Test that gaussian has roughly zero mean and unit spread.
+test "gaussian has roughly zero mean and unit spread" {
+    r = Rng.new(2024)
+    sum = 0.0
+    sq = 0.0
+    for 0..3000 {
+        g = @r.gauss()
+        sum += g
+        sq += g * g
+    }
+    mean = sum / 3000.0
+    var = sq / 3000.0 - mean * mean
+    #assert(mean > 0.0 - 0.1 && mean < 0.1)
+    #assert(var > 0.85 && var < 1.15)
+    n = @r.normal(100.0, 0.0)
+    assert_eq(n, 100.0)
+}
+
+/// Test that pick and shuffle.
+test "pick and shuffle" {
+    r = Rng.new(5)
+    items = [10, 20, 30, 40, 50]
+    p = @r.pick(items)
+    assert_eq(p % 10, 0)
+    #assert(p >= 10 && p <= 50)
+    assert_eq(@r.pick([]) or -1, -1)
+    s = @r.shuffle(items)
+    assert_eq(host.sys_arr_len(s), 5)
+    total = s.sum()
+    assert_eq(total, 150)
+    assert_eq(items[0], 10)
+    moved = 0
+    for 0..20 {
+        t = @r.shuffle(items)
+        if t[0] != 10 { moved += 1 }
+    }
+    #assert(moved > 8)
+}
+
+/// Test that weighted choice respects weights.
+test "weighted choice respects weights" {
+    r = Rng.new(11)
+    counts = [0, 0, 0]
+    for 0..1000 {
+        k = @r.weighted([1.0, 0.0, 3.0])
+        counts = host.sys_arr_set(counts, k, counts[k] + 1)
+    }
+    assert_eq(counts[1], 0)
+    #assert(counts[2] > counts[0] * 2)
+    assert_eq(@r.weighted([0.0, 0.0]), -1)
+    assert_eq(@r.weighted([]), -1)
+}
+
+/// Test that sample draws distinct indices.
+test "sample draws distinct indices" {
+    r = Rng.new(77)
+    pick = @r.sample(10, 4)
+    assert_eq(host.sys_arr_len(pick), 4)
+    distinct = true
+    for pick {
+        a = it
+        dup = 0
+        for pick { if it == a { dup += 1 } }
+        if dup != 1 { distinct = false }
+        if a < 0 || a >= 10 { distinct = false }
+    }
+    #assert(distinct)
+    assert_eq(host.sys_arr_len(@r.sample(3, 9)), 3)
+}
+
+/// Test that clock seeding produces a usable generator.
+test "clock seeding produces a usable generator" {
+    r = Rng.from_clock()
+    v = @r.range(0, 100)
+    #assert(v >= 0 && v < 100)
+}
+
+/// Test that the 32x32 multiply halves are exact.
+test "philox multiply halves are exact" {
+    assert_eq(philox_mulhi(4294967295, 4294967295), 4294967294)
+    assert_eq(philox_mullo(4294967295, 4294967295), 1)
+    assert_eq(philox_mulhi(PHILOX_M0, PHILOX_M1), 2834118724)
+    assert_eq(philox_mullo(PHILOX_M0, PHILOX_M1), 4094450741)
+    assert_eq(philox_mulhi(0, PHILOX_M1), 0)
+    assert_eq(philox_mullo(1, 7), 7)
+    assert_eq(philox_mulhi(65536, 65536), 1)
+    assert_eq(philox_mullo(65536, 65536), 0)
+}
+
+/// Test that Philox4x32-10 matches the Random123 known-answer vectors.
+test "Philox4x32-10 matches the Random123 known-answer vectors" {
+    z = philox4x32_10(0, 0, 0, 0, 0, 0)
+    assert_eq(z[0], 0x6627e8d5)
+    assert_eq(z[1], 0xe169c58d)
+    assert_eq(z[2], 0xbc57ac4c)
+    assert_eq(z[3], 0x9b00dbd8)
+    ones = philox4x32_10(0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff)
+    assert_eq(ones[0], 0x408f276d)
+    assert_eq(ones[1], 0x41c83b0e)
+    assert_eq(ones[2], 0xa20bc7c6)
+    assert_eq(ones[3], 0x6d5451fd)
+    pi = philox4x32_10(0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344, 0xa4093822, 0x299f31d0)
+    assert_eq(pi[0], 0xd16cfe09)
+    assert_eq(pi[1], 0x94fdcceb)
+    assert_eq(pi[2], 0x5001e420)
+    assert_eq(pi[3], 0x24126ea1)
+}
+
+/// Test that blocks are pure functions of seed, stream and counter.
+test "Philox blocks are pure functions of seed, stream and counter" {
+    b = philox_block(42, 7, 0)
+    assert_eq(b[0], 1743679276)
+    assert_eq(b[1], 3847491788)
+    assert_eq(b[2], 1820248629)
+    assert_eq(b[3], 1433639123)
+    c = philox_block(42, 7, 3)
+    assert_eq(c[0], 2489043674)
+    assert_eq(c[3], 4242002894)
+    d = philox_block(42, 0, 1)
+    assert_eq(d[0], 4242219303)
+    assert_eq(d[3], 1951270651)
+    e = philox_block(1, 0, 0)
+    assert_eq(e[0], 3823634032)
+    assert_eq(e[3], 3054873127)
+    again = philox_block(42, 7, 3)
+    for 0..4 { assert_eq(again[it], c[it]) }
+    #assert(philox_block(42, 7, 4294967296 + 5)[1] != philox_block(42, 7, 5)[1])
+}
+
+/// Test that the generator walks the block stream in order.
+test "Philox generator walks the block stream in order" {
+    g = Philox4x32.with_stream(42, 7)
+    assert_eq(g.position(), 0)
+    assert_eq(@g.next(), 1743679276)
+    assert_eq(@g.next(), 3847491788)
+    assert_eq(@g.next(), 1820248629)
+    assert_eq(@g.next(), 1433639123)
+    assert_eq(g.position(), 4)
+    assert_eq(@g.next(), philox_block(42, 7, 1)[0])
+    assert_eq(g.position(), 5)
+    base = Philox4x32.new(42)
+    sub = base.substream(7)
+    assert_eq(@sub.next(), 1743679276)
+    s0 = Philox4x32.new(42)
+    assert_eq(@s0.next(), philox_block(42, 0, 0)[0])
+}
+
+/// Test that seeds and streams diverge and replays are exact.
+test "Philox seeds and streams diverge and replays are exact" {
+    a = Philox4x32.with_stream(5, 1)
+    b = Philox4x32.with_stream(5, 1)
+    c = Philox4x32.with_stream(5, 2)
+    d = Philox4x32.with_stream(6, 1)
+    same = true
+    diff_stream = 0
+    diff_seed = 0
+    for 0..64 {
+        x = @a.next()
+        y = @b.next()
+        z = @c.next()
+        w = @d.next()
+        if x != y { same = false }
+        if x != z { diff_stream += 1 }
+        if x != w { diff_seed += 1 }
+    }
+    #assert(same)
+    assert_eq(diff_stream, 64)
+    assert_eq(diff_seed, 64)
+    big = Philox4x32.with_stream(9, 4294967296 + 3)
+    low = Philox4x32.with_stream(9, 3)
+    #assert(@big.next() != @low.next())
+    hi_seed = Philox4x32.new(4294967296 + 1)
+    lo_seed = Philox4x32.new(1)
+    #assert(@hi_seed.next() != @lo_seed.next())
+}
+
+/// Test that seek and skip jump to the same words as sequential draws.
+test "Philox seek and skip jump to the same words as sequential draws" {
+    ref = Philox4x32.with_stream(11, 3)
+    words = []
+    for 0..40 { words = host.sys_arr_push(words, @ref.next()) }
+    for [0, 1, 3, 4, 5, 8, 13, 39] {
+        n = it
+        g = Philox4x32.with_stream(11, 3)
+        @g.seek(n)
+        assert_eq(g.position(), n)
+        assert_eq(@g.next(), words[n])
+    }
+    h = Philox4x32.with_stream(11, 3)
+    @h.next()
+    @h.skip(6)
+    assert_eq(h.position(), 7)
+    assert_eq(@h.next(), words[7])
+    @h.skip(0)
+    assert_eq(@h.next(), words[8])
+}
+
+/// Test that floats are in [0, 1), match the stateless draw, and have a sane mean.
+test "Philox floats are in the unit interval and match the stateless draw" {
+    g = Philox4x32.with_stream(2024, 5)
+    lo = 1.0
+    hi = 0.0
+    sum = 0.0
+    same = true
+    for 0..2000 {
+        f = @g.float()
+        if f < lo { lo = f }
+        if f > hi { hi = f }
+        sum += f
+        if f != philox_float(2024, 5, index) { same = false }
+    }
+    #assert(lo >= 0.0)
+    #assert(hi < 1.0)
+    #assert(same)
+    mean = sum / 2000.0
+    #assert(mean > 0.46 && mean < 0.54)
+    assert_eq(g.position(), 4000)
+    #assert(@g.float_range(10.0, 20.0) >= 10.0)
+}
+
+/// Test that range is bounded, covers every value, and handles huge and empty spans.
+test "Philox range is bounded, covers every value and handles huge spans" {
+    g = Philox4x32.with_stream(99, 0)
+    seen = host.sys_arr_new(6, 0)
+    ok = true
+    for 0..1200 {
+        v = @g.range(1, 7)
+        if v < 1 || v > 6 { ok = false } else { seen = host.sys_arr_set(seen, v - 1, seen[v - 1] + 1) }
+    }
+    #assert(ok)
+    for seen { #assert(it > 140 && it < 260) }
+    assert_eq(@g.range(5, 5), 5)
+    assert_eq(@g.range(9, 3), 9)
+    neg = @g.range(-5, -2)
+    #assert(neg >= -5 && neg < -2)
+    wide_ok = true
+    for 0..200 {
+        a = @g.range(0, 10000000000)
+        if a < 0 || a >= 10000000000 { wide_ok = false }
+        b = @g.range(0, 9223372036854775807)
+        if b < 0 { wide_ok = false }
+        c = @g.range(1, 4611686018427387905)
+        if c < 1 || c >= 4611686018427387905 { wide_ok = false }
+    }
+    #assert(wide_ok)
+    one = @g.range(0, 1)
+    assert_eq(one, 0)
+}
+
+/// Test that gauss has roughly zero mean and unit spread, and chance honours its bounds.
+test "Philox gauss moments and chance bounds" {
+    g = Philox4x32.with_stream(31, 1)
+    sum = 0.0
+    sq = 0.0
+    for 0..4000 {
+        x = @g.gauss()
+        sum += x
+        sq += x * x
+    }
+    mean = sum / 4000.0
+    var = sq / 4000.0 - mean * mean
+    #assert(mean > 0.0 - 0.08 && mean < 0.08)
+    #assert(var > 0.88 && var < 1.12)
+    assert_eq(@g.normal(100.0, 0.0), 100.0)
+    hits = 0
+    for 0..1000 { if @g.chance(0.25) { hits += 1 } }
+    #assert(hits > 190 && hits < 310)
+    #assert(!(@g.chance(0.0)))
+    #assert(@g.chance(1.0))
+}
+
+/// Test that shuffle is a permutation and deterministic per stream.
+test "Philox shuffle is a deterministic permutation" {
+    items = [1, 2, 3, 4, 5, 6, 7, 8]
+    a = Philox4x32.with_stream(8, 2)
+    b = Philox4x32.with_stream(8, 2)
+    s = @a.shuffle(items)
+    t = @b.shuffle(items)
+    assert_eq(s.sum(), 36)
+    same = true
+    for 0..8 { if s[it] != t[it] { same = false } }
+    #assert(same)
+    assert_eq(items[0], 1)
+    moved = 0
+    for 0..8 { if s[it] != items[it] { moved += 1 } }
+    #assert(moved > 1)
+}
+
+/// Test that parallel streams are independent and reproducible.
+test "philox_streams are independent and reproducible" {
+    gs = philox_streams(77, 4)
+    hs = philox_streams(77, 4)
+    assert_eq(host.sys_arr_len(gs), 4)
+    firsts = []
+    for 0..4 {
+        a: Philox4x32 = gs[it]
+        b: Philox4x32 = hs[it]
+        x = @a.next()
+        y = @b.next()
+        assert_eq(x, y)
+        firsts = host.sys_arr_push(firsts, x)
+    }
+    distinct = true
+    for 0..4 {
+        i = it
+        for 0..4 { if it != i && firsts[it] == firsts[i] { distinct = false } }
+    }
+    #assert(distinct)
+    assert_eq(host.sys_arr_len(philox_streams(1, 0)), 0)
+}
+
+/// Test that the Halton radical inverse mirrors digits.
+test "Halton radical inverse mirrors digits" {
+    assert_eq(halton_radical_inverse(0, 2), 0.0)
+    assert_eq(halton_radical_inverse(1, 2), 0.5)
+    assert_eq(halton_radical_inverse(2, 2), 0.25)
+    assert_eq(halton_radical_inverse(3, 2), 0.75)
+    assert_eq(halton_radical_inverse(4, 2), 0.125)
+    assert_eq(halton_radical_inverse(7, 2), 0.875)
+    #assert(host.sys_abs(halton_radical_inverse(1, 3) - 1.0 / 3.0) < 0.000000001)
+    #assert(host.sys_abs(halton_radical_inverse(2, 3) - 2.0 / 3.0) < 0.000000001)
+    #assert(host.sys_abs(halton_radical_inverse(3, 3) - 1.0 / 9.0) < 0.000000001)
+    #assert(host.sys_abs(halton_radical_inverse(5, 5) - 0.04) < 0.000000001)
+}
+
+/// Test that Halton points walk the sequence, skip and reject bad dimensions.
+test "Halton points walk the sequence, skip and reject bad dimensions" {
+    h = Halton.new(2) or Halton.{}
+    assert_eq(h.dim, 2)
+    p1 = @h.next()
+    assert_eq(p1[0], 0.5)
+    #assert(host.sys_abs(p1[1] - 1.0 / 3.0) < 0.000000001)
+    p2 = @h.next()
+    assert_eq(p2[0], 0.25)
+    #assert(host.sys_abs(p2[1] - 2.0 / 3.0) < 0.000000001)
+    @h.skip(5)
+    p8 = @h.next()
+    assert_eq(p8[0], 0.0625)
+    at8 = h.at(8)
+    assert_eq(at8[0], p8[0])
+    assert_eq(at8[1], p8[1])
+    assert_eq(host.sys_arr_len(h.at(3)), 2)
+    assert_eq((Halton.new(0) or Halton.{dim: 99}).dim, 99)
+    assert_eq((Halton.new(17) or Halton.{dim: 99}).dim, 99)
+    assert_eq((Halton.new(16) or Halton.{dim: 99}).dim, 16)
+}
+
+/// Test that Sobol direction numbers and the first points match the reference sequence.
+test "Sobol first points match the reference sequence" {
+    s = Sobol.new(2) or Sobol.{}
+    d1 = [0.0, 0.5, 0.75, 0.25, 0.375, 0.875, 0.625, 0.125]
+    d2 = [0.0, 0.5, 0.25, 0.75, 0.375, 0.875, 0.125, 0.625]
+    for 0..8 {
+        p = @s.next()
+        assert_eq(p[0], d1[it])
+        assert_eq(p[1], d2[it])
+    }
+    assert_eq(s.index, 8)
+    v = sobol_directions(1)
+    assert_eq(v[0], 0x80000000)
+    assert_eq(v[1], 0xC0000000)
+    assert_eq(v[2], 0xA0000000)
+    w = sobol_directions(0)
+    assert_eq(w[0], 0x80000000)
+    assert_eq(w[31], 1)
+}
+
+/// Test that incremental, direct and skipped generation agree.
+test "Sobol incremental, direct and skipped generation agree" {
+    s = Sobol.new(5) or Sobol.{}
+    ref = Sobol.new(5) or Sobol.{}
+    same = true
+    for 0..200 {
+        p = @s.next()
+        q = ref.at(index)
+        for 0..5 { if p[it] != q[it] { same = false } }
+    }
+    #assert(same)
+    k = Sobol.new(5) or Sobol.{}
+    @k.skip(137)
+    assert_eq(k.index, 137)
+    nxt = @k.next()
+    want = ref.at(137)
+    for 0..5 { assert_eq(nxt[it], want[it]) }
+    after = @k.next()
+    want2 = ref.at(138)
+    for 0..5 { assert_eq(after[it], want2[it]) }
+    z = Sobol.new(3) or Sobol.{}
+    @z.skip(0)
+    assert_eq(@z.next()[0], 0.0)
+}
+
+/// Test that every dimension is stratified: the first 2^m points hit each 1/2^m interval once.
+test "Sobol dimensions are stratified" {
+    dims = SOBOL_MAX_DIM
+    s = Sobol.new(dims) or Sobol.{}
+    for [3, 5, 8] {
+        m = it
+        n = 1 << m
+        hits = []
+        for 0..dims { hits = host.sys_arr_push(hits, host.sys_arr_new(n, 0)) }
+        g = Sobol.new(dims) or Sobol.{}
+        for 0..n {
+            p = @g.next()
+            for 0..dims {
+                d = it
+                cell = host.sys_to_int(p[d] * host.sys_to_float(n))
+                row = host.sys_arr_set(hits[d], cell, hits[d][cell] + 1)
+                hits = host.sys_arr_set(hits, d, row)
+            }
+        }
+        for 0..dims {
+            row = hits[it]
+            for row { assert_eq(it, 1) }
+        }
+    }
+    assert_eq(s.dim, 12)
+}
+
+/// Test that the first two Sobol dimensions form a (0, 4, 2)-net: every dyadic box of area 1/16 holds one point.
+test "Sobol first two dimensions form a net" {
+    g = Sobol.new(2) or Sobol.{}
+    xs = []
+    ys = []
+    for 0..16 {
+        p = @g.next()
+        xs = host.sys_arr_push(xs, p[0])
+        ys = host.sys_arr_push(ys, p[1])
+    }
+    for [0, 1, 2, 3, 4] {
+        a = it
+        b = 4 - a
+        nx = 1 << a
+        ny = 1 << b
+        counts = host.sys_arr_new(16, 0)
+        for 0..16 {
+            cx = host.sys_to_int(xs[it] * host.sys_to_float(nx))
+            cy = host.sys_to_int(ys[it] * host.sys_to_float(ny))
+            slot = cx * ny + cy
+            counts = host.sys_arr_set(counts, slot, counts[slot] + 1)
+        }
+        for counts { assert_eq(it, 1) }
+    }
+}
+
+/// Test that quasi-random points integrate with low error.
+test "Sobol and Halton integrate with low error" {
+    n = 4096
+    s = Sobol.new(2) or Sobol.{}
+    h = Halton.new(2) or Halton.{}
+    sob_xy = 0.0
+    hal_xy = 0.0
+    sob_in = 0
+    hal_in = 0
+    for 0..n {
+        p = @s.next()
+        q = @h.next()
+        sob_xy += p[0] * p[1]
+        hal_xy += q[0] * q[1]
+        if p[0] * p[0] + p[1] * p[1] < 1.0 { sob_in += 1 }
+        if q[0] * q[0] + q[1] * q[1] < 1.0 { hal_in += 1 }
+    }
+    nf = host.sys_to_float(n)
+    #assert(host.sys_abs(sob_xy / nf - 0.25) < 0.002)
+    #assert(host.sys_abs(hal_xy / nf - 0.25) < 0.002)
+    #assert(host.sys_abs(4.0 * host.sys_to_float(sob_in) / nf - 3.141592653589793) < 0.01)
+    #assert(host.sys_abs(4.0 * host.sys_to_float(hal_in) / nf - 3.141592653589793) < 0.01)
+}
+
+/// Test that Sobol rejects unsupported dimensions.
+test "Sobol rejects unsupported dimensions" {
+    assert_eq((Sobol.new(0) or Sobol.{dim: 99}).dim, 99)
+    assert_eq((Sobol.new(13) or Sobol.{dim: 99}).dim, 99)
+    assert_eq((Sobol.new(12) or Sobol.{dim: 99}).dim, 12)
+    assert_eq((Sobol.new(1) or Sobol.{dim: 99}).dim, 1)
+}

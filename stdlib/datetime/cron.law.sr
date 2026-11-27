@@ -1,0 +1,23 @@
+//! Laws for std.datetime.cron — real-body (`cron_match`, `cron_digit_acc`).
+//! `cron_split` / scheduler ticks need host arrays (docs/LAWS_STATUS.md).
+
+#law("cron_match star accepts zero and fifty-nine")
+cron_star_matches() {
+    #assert(cron_match("*", 0))
+    #assert(cron_match("*", 59))
+}
+
+#law("cron_match star is independent of value")
+cron_exact_matches() {
+    #assert(cron_match("*", 12))
+    #assert(cron_match("*", 1))
+}
+
+#law("cron_digit_acc builds multi-digit values")
+cron_digit_acc_law() {
+    v = cron_digit_acc(0, 49)
+    #assert(v == 1)
+    v = cron_digit_acc(v, 50)
+    #assert(v == 12)
+    #assert(cron_digit_acc(5, 47) == -1)
+}

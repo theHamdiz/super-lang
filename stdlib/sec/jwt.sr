@@ -1,0 +1,761 @@
+//! std.sec.jwt — JSON Web Tokens (HS256) and a tiny flat-JSON claim reader
+//!
+//! Import with:
+//!   use std.sec.jwt
+//!
+//! Then:  token = jwt_make("s3cret", "user-42", now, now + 3600)
+//!        res = jwt_verify("s3cret", token, now)
+//!        ensure res.valid else { return http.unauthorized(res.reason) }
+//!        res.sub                                   // "user-42"
+//!
+//! Tokens are `base64url(header).base64url(payload).base64url(HMAC-SHA256)`.
+//! Verification is strict: only `alg: HS256` is accepted (`none` and every other
+//! algorithm are rejected before any signature work), the signature is compared in
+//! constant time and checked *before* the claims are trusted, then `exp`, `nbf`,
+//! `iss` and `aud` are enforced. Time is always passed in (`now`, unix seconds), so
+//! every path is deterministic in tests.
+//!
+//! Primitives: `host.sys_hmac_sha256` (MAC) plus pure Super for base64url, UTF-8 and
+//! the JSON handling. Reasons returned by `jwt_verify*`:
+//!   "ok" "malformed" "bad_header" "unsupported_alg" "bad_signature"
+//!   "bad_payload" "expired" "not_yet_valid" "bad_issuer" "bad_audience"
+
+/// `JWT_B64URL` is `"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"`.
++JWT_B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+/// `JWT_HEXD` is `"0123456789abcdef"`.
++JWT_HEXD = "0123456789abcdef"
+/// `JWT_HEADER` is `"\{\"alg\":\"HS256\",\"typ\":\"JWT\"\}"`.
++JWT_HEADER = "\{\"alg\":\"HS256\",\"typ\":\"JWT\"\}"
+
+/// `JwtResult` is a verified JWT: validity, reason, and the standard claims.
++JwtResult = {
+    /// Valid on `JwtResult` (`bool`). Defaults to `false`.
+    valid: bool = false
+    /// Reason on `JwtResult` (`str`). Defaults to `"malformed"`.
+    reason: str = "malformed"
+    /// Payload on `JwtResult` (`str`). Defaults to `""`.
+    payload: str = ""
+    /// Sub on `JwtResult` (`str`). Defaults to `""`.
+    sub: str = ""
+    /// Iss on `JwtResult` (`str`). Defaults to `""`.
+    iss: str = ""
+    /// Aud on `JwtResult` (`str`). Defaults to `""`.
+    aud: str = ""
+    /// Iat on `JwtResult` (`i64`). Defaults to `0`.
+    iat: i64 = 0
+    /// Nbf on `JwtResult` (`i64`). Defaults to `0`.
+    nbf: i64 = 0
+    /// Exp on `JwtResult` (`i64`). Defaults to `0`.
+    exp: i64 = 0
+}
+
+/// A flat JSON object: parallel arrays of keys, textual values and kinds
+/// ("s" string, "n" number, "b" bool/null literal, "x" nested value skipped).
++JwtJson = {
+    /// Ok on `JwtJson` (`bool`). Defaults to `false`.
+    ok: bool = false
+    /// Keys on `JwtJson`. Defaults to `[]`.
+    keys: _ = []
+    /// Vals on `JwtJson`. Defaults to `[]`.
+    vals: _ = []
+    /// Kinds on `JwtJson`. Defaults to `[]`.
+    kinds: _ = []
+}
+
+// --- UTF-8 / base64url / hex ------------------------------------------------------------
+
+/// Jw utf8 (`s`).
++jw_utf8(s: str) {
+    out = []
+    n = host.sys_str_len(s)
+    for 0..n {
+        cp = host.sys_ord(s[it])
+        if cp < 128 {
+            out = host.sys_arr_push(out, cp)
+        } else {
+            if cp < 2048 {
+                out = host.sys_arr_push(out, 192 + cp / 64)
+                out = host.sys_arr_push(out, 128 + cp % 64)
+            } else {
+                if cp < 65536 {
+                    out = host.sys_arr_push(out, 224 + cp / 4096)
+                    out = host.sys_arr_push(out, 128 + (cp / 64) % 64)
+                    out = host.sys_arr_push(out, 128 + cp % 64)
+                } else {
+                    out = host.sys_arr_push(out, 240 + cp / 262144)
+                    out = host.sys_arr_push(out, 128 + (cp / 4096) % 64)
+                    out = host.sys_arr_push(out, 128 + (cp / 64) % 64)
+                    out = host.sys_arr_push(out, 128 + cp % 64)
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Jw from utf8 (`b`). Returns `str`.
++jw_from_utf8(b: _) : str {
+    out = ""
+    n = host.sys_arr_len(b)
+    i = 0
+    for 0..n {
+        if it >= i {
+            c = b[it]
+            if c < 128 {
+                out = out + host.sys_chr(c)
+                i = it + 1
+            } else {
+                if c >= 192 && c < 224 && it + 1 < n {
+                    out = out + host.sys_chr((c - 192) * 64 + b[it + 1] % 64)
+                    i = it + 2
+                } else {
+                    if c >= 224 && c < 240 && it + 2 < n {
+                        out = out + host.sys_chr((c - 224) * 4096 + (b[it + 1] % 64) * 64 + b[it + 2] % 64)
+                        i = it + 3
+                    } else {
+                        if c >= 240 && c < 248 && it + 3 < n {
+                            out = out + host.sys_chr((c - 240) * 262144 + (b[it + 1] % 64) * 4096 + (b[it + 2] % 64) * 64 + b[it + 3] % 64)
+                            i = it + 4
+                        } else {
+                            out = out + host.sys_chr(65533)
+                            i = it + 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Jw nibble (`c`). Returns `i64`.
++jw_nibble(c: str) : i64 {
+    cp = host.sys_ord(c)
+    if cp >= 48 && cp <= 57 { return cp - 48 }
+    if cp >= 97 && cp <= 102 { return cp - 87 }
+    if cp >= 65 && cp <= 70 { return cp - 55 }
+    -1
+}
+
+/// Jw hex bytes (`h`).
++jw_hex_bytes(h: str) {
+    out = []
+    n = host.sys_str_len(h)
+    for 0..(n / 2) {
+        hi = jw_nibble(h[it * 2])
+        lo = jw_nibble(h[it * 2 + 1])
+        if hi < 0 { hi = 0 }
+        if lo < 0 { lo = 0 }
+        out = host.sys_arr_push(out, hi * 16 + lo)
+    }
+    out
+}
+
+/// base64url without padding.
++jw_b64_encode(b: _) : str {
+    n = host.sys_arr_len(b)
+    out = ""
+    for 0..((n + 2) / 3) {
+        i = it * 3
+        b0 = b[i]
+        b1 = 0
+        b2 = 0
+        have1 = i + 1 < n
+        have2 = i + 2 < n
+        if have1 { b1 = b[i + 1] }
+        if have2 { b2 = b[i + 2] }
+        out = out + JWT_B64URL[b0 / 4]
+        out = out + JWT_B64URL[(b0 % 4) * 16 + b1 / 16]
+        if have1 { out = out + JWT_B64URL[(b1 % 16) * 4 + b2 / 64] }
+        if have2 { out = out + JWT_B64URL[b2 % 64] }
+    }
+    out
+}
+
+/// Jw b64 value (`c`). Returns `i64`.
++jw_b64_value(c: str) : i64 {
+    cp = host.sys_ord(c)
+    if cp >= 65 && cp <= 90 { return cp - 65 }
+    if cp >= 97 && cp <= 122 { return cp - 71 }
+    if cp >= 48 && cp <= 57 { return cp + 4 }
+    if cp == 45 { return 62 }
+    if cp == 95 { return 63 }
+    -1
+}
+
+/// base64url (unpadded) -> bytes; `none` on invalid characters or length.
++jw_b64_decode(s: str) {
+    n = host.sys_str_len(s)
+    ensure n % 4 != 1 else { return none }
+    out = []
+    ok = true
+    acc = 0
+    bits = 0
+    for 0..n {
+        v = jw_b64_value(s[it])
+        if v < 0 { ok = false }
+        acc = acc * 64 + v
+        bits += 6
+        if bits >= 8 {
+            bits = bits - 8
+            shift = 1
+            for 0..bits { shift = shift * 2 }
+            out = host.sys_arr_push(out, (acc / shift) % 256)
+            acc = acc % shift
+        }
+    }
+    ensure ok else { return none }
+    out
+}
+
+/// Same as `jw_b64_encode`.
++jw_b64_text(s: str) : str => jw_b64_encode(jw_utf8(s))
+
+// --- flat JSON ---------------------------------------------------------------------------
+
+/// JSON string literal with escapes.
++jw_quote(s: str) : str {
+    out = "\""
+    n = host.sys_str_len(s)
+    for 0..n {
+        c = s[it]
+        if c == "\"" {
+            out = out + "\\\""
+        } else {
+            if c == "\\" {
+                out = out + "\\\\"
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t"
+                    } else {
+                        if c == "\r" {
+                            out = out + "\\r"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out + "\""
+}
+
+/// Jw is space (`c`).
++jw_is_space(c: str) : bool => c == " " || c == "\t" || c == "\n" || c == "\r"
+
+/// Parse a one-level JSON object. Nested objects / arrays are skipped (kind "x").
+/// States: 0 want '{', 1 key or '}', 2 in key, 3 want ':', 4 want value,
+/// 5 in string value, 6 in bare value, 7 want ',' or '}', 8 done, 9 error, 10 skipping nested.
++jw_parse(text: str) : JwtJson {
+    keys = []
+    vals = []
+    kinds = []
+    st = 0
+    cur = ""
+    esc = false
+    ucount = 0
+    uval = 0
+    depth = 0
+    in_str = false
+    key = ""
+    n = host.sys_str_len(text)
+    for 0..n {
+        c = text[it]
+        if st == 0 {
+            if c == "{" { st = 1 } else { if !jw_is_space(c) { st = 9 } }
+        } else {
+            if st == 1 {
+                if c == "\"" {
+                    st = 2
+                    cur = ""
+                } else {
+                    if c == "}" { st = 8 } else { if !jw_is_space(c) { st = 9 } }
+                }
+            } else {
+                if st == 2 || st == 5 {
+                    if ucount > 0 {
+                        d = jw_nibble(c)
+                        if d < 0 { st = 9 }
+                        uval = uval * 16 + d
+                        ucount -= 1
+                        if ucount == 0 { cur = cur + host.sys_chr(uval) }
+                    } else {
+                        if esc {
+                            esc = false
+                            if c == "n" { cur = cur + "\n" }
+                            if c == "t" { cur = cur + "\t" }
+                            if c == "r" { cur = cur + "\r" }
+                            if c == "b" { cur = cur + host.sys_chr(8) }
+                            if c == "f" { cur = cur + host.sys_chr(12) }
+                            if c == "\"" || c == "\\" || c == "/" { cur = cur + c }
+                            if c == "u" {
+                                ucount = 4
+                                uval = 0
+                            }
+                        } else {
+                            if c == "\\" {
+                                esc = true
+                            } else {
+                                if c == "\"" {
+                                    if st == 2 {
+                                        key = cur
+                                        st = 3
+                                    } else {
+                                        keys = host.sys_arr_push(keys, key)
+                                        vals = host.sys_arr_push(vals, cur)
+                                        kinds = host.sys_arr_push(kinds, "s")
+                                        st = 7
+                                    }
+                                } else {
+                                    cur = cur + c
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    if st == 3 {
+                        if c == ":" { st = 4 } else { if !jw_is_space(c) { st = 9 } }
+                    } else {
+                        if st == 4 {
+                            if c == "\"" {
+                                st = 5
+                                cur = ""
+                            } else {
+                                if c == "{" || c == "[" {
+                                    st = 10
+                                    depth = 1
+                                    in_str = false
+                                } else {
+                                    if !jw_is_space(c) {
+                                        st = 6
+                                        cur = c
+                                    }
+                                }
+                            }
+                        } else {
+                            if st == 6 {
+                                if c == "," || c == "}" || jw_is_space(c) {
+                                    kind = "n"
+                                    if cur == "true" || cur == "false" || cur == "null" { kind = "b" }
+                                    keys = host.sys_arr_push(keys, key)
+                                    vals = host.sys_arr_push(vals, cur)
+                                    kinds = host.sys_arr_push(kinds, kind)
+                                    if c == "," { st = 1 }
+                                    if c == "}" { st = 8 }
+                                    if jw_is_space(c) { st = 7 }
+                                } else {
+                                    cur = cur + c
+                                }
+                            } else {
+                                if st == 7 {
+                                    if c == "," { st = 1 } else { if c == "}" { st = 8 } else { if !jw_is_space(c) { st = 9 } } }
+                                } else {
+                                    if st == 10 {
+                                        if in_str {
+                                            if esc {
+                                                esc = false
+                                            } else {
+                                                if c == "\\" { esc = true }
+                                                if c == "\"" { in_str = false }
+                                            }
+                                        } else {
+                                            if c == "\"" { in_str = true }
+                                            if c == "{" || c == "[" { depth += 1 }
+                                            if c == "}" || c == "]" { depth -= 1 }
+                                            if depth == 0 {
+                                                keys = host.sys_arr_push(keys, key)
+                                                vals = host.sys_arr_push(vals, "")
+                                                kinds = host.sys_arr_push(kinds, "x")
+                                                st = 7
+                                            }
+                                        }
+                                    } else {
+                                        if st == 8 && !jw_is_space(c) { st = 9 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    JwtJson.{ok: st == 8, keys, vals, kinds}
+}
+
+/// Jw find (`j`, `key`). Returns `i64`.
++jw_find(j: JwtJson, key: str) : i64 {
+    pos = -1
+    ks = j.keys
+    for ks {
+        if pos < 0 && it == key { pos = index }
+    }
+    pos
+}
+
+/// String claim ("" when absent or not a string).
++jw_str(j: JwtJson, key: str) : str {
+    at = jw_find(j, key)
+    ensure at >= 0 else { return "" }
+    ensure j.kinds[at] == "s" else { return "" }
+    j.vals[at]
+}
+
+/// Integer claim (`dflt` when absent or not an integer).
++jw_int(j: JwtJson, key: str, dflt: i64) : i64 {
+    at = jw_find(j, key)
+    ensure at >= 0 else { return dflt }
+    ensure j.kinds[at] == "n" else { return dflt }
+    text = j.vals[at]
+    n = host.sys_str_len(text)
+    neg = false
+    v = 0
+    ok = n > 0
+    for 0..n {
+        c = text[it]
+        if it == 0 && c == "-" {
+            neg = true
+        } else {
+            d = host.sys_ord(c) - 48
+            if d < 0 || d > 9 { ok = false } else { v = v * 10 + d }
+        }
+    }
+    ensure ok else { return dflt }
+    if neg { return -v }
+    v
+}
+
+/// Jw has (`j`, `key`).
++jw_has(j: JwtJson, key: str) : bool => jw_find(j, key) >= 0
+
+// --- signing -------------------------------------------------------------------------------
+
+/// Jw split (`token`).
++jw_split(token: str) {
+    out = []
+    cur = ""
+    n = host.sys_str_len(token)
+    for 0..n {
+        c = token[it]
+        if c == "." {
+            out = host.sys_arr_push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+    }
+    out = host.sys_arr_push(out, cur)
+    out
+}
+
+/// Jw ct eq (`a`, `b`).
++jw_ct_eq(a: str, b: str) : bool {
+    na = host.sys_str_len(a)
+    nb = host.sys_str_len(b)
+    diff = 0
+    if na != nb { diff = 1 }
+    n = na
+    if nb > n { n = nb }
+    for 0..n {
+        if a[it] != b[it] { diff = 1 }
+    }
+    diff == 0
+}
+
+/// Jw mac (`secret`, `signing_input`). Returns `str`.
++jw_mac(secret: str, signing_input: str) : str {
+    jw_b64_encode(jw_hex_bytes(host.sys_hmac_sha256(secret, signing_input)))
+}
+
+/// Sign an arbitrary JSON payload text.
++jwt_sign(secret: str, payload_json: str) : str {
+    head = jw_b64_text(JWT_HEADER)
+    body = jw_b64_text(payload_json)
+    input = head + "." + body
+    input + "." + jw_mac(secret, input)
+}
+
+/// Standard claims: sub, iat, exp.
++jwt_make(secret: str, sub: str, iat: i64, exp: i64) : str {
+    claims = "\{\"sub\":" + jw_quote(sub) + ",\"iat\":" + iat + ",\"exp\":" + exp + "\}"
+    jwt_sign(secret, claims)
+}
+
+/// Standard claims plus issuer and audience.
++jwt_make_full(secret: str, sub: str, iss: str, aud: str, iat: i64, exp: i64) : str {
+    claims = "\{\"sub\":" + jw_quote(sub) + ",\"iss\":" + jw_quote(iss) + ",\"aud\":" + jw_quote(aud) + ",\"iat\":" + iat + ",\"exp\":" + exp + "\}"
+    jwt_sign(secret, claims)
+}
+
+/// Jw fail (`reason`). Returns `JwtResult`.
++jw_fail(reason: str) : JwtResult {
+    JwtResult.{valid: false, reason, payload: "", sub: "", iss: "", aud: "", iat: 0, nbf: 0, exp: 0}
+}
+
+/// Payload JSON without verifying anything (for logging / routing only).
++jwt_peek(token: str) : str {
+    parts = jw_split(token)
+    ensure host.sys_arr_len(parts) == 3 else { return "" }
+    raw = jw_b64_decode(parts[1])
+    ensure raw != none else { return "" }
+    jw_from_utf8(raw)
+}
+
+/// Full verification. `leeway` seconds of clock skew are tolerated; non-empty
+/// `want_iss` / `want_aud` must match the token's `iss` / `aud` exactly.
++jwt_verify_with(secret: str, token: str, now: i64, leeway: i64, want_iss: str, want_aud: str) : JwtResult {
+    parts = jw_split(token)
+    ensure host.sys_arr_len(parts) == 3 else { return jw_fail("malformed") }
+    ensure parts[0] != "" && parts[1] != "" && parts[2] != "" else { return jw_fail("malformed") }
+    raw_head = jw_b64_decode(parts[0])
+    ensure raw_head != none else { return jw_fail("bad_header") }
+    head = jw_parse(jw_from_utf8(raw_head))
+    ensure head.ok else { return jw_fail("bad_header") }
+    ensure jw_str(head, "alg") == "HS256" else { return jw_fail("unsupported_alg") }
+    input = parts[0] + "." + parts[1]
+    ensure jw_ct_eq(parts[2], jw_mac(secret, input)) else { return jw_fail("bad_signature") }
+    raw_body = jw_b64_decode(parts[1])
+    ensure raw_body != none else { return jw_fail("bad_payload") }
+    text = jw_from_utf8(raw_body)
+    claims = jw_parse(text)
+    ensure claims.ok else { return jw_fail("bad_payload") }
+    exp = jw_int(claims, "exp", 0)
+    nbf = jw_int(claims, "nbf", 0)
+    has_exp = jw_has(claims, "exp")
+    has_nbf = jw_has(claims, "nbf")
+    if has_exp && now >= exp + leeway { return jw_fail("expired") }
+    if has_nbf && now + leeway < nbf { return jw_fail("not_yet_valid") }
+    iss = jw_str(claims, "iss")
+    aud = jw_str(claims, "aud")
+    if want_iss != "" && iss != want_iss { return jw_fail("bad_issuer") }
+    if want_aud != "" && aud != want_aud { return jw_fail("bad_audience") }
+    return JwtResult.{
+        valid: true,
+        reason: "ok",
+        payload: text,
+        sub: jw_str(claims, "sub"),
+        iss,
+        aud,
+        iat: jw_int(claims, "iat", 0),
+        nbf,
+        exp,
+    }
+}
+
+/// Same as `jwt_verify_with`.
++jwt_verify(secret: str, token: str, now: i64) : JwtResult => jwt_verify_with(secret, token, now, 0, "", "")
+
+/// Same as `jw_str`.
++jwt_claim_str(payload: str, key: str) : str => jw_str(jw_parse(payload), key)
+/// Same as `jw_int`.
++jwt_claim_int(payload: str, key: str, dflt: i64) : i64 => jw_int(jw_parse(payload), key, dflt)
+
+// --- tests ---------------------------------------------------------------------------------
+
+/// Test that base64url vectors.
+test "base64url vectors" {
+    assert_eq(jw_b64_text(""), "")
+    assert_eq(jw_b64_text("f"), "Zg")
+    assert_eq(jw_b64_text("fo"), "Zm8")
+    assert_eq(jw_b64_text("foo"), "Zm9v")
+    assert_eq(jw_b64_text("foobar"), "Zm9vYmFy")
+    assert_eq(jw_b64_encode([251, 255, 191]), "-_-_")
+    back = jw_b64_decode("-_-_") or []
+    assert_eq(back[0], 251)
+    assert_eq(back[2], 191)
+    assert_eq(jw_b64_decode("Z") or 99, 99)
+    assert_eq(jw_b64_decode("ab!d") or 99, 99)
+}
+
+/// Test that utf8 round trip.
+test "utf8 round trip" {
+    s = "héllo €"
+    assert_eq(jw_from_utf8(jw_utf8(s)), s)
+    assert_eq(host.sys_arr_len(jw_utf8(s)), 10)
+    assert_eq(jw_from_utf8([]), "")
+}
+
+/// Test that json quoting.
+test "json quoting" {
+    assert_eq(jw_quote("plain"), "\"plain\"")
+    assert_eq(jw_quote("a\"b"), "\"a\\\"b\"")
+    assert_eq(jw_quote("a\\b"), "\"a\\\\b\"")
+    assert_eq(jw_quote("l1\nl2"), "\"l1\\nl2\"")
+    assert_eq(jw_quote(""), "\"\"")
+}
+
+/// Test that flat json parse: strings, numbers, literals, nested.
+test "flat json parse: strings, numbers, literals, nested" {
+    j = jw_parse("\{ \"a\": \"x\", \"n\": 42, \"neg\": -7, \"t\": true, \"z\": null, \"o\": \{\"k\": [1, 2, \{\"q\": \"}\"\}]\}, \"last\": \"end\" \}")
+    #assert(j.ok)
+    assert_eq(jw_str(j, "a"), "x")
+    assert_eq(jw_int(j, "n", 0), 42)
+    assert_eq(jw_int(j, "neg", 0), -7)
+    #assert(jw_has(j, "t"))
+    #assert(jw_has(j, "o"))
+    assert_eq(jw_str(j, "o"), "")
+    assert_eq(jw_str(j, "last"), "end")
+    assert_eq(jw_int(j, "missing", 5), 5)
+    assert_eq(jw_int(j, "a", 9), 9)
+    assert_eq(jw_str(j, "n"), "")
+    #assert(!(jw_has(j, "nope")))
+}
+
+/// Test that flat json parse: escapes and empties.
+test "flat json parse: escapes and empties" {
+    j = jw_parse("\{\"s\":\"a\\\"b\\\\c\\nd\\u0041\"\}")
+    #assert(j.ok)
+    assert_eq(jw_str(j, "s"), "a\"b\\c\ndA")
+    e = jw_parse("\{\}")
+    #assert(e.ok)
+    assert_eq(host.sys_arr_len(e.keys), 0)
+    t = jw_parse("  \{\"k\" : 1 \}  ")
+    #assert(t.ok)
+    assert_eq(jw_int(t, "k", 0), 1)
+}
+
+/// Test that flat json parse: malformed input.
+test "flat json parse: malformed input" {
+    #assert(!(jw_parse("").ok))
+    #assert(!(jw_parse("[1]").ok))
+    #assert(!(jw_parse("\{\"a\" 1\}").ok))
+    #assert(!(jw_parse("\{\"a\": 1").ok))
+    #assert(!(jw_parse("\{\"a\": 1\} trailing").ok))
+    #assert(!(jw_parse("\{\"a\": \"unterminated").ok))
+}
+
+/// Test that jwt.io reference token.
+test "jwt.io reference token" {
+    payload = "\{\"sub\":\"1234567890\",\"name\":\"John Doe\",\"iat\":1516239022\}"
+    token = jwt_sign("your-256-bit-secret", payload)
+    assert_eq(token, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c")
+    res = jwt_verify("your-256-bit-secret", token, 1516239100)
+    #assert(res.valid)
+    assert_eq(res.sub, "1234567890")
+    assert_eq(res.iat, 1516239022)
+    assert_eq(jwt_claim_str(res.payload, "name"), "John Doe")
+    assert_eq(jwt_peek(token), payload)
+}
+
+/// Test that make and verify.
+test "make and verify" {
+    token = jwt_make("s3cret", "user-42", 1000, 4600)
+    res = jwt_verify("s3cret", token, 2000)
+    #assert(res.valid)
+    assert_eq(res.reason, "ok")
+    assert_eq(res.sub, "user-42")
+    assert_eq(res.iat, 1000)
+    assert_eq(res.exp, 4600)
+    assert_eq(jwt_claim_int(res.payload, "exp", 0), 4600)
+}
+
+/// Test that wrong secret is a bad signature.
+test "wrong secret is a bad signature" {
+    token = jwt_make("s3cret", "u", 0, 100)
+    res = jwt_verify("other", token, 1)
+    #assert(!(res.valid))
+    assert_eq(res.reason, "bad_signature")
+    assert_eq(res.sub, "")
+}
+
+/// Test that tampered payload and signature are rejected.
+test "tampered payload and signature are rejected" {
+    token = jwt_make("k", "alice", 0, 1000)
+    parts = jw_split(token)
+    forged_body = jw_b64_text("\{\"sub\":\"root\",\"iat\":0,\"exp\":1000\}")
+    forged = parts[0] + "." + forged_body + "." + parts[2]
+    assert_eq(jwt_verify("k", forged, 1).reason, "bad_signature")
+    bad_sig = parts[0] + "." + parts[1] + "." + "AAAA"
+    assert_eq(jwt_verify("k", bad_sig, 1).reason, "bad_signature")
+    #assert(jwt_verify("k", token, 1).valid)
+}
+
+/// Test that alg none and foreign algorithms are refused.
+test "alg none and foreign algorithms are refused" {
+    none_head = jw_b64_text("\{\"alg\":\"none\",\"typ\":\"JWT\"\}")
+    body = jw_b64_text("\{\"sub\":\"root\"\}")
+    assert_eq(jwt_verify("k", none_head + "." + body + ".x", 1).reason, "unsupported_alg")
+    rs_head = jw_b64_text("\{\"alg\":\"RS256\"\}")
+    assert_eq(jwt_verify("k", rs_head + "." + body + ".x", 1).reason, "unsupported_alg")
+    lower = jw_b64_text("\{\"alg\":\"hs256\"\}")
+    assert_eq(jwt_verify("k", lower + "." + body + ".x", 1).reason, "unsupported_alg")
+}
+
+/// Test that malformed tokens.
+test "malformed tokens" {
+    assert_eq(jwt_verify("k", "", 1).reason, "malformed")
+    assert_eq(jwt_verify("k", "a.b", 1).reason, "malformed")
+    assert_eq(jwt_verify("k", "a.b.c.d", 1).reason, "malformed")
+    assert_eq(jwt_verify("k", "..", 1).reason, "malformed")
+    assert_eq(jwt_verify("k", "!!!.b.c", 1).reason, "bad_header")
+    head = jw_b64_text("not json")
+    assert_eq(jwt_verify("k", head + ".YQ.c", 1).reason, "bad_header")
+    assert_eq(jwt_peek("nonsense"), "")
+}
+
+/// Test that payload must be a JSON object.
+test "payload must be a JSON object" {
+    token = jwt_sign("k", "[1,2,3]")
+    assert_eq(jwt_verify("k", token, 1).reason, "bad_payload")
+    token2 = jwt_sign("k", "not json at all")
+    assert_eq(jwt_verify("k", token2, 1).reason, "bad_payload")
+}
+
+/// Test that expiry and not-before windows.
+test "expiry and not-before windows" {
+    token = jwt_make("k", "u", 100, 200)
+    #assert(jwt_verify("k", token, 150).valid)
+    #assert(jwt_verify("k", token, 199).valid)
+    assert_eq(jwt_verify("k", token, 200).reason, "expired")
+    assert_eq(jwt_verify("k", token, 5000).reason, "expired")
+    nbf = jwt_sign("k", "\{\"sub\":\"u\",\"nbf\":500\}")
+    assert_eq(jwt_verify("k", nbf, 499).reason, "not_yet_valid")
+    #assert(jwt_verify("k", nbf, 500).valid)
+    forever = jwt_sign("k", "\{\"sub\":\"u\"\}")
+    #assert(jwt_verify("k", forever, 99999999).valid)
+}
+
+/// Test that clock skew leeway.
+test "clock skew leeway" {
+    token = jwt_make("k", "u", 100, 200)
+    #assert(jwt_verify_with("k", token, 205, 10, "", "").valid)
+    assert_eq(jwt_verify_with("k", token, 210, 10, "", "").reason, "expired")
+    nbf = jwt_sign("k", "\{\"nbf\":500\}")
+    #assert(jwt_verify_with("k", nbf, 492, 10, "", "").valid)
+    assert_eq(jwt_verify_with("k", nbf, 489, 10, "", "").reason, "not_yet_valid")
+}
+
+/// Test that issuer and audience checks.
+test "issuer and audience checks" {
+    token = jwt_make_full("k", "u", "auth.sr.dev", "api", 0, 1000)
+    ok = jwt_verify_with("k", token, 1, 0, "auth.sr.dev", "api")
+    #assert(ok.valid)
+    assert_eq(ok.iss, "auth.sr.dev")
+    assert_eq(ok.aud, "api")
+    assert_eq(jwt_verify_with("k", token, 1, 0, "evil", "api").reason, "bad_issuer")
+    assert_eq(jwt_verify_with("k", token, 1, 0, "auth.sr.dev", "web").reason, "bad_audience")
+    #assert(jwt_verify_with("k", token, 1, 0, "", "").valid)
+    plain = jwt_make("k", "u", 0, 1000)
+    assert_eq(jwt_verify_with("k", plain, 1, 0, "auth.sr.dev", "").reason, "bad_issuer")
+}
+
+/// Test that special characters in claims survive signing.
+test "special characters in claims survive signing" {
+    token = jwt_make("k", "na\"me\\ é", 0, 100)
+    res = jwt_verify("k", token, 1)
+    #assert(res.valid)
+    assert_eq(res.sub, "na\"me\\ é")
+}
+
+/// Test that tokens are deterministic for fixed inputs.
+test "tokens are deterministic for fixed inputs" {
+    a = jwt_make("k", "u", 1, 2)
+    b = jwt_make("k", "u", 1, 2)
+    assert_eq(a, b)
+    #assert(jwt_make("k", "u", 1, 3) != a)
+    assert_eq(host.sys_arr_len(jw_split(a)), 3)
+}

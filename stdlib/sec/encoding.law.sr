@@ -1,0 +1,17 @@
+//! Laws for std.sec.encoding (Round 7 real bodies).
+//! Implementation: `enc_hex_value` in `encoding.sr`.
+
+#law("enc_hex_value maps 0-9 and a-f")
+encoding_hex_digits() {
+    #assert(enc_hex_value("0") == 0)
+    #assert(enc_hex_value("9") == 9)
+    #assert(enc_hex_value("a") == 10)
+    #assert(enc_hex_value("f") == 15)
+    #assert(enc_hex_value("A") == 10)
+}
+
+#law("enc_hex_value rejects non-hex")
+encoding_hex_rejects() {
+    #assert(enc_hex_value("g") == -1)
+    #assert(enc_hex_value("?") == -1)
+}

@@ -1,0 +1,2655 @@
+//! std.net.grpc — gRPC over HTTP/2: frames, HPACK, protobuf wire format and unary RPC framing
+//!
+//! Import with:
+//!   use std.net.grpc
+//!
+//! Byte buffers are arrays of `i64` in 0..255. Nothing here touches a socket: builders return the
+//! bytes to write, parsers consume the bytes that were read.
+//!
+//!   req = pb_string_field(1, "Amina")                                   // HelloRequest { name = 1 }
+//!   wire = grpc_unary_request(1, "api.example.com", "/helloworld.Greeter/SayHello", req, 5000) or []
+//!   call = grpc_parse_request(wire) or none                             // server side
+//!   out = grpc_unary_response(call.stream_id, reply_bytes, GRPC_OK, "") or []
+//!   res = grpc_parse_response(out) or none                              // client side
+//!
+//! Layers, bottom to top:
+//!   * HTTP/2 frame header (9 bytes), frame builders for DATA/HEADERS/SETTINGS/PING/GOAWAY/...
+//!   * HPACK (RFC 7541): prefix integers, the static table, a dynamic table decoder and a
+//!     literal-without-indexing encoder. Huffman coded strings are rejected with a clear error;
+//!     everything this module encodes is plain, which every peer must accept.
+//!   * Protobuf wire format: varints, zigzag, tags, length-delimited, fixed32/64, parse, lookup.
+//!   * gRPC message framing (1 flag byte + 4 byte big-endian length), request/response headers,
+//!     `grpc-timeout`, status codes, percent-encoded `grpc-message`, and unary call wire images.
+
+/// HTTP/2 frame type DATA.
++H2_DATA = 0
+/// HTTP/2 frame type HEADERS.
++H2_HEADERS = 1
+/// HTTP/2 frame type PRIORITY.
++H2_PRIORITY = 2
+/// HTTP/2 frame type RST_STREAM.
++H2_RST_STREAM = 3
+/// HTTP/2 frame type SETTINGS.
++H2_SETTINGS = 4
+/// HTTP/2 frame type PUSH_PROMISE.
++H2_PUSH_PROMISE = 5
+/// HTTP/2 frame type PING.
++H2_PING = 6
+/// HTTP/2 frame type GOAWAY.
++H2_GOAWAY = 7
+/// HTTP/2 frame type WINDOW_UPDATE.
++H2_WINDOW_UPDATE = 8
+/// HTTP/2 frame type CONTINUATION.
++H2_CONTINUATION = 9
+
+/// Flag END_STREAM (DATA, HEADERS) and ACK (SETTINGS, PING) share bit 0.
++H2_FLAG_END_STREAM = 1
+/// Flag ACK on SETTINGS and PING frames.
++H2_FLAG_ACK = 1
+/// Flag END_HEADERS on HEADERS and CONTINUATION frames.
++H2_FLAG_END_HEADERS = 4
+/// Flag PADDED on DATA and HEADERS frames.
++H2_FLAG_PADDED = 8
+/// Flag PRIORITY on HEADERS frames.
++H2_FLAG_PRIORITY = 32
+
+/// SETTINGS parameter SETTINGS_HEADER_TABLE_SIZE.
++H2_SET_HEADER_TABLE_SIZE = 1
+/// SETTINGS parameter SETTINGS_ENABLE_PUSH.
++H2_SET_ENABLE_PUSH = 2
+/// SETTINGS parameter SETTINGS_MAX_CONCURRENT_STREAMS.
++H2_SET_MAX_CONCURRENT_STREAMS = 3
+/// SETTINGS parameter SETTINGS_INITIAL_WINDOW_SIZE.
++H2_SET_INITIAL_WINDOW_SIZE = 4
+/// SETTINGS parameter SETTINGS_MAX_FRAME_SIZE.
++H2_SET_MAX_FRAME_SIZE = 5
+/// SETTINGS parameter SETTINGS_MAX_HEADER_LIST_SIZE.
++H2_SET_MAX_HEADER_LIST_SIZE = 6
+
+/// Default SETTINGS_MAX_FRAME_SIZE, the largest payload every peer accepts.
++H2_DEFAULT_MAX_FRAME = 16384
+/// Largest value of the 24-bit length field.
++H2_LENGTH_LIMIT = 16777215
+/// Largest stream id (31 bits).
++H2_STREAM_LIMIT = 2147483647
+
+/// Default cap for one gRPC message (4 MiB, the grpc-go default).
++GRPC_MAX_MESSAGE = 4194304
+
+/// gRPC status OK.
++GRPC_OK = 0
+/// gRPC status CANCELLED.
++GRPC_CANCELLED = 1
+/// gRPC status UNKNOWN.
++GRPC_UNKNOWN = 2
+/// gRPC status INVALID_ARGUMENT.
++GRPC_INVALID_ARGUMENT = 3
+/// gRPC status DEADLINE_EXCEEDED.
++GRPC_DEADLINE_EXCEEDED = 4
+/// gRPC status NOT_FOUND.
++GRPC_NOT_FOUND = 5
+/// gRPC status ALREADY_EXISTS.
++GRPC_ALREADY_EXISTS = 6
+/// gRPC status PERMISSION_DENIED.
++GRPC_PERMISSION_DENIED = 7
+/// gRPC status RESOURCE_EXHAUSTED.
++GRPC_RESOURCE_EXHAUSTED = 8
+/// gRPC status FAILED_PRECONDITION.
++GRPC_FAILED_PRECONDITION = 9
+/// gRPC status ABORTED.
++GRPC_ABORTED = 10
+/// gRPC status OUT_OF_RANGE.
++GRPC_OUT_OF_RANGE = 11
+/// gRPC status UNIMPLEMENTED.
++GRPC_UNIMPLEMENTED = 12
+/// gRPC status INTERNAL.
++GRPC_INTERNAL = 13
+/// gRPC status UNAVAILABLE.
++GRPC_UNAVAILABLE = 14
+/// gRPC status DATA_LOSS.
++GRPC_DATA_LOSS = 15
+/// gRPC status UNAUTHENTICATED.
++GRPC_UNAUTHENTICATED = 16
+
+/// Protobuf wire type: varint.
++PB_VARINT = 0
+/// Protobuf wire type: 64-bit little-endian.
++PB_FIXED64 = 1
+/// Protobuf wire type: length-delimited.
++PB_LEN = 2
+/// Protobuf wire type: 32-bit little-endian.
++PB_FIXED32 = 5
+
+// --- byte helpers ---------------------------------------------------------------------------
+
+/// `a[from..to]` as a new array.
++g_slice(a: _, from: i64, to: i64) : _ {
+    out = []
+    i = from
+    while i < to {
+        out = host.sys_arr_push(out, a[i])
+        i = i + 1
+    }
+    out
+}
+
+/// `a` followed by `b` as a new array.
++g_cat(a: _, b: _) : _ {
+    out = a
+    i = 0
+    n = host.sys_arr_len(b)
+    while i < n {
+        out = host.sys_arr_push(out, b[i])
+        i = i + 1
+    }
+    out
+}
+
+/// Big-endian `width` byte encoding of `value`.
++g_be(value: i64, width: i64) : _ {
+    out = []
+    i = width - 1
+    while i >= 0 {
+        out = host.sys_arr_push(out, (value >>> (i * 8)) & 255)
+        i = i - 1
+    }
+    out
+}
+
+/// Big-endian integer read from `width` bytes at `pos`.
++g_read_be(data: _, pos: i64, width: i64) : i64 {
+    v = 0
+    i = 0
+    while i < width {
+        v = (v << 8) | data[pos + i]
+        i = i + 1
+    }
+    v
+}
+
+/// True when two byte arrays hold the same bytes.
++g_same(a: _, b: _) : bool {
+    n = host.sys_arr_len(a)
+    if n != host.sys_arr_len(b) { return false }
+    same = true
+    i = 0
+    while i < n {
+        if a[i] != b[i] { same = false }
+        i = i + 1
+    }
+    same
+}
+
+/// UTF-8 bytes of `s`.
++g_bytes(s: str) : _ => host.sys_str_to_bytes(s)
+
+/// Text decoded from UTF-8 `bytes`.
++g_text(bytes: _) : str => host.sys_bytes_to_str(bytes)
+
+/// True when `bytes` is made of values in 0..255 only.
++g_is_bytes(bytes: _) : bool {
+    ok = true
+    i = 0
+    n = host.sys_arr_len(bytes)
+    while i < n {
+        b = bytes[i]
+        if b < 0 { ok = false }
+        if b > 255 { ok = false }
+        i = i + 1
+    }
+    ok
+}
+
+/// Index of `needle` in `s` at or after `start`, or -1.
+g_find(s: str, needle: str, start: i64) : i64 {
+    n = host.sys_str_len(s)
+    k = host.sys_str_len(needle)
+    found = -1
+    p = start
+    while p + k <= n {
+        if s[p..(p + k)] == needle {
+            found = p
+            break
+        }
+        p = p + 1
+    }
+    found
+}
+
+/// True when `s` starts with `prefix`.
+g_starts(s: str, prefix: str) : bool {
+    k = host.sys_str_len(prefix)
+    if host.sys_str_len(s) < k { return false }
+    s[0..k] == prefix
+}
+
+/// True when `s` has no CR, LF or NUL.
+g_ctl_free(s: str) : bool {
+    if g_find(s, "\r", 0) >= 0 { return false }
+    if g_find(s, "\n", 0) >= 0 { return false }
+    nul = host.sys_chr(0)
+    g_find(s, nul, 0) < 0
+}
+
+// --- HTTP/2 frames --------------------------------------------------------------------------
+
+/// The 9-byte header in front of every HTTP/2 frame.
++H2Header = {
+    /// Payload length (24 bits). Defaults to `0`.
+    length: i64 = 0
+    /// Frame type (`H2_*`). Defaults to `0`.
+    ftype: i64 = 0
+    /// Flag bits. Defaults to `0`.
+    flags: i64 = 0
+    /// Stream identifier (31 bits). Defaults to `0`.
+    stream_id: i64 = 0
+}
+
+/// A whole frame: header fields plus payload bytes.
++H2Frame = {
+    /// Payload length. Defaults to `0`.
+    length: i64 = 0
+    /// Frame type (`H2_*`). Defaults to `0`.
+    ftype: i64 = 0
+    /// Flag bits. Defaults to `0`.
+    flags: i64 = 0
+    /// Stream identifier. Defaults to `0`.
+    stream_id: i64 = 0
+    /// Payload bytes. Defaults to `[]`.
+    payload: _ = []
+
+    /// True when `flag` is set.
+    flagged(self, flag: i64) : bool => (self.flags & flag) == flag
+}
+
+/// Pack a frame header: 24-bit length, type, flags, reserved bit + 31-bit stream id.
++h2_header_pack(length: i64, ftype: i64, flags: i64, stream_id: i64) : _! {
+    ensure length >= 0 else {
+        fail "h2: negative frame length"
+        return
+    }
+    ensure length <= H2_LENGTH_LIMIT else {
+        fail "h2: frame length {length} exceeds 24 bits"
+        return
+    }
+    ensure ftype >= 0 else {
+        fail "h2: invalid frame type {ftype}"
+        return
+    }
+    ensure ftype <= 255 else {
+        fail "h2: invalid frame type {ftype}"
+        return
+    }
+    ensure flags >= 0 else {
+        fail "h2: invalid flags {flags}"
+        return
+    }
+    ensure flags <= 255 else {
+        fail "h2: invalid flags {flags}"
+        return
+    }
+    ensure stream_id >= 0 else {
+        fail "h2: negative stream id"
+        return
+    }
+    ensure stream_id <= H2_STREAM_LIMIT else {
+        fail "h2: stream id {stream_id} exceeds 31 bits"
+        return
+    }
+    head = g_be(length, 3)
+    head = host.sys_arr_push(head, ftype)
+    head = host.sys_arr_push(head, flags)
+    g_cat(head, g_be(stream_id, 4))
+}
+
+/// Read the 9-byte frame header at `pos`; the reserved bit is ignored.
++h2_header_unpack(data: _, pos: i64) : H2Header! {
+    ensure pos >= 0 else {
+        fail "h2: negative offset"
+        return
+    }
+    ensure pos + 9 <= host.sys_arr_len(data) else {
+        fail "h2: truncated frame header"
+        return
+    }
+    H2Header.{length: g_read_be(data, pos, 3), ftype: data[pos + 3], flags: data[pos + 4], stream_id: g_read_be(data, pos + 5, 4) & H2_STREAM_LIMIT}
+}
+
+/// A complete frame: header followed by `payload`.
++h2_frame(ftype: i64, flags: i64, stream_id: i64, payload: _) : _! {
+    ensure g_is_bytes(payload) else {
+        fail "h2: payload is not a byte array"
+        return
+    }
+    head = h2_header_pack(host.sys_arr_len(payload), ftype, flags, stream_id) or err { fail "{err}" }
+    g_cat(head, payload)
+}
+
+/// Total bytes of the frame starting at `pos`, or -1 while the header is incomplete.
++h2_frame_size(data: _, pos: i64) : i64 {
+    if pos + 9 > host.sys_arr_len(data) { return -1 }
+    9 + g_read_be(data, pos, 3)
+}
+
+/// Parse the frame at `pos`; `max_len` bounds the payload (use `H2_DEFAULT_MAX_FRAME`).
++h2_frame_at(data: _, pos: i64, max_len: i64) : H2Frame! {
+    head = h2_header_unpack(data, pos) or err { fail "{err}" }
+    ensure head.length <= max_len else {
+        fail "h2: frame of {head.length} bytes exceeds the limit {max_len}"
+        return
+    }
+    ensure pos + 9 + head.length <= host.sys_arr_len(data) else {
+        fail "h2: truncated frame payload"
+        return
+    }
+    H2Frame.{length: head.length, ftype: head.ftype, flags: head.flags, stream_id: head.stream_id, payload: g_slice(data, pos + 9, pos + 9 + head.length)}
+}
+
+/// Number of leading bytes of `data` that form whole frames (the rest is a partial frame).
++h2_complete_len(data: _) : i64 {
+    pos = 0
+    n = host.sys_arr_len(data)
+    going = true
+    while going {
+        size = h2_frame_size(data, pos)
+        if size < 0 {
+            going = false
+        } else {
+            if pos + size > n {
+                going = false
+            } else {
+                pos = pos + size
+            }
+        }
+    }
+    pos
+}
+
+/// Every frame in `data`, which must contain only whole frames.
++h2_frames(data: _, max_len: i64) : _! {
+    ensure h2_complete_len(data) == host.sys_arr_len(data) else {
+        fail "h2: buffer ends with a partial frame"
+        return
+    }
+    out = []
+    pos = 0
+    n = host.sys_arr_len(data)
+    problem = ""
+    while pos < n {
+        f = h2_frame_at(data, pos, max_len) or err {
+            problem = "{err}"
+            H2Frame.{ftype: -1}
+        }
+        if f.ftype < 0 {
+            pos = n
+        } else {
+            out = host.sys_arr_push(out, f)
+            pos = pos + 9 + f.length
+        }
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+/// The HTTP/2 client connection preface that precedes the first SETTINGS frame.
++h2_preface() : _ => g_bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+
+/// True when `data` starts with the client connection preface.
++h2_has_preface(data: _) : bool {
+    pre = h2_preface()
+    n = host.sys_arr_len(pre)
+    if host.sys_arr_len(data) < n { return false }
+    g_same(g_slice(data, 0, n), pre)
+}
+
+/// DATA frame for `stream`.
++h2_data(stream: i64, payload: _, end_stream: bool) : _! {
+    ensure stream > 0 else {
+        fail "h2: DATA needs a stream"
+        return
+    }
+    flags = 0
+    if end_stream { flags = H2_FLAG_END_STREAM }
+    h2_frame(H2_DATA, flags, stream, payload)
+}
+
+/// DATA frames of at most `max_frame` payload bytes carrying all of `payload`; the last one ends
+/// the stream when `end_stream` is true. An empty payload still produces one frame.
++h2_data_frames(stream: i64, payload: _, end_stream: bool, max_frame: i64) : _! {
+    ensure max_frame > 0 else {
+        fail "h2: frame size limit must be positive"
+        return
+    }
+    n = host.sys_arr_len(payload)
+    out = []
+    nothing = []
+    pos = 0
+    problem = ""
+    going = true
+    while going {
+        end = pos + max_frame
+        if end > n { end = n }
+        last = end == n
+        fin = false
+        if last { fin = end_stream }
+        piece = g_slice(payload, pos, end)
+        f = h2_data(stream, piece, fin) or err {
+            problem = "{err}"
+            nothing
+        }
+        out = g_cat(out, f)
+        pos = end
+        if last { going = false }
+        if problem != "" { going = false }
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+/// HEADERS frame carrying the HPACK block `block`.
++h2_headers(stream: i64, block: _, end_stream: bool, end_headers: bool) : _! {
+    ensure stream > 0 else {
+        fail "h2: HEADERS needs a stream"
+        return
+    }
+    flags = 0
+    if end_stream { flags = flags | H2_FLAG_END_STREAM }
+    if end_headers { flags = flags | H2_FLAG_END_HEADERS }
+    h2_frame(H2_HEADERS, flags, stream, block)
+}
+
+/// CONTINUATION frame carrying more of a header block.
++h2_continuation(stream: i64, block: _, end_headers: bool) : _! {
+    ensure stream > 0 else {
+        fail "h2: CONTINUATION needs a stream"
+        return
+    }
+    flags = 0
+    if end_headers { flags = H2_FLAG_END_HEADERS }
+    h2_frame(H2_CONTINUATION, flags, stream, block)
+}
+
+/// SETTINGS frame from parallel `ids` and `values` arrays.
++h2_settings(ids: _, values: _) : _! {
+    n = host.sys_arr_len(ids)
+    ensure n == host.sys_arr_len(values) else {
+        fail "h2: SETTINGS ids and values differ in length"
+        return
+    }
+    payload = []
+    i = 0
+    bad = ""
+    while i < n {
+        id = ids[i]
+        v = values[i]
+        if id < 1 {
+            if bad == "" { bad = "h2: invalid SETTINGS id {id}" }
+        }
+        if id > 65535 {
+            if bad == "" { bad = "h2: invalid SETTINGS id {id}" }
+        }
+        if v < 0 {
+            if bad == "" { bad = "h2: negative SETTINGS value" }
+        }
+        if v > 4294967295 {
+            if bad == "" { bad = "h2: SETTINGS value exceeds 32 bits" }
+        }
+        payload = g_cat(payload, g_be(id, 2))
+        payload = g_cat(payload, g_be(v, 4))
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "{bad}"
+        return
+    }
+    h2_frame(H2_SETTINGS, 0, 0, payload)
+}
+
+/// The empty SETTINGS frame with ACK that acknowledges the peer's settings.
++h2_settings_ack() : _ {
+    out = h2_frame(H2_SETTINGS, H2_FLAG_ACK, 0, []) or []
+    out
+}
+
+/// Settings of a SETTINGS payload as `[ids, values]`.
++h2_settings_parse(payload: _) : _! {
+    n = host.sys_arr_len(payload)
+    ensure n % 6 == 0 else {
+        fail "h2: SETTINGS payload length {n} is not a multiple of 6"
+        return
+    }
+    ids = []
+    values = []
+    i = 0
+    while i < n {
+        ids = host.sys_arr_push(ids, g_read_be(payload, i, 2))
+        values = host.sys_arr_push(values, g_read_be(payload, i + 2, 4))
+        i = i + 6
+    }
+    [ids, values]
+}
+
+/// WINDOW_UPDATE for `stream` (0 = connection) adding `increment` bytes of credit.
++h2_window_update(stream: i64, increment: i64) : _! {
+    ensure increment >= 1 else {
+        fail "h2: window increment must be at least 1"
+        return
+    }
+    ensure increment <= H2_STREAM_LIMIT else {
+        fail "h2: window increment exceeds 31 bits"
+        return
+    }
+    h2_frame(H2_WINDOW_UPDATE, 0, stream, g_be(increment, 4))
+}
+
+/// PING with exactly 8 opaque bytes; `ack` marks a response.
++h2_ping(opaque: _, ack: bool) : _! {
+    ensure host.sys_arr_len(opaque) == 8 else {
+        fail "h2: PING carries exactly 8 bytes"
+        return
+    }
+    flags = 0
+    if ack { flags = H2_FLAG_ACK }
+    h2_frame(H2_PING, flags, 0, opaque)
+}
+
+/// RST_STREAM ending `stream` with error `code`.
++h2_rst_stream(stream: i64, code: i64) : _! {
+    ensure stream > 0 else {
+        fail "h2: RST_STREAM needs a stream"
+        return
+    }
+    ensure code >= 0 else {
+        fail "h2: negative error code"
+        return
+    }
+    h2_frame(H2_RST_STREAM, 0, stream, g_be(code, 4))
+}
+
+/// GOAWAY with the last processed stream, an error code and optional debug text.
++h2_goaway(last_stream: i64, code: i64, debug: str) : _! {
+    ensure last_stream >= 0 else {
+        fail "h2: negative last stream id"
+        return
+    }
+    payload = g_cat(g_be(last_stream, 4), g_be(code, 4))
+    payload = g_cat(payload, g_bytes(debug))
+    h2_frame(H2_GOAWAY, 0, 0, payload)
+}
+
+/// DATA or HEADERS payload without its padding and priority prefix.
++h2_body(frame: H2Frame) : _! {
+    data = frame.payload
+    n = host.sys_arr_len(data)
+    start = 0
+    stop = n
+    if frame.flagged(H2_FLAG_PADDED) {
+        ensure n >= 1 else {
+            fail "h2: padded frame without a pad length"
+            return
+        }
+        pad = data[0]
+        start = 1
+        stop = n - pad
+        ensure stop >= start else {
+            fail "h2: padding longer than the frame"
+            return
+        }
+    }
+    if frame.ftype == H2_HEADERS {
+        if frame.flagged(H2_FLAG_PRIORITY) {
+            start = start + 5
+            ensure start <= stop else {
+                fail "h2: truncated priority block"
+                return
+            }
+        }
+    }
+    g_slice(data, start, stop)
+}
+
+// --- HPACK ----------------------------------------------------------------------------------
+
+/// HPACK static table names (index 0 unused).
+HPACK_NAMES = ["", ":authority", ":method", ":method", ":path", ":path", ":scheme", ":scheme", ":status", ":status", ":status", ":status", ":status", ":status", ":status", "accept-charset", "accept-encoding", "accept-language", "accept-ranges", "accept", "access-control-allow-origin", "age", "allow", "authorization", "cache-control", "content-disposition", "content-encoding", "content-language", "content-length", "content-location", "content-range", "content-type", "cookie", "date", "etag", "expect", "expires", "from", "host", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "last-modified", "link", "location", "max-forwards", "proxy-authenticate", "proxy-authorization", "range", "referer", "refresh", "retry-after", "server", "set-cookie", "strict-transport-security", "transfer-encoding", "user-agent", "vary", "via", "www-authenticate"]
+
+/// HPACK static table values, parallel to the names.
+HPACK_VALUES = ["", "", "GET", "POST", "/", "/index.html", "http", "https", "200", "204", "206", "304", "400", "404", "500", "", "gzip, deflate", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+
+/// Number of entries in the HPACK static table.
++HPACK_STATIC_LEN = 61
+
+/// HPACK prefix integer (RFC 7541 5.1): `value` in an `n`-bit prefix whose upper bits are `flags`.
++hpack_int(value: i64, prefix: i64, flags: i64) : _! {
+    ensure value >= 0 else {
+        fail "hpack: negative integer"
+        return
+    }
+    ensure prefix >= 1 else {
+        fail "hpack: prefix must be 1..8 bits"
+        return
+    }
+    ensure prefix <= 8 else {
+        fail "hpack: prefix must be 1..8 bits"
+        return
+    }
+    limit = (1 << prefix) - 1
+    if value < limit { return [flags | value] }
+    out = [flags | limit]
+    rest = value - limit
+    while rest >= 128 {
+        out = host.sys_arr_push(out, (rest & 127) | 128)
+        rest = rest >>> 7
+    }
+    host.sys_arr_push(out, rest)
+}
+
+/// A decoded prefix integer and the offset just past it.
++HpInt = {
+    /// The decoded value. Defaults to `0`.
+    value: i64 = 0
+    /// Offset of the first byte after the integer. Defaults to `0`.
+    next: i64 = 0
+}
+
+/// Decode an `prefix`-bit prefix integer at `pos`.
++hpack_int_at(data: _, pos: i64, prefix: i64) : HpInt! {
+    n = host.sys_arr_len(data)
+    ensure pos >= 0 else {
+        fail "hpack: negative offset"
+        return
+    }
+    ensure pos < n else {
+        fail "hpack: truncated integer"
+        return
+    }
+    limit = (1 << prefix) - 1
+    first = data[pos] & limit
+    if first < limit { return HpInt.{value: first, next: pos + 1} }
+    value = limit
+    shift = 0
+    p = pos + 1
+    going = true
+    problem = ""
+    while going {
+        if p >= n {
+            problem = "hpack: truncated integer"
+            going = false
+        } else {
+            if shift > 56 {
+                problem = "hpack: integer too large"
+                going = false
+            } else {
+                b = data[p]
+                value = value + ((b & 127) << shift)
+                shift = shift + 7
+                p = p + 1
+                if (b & 128) == 0 { going = false }
+            }
+        }
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    HpInt.{value, next: p}
+}
+
+/// A header string: 7-bit length prefix then the raw (non-Huffman) bytes.
+hpack_string(s: str) : _ {
+    raw = g_bytes(s)
+    len = hpack_int(host.sys_arr_len(raw), 7, 0) or []
+    g_cat(len, raw)
+}
+
+/// Names and values of a decoded header list, in order.
++HeaderList = {
+    /// Header names. Defaults to `[]`.
+    names: _ = []
+    /// Header values, parallel to `names`. Defaults to `[]`.
+    values: _ = []
+
+    /// First value of `name`, or `fallback`.
+    get(self, name: str, fallback: str) : str {
+        out = fallback
+        found = false
+        i = 0
+        n = host.sys_arr_len(self.names)
+        while i < n {
+            if self.names[i] == name {
+                if !found {
+                    out = self.values[i]
+                    found = true
+                }
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    /// True when a header called `name` exists.
+    has(self, name: str) : bool {
+        found = false
+        i = 0
+        n = host.sys_arr_len(self.names)
+        while i < n {
+            if self.names[i] == name { found = true }
+            i = i + 1
+        }
+        found
+    }
+}
+
+/// Encode `names`/`values` as a HPACK block without Huffman and without table updates: fully
+/// matching static entries use the indexed form, other known names reuse the static name index.
++hpack_encode(names: _, values: _) : _! {
+    n = host.sys_arr_len(names)
+    ensure n == host.sys_arr_len(values) else {
+        fail "hpack: names and values differ in length"
+        return
+    }
+    out = []
+    i = 0
+    bad = ""
+    while i < n {
+        name = names[i]
+        value = values[i]
+        if name == "" {
+            if bad == "" { bad = "hpack: empty header name" }
+        }
+        if !g_ctl_free(name) {
+            if bad == "" { bad = "hpack: control character in header name" }
+        }
+        if !g_ctl_free(value) {
+            if bad == "" { bad = "hpack: control character in header value" }
+        }
+        full = 0
+        name_only = 0
+        j = 1
+        while j <= HPACK_STATIC_LEN {
+            if HPACK_NAMES[j] == name {
+                if name_only == 0 { name_only = j }
+                if HPACK_VALUES[j] == value {
+                    if full == 0 { full = j }
+                }
+            }
+            j = j + 1
+        }
+        if full > 0 {
+            out = g_cat(out, hpack_int(full, 7, 128) or [])
+        } else {
+            if name_only > 0 {
+                out = g_cat(out, hpack_int(name_only, 4, 0) or [])
+            } else {
+                out = host.sys_arr_push(out, 0)
+                out = g_cat(out, hpack_string(name))
+            }
+            out = g_cat(out, hpack_string(value))
+        }
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "{bad}"
+        return
+    }
+    out
+}
+
+/// One looked-up table entry.
++HpEntry = {
+    /// Header name. Defaults to `""`.
+    name: str = ""
+    /// Header value. Defaults to `""`.
+    value: str = ""
+    /// False when the index is out of range. Defaults to `false`.
+    ok: bool = false
+}
+
+/// HPACK decoder with a dynamic table. Keep one per HTTP/2 connection direction.
++HpackDecoder = {
+    /// Dynamic entry names, oldest first. Defaults to `[]`.
+    dyn_names: _ = []
+    /// Dynamic entry values, parallel to `dyn_names`. Defaults to `[]`.
+    dyn_values: _ = []
+    /// Current dynamic table size in bytes. Defaults to `0`.
+    size: i64 = 0
+    /// Maximum dynamic table size in bytes (SETTINGS_HEADER_TABLE_SIZE). Defaults to `4096`.
+    max_size: i64 = 4096
+
+    /// Entry for table `idx` (1-based, static entries first, then the newest dynamic entry).
+    lookup(self, idx: i64) : HpEntry {
+        if idx < 1 { return HpEntry.{} }
+        if idx <= HPACK_STATIC_LEN { return HpEntry.{name: HPACK_NAMES[idx], value: HPACK_VALUES[idx], ok: true} }
+        k = idx - HPACK_STATIC_LEN - 1
+        count = host.sys_arr_len(self.dyn_names)
+        if k >= count { return HpEntry.{} }
+        pos = count - 1 - k
+        HpEntry.{name: self.dyn_names[pos], value: self.dyn_values[pos], ok: true}
+    }
+
+    /// Evict oldest entries until the table fits in `limit` bytes.
+    shrink(@self, limit: i64) : i64 {
+        while self.size > limit {
+            count = host.sys_arr_len(self.dyn_names)
+            if count == 0 {
+                self.size = 0
+                break
+            }
+            gone = host.sys_str_len(self.dyn_names[0]) + host.sys_str_len(self.dyn_values[0]) + 32
+            self.size = self.size - gone
+            self.dyn_names = g_slice(self.dyn_names, 1, count)
+            self.dyn_values = g_slice(self.dyn_values, 1, count)
+        }
+        self.size
+    }
+
+    /// Add an entry to the dynamic table (incremental indexing).
+    insert(@self, name: str, value: str) : i64 {
+        cost = host.sys_arr_len(g_bytes(name)) + host.sys_arr_len(g_bytes(value)) + 32
+        @self.shrink(self.max_size - cost)
+        if cost <= self.max_size {
+            self.dyn_names = host.sys_arr_push(self.dyn_names, name)
+            self.dyn_values = host.sys_arr_push(self.dyn_values, value)
+            self.size = self.size + cost
+        }
+        self.size
+    }
+
+    /// Decode one header block into its header list.
+    decode(@self, block: _) : HeaderList! {
+        n = host.sys_arr_len(block)
+        names = []
+        values = []
+        pos = 0
+        problem = ""
+        while pos < n {
+            if problem != "" { break }
+            b = block[pos]
+            if (b & 128) != 0 {
+                r = hpack_int_at(block, pos, 7) or err {
+                    problem = "{err}"
+                    HpInt.{next: n}
+                }
+                pos = r.next
+                if problem == "" {
+                    e = self.lookup(r.value)
+                    if e.ok {
+                        names = host.sys_arr_push(names, e.name)
+                        values = host.sys_arr_push(values, e.value)
+                    } else {
+                        problem = "hpack: index {r.value} is not in the table"
+                    }
+                }
+            } else {
+                if (b & 224) == 32 {
+                    r = hpack_int_at(block, pos, 5) or err {
+                        problem = "{err}"
+                        HpInt.{next: n}
+                    }
+                    pos = r.next
+                    if problem == "" {
+                        if r.value > 65536 {
+                            problem = "hpack: table size update {r.value} too large"
+                        } else {
+                            self.max_size = r.value
+                            @self.shrink(r.value)
+                        }
+                    }
+                } else {
+                    indexed = (b & 192) == 64
+                    prefix = 4
+                    if indexed { prefix = 6 }
+                    r = hpack_int_at(block, pos, prefix) or err {
+                        problem = "{err}"
+                        HpInt.{next: n}
+                    }
+                    pos = r.next
+                    name = ""
+                    if problem == "" {
+                        if r.value > 0 {
+                            e = self.lookup(r.value)
+                            if e.ok {
+                                name = e.name
+                            } else {
+                                problem = "hpack: index {r.value} is not in the table"
+                            }
+                        } else {
+                            s = hpack_string_at(block, pos) or err {
+                                problem = "{err}"
+                                HpString.{next: n}
+                            }
+                            pos = s.next
+                            name = s.text
+                        }
+                    }
+                    value = ""
+                    if problem == "" {
+                        s2 = hpack_string_at(block, pos) or err {
+                            problem = "{err}"
+                            HpString.{next: n}
+                        }
+                        pos = s2.next
+                        value = s2.text
+                    }
+                    if problem == "" {
+                        names = host.sys_arr_push(names, name)
+                        values = host.sys_arr_push(values, value)
+                        if indexed { @self.insert(name, value) }
+                    }
+                }
+            }
+        }
+        ensure problem == "" else {
+            fail "{problem}"
+            return
+        }
+        HeaderList.{names, values}
+    }
+}
+
+/// A decoded header string and the offset after it.
++HpString = {
+    /// The text. Defaults to `""`.
+    text: str = ""
+    /// Offset of the first byte after the string. Defaults to `0`.
+    next: i64 = 0
+}
+
+/// Decode a header string at `pos`; Huffman coded strings are rejected.
++hpack_string_at(data: _, pos: i64) : HpString! {
+    ensure pos < host.sys_arr_len(data) else {
+        fail "hpack: truncated string"
+        return
+    }
+    huffman = (data[pos] & 128) != 0
+    ensure !huffman else {
+        fail "hpack: huffman coded strings are not supported"
+        return
+    }
+    r = hpack_int_at(data, pos, 7) or err { fail "{err}" }
+    ensure r.next + r.value <= host.sys_arr_len(data) else {
+        fail "hpack: truncated string"
+        return
+    }
+    HpString.{text: g_text(g_slice(data, r.next, r.next + r.value)), next: r.next + r.value}
+}
+
+// --- protobuf wire format -------------------------------------------------------------------
+
+/// Protobuf varint of `n`; negative numbers use the 10-byte two's complement form.
++pb_varint(n: i64) : _ {
+    out = []
+    v = n
+    while (v & -128) != 0 {
+        out = host.sys_arr_push(out, (v & 127) | 128)
+        v = v >>> 7
+    }
+    host.sys_arr_push(out, v)
+}
+
+/// A decoded varint and the offset after it.
++PbVar = {
+    /// The decoded value (wraps like int64). Defaults to `0`.
+    value: i64 = 0
+    /// Offset of the first byte after the varint. Defaults to `0`.
+    next: i64 = 0
+}
+
+/// Read a varint at `pos` (at most 10 bytes).
++pb_read_varint(data: _, pos: i64) : PbVar! {
+    n = host.sys_arr_len(data)
+    value = 0
+    shift = 0
+    p = pos
+    going = true
+    problem = ""
+    while going {
+        if p >= n {
+            problem = "protobuf: truncated varint"
+            going = false
+        } else {
+            if shift > 63 {
+                problem = "protobuf: varint longer than 10 bytes"
+                going = false
+            } else {
+                b = data[p]
+                value = value | ((b & 127) << shift)
+                shift = shift + 7
+                p = p + 1
+                if (b & 128) == 0 { going = false }
+            }
+        }
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    PbVar.{value, next: p}
+}
+
+/// Zigzag encoding for `sint32`/`sint64`.
++pb_zigzag(n: i64) : i64 => (n << 1) ^ (n >> 63)
+
+/// Inverse of `pb_zigzag`.
++pb_unzigzag(n: i64) : i64 => (n >>> 1) ^ (0 - (n & 1))
+
+/// Field key: `(number << 3) | wire`.
++pb_tag(number: i64, wire: i64) : _! {
+    ensure number >= 1 else {
+        fail "protobuf: field numbers start at 1"
+        return
+    }
+    ensure number <= 536870911 else {
+        fail "protobuf: field number {number} exceeds 29 bits"
+        return
+    }
+    reserved = false
+    if number >= 19000 {
+        if number <= 19999 { reserved = true }
+    }
+    ensure !reserved else {
+        fail "protobuf: field numbers 19000-19999 are reserved"
+        return
+    }
+    pb_varint((number << 3) | wire)
+}
+
+/// `int32`/`int64`/`uint*`/`bool`/enum field.
++pb_varint_field(number: i64, value: i64) : _! {
+    tag = pb_tag(number, PB_VARINT) or err { fail "{err}" }
+    g_cat(tag, pb_varint(value))
+}
+
+/// `bool` field.
++pb_bool_field(number: i64, value: bool) : _! {
+    v = 0
+    if value { v = 1 }
+    pb_varint_field(number, v)
+}
+
+/// `sint32`/`sint64` field (zigzag).
++pb_sint_field(number: i64, value: i64) : _! {
+    pb_varint_field(number, pb_zigzag(value))
+}
+
+/// `bytes`, `string` or embedded message field.
++pb_bytes_field(number: i64, bytes: _) : _! {
+    tag = pb_tag(number, PB_LEN) or err { fail "{err}" }
+    head = g_cat(tag, pb_varint(host.sys_arr_len(bytes)))
+    g_cat(head, bytes)
+}
+
+/// `string` field.
++pb_string_field(number: i64, text: str) : _! {
+    pb_bytes_field(number, g_bytes(text))
+}
+
+/// `fixed32`/`sfixed32`/`float` bit pattern field (little-endian).
++pb_fixed32_field(number: i64, bits: i64) : _! {
+    tag = pb_tag(number, PB_FIXED32) or err { fail "{err}" }
+    g_cat(tag, g_le(bits, 4))
+}
+
+/// `fixed64`/`sfixed64`/`double` bit pattern field (little-endian).
++pb_fixed64_field(number: i64, bits: i64) : _! {
+    tag = pb_tag(number, PB_FIXED64) or err { fail "{err}" }
+    g_cat(tag, g_le(bits, 8))
+}
+
+/// Little-endian `width` byte encoding.
++g_le(value: i64, width: i64) : _ {
+    out = []
+    i = 0
+    while i < width {
+        out = host.sys_arr_push(out, (value >>> (i * 8)) & 255)
+        i = i + 1
+    }
+    out
+}
+
+/// Packed repeated varint field (proto3 default for scalars).
++pb_packed_field(number: i64, values: _) : _! {
+    body = []
+    i = 0
+    n = host.sys_arr_len(values)
+    while i < n {
+        body = g_cat(body, pb_varint(values[i]))
+        i = i + 1
+    }
+    pb_bytes_field(number, body)
+}
+
+/// Values of a packed varint payload.
++pb_unpack_varints(data: _) : _! {
+    out = []
+    pos = 0
+    n = host.sys_arr_len(data)
+    problem = ""
+    while pos < n {
+        r = pb_read_varint(data, pos) or err {
+            problem = "{err}"
+            PbVar.{next: n}
+        }
+        if problem == "" { out = host.sys_arr_push(out, r.value) }
+        pos = r.next
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+/// One parsed field.
++PbField = {
+    /// Field number. Defaults to `0`.
+    number: i64 = 0
+    /// Wire type (`PB_*`). Defaults to `0`.
+    wire: i64 = 0
+    /// Value of varint and fixed fields (fixed32 is zero-extended). Defaults to `0`.
+    ival: i64 = 0
+    /// Payload of length-delimited fields. Defaults to `[]`.
+    data: _ = []
+}
+
+/// Parse all fields of a message. Groups (wire types 3 and 4) are rejected.
++pb_parse(data: _) : _! {
+    out = []
+    pos = 0
+    n = host.sys_arr_len(data)
+    problem = ""
+    while pos < n {
+        if problem != "" { break }
+        key = pb_read_varint(data, pos) or err {
+            problem = "{err}"
+            PbVar.{next: n}
+        }
+        pos = key.next
+        if problem == "" {
+            number = key.value >>> 3
+            wire = key.value & 7
+            if number < 1 { problem = "protobuf: field number 0" }
+            if problem == "" {
+                if wire == 0 {
+                    v = pb_read_varint(data, pos) or err {
+                        problem = "{err}"
+                        PbVar.{next: n}
+                    }
+                    pos = v.next
+                    out = host.sys_arr_push(out, PbField.{number, wire, ival: v.value})
+                } else {
+                    if wire == 2 {
+                        ln = pb_read_varint(data, pos) or err {
+                            problem = "{err}"
+                            PbVar.{next: n}
+                        }
+                        pos = ln.next
+                        if problem == "" {
+                            if ln.value < 0 {
+                                problem = "protobuf: negative length"
+                            } else {
+                                if pos + ln.value > n {
+                                    problem = "protobuf: length-delimited field overruns the message"
+                                } else {
+                                    out = host.sys_arr_push(out, PbField.{number, wire, data: g_slice(data, pos, pos + ln.value)})
+                                    pos = pos + ln.value
+                                }
+                            }
+                        }
+                    } else {
+                        if wire == 5 {
+                            if pos + 4 > n {
+                                problem = "protobuf: truncated fixed32"
+                            } else {
+                                out = host.sys_arr_push(out, PbField.{number, wire, ival: g_read_le(data, pos, 4)})
+                                pos = pos + 4
+                            }
+                        } else {
+                            if wire == 1 {
+                                if pos + 8 > n {
+                                    problem = "protobuf: truncated fixed64"
+                                } else {
+                                    out = host.sys_arr_push(out, PbField.{number, wire, ival: g_read_le(data, pos, 8)})
+                                    pos = pos + 8
+                                }
+                            } else {
+                                problem = "protobuf: unsupported wire type {wire}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+/// Little-endian integer read from `width` bytes at `pos`.
++g_read_le(data: _, pos: i64, width: i64) : i64 {
+    v = 0
+    i = width - 1
+    while i >= 0 {
+        v = (v << 8) | data[pos + i]
+        i = i - 1
+    }
+    v
+}
+
+/// Value of the last varint field `number`, or `fallback` (protobuf: last one wins).
++pb_get_varint(fields: _, number: i64, fallback: i64) : i64 {
+    out = fallback
+    i = 0
+    n = host.sys_arr_len(fields)
+    while i < n {
+        f = fields[i]
+        if f.number == number {
+            if f.wire == 0 { out = f.ival }
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Bytes of the last length-delimited field `number`, or `fallback`.
++pb_get_bytes(fields: _, number: i64, fallback: _) : _ {
+    out = fallback
+    i = 0
+    n = host.sys_arr_len(fields)
+    while i < n {
+        f = fields[i]
+        if f.number == number {
+            if f.wire == 2 { out = f.data }
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Text of the last string field `number`, or `fallback`.
++pb_get_string(fields: _, number: i64, fallback: str) : str {
+    out = fallback
+    i = 0
+    n = host.sys_arr_len(fields)
+    while i < n {
+        f = fields[i]
+        if f.number == number {
+            if f.wire == 2 { out = g_text(f.data) }
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Every value of the repeated string field `number`, in order.
++pb_get_strings(fields: _, number: i64) : _ {
+    out = []
+    i = 0
+    n = host.sys_arr_len(fields)
+    while i < n {
+        f = fields[i]
+        if f.number == number {
+            if f.wire == 2 { out = host.sys_arr_push(out, g_text(f.data)) }
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// How many fields carry `number`.
++pb_count(fields: _, number: i64) : i64 {
+    c = 0
+    i = 0
+    n = host.sys_arr_len(fields)
+    while i < n {
+        f = fields[i]
+        if f.number == number { c = c + 1 }
+        i = i + 1
+    }
+    c
+}
+
+// --- gRPC message framing -------------------------------------------------------------------
+
+/// One length-prefixed gRPC message.
++GrpcMessage = {
+    /// True when the payload is compressed (needs `grpc-encoding`). Defaults to `false`.
+    compressed: bool = false
+    /// The payload. Defaults to `[]`.
+    data: _ = []
+    /// Offset just past this message in the buffer. Defaults to `0`.
+    next: i64 = 0
+}
+
+/// Length-prefixed message: 1 compressed-flag byte, 4 byte big-endian length, payload.
++grpc_frame(data: _, compressed: bool) : _! {
+    n = host.sys_arr_len(data)
+    ensure n <= 4294967295 else {
+        fail "grpc: message exceeds 4 GiB"
+        return
+    }
+    ensure g_is_bytes(data) else {
+        fail "grpc: payload is not a byte array"
+        return
+    }
+    flag = 0
+    if compressed { flag = 1 }
+    head = host.sys_arr_push([], flag)
+    head = g_cat(head, g_be(n, 4))
+    g_cat(head, data)
+}
+
+/// Read the message at `pos`; `max_size` bounds the payload.
++grpc_unframe(buf: _, pos: i64, max_size: i64) : GrpcMessage! {
+    n = host.sys_arr_len(buf)
+    ensure pos + 5 <= n else {
+        fail "grpc: truncated message prefix"
+        return
+    }
+    flag = buf[pos]
+    ensure flag <= 1 else {
+        fail "grpc: invalid compression flag {flag}"
+        return
+    }
+    size = g_read_be(buf, pos + 1, 4)
+    ensure size <= max_size else {
+        fail "grpc: message of {size} bytes exceeds the limit {max_size}"
+        return
+    }
+    ensure pos + 5 + size <= n else {
+        fail "grpc: truncated message body"
+        return
+    }
+    GrpcMessage.{compressed: flag == 1, data: g_slice(buf, pos + 5, pos + 5 + size), next: pos + 5 + size}
+}
+
+/// All messages of a buffer that holds nothing else (streaming RPCs).
++grpc_unframe_all(buf: _, max_size: i64) : _! {
+    out = []
+    pos = 0
+    n = host.sys_arr_len(buf)
+    problem = ""
+    while pos < n {
+        m = grpc_unframe(buf, pos, max_size) or err {
+            problem = "{err}"
+            GrpcMessage.{next: n}
+        }
+        if problem == "" { out = host.sys_arr_push(out, m) }
+        pos = m.next
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+// --- gRPC status, timeout, metadata ---------------------------------------------------------
+
+/// Canonical name of a gRPC status code.
++grpc_status_name(code: i64) : str {
+    names = ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"]
+    if code < 0 { return "UNKNOWN" }
+    if code > 16 { return "UNKNOWN" }
+    names[code]
+}
+
+/// HTTP status that a gRPC status maps to when a proxy translates (grpc-gateway convention).
++grpc_http_status(code: i64) : i64 {
+    if code == 0 { return 200 }
+    if code == 1 { return 499 }
+    if code == 3 { return 400 }
+    if code == 4 { return 504 }
+    if code == 5 { return 404 }
+    if code == 6 { return 409 }
+    if code == 7 { return 403 }
+    if code == 8 { return 429 }
+    if code == 9 { return 400 }
+    if code == 10 { return 409 }
+    if code == 11 { return 400 }
+    if code == 12 { return 501 }
+    if code == 14 { return 503 }
+    if code == 16 { return 401 }
+    500
+}
+
+/// `grpc-timeout` header value for `ms` milliseconds: at most 8 digits plus a unit letter.
++grpc_timeout_header(ms: i64) : str! {
+    ensure ms >= 0 else {
+        fail "grpc: negative timeout"
+        return
+    }
+    if ms <= 99999999 { return "{ms}m" }
+    secs = ms / 1000
+    if secs <= 99999999 { return "{secs}S" }
+    mins = secs / 60
+    if mins <= 99999999 { return "{mins}M" }
+    hours = mins / 60
+    ensure hours <= 99999999 else {
+        fail "grpc: timeout too large"
+        return
+    }
+    "{hours}H"
+}
+
+/// Milliseconds of a `grpc-timeout` value (sub-millisecond units round up).
++grpc_parse_timeout(text: str) : i64! {
+    n = host.sys_str_len(text)
+    ensure n >= 2 else {
+        fail "grpc: timeout '{text}' is too short"
+        return
+    }
+    ensure n <= 9 else {
+        fail "grpc: timeout '{text}' has more than 8 digits"
+        return
+    }
+    digits = text[0..(n - 1)]
+    unit = text[(n - 1)..n]
+    amount = 0
+    bad = false
+    i = 0
+    while i < n - 1 {
+        d = g_find("0123456789", digits[i], 0)
+        if d < 0 { bad = true } else { amount = amount * 10 + d }
+        i = i + 1
+    }
+    ensure !bad else {
+        fail "grpc: timeout '{text}' is not numeric"
+        return
+    }
+    if unit == "H" { return amount * 3600000 }
+    if unit == "M" { return amount * 60000 }
+    if unit == "S" { return amount * 1000 }
+    if unit == "m" { return amount }
+    if unit == "u" { return (amount + 999) / 1000 }
+    if unit == "n" { return (amount + 999999) / 1000000 }
+    fail "grpc: unknown timeout unit '{unit}'"
+}
+
+/// Percent-encode a `grpc-message` value (printable ASCII except `%` is kept as is).
++grpc_message_encode(text: str) : str {
+    hex = "0123456789ABCDEF"
+    raw = g_bytes(text)
+    out = ""
+    i = 0
+    n = host.sys_arr_len(raw)
+    while i < n {
+        b = raw[i]
+        plain = false
+        if b >= 32 {
+            if b <= 126 {
+                if b != 37 { plain = true }
+            }
+        }
+        if plain {
+            out = "{out}{host.sys_chr(b)}"
+        } else {
+            hi = hex[b >> 4]
+            lo = hex[b & 15]
+            out = "{out}%{hi}{lo}"
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Decode a percent-encoded `grpc-message`; malformed escapes are kept verbatim as the spec asks.
++grpc_message_decode(text: str) : str {
+    hex = "0123456789ABCDEF"
+    n = host.sys_str_len(text)
+    out = []
+    i = 0
+    while i < n {
+        hi = -1
+        lo = -1
+        if text[i] == "%" {
+            if i + 2 < n {
+                hi = g_find(hex, text[i + 1], 0)
+                lo = g_find(hex, text[i + 2], 0)
+            }
+        }
+        if hi >= 0 {
+            if lo >= 0 {
+                out = host.sys_arr_push(out, hi * 16 + lo)
+                i = i + 3
+            }
+        }
+        if hi < 0 {
+            out = g_cat(out, g_bytes(text[i]))
+            i = i + 1
+        } else {
+            if lo < 0 {
+                out = g_cat(out, g_bytes(text[i]))
+                i = i + 1
+            }
+        }
+    }
+    g_text(out)
+}
+
+// --- unary RPC ------------------------------------------------------------------------------
+
+/// True for `/package.Service/Method` style paths.
++grpc_valid_path(path: str) : bool {
+    if !g_starts(path, "/") { return false }
+    if !g_ctl_free(path) { return false }
+    if g_find(path, " ", 0) >= 0 { return false }
+    second = g_find(path, "/", 1)
+    if second < 2 { return false }
+    if second + 1 >= host.sys_str_len(path) { return false }
+    g_find(path, "/", second + 1) < 0
+}
+
+/// Request header block for a unary call (`:method POST`, `content-type application/grpc`, `te trailers`,
+/// optional `grpc-timeout`). `meta_names`/`meta_values` add lower-case custom metadata.
++grpc_request_headers(authority: str, path: str, timeout_ms: i64, meta_names: _, meta_values: _) : _! {
+    ensure authority != "" else {
+        fail "grpc: authority is required"
+        return
+    }
+    ensure g_ctl_free(authority) else {
+        fail "grpc: control character in authority"
+        return
+    }
+    ensure grpc_valid_path(path) else {
+        fail "grpc: path must look like /package.Service/Method, got '{path}'"
+        return
+    }
+    ensure host.sys_arr_len(meta_names) == host.sys_arr_len(meta_values) else {
+        fail "grpc: metadata names and values differ in length"
+        return
+    }
+    ensure timeout_ms >= 0 else {
+        fail "grpc: negative timeout"
+        return
+    }
+    names = [":method", ":scheme", ":path", ":authority", "content-type", "te"]
+    values = ["POST", "http", path, authority, "application/grpc", "trailers"]
+    if timeout_ms > 0 {
+        t = grpc_timeout_header(timeout_ms) or err { fail "{err}" }
+        names = host.sys_arr_push(names, "grpc-timeout")
+        values = host.sys_arr_push(values, t)
+    }
+    bad = ""
+    i = 0
+    while i < host.sys_arr_len(meta_names) {
+        key = meta_names[i]
+        if key == "" {
+            if bad == "" { bad = "grpc: empty metadata key" }
+        }
+        if g_starts(key, ":") {
+            if bad == "" { bad = "grpc: metadata key '{key}' collides with a pseudo header" }
+        }
+        if g_starts(key, "grpc-") {
+            if bad == "" { bad = "grpc: metadata key '{key}' uses the reserved grpc- prefix" }
+        }
+        if key != to_lower_ascii(key) {
+            if bad == "" { bad = "grpc: metadata key '{key}' must be lower case" }
+        }
+        names = host.sys_arr_push(names, key)
+        values = host.sys_arr_push(values, meta_values[i])
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "{bad}"
+        return
+    }
+    hpack_encode(names, values) or err { fail "{err}" }
+}
+
+/// ASCII lower-case copy of `s`.
++to_lower_ascii(s: str) : str {
+    upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    lower = "abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    i = 0
+    n = host.sys_str_len(s)
+    while i < n {
+        c = s[i]
+        at = g_find(upper, c, 0)
+        if at >= 0 { c = lower[at] }
+        out = "{out}{c}"
+        i = i + 1
+    }
+    out
+}
+
+/// Wire image of a unary request on client `stream` (odd): HEADERS then DATA with END_STREAM.
++grpc_unary_request(stream: i64, authority: str, path: str, message: _, timeout_ms: i64) : _! {
+    ensure stream % 2 == 1 else {
+        fail "grpc: client streams use odd ids, got {stream}"
+        return
+    }
+    block = grpc_request_headers(authority, path, timeout_ms, [], []) or err { fail "{err}" }
+    head = h2_headers(stream, block, false, true) or err { fail "{err}" }
+    body = grpc_frame(message, false) or err { fail "{err}" }
+    data = h2_data_frames(stream, body, true, H2_DEFAULT_MAX_FRAME) or err { fail "{err}" }
+    g_cat(head, data)
+}
+
+/// A request as the server sees it.
++GrpcCall = {
+    /// HTTP/2 stream id. Defaults to `0`.
+    stream_id: i64 = 0
+    /// `/package.Service/Method`. Defaults to `""`.
+    path: str = ""
+    /// `:authority`. Defaults to `""`.
+    authority: str = ""
+    /// Deadline in milliseconds, 0 when none. Defaults to `0`.
+    timeout_ms: i64 = 0
+    /// The request message payload. Defaults to `[]`.
+    message: _ = []
+    /// All request headers. Defaults to an empty list.
+    headers: HeaderList = HeaderList.{}
+}
+
+/// Split frames of one stream into its header block bytes, data bytes and whether it ended.
++GrpcStreamParts = {
+    /// Concatenated HPACK blocks of the first HEADERS (+ CONTINUATION) sequence. Defaults to `[]`.
+    block: _ = []
+    /// Concatenated DATA payloads. Defaults to `[]`.
+    data: _ = []
+    /// Concatenated blocks of a second HEADERS sequence (trailers). Defaults to `[]`.
+    trailer: _ = []
+    /// Stream id of the frames. Defaults to `0`.
+    stream_id: i64 = 0
+    /// True when END_STREAM was seen. Defaults to `false`.
+    ended: bool = false
+    /// Number of HEADERS sequences. Defaults to `0`.
+    sequences: i64 = 0
+}
+
+/// Sort the frames of one stream into header blocks and data. SETTINGS/WINDOW_UPDATE/PING frames
+/// on stream 0 are skipped.
++grpc_split_stream(wire: _) : GrpcStreamParts! {
+    frames = h2_frames(wire, H2_DEFAULT_MAX_FRAME) or err { fail "{err}" }
+    block = []
+    data = []
+    trailer = []
+    nothing = []
+    sid = 0
+    ended = false
+    seqs = 0
+    problem = ""
+    open_block = false
+    i = 0
+    n = host.sys_arr_len(frames)
+    while i < n {
+        f = frames[i]
+        if f.stream_id == 0 {
+            i = i + 1
+        } else {
+            if sid == 0 { sid = f.stream_id }
+            if f.stream_id != sid {
+                if problem == "" { problem = "grpc: frames of several streams (expected stream {sid}, saw {f.stream_id})" }
+            }
+            if f.ftype == H2_HEADERS {
+                body = h2_body(f) or err {
+                    problem = "{err}"
+                    nothing
+                }
+                if open_block {
+                    if problem == "" { problem = "grpc: HEADERS inside an unfinished header block" }
+                }
+                seqs = seqs + 1
+                if seqs == 1 { block = g_cat(block, body) } else { trailer = g_cat(trailer, body) }
+                open_block = !f.flagged(H2_FLAG_END_HEADERS)
+            } else {
+                if f.ftype == H2_CONTINUATION {
+                    if !open_block {
+                        if problem == "" { problem = "grpc: CONTINUATION without HEADERS" }
+                    }
+                    if seqs == 1 { block = g_cat(block, f.payload) } else { trailer = g_cat(trailer, f.payload) }
+                    open_block = !f.flagged(H2_FLAG_END_HEADERS)
+                } else {
+                    if f.ftype == H2_DATA {
+                        if open_block {
+                            if problem == "" { problem = "grpc: DATA inside an unfinished header block" }
+                        }
+                        body = h2_body(f) or err {
+                            problem = "{err}"
+                            nothing
+                        }
+                        data = g_cat(data, body)
+                    } else {
+                        if problem == "" { problem = "grpc: unexpected frame type {f.ftype}" }
+                    }
+                }
+            }
+            if f.flagged(H2_FLAG_END_STREAM) {
+                if f.ftype != H2_CONTINUATION { ended = true }
+            }
+            i = i + 1
+        }
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    ensure !open_block else {
+        fail "grpc: header block never ended"
+        return
+    }
+    GrpcStreamParts.{block, data, trailer, stream_id: sid, ended, sequences: seqs}
+}
+
+/// Parse a unary request wire image (what `grpc_unary_request` produced, or a real client's
+/// frames without the preface/SETTINGS).
++grpc_parse_request(wire: _) : GrpcCall! {
+    parts = grpc_split_stream(wire) or err { fail "{err}" }
+    ensure parts.sequences == 1 else {
+        fail "grpc: expected exactly one header block in a request"
+        return
+    }
+    ensure parts.ended else {
+        fail "grpc: request stream did not end"
+        return
+    }
+    dec = HpackDecoder.{}
+    headers = @dec.decode(parts.block) or err { fail "{err}" }
+    ensure headers.get(":method", "") == "POST" else {
+        fail "grpc: :method must be POST"
+        return
+    }
+    ctype = headers.get("content-type", "")
+    ensure g_starts(ctype, "application/grpc") else {
+        fail "grpc: content-type must be application/grpc, got '{ctype}'"
+        return
+    }
+    path = headers.get(":path", "")
+    ensure grpc_valid_path(path) else {
+        fail "grpc: invalid :path '{path}'"
+        return
+    }
+    timeout = 0
+    raw = headers.get("grpc-timeout", "")
+    if raw != "" {
+        timeout = grpc_parse_timeout(raw) or err { fail "{err}" }
+    }
+    msgs = grpc_unframe_all(parts.data, GRPC_MAX_MESSAGE) or err { fail "{err}" }
+    ensure host.sys_arr_len(msgs) == 1 else {
+        fail "grpc: a unary request carries exactly one message, got {host.sys_arr_len(msgs)}"
+        return
+    }
+    first = msgs[0]
+    ensure !first.compressed else {
+        fail "grpc: compressed requests are not supported"
+        return
+    }
+    GrpcCall.{stream_id: parts.stream_id, path, authority: headers.get(":authority", ""), timeout_ms: timeout, message: first.data, headers}
+}
+
+/// Response header block: `:status 200` and `content-type application/grpc`.
+grpc_response_block() : _ {
+    out = hpack_encode([":status", "content-type"], ["200", "application/grpc"]) or []
+    out
+}
+
+/// Trailer block with `grpc-status` and, when non-empty, a percent-encoded `grpc-message`.
+grpc_trailer_block(code: i64, text: str) : _ {
+    names = ["grpc-status"]
+    values = ["{code}"]
+    if text != "" {
+        names = host.sys_arr_push(names, "grpc-message")
+        values = host.sys_arr_push(values, grpc_message_encode(text))
+    }
+    out = hpack_encode(names, values) or []
+    out
+}
+
+/// Wire image of a unary response on `stream`: HEADERS, DATA, trailers. With a non-OK `code` and
+/// an empty `message` the "trailers-only" form (a single HEADERS frame) is produced.
++grpc_unary_response(stream: i64, message: _, code: i64, text: str) : _! {
+    ensure stream > 0 else {
+        fail "grpc: response needs a stream"
+        return
+    }
+    ensure code >= 0 else {
+        fail "grpc: negative status"
+        return
+    }
+    ensure code <= 16 else {
+        fail "grpc: status {code} is outside 0..16"
+        return
+    }
+    if code != 0 {
+        if host.sys_arr_len(message) == 0 {
+            names = [":status", "content-type", "grpc-status"]
+            values = ["200", "application/grpc", "{code}"]
+            if text != "" {
+                names = host.sys_arr_push(names, "grpc-message")
+                values = host.sys_arr_push(values, grpc_message_encode(text))
+            }
+            block = hpack_encode(names, values) or err { fail "{err}" }
+            only = h2_headers(stream, block, true, true) or err { fail "{err}" }
+            return only
+        }
+    }
+    head = h2_headers(stream, grpc_response_block(), false, true) or err { fail "{err}" }
+    body = grpc_frame(message, false) or err { fail "{err}" }
+    data = h2_data_frames(stream, body, false, H2_DEFAULT_MAX_FRAME) or err { fail "{err}" }
+    tail = h2_headers(stream, grpc_trailer_block(code, text), true, true) or err { fail "{err}" }
+    g_cat(g_cat(head, data), tail)
+}
+
+/// A response as the client sees it.
++GrpcReply = {
+    /// `grpc-status` (0 = OK). Defaults to `0`.
+    status: i64 = 0
+    /// Decoded `grpc-message`. Defaults to `""`.
+    status_message: str = ""
+    /// The response message, empty for errors. Defaults to `[]`.
+    message: _ = []
+    /// True when the server answered with a single HEADERS frame and no message. Defaults to `false`.
+    trailers_only: bool = false
+
+    /// True when the status is OK.
+    ok(self) : bool => self.status == 0
+}
+
+/// Parse a unary response wire image.
++grpc_parse_response(wire: _) : GrpcReply! {
+    parts = grpc_split_stream(wire) or err { fail "{err}" }
+    ensure parts.ended else {
+        fail "grpc: response stream did not end"
+        return
+    }
+    dec = HpackDecoder.{}
+    head = @dec.decode(parts.block) or err { fail "{err}" }
+    http_status = head.get(":status", "missing")
+    ensure http_status == "200" else {
+        fail "grpc: HTTP status {http_status}"
+        return
+    }
+    ctype = head.get("content-type", "")
+    ensure g_starts(ctype, "application/grpc") else {
+        fail "grpc: content-type must be application/grpc, got '{ctype}'"
+        return
+    }
+    trailers = head
+    only = parts.sequences == 1
+    if !only {
+        ensure parts.sequences == 2 else {
+            fail "grpc: response has {parts.sequences} header blocks"
+            return
+        }
+        trailers = @dec.decode(parts.trailer) or err { fail "{err}" }
+    }
+    raw = trailers.get("grpc-status", "")
+    ensure raw != "" else {
+        fail "grpc: response lacks grpc-status"
+        return
+    }
+    status = 0
+    numeric = true
+    i = 0
+    while i < host.sys_str_len(raw) {
+        d = g_find("0123456789", raw[i], 0)
+        if d < 0 { numeric = false } else { status = status * 10 + d }
+        i = i + 1
+    }
+    ensure numeric else {
+        fail "grpc: grpc-status '{raw}' is not numeric"
+        return
+    }
+    ensure status <= 16 else {
+        fail "grpc: grpc-status {status} is outside 0..16"
+        return
+    }
+    note = grpc_message_decode(trailers.get("grpc-message", ""))
+    msg = []
+    if host.sys_arr_len(parts.data) > 0 {
+        msgs = grpc_unframe_all(parts.data, GRPC_MAX_MESSAGE) or err { fail "{err}" }
+        ensure host.sys_arr_len(msgs) == 1 else {
+            fail "grpc: a unary response carries one message, got {host.sys_arr_len(msgs)}"
+            return
+        }
+        first = msgs[0]
+        ensure !first.compressed else {
+            fail "grpc: compressed responses are not supported"
+            return
+        }
+        msg = first.data
+    }
+    GrpcReply.{status, status_message: note, message: msg, trailers_only: only}
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+/// `piece` repeated `times` times (test helper).
+repeat_text(piece: str, times: i64) : str {
+    out = ""
+    i = 0
+    while i < times {
+        out = "{out}{piece}"
+        i = i + 1
+    }
+    out
+}
+
+/// Toy Greeter service used by the tests: `SayHello(HelloRequest{name=1}) -> HelloReply{message=1, length=2}`.
+greeter_serve(wire: _) : _ {
+    call = grpc_parse_request(wire) or GrpcCall.{}
+    if call.stream_id == 0 { return [] }
+    if call.path != "/helloworld.Greeter/SayHello" {
+        unknown = grpc_unary_response(call.stream_id, [], GRPC_UNIMPLEMENTED, "unknown method {call.path}") or []
+        return unknown
+    }
+    fields = pb_parse(call.message) or []
+    name = pb_get_string(fields, 1, "")
+    if name == "" {
+        invalid = grpc_unary_response(call.stream_id, [], GRPC_INVALID_ARGUMENT, "name must not be empty") or []
+        return invalid
+    }
+    text = pb_string_field(1, "Hello, {name}!") or []
+    size = pb_varint_field(2, host.sys_str_len(name)) or []
+    ok = grpc_unary_response(call.stream_id, g_cat(text, size), GRPC_OK, "") or []
+    ok
+}
+
+test "grpc byte helpers" {
+    assert_eq(g_slice([1, 2, 3, 4], 1, 3), [2, 3])
+    assert_eq(g_slice([1, 2], 2, 2), [])
+    assert_eq(g_cat([1], [2, 3]), [1, 2, 3])
+    assert_eq(g_cat([], []), [])
+    assert_eq(g_be(258, 2), [1, 2])
+    assert_eq(g_be(16909060, 4), [1, 2, 3, 4])
+    assert_eq(g_be(5, 3), [0, 0, 5])
+    assert_eq(g_read_be([0, 0, 1, 0], 0, 4), 256)
+    assert_eq(g_read_be([9, 1, 2], 1, 2), 258)
+    assert_eq(g_le(258, 2), [2, 1])
+    assert_eq(g_read_le([2, 1, 0, 0], 0, 4), 258)
+    #assert(g_same([1, 2], [1, 2]))
+    #assert(!(g_same([1, 2], [1, 3])))
+    #assert(!(g_same([1], [1, 2])))
+    assert_eq(g_bytes("Hi"), [72, 105])
+    assert_eq(g_text([72, 105]), "Hi")
+    #assert(g_is_bytes([0, 255]))
+    #assert(!(g_is_bytes([256])))
+    #assert(!(g_is_bytes([-1])))
+}
+
+test "h2 frame header pack and unpack" {
+    hdr = h2_header_pack(5, H2_DATA, H2_FLAG_END_STREAM, 3) or []
+    assert_eq(hdr, [0, 0, 5, 0, 1, 0, 0, 0, 3])
+    back = h2_header_unpack(hdr, 0) or H2Header.{length: -1}
+    assert_eq(back.length, 5)
+    assert_eq(back.ftype, 0)
+    assert_eq(back.flags, 1)
+    assert_eq(back.stream_id, 3)
+    big = h2_header_pack(16777215, H2_HEADERS, 4, 2147483647) or []
+    assert_eq(big, [255, 255, 255, 1, 4, 127, 255, 255, 255])
+    rt = h2_header_unpack(big, 0) or H2Header.{length: -1}
+    assert_eq(rt.length, 16777215)
+    assert_eq(rt.stream_id, 2147483647)
+    reserved = h2_header_unpack([0, 0, 0, 0, 0, 128, 0, 0, 7], 0) or H2Header.{length: -1}
+    assert_eq(reserved.stream_id, 7)
+    offset = h2_header_unpack([99, 99, 0, 0, 1, 6, 0, 0, 0, 0, 0], 2) or H2Header.{length: -1}
+    assert_eq(offset.length, 1)
+    assert_eq(offset.ftype, 6)
+    assert_eq(host.sys_arr_len(h2_header_pack(16777216, 0, 0, 0) or []), 0)
+    assert_eq(host.sys_arr_len(h2_header_pack(-1, 0, 0, 0) or []), 0)
+    assert_eq(host.sys_arr_len(h2_header_pack(0, 256, 0, 0) or []), 0)
+    assert_eq(host.sys_arr_len(h2_header_pack(0, 0, 256, 0) or []), 0)
+    assert_eq(host.sys_arr_len(h2_header_pack(0, 0, 0, 2147483648) or []), 0)
+    assert_eq(host.sys_arr_len(h2_header_pack(0, 0, 0, -1) or []), 0)
+    assert_eq(h2_header_unpack([0, 0, 0], 0) or H2Header.{length: -1}.length, -1)
+    assert_eq(h2_header_unpack(hdr, -1) or H2Header.{length: -1}.length, -1)
+}
+
+test "h2 frames parse and roundtrip" {
+    f = h2_frame(H2_DATA, 1, 5, [10, 20, 30]) or []
+    assert_eq(f, [0, 0, 3, 0, 1, 0, 0, 0, 5, 10, 20, 30])
+    assert_eq(h2_frame_size(f, 0), 12)
+    assert_eq(h2_frame_size([0, 0], 0), -1)
+    parsed = h2_frame_at(f, 0, H2_DEFAULT_MAX_FRAME) or H2Frame.{ftype: -1}
+    assert_eq(parsed.ftype, H2_DATA)
+    assert_eq(parsed.stream_id, 5)
+    assert_eq(parsed.payload, [10, 20, 30])
+    #assert(parsed.flagged(H2_FLAG_END_STREAM))
+    #assert(!(parsed.flagged(H2_FLAG_END_HEADERS)))
+    assert_eq(h2_frame_at(f, 0, 2) or H2Frame.{ftype: -1}.ftype, -1)
+    assert_eq(h2_frame_at(g_slice(f, 0, 11), 0, 100) or H2Frame.{ftype: -1}.ftype, -1)
+    two = g_cat(f, h2_ping([1, 2, 3, 4, 5, 6, 7, 8], false) or [])
+    all = h2_frames(two, H2_DEFAULT_MAX_FRAME) or []
+    assert_eq(host.sys_arr_len(all), 2)
+    assert_eq(all[1].ftype, H2_PING)
+    assert_eq(all[1].payload, [1, 2, 3, 4, 5, 6, 7, 8])
+    assert_eq(h2_complete_len(two), host.sys_arr_len(two))
+    partial = g_cat(two, [0, 0, 9])
+    assert_eq(h2_complete_len(partial), host.sys_arr_len(two))
+    assert_eq(host.sys_arr_len(h2_frames(partial, H2_DEFAULT_MAX_FRAME) or []), 0)
+    assert_eq(h2_complete_len([]), 0)
+    assert_eq(host.sys_arr_len(h2_frames([], H2_DEFAULT_MAX_FRAME) or [9]), 0)
+    assert_eq(host.sys_arr_len(h2_frame(H2_DATA, 0, 1, [256]) or []), 0)
+}
+
+test "h2 control frames" {
+    assert_eq(h2_settings_ack(), [0, 0, 0, 4, 1, 0, 0, 0, 0])
+    s = h2_settings([H2_SET_MAX_CONCURRENT_STREAMS, H2_SET_INITIAL_WINDOW_SIZE], [100, 65535]) or []
+    assert_eq(s, [0, 0, 12, 4, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 100, 0, 4, 0, 0, 255, 255])
+    fr = h2_frame_at(s, 0, 100) or H2Frame.{}
+    pair = h2_settings_parse(fr.payload) or [[], []]
+    assert_eq(pair[0], [3, 4])
+    assert_eq(pair[1], [100, 65535])
+    assert_eq(host.sys_arr_len(h2_settings([], []) or [1]), 9)
+    assert_eq(host.sys_arr_len(h2_settings([1], []) or []), 0)
+    assert_eq(host.sys_arr_len(h2_settings([0], [1]) or []), 0)
+    assert_eq(host.sys_arr_len(h2_settings([65536], [1]) or []), 0)
+    assert_eq(host.sys_arr_len(h2_settings([1], [-1]) or []), 0)
+    assert_eq(host.sys_arr_len(h2_settings([1], [4294967296]) or []), 0)
+    assert_eq(h2_settings_parse([0, 1, 0, 0, 0]) or [[9], [9]], [[9], [9]])
+    assert_eq(h2_window_update(0, 65535) or [], [0, 0, 4, 8, 0, 0, 0, 0, 0, 0, 0, 255, 255])
+    assert_eq(host.sys_arr_len(h2_window_update(0, 0) or []), 0)
+    assert_eq(host.sys_arr_len(h2_window_update(0, 2147483648) or []), 0)
+    ping = h2_ping([1, 2, 3, 4, 5, 6, 7, 8], true) or []
+    assert_eq(ping[4], 1)
+    assert_eq(ping[3], H2_PING)
+    assert_eq(host.sys_arr_len(h2_ping([1, 2], false) or []), 0)
+    assert_eq(h2_rst_stream(3, 8) or [], [0, 0, 4, 3, 0, 0, 0, 0, 3, 0, 0, 0, 8])
+    assert_eq(host.sys_arr_len(h2_rst_stream(0, 8) or []), 0)
+    goaway = h2_goaway(7, 0, "bye") or []
+    assert_eq(goaway, [0, 0, 11, 7, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 98, 121, 101])
+    assert_eq(host.sys_arr_len(h2_goaway(-1, 0, "") or []), 0)
+}
+
+test "h2 data and headers frames" {
+    d = h2_data(1, [1, 2], true) or []
+    assert_eq(d, [0, 0, 2, 0, 1, 0, 0, 0, 1, 1, 2])
+    assert_eq(host.sys_arr_len(h2_data(0, [1], false) or []), 0)
+    h = h2_headers(3, [130], false, true) or []
+    assert_eq(h, [0, 0, 1, 1, 4, 0, 0, 0, 3, 130])
+    both = h2_headers(3, [130], true, true) or []
+    assert_eq(both[4], 5)
+    assert_eq(host.sys_arr_len(h2_headers(0, [], false, true) or []), 0)
+    c = h2_continuation(3, [1], true) or []
+    assert_eq(c[3], H2_CONTINUATION)
+    assert_eq(c[4], 4)
+    assert_eq(host.sys_arr_len(h2_continuation(0, [], true) or []), 0)
+    payload = host.sys_arr_new(10, 7)
+    chunks = h2_data_frames(1, payload, true, 4) or []
+    frames = h2_frames(chunks, H2_DEFAULT_MAX_FRAME) or []
+    assert_eq(host.sys_arr_len(frames), 3)
+    assert_eq(frames[0].length, 4)
+    assert_eq(frames[1].length, 4)
+    assert_eq(frames[2].length, 2)
+    f0 = frames[0]
+    f2 = frames[2]
+    #assert(!(f0.flagged(H2_FLAG_END_STREAM)))
+    #assert(f2.flagged(H2_FLAG_END_STREAM))
+    empty = h2_frames(h2_data_frames(1, [], true, 4) or [], 100) or []
+    assert_eq(host.sys_arr_len(empty), 1)
+    assert_eq(empty[0].length, 0)
+    open_end = h2_frames(h2_data_frames(1, [1, 2], false, 4) or [], 100) or []
+    oe0 = open_end[0]
+    #assert(!(oe0.flagged(H2_FLAG_END_STREAM)))
+    assert_eq(host.sys_arr_len(h2_data_frames(1, [1], true, 0) or []), 0)
+    assert_eq(host.sys_arr_len(h2_data_frames(0, [1], true, 4) or []), 0)
+}
+
+test "h2 preface and padded bodies" {
+    pre = h2_preface()
+    assert_eq(host.sys_arr_len(pre), 24)
+    #assert(h2_has_preface(g_cat(pre, [0, 0, 0])))
+    #assert(!(h2_has_preface(g_slice(pre, 0, 23))))
+    #assert(!(h2_has_preface([1, 2, 3])))
+    padded = H2Frame.{ftype: H2_DATA, flags: H2_FLAG_PADDED, payload: [2, 10, 11, 0, 0]}
+    assert_eq(h2_body(padded) or [99], [10, 11])
+    over = H2Frame.{ftype: H2_DATA, flags: H2_FLAG_PADDED, payload: [9, 10]}
+    assert_eq(h2_body(over) or [99], [99])
+    nopad = H2Frame.{ftype: H2_DATA, flags: H2_FLAG_PADDED, payload: []}
+    assert_eq(h2_body(nopad) or [99], [99])
+    plain = H2Frame.{ftype: H2_DATA, flags: 0, payload: [5, 6]}
+    assert_eq(h2_body(plain) or [99], [5, 6])
+    prio = H2Frame.{ftype: H2_HEADERS, flags: H2_FLAG_PRIORITY, payload: [0, 0, 0, 1, 16, 130]}
+    assert_eq(h2_body(prio) or [99], [130])
+    cut = H2Frame.{ftype: H2_HEADERS, flags: H2_FLAG_PRIORITY, payload: [0, 0]}
+    assert_eq(h2_body(cut) or [99], [99])
+    both = H2Frame.{ftype: H2_HEADERS, flags: H2_FLAG_PRIORITY | H2_FLAG_PADDED, payload: [1, 0, 0, 0, 1, 16, 130, 0]}
+    assert_eq(h2_body(both) or [99], [130])
+}
+
+test "hpack prefix integers match rfc 7541" {
+    assert_eq(hpack_int(10, 5, 0) or [], [10])
+    assert_eq(hpack_int(1337, 5, 0) or [], [31, 154, 10])
+    assert_eq(hpack_int(42, 8, 0) or [], [42])
+    assert_eq(hpack_int(2, 7, 128) or [], [130])
+    assert_eq(hpack_int(31, 5, 0) or [], [31, 0])
+    assert_eq(hpack_int(255, 8, 0) or [], [255, 0])
+    assert_eq(host.sys_arr_len(hpack_int(-1, 5, 0) or []), 0)
+    assert_eq(host.sys_arr_len(hpack_int(1, 0, 0) or []), 0)
+    assert_eq(host.sys_arr_len(hpack_int(1, 9, 0) or []), 0)
+    a = hpack_int_at([31, 154, 10], 0, 5) or HpInt.{value: -1}
+    assert_eq(a.value, 1337)
+    assert_eq(a.next, 3)
+    b = hpack_int_at([99, 10], 1, 5) or HpInt.{value: -1}
+    assert_eq(b.value, 10)
+    assert_eq(b.next, 2)
+    c = hpack_int_at([255, 0], 0, 8) or HpInt.{value: -1}
+    assert_eq(c.value, 255)
+    assert_eq(hpack_int_at([31, 154], 0, 5) or HpInt.{value: -1}.value, -1)
+    assert_eq(hpack_int_at([], 0, 5) or HpInt.{value: -1}.value, -1)
+    assert_eq(hpack_int_at([31, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1], 0, 5) or HpInt.{value: -1}.value, -1)
+    for v in [0, 1, 30, 31, 32, 127, 128, 1000, 100000, 16777216] {
+        enc = hpack_int(v, 5, 0) or []
+        dec = hpack_int_at(enc, 0, 5) or HpInt.{value: -1}
+        assert_eq(dec.value, v)
+        assert_eq(dec.next, host.sys_arr_len(enc))
+    }
+}
+
+test "hpack decodes the rfc 7541 appendix c examples" {
+    dec = HpackDecoder.{}
+    c21 = [64, 10, 99, 117, 115, 116, 111, 109, 45, 107, 101, 121, 13, 99, 117, 115, 116, 111, 109, 45, 104, 101, 97, 100, 101, 114]
+    h1 = @dec.decode(c21) or HeaderList.{}
+    assert_eq(h1.names, ["custom-key"])
+    assert_eq(h1.values, ["custom-header"])
+    assert_eq(dec.size, 55)
+    assert_eq(host.sys_arr_len(dec.dyn_names), 1)
+    again = @dec.decode([190]) or HeaderList.{}
+    assert_eq(again.names, ["custom-key"])
+    assert_eq(again.values, ["custom-header"])
+    c22 = [4, 12, 47, 115, 97, 109, 112, 108, 101, 47, 112, 97, 116, 104]
+    h2 = @dec.decode(c22) or HeaderList.{}
+    assert_eq(h2.names, [":path"])
+    assert_eq(h2.values, ["/sample/path"])
+    assert_eq(dec.size, 55)
+    c23 = [16, 8, 112, 97, 115, 115, 119, 111, 114, 100, 6, 115, 101, 99, 114, 101, 116]
+    h3 = @dec.decode(c23) or HeaderList.{}
+    assert_eq(h3.get("password", ""), "secret")
+    assert_eq(host.sys_arr_len(dec.dyn_names), 1)
+    h4 = @dec.decode([130]) or HeaderList.{}
+    assert_eq(h4.names, [":method"])
+    assert_eq(h4.values, ["GET"])
+    multi = @dec.decode([130, 135, 132, 65, 15, 119, 119, 119, 46, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109]) or HeaderList.{}
+    assert_eq(multi.names, [":method", ":scheme", ":path", ":authority"])
+    assert_eq(multi.values, ["GET", "https", "/", "www.example.com"])
+    #assert(multi.has(":authority"))
+    #assert(!(multi.has("nope")))
+    assert_eq(multi.get("nope", "dflt"), "dflt")
+}
+
+test "hpack decoder errors and table limits" {
+    d1 = HpackDecoder.{}
+    assert_eq(@d1.decode([128]) or HeaderList.{names: ["bad"]}.names, ["bad"])
+    d2 = HpackDecoder.{}
+    assert_eq(@d2.decode([190]) or HeaderList.{names: ["bad"]}.names, ["bad"])
+    d3 = HpackDecoder.{}
+    huff = [0, 129, 65, 1, 66]
+    assert_eq(@d3.decode(huff) or HeaderList.{names: ["bad"]}.names, ["bad"])
+    d4 = HpackDecoder.{}
+    assert_eq(@d4.decode([64, 10, 99]) or HeaderList.{names: ["bad"]}.names, ["bad"])
+    d5 = HpackDecoder.{}
+    assert_eq(@d5.decode([130, 64]) or HeaderList.{names: ["bad"]}.names, ["bad"])
+    d6 = HpackDecoder.{max_size: 60}
+    big1 = hpack_string("aaaaaaaa")
+    first = g_cat(g_cat([64], big1), hpack_string("bbbbbbbb"))
+    @d6.decode(first) or HeaderList.{}
+    assert_eq(d6.size, 48)
+    second = g_cat(g_cat([64], hpack_string("cccccccc")), hpack_string("dddddddd"))
+    @d6.decode(second) or HeaderList.{}
+    assert_eq(host.sys_arr_len(d6.dyn_names), 1)
+    assert_eq(d6.dyn_names[0], "cccccccc")
+    assert_eq(d6.size, 48)
+    giant = g_cat(g_cat([64], hpack_string("eeeeeeeeeeeeeeeeeeee")), hpack_string("ffffffffffffffffffff"))
+    @d6.decode(giant) or HeaderList.{}
+    assert_eq(host.sys_arr_len(d6.dyn_names), 0)
+    assert_eq(d6.size, 0)
+    d7 = HpackDecoder.{}
+    @d7.decode(first) or HeaderList.{}
+    @d7.decode([32]) or HeaderList.{}
+    assert_eq(host.sys_arr_len(d7.dyn_names), 0)
+    assert_eq(d7.max_size, 0)
+    d8 = HpackDecoder.{}
+    assert_eq(@d8.decode([63, 255, 255, 255]) or HeaderList.{names: ["bad"]}.names, ["bad"])
+    e = d8.lookup(0)
+    #assert(!(e.ok))
+    s = d8.lookup(8)
+    assert_eq(s.name, ":status")
+    assert_eq(s.value, "200")
+    #assert(!(d8.lookup(62).ok))
+}
+
+test "hpack encoder uses the static table" {
+    block = hpack_encode([":method", ":scheme", ":path", ":authority"], ["POST", "http", "/pkg.Svc/Do", "example.com"]) or []
+    assert_eq(block[0], 131)
+    assert_eq(block[1], 134)
+    dec = HpackDecoder.{}
+    back = @dec.decode(block) or HeaderList.{}
+    assert_eq(back.names, [":method", ":scheme", ":path", ":authority"])
+    assert_eq(back.values, ["POST", "http", "/pkg.Svc/Do", "example.com"])
+    custom = hpack_encode(["x-trace", "content-type"], ["abc", "application/grpc"]) or []
+    dec2 = HpackDecoder.{}
+    back2 = @dec2.decode(custom) or HeaderList.{}
+    assert_eq(back2.names, ["x-trace", "content-type"])
+    assert_eq(back2.values, ["abc", "application/grpc"])
+    assert_eq(custom[0], 0)
+    ctype_offset = 1 + 1 + 7 + 1 + 3
+    assert_eq(custom[ctype_offset], 15)
+    assert_eq(custom[ctype_offset + 1], 16)
+    assert_eq(host.sys_arr_len(hpack_encode(["a"], []) or []), 0)
+    assert_eq(host.sys_arr_len(hpack_encode([""], ["v"]) or []), 0)
+    assert_eq(host.sys_arr_len(hpack_encode(["a\r\nb"], ["v"]) or []), 0)
+    assert_eq(host.sys_arr_len(hpack_encode(["a"], ["v\n"]) or []), 0)
+    unicode = hpack_encode(["x-name"], ["héllo"]) or []
+    dec3 = HpackDecoder.{}
+    back3 = @dec3.decode(unicode) or HeaderList.{}
+    assert_eq(back3.values, ["héllo"])
+    long_value = repeat_text("v", 300)
+    wide = hpack_encode(["x-long"], [long_value]) or []
+    dec4 = HpackDecoder.{}
+    back4 = @dec4.decode(wide) or HeaderList.{}
+    assert_eq(host.sys_str_len(back4.values[0]), 300)
+}
+
+test "protobuf varints" {
+    assert_eq(pb_varint(0), [0])
+    assert_eq(pb_varint(1), [1])
+    assert_eq(pb_varint(127), [127])
+    assert_eq(pb_varint(128), [128, 1])
+    assert_eq(pb_varint(150), [150, 1])
+    assert_eq(pb_varint(300), [172, 2])
+    assert_eq(pb_varint(16384), [128, 128, 1])
+    assert_eq(pb_varint(-1), [255, 255, 255, 255, 255, 255, 255, 255, 255, 1])
+    for v in [0, 1, 127, 128, 255, 300, 65535, 2147483647, 4294967296, 9223372036854775807, -1, -2, -9223372036854775807] {
+        enc = pb_varint(v)
+        dec = pb_read_varint(enc, 0) or PbVar.{value: 12345, next: 0}
+        assert_eq(dec.value, v)
+        assert_eq(dec.next, host.sys_arr_len(enc))
+    }
+    mid = pb_read_varint([9, 150, 1, 7], 1) or PbVar.{value: -5}
+    assert_eq(mid.value, 150)
+    assert_eq(mid.next, 3)
+    assert_eq(pb_read_varint([128], 0) or PbVar.{value: -5}.value, -5)
+    assert_eq(pb_read_varint([], 0) or PbVar.{value: -5}.value, -5)
+    assert_eq(pb_read_varint([128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 1], 0) or PbVar.{value: -5}.value, -5)
+}
+
+test "protobuf zigzag" {
+    assert_eq(pb_zigzag(0), 0)
+    assert_eq(pb_zigzag(-1), 1)
+    assert_eq(pb_zigzag(1), 2)
+    assert_eq(pb_zigzag(-2), 3)
+    assert_eq(pb_zigzag(2147483647), 4294967294)
+    assert_eq(pb_zigzag(-2147483648), 4294967295)
+    for v in [0, 1, -1, 2, -2, 1000, -1000, 2147483647, -2147483648, 9223372036854775807, -9223372036854775807] {
+        assert_eq(pb_unzigzag(pb_zigzag(v)), v)
+    }
+}
+
+test "protobuf field builders match the spec examples" {
+    assert_eq(pb_varint_field(1, 150) or [], [8, 150, 1])
+    assert_eq(pb_string_field(2, "testing") or [], [18, 7, 116, 101, 115, 116, 105, 110, 103])
+    assert_eq(pb_bytes_field(3, [1, 2]) or [], [26, 2, 1, 2])
+    assert_eq(pb_bool_field(4, true) or [], [32, 1])
+    assert_eq(pb_bool_field(4, false) or [], [32, 0])
+    assert_eq(pb_sint_field(5, -1) or [], [40, 1])
+    assert_eq(pb_fixed32_field(6, 1) or [], [53, 1, 0, 0, 0])
+    assert_eq(pb_fixed64_field(7, 258) or [], [57, 2, 1, 0, 0, 0, 0, 0, 0])
+    assert_eq(pb_packed_field(4, [3, 270, 86942]) or [], [34, 6, 3, 142, 2, 158, 167, 5])
+    assert_eq(pb_string_field(1, "") or [], [10, 0])
+    assert_eq(pb_tag(16, 2) or [], [130, 1])
+    assert_eq(host.sys_arr_len(pb_tag(0, 0) or []), 0)
+    assert_eq(host.sys_arr_len(pb_tag(536870912, 0) or []), 0)
+    assert_eq(host.sys_arr_len(pb_tag(19000, 0) or []), 0)
+    assert_eq(host.sys_arr_len(pb_tag(19999, 0) or []), 0)
+    assert_eq(host.sys_arr_len(pb_tag(18999, 0) or []), 3)
+    assert_eq(host.sys_arr_len(pb_tag(20000, 0) or []), 3)
+    assert_eq(host.sys_arr_len(pb_varint_field(0, 1) or []), 0)
+}
+
+test "protobuf parse and lookup" {
+    msg = g_cat(pb_varint_field(1, 150) or [], pb_string_field(2, "testing") or [])
+    msg = g_cat(msg, pb_fixed32_field(3, 4294967295) or [])
+    msg = g_cat(msg, pb_fixed64_field(4, -2) or [])
+    msg = g_cat(msg, pb_string_field(5, "a") or [])
+    msg = g_cat(msg, pb_string_field(5, "b") or [])
+    msg = g_cat(msg, pb_varint_field(1, 151) or [])
+    fields = pb_parse(msg) or []
+    assert_eq(host.sys_arr_len(fields), 7)
+    assert_eq(fields[0].number, 1)
+    assert_eq(fields[0].wire, PB_VARINT)
+    assert_eq(fields[1].wire, PB_LEN)
+    assert_eq(fields[2].wire, PB_FIXED32)
+    assert_eq(fields[3].wire, PB_FIXED64)
+    assert_eq(pb_get_varint(fields, 1, -1), 151)
+    assert_eq(pb_get_varint(fields, 9, -1), -1)
+    assert_eq(pb_get_varint(fields, 2, -1), -1)
+    assert_eq(pb_get_string(fields, 2, "none"), "testing")
+    assert_eq(pb_get_string(fields, 5, "none"), "b")
+    assert_eq(pb_get_string(fields, 9, "none"), "none")
+    assert_eq(pb_get_bytes(fields, 2, []), g_bytes("testing"))
+    assert_eq(pb_get_bytes(fields, 1, [7]), [7])
+    assert_eq(pb_get_strings(fields, 5), ["a", "b"])
+    assert_eq(pb_count(fields, 5), 2)
+    assert_eq(pb_count(fields, 9), 0)
+    assert_eq(fields[2].ival, 4294967295)
+    assert_eq(fields[3].ival, -2)
+    assert_eq(host.sys_arr_len(pb_parse([]) or [1]), 0)
+}
+
+test "protobuf nesting and packed values" {
+    inner = g_cat(pb_string_field(1, "inner") or [], pb_varint_field(2, 42) or [])
+    outer = g_cat(pb_bytes_field(1, inner) or [], pb_packed_field(2, [1, 2, 300, 0]) or [])
+    fields = pb_parse(outer) or []
+    nested = pb_parse(pb_get_bytes(fields, 1, [])) or []
+    assert_eq(pb_get_string(nested, 1, ""), "inner")
+    assert_eq(pb_get_varint(nested, 2, 0), 42)
+    nums = pb_unpack_varints(pb_get_bytes(fields, 2, [])) or []
+    assert_eq(nums, [1, 2, 300, 0])
+    assert_eq(host.sys_arr_len(pb_unpack_varints([]) or [1]), 0)
+    assert_eq(pb_unpack_varints([128]) or [9], [9])
+}
+
+test "protobuf rejects malformed input" {
+    assert_eq(pb_parse([8]) or [9], [9])
+    assert_eq(pb_parse([10, 5, 1]) or [9], [9])
+    assert_eq(pb_parse([13, 1, 2]) or [9], [9])
+    assert_eq(pb_parse([9, 1, 2, 3]) or [9], [9])
+    assert_eq(pb_parse([11, 0]) or [9], [9])
+    assert_eq(pb_parse([12]) or [9], [9])
+    assert_eq(pb_parse([0, 1]) or [9], [9])
+    assert_eq(pb_parse([10, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1]) or [9], [9])
+    assert_eq(pb_parse([128]) or [9], [9])
+}
+
+test "grpc message framing" {
+    f = grpc_frame([1, 2, 3], false) or []
+    assert_eq(f, [0, 0, 0, 0, 3, 1, 2, 3])
+    c = grpc_frame([9], true) or []
+    assert_eq(c, [1, 0, 0, 0, 1, 9])
+    e = grpc_frame([], false) or []
+    assert_eq(e, [0, 0, 0, 0, 0])
+    assert_eq(host.sys_arr_len(grpc_frame([300], false) or []), 0)
+    m = grpc_unframe(f, 0, GRPC_MAX_MESSAGE) or GrpcMessage.{next: -1}
+    assert_eq(m.data, [1, 2, 3])
+    #assert(!(m.compressed))
+    assert_eq(m.next, 8)
+    mc = grpc_unframe(c, 0, 100) or GrpcMessage.{next: -1}
+    #assert(mc.compressed)
+    assert_eq(mc.data, [9])
+    two = g_cat(f, c)
+    all = grpc_unframe_all(two, 100) or []
+    assert_eq(host.sys_arr_len(all), 2)
+    assert_eq(all[1].data, [9])
+    assert_eq(host.sys_arr_len(grpc_unframe_all([], 100) or [1]), 0)
+    second = grpc_unframe(two, 8, 100) or GrpcMessage.{next: -1}
+    assert_eq(second.next, 14)
+    assert_eq(grpc_unframe([0, 0, 0], 0, 100) or GrpcMessage.{next: -1}.next, -1)
+    assert_eq(grpc_unframe([0, 0, 0, 0, 9, 1], 0, 100) or GrpcMessage.{next: -1}.next, -1)
+    assert_eq(grpc_unframe([2, 0, 0, 0, 0], 0, 100) or GrpcMessage.{next: -1}.next, -1)
+    assert_eq(grpc_unframe(f, 0, 2) or GrpcMessage.{next: -1}.next, -1)
+    assert_eq(grpc_unframe_all(g_cat(f, [0, 0]), 100) or [9], [9])
+    huge = grpc_unframe([0, 255, 255, 255, 255], 0, GRPC_MAX_MESSAGE) or GrpcMessage.{next: -1}
+    assert_eq(huge.next, -1)
+}
+
+test "grpc status names and http mapping" {
+    assert_eq(grpc_status_name(GRPC_OK), "OK")
+    assert_eq(grpc_status_name(GRPC_INVALID_ARGUMENT), "INVALID_ARGUMENT")
+    assert_eq(grpc_status_name(GRPC_UNAUTHENTICATED), "UNAUTHENTICATED")
+    assert_eq(grpc_status_name(17), "UNKNOWN")
+    assert_eq(grpc_status_name(-1), "UNKNOWN")
+    assert_eq(grpc_http_status(GRPC_OK), 200)
+    assert_eq(grpc_http_status(GRPC_NOT_FOUND), 404)
+    assert_eq(grpc_http_status(GRPC_UNAUTHENTICATED), 401)
+    assert_eq(grpc_http_status(GRPC_UNAVAILABLE), 503)
+    assert_eq(grpc_http_status(GRPC_INTERNAL), 500)
+    assert_eq(grpc_http_status(GRPC_UNIMPLEMENTED), 501)
+    assert_eq(grpc_http_status(GRPC_DEADLINE_EXCEEDED), 504)
+    assert_eq(grpc_http_status(GRPC_RESOURCE_EXHAUSTED), 429)
+}
+
+test "grpc timeouts" {
+    assert_eq(grpc_timeout_header(5000) or "bad", "5000m")
+    assert_eq(grpc_timeout_header(0) or "bad", "0m")
+    assert_eq(grpc_timeout_header(99999999) or "bad", "99999999m")
+    assert_eq(grpc_timeout_header(100000000) or "bad", "100000S")
+    assert_eq(grpc_timeout_header(100000000000) or "bad", "1666666M")
+    assert_eq(grpc_timeout_header(-1) or "bad", "bad")
+    assert_eq(grpc_parse_timeout("5000m") or -1, 5000)
+    assert_eq(grpc_parse_timeout("3S") or -1, 3000)
+    assert_eq(grpc_parse_timeout("2M") or -1, 120000)
+    assert_eq(grpc_parse_timeout("1H") or -1, 3600000)
+    assert_eq(grpc_parse_timeout("1500u") or -1, 2)
+    assert_eq(grpc_parse_timeout("1000u") or -1, 1)
+    assert_eq(grpc_parse_timeout("1n") or -1, 1)
+    assert_eq(grpc_parse_timeout("0m") or -1, 0)
+    assert_eq(grpc_parse_timeout("5") or -1, -1)
+    assert_eq(grpc_parse_timeout("S") or -1, -1)
+    assert_eq(grpc_parse_timeout("5x") or -1, -1)
+    assert_eq(grpc_parse_timeout("12a4S") or -1, -1)
+    assert_eq(grpc_parse_timeout("123456789S") or -1, -1)
+    assert_eq(grpc_parse_timeout("") or -1, -1)
+}
+
+test "grpc message percent encoding" {
+    assert_eq(grpc_message_encode("plain text"), "plain text")
+    assert_eq(grpc_message_encode("100%"), "100%25")
+    assert_eq(grpc_message_encode("line\nbreak"), "line%0Abreak")
+    assert_eq(grpc_message_encode("héllo"), "h%C3%A9llo")
+    assert_eq(grpc_message_encode(""), "")
+    assert_eq(grpc_message_decode("h%C3%A9llo"), "héllo")
+    assert_eq(grpc_message_decode("100%25"), "100%")
+    assert_eq(grpc_message_decode("bad%zz"), "bad%zz")
+    assert_eq(grpc_message_decode("trail%"), "trail%")
+    assert_eq(grpc_message_decode("trail%4"), "trail%4")
+    assert_eq(grpc_message_decode("a%0Ab"), "a\nb")
+    for text in ["", "ok", "50% off!", "café 中文", "tab\there"] {
+        assert_eq(grpc_message_decode(grpc_message_encode(text)), text)
+    }
+}
+
+test "grpc path validation" {
+    #assert(grpc_valid_path("/helloworld.Greeter/SayHello"))
+    #assert(grpc_valid_path("/a/b"))
+    #assert(!(grpc_valid_path("helloworld.Greeter/SayHello")))
+    #assert(!(grpc_valid_path("/onlyone")))
+    #assert(!(grpc_valid_path("//Method")))
+    #assert(!(grpc_valid_path("/Service/")))
+    #assert(!(grpc_valid_path("/a/b/c")))
+    #assert(!(grpc_valid_path("/a b/c")))
+    #assert(!(grpc_valid_path("/a/b\r\n")))
+    #assert(!(grpc_valid_path("")))
+    #assert(!(grpc_valid_path("/")))
+}
+
+test "grpc request headers" {
+    block = grpc_request_headers("api.example.com", "/pkg.Svc/Do", 2000, ["x-token"], ["abc"]) or []
+    dec = HpackDecoder.{}
+    h = @dec.decode(block) or HeaderList.{}
+    assert_eq(h.get(":method", ""), "POST")
+    assert_eq(h.get(":scheme", ""), "http")
+    assert_eq(h.get(":path", ""), "/pkg.Svc/Do")
+    assert_eq(h.get(":authority", ""), "api.example.com")
+    assert_eq(h.get("content-type", ""), "application/grpc")
+    assert_eq(h.get("te", ""), "trailers")
+    assert_eq(h.get("grpc-timeout", ""), "2000m")
+    assert_eq(h.get("x-token", ""), "abc")
+    no_timeout = grpc_request_headers("h", "/a/b", 0, [], []) or []
+    dec2 = HpackDecoder.{}
+    h2 = @dec2.decode(no_timeout) or HeaderList.{}
+    #assert(!(h2.has("grpc-timeout")))
+    assert_eq(host.sys_arr_len(grpc_request_headers("", "/a/b", 0, [], []) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h\r\nx", "/a/b", 0, [], []) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h", "bad", 0, [], []) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h", "/a/b", 0, ["k"], []) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h", "/a/b", 0, [":path"], ["x"]) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h", "/a/b", 0, ["grpc-status"], ["0"]) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h", "/a/b", 0, ["X-Upper"], ["x"]) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h", "/a/b", 0, [""], ["x"]) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_request_headers("h", "/a/b", -5, [], []) or []), 0)
+}
+
+test "grpc unary call roundtrip" {
+    req = pb_string_field(1, "Amina") or []
+    wire = grpc_unary_request(1, "api.example.com", "/helloworld.Greeter/SayHello", req, 5000) or []
+    call = grpc_parse_request(wire) or GrpcCall.{}
+    assert_eq(call.stream_id, 1)
+    assert_eq(call.path, "/helloworld.Greeter/SayHello")
+    assert_eq(call.authority, "api.example.com")
+    assert_eq(call.timeout_ms, 5000)
+    assert_eq(call.message, req)
+    assert_eq(call.headers.get("te", ""), "trailers")
+    out = greeter_serve(wire)
+    res = grpc_parse_response(out) or GrpcReply.{status: -1}
+    #assert(res.ok())
+    assert_eq(res.status, 0)
+    #assert(!(res.trailers_only))
+    fields = pb_parse(res.message) or []
+    assert_eq(pb_get_string(fields, 1, ""), "Hello, Amina!")
+    assert_eq(pb_get_varint(fields, 2, 0), 5)
+    again = grpc_unary_request(7, "h", "/helloworld.Greeter/SayHello", pb_string_field(1, "中文") or [], 0) or []
+    reply = grpc_parse_response(greeter_serve(again)) or GrpcReply.{status: -1}
+    assert_eq(pb_get_string(pb_parse(reply.message) or [], 1, ""), "Hello, 中文!")
+    call2 = grpc_parse_request(again) or GrpcCall.{timeout_ms: -1}
+    assert_eq(call2.timeout_ms, 0)
+    assert_eq(call2.stream_id, 7)
+}
+
+test "grpc unary error statuses" {
+    wrong_path = grpc_unary_request(3, "h", "/helloworld.Greeter/Missing", [], 0) or []
+    r1 = grpc_parse_response(greeter_serve(wrong_path)) or GrpcReply.{status: -1}
+    assert_eq(r1.status, GRPC_UNIMPLEMENTED)
+    assert_eq(r1.status_message, "unknown method /helloworld.Greeter/Missing")
+    #assert(r1.trailers_only)
+    #assert(!(r1.ok()))
+    assert_eq(host.sys_arr_len(r1.message), 0)
+    empty_name = grpc_unary_request(5, "h", "/helloworld.Greeter/SayHello", pb_string_field(1, "") or [], 0) or []
+    r2 = grpc_parse_response(greeter_serve(empty_name)) or GrpcReply.{status: -1}
+    assert_eq(r2.status, GRPC_INVALID_ARGUMENT)
+    assert_eq(r2.status_message, "name must not be empty")
+    rich = grpc_unary_response(1, [1, 2], GRPC_NOT_FOUND, "café 100%") or []
+    r3 = grpc_parse_response(rich) or GrpcReply.{status: -1}
+    assert_eq(r3.status, GRPC_NOT_FOUND)
+    assert_eq(r3.status_message, "café 100%")
+    #assert(!(r3.trailers_only))
+    assert_eq(r3.message, [1, 2])
+    bare = grpc_unary_response(1, [], GRPC_UNAVAILABLE, "") or []
+    r4 = grpc_parse_response(bare) or GrpcReply.{status: -1}
+    assert_eq(r4.status, GRPC_UNAVAILABLE)
+    assert_eq(r4.status_message, "")
+    #assert(r4.trailers_only)
+    ok_empty = grpc_unary_response(1, [], GRPC_OK, "") or []
+    r5 = grpc_parse_response(ok_empty) or GrpcReply.{status: -1}
+    assert_eq(r5.status, 0)
+    #assert(!(r5.trailers_only))
+    assert_eq(host.sys_arr_len(r5.message), 0)
+}
+
+test "grpc request validation" {
+    assert_eq(host.sys_arr_len(grpc_unary_request(2, "h", "/a/b", [], 0) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_unary_request(1, "", "/a/b", [], 0) or []), 0)
+    assert_eq(host.sys_arr_len(grpc_unary_request(1, "h", "nope", [], 0) or []), 0)
+    ok = grpc_unary_request(1, "h", "/a/b", [], 0) or []
+    #assert(host.sys_arr_len(ok) > 0)
+    block = hpack_encode([":method", ":path", "content-type"], ["GET", "/a/b", "application/grpc"]) or []
+    getreq = g_cat(h2_headers(1, block, false, true) or [], h2_data(1, grpc_frame([], false) or [], true) or [])
+    assert_eq(grpc_parse_request(getreq) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    block2 = hpack_encode([":method", ":path", "content-type"], ["POST", "/a/b", "text/plain"]) or []
+    plain = g_cat(h2_headers(1, block2, false, true) or [], h2_data(1, grpc_frame([], false) or [], true) or [])
+    assert_eq(grpc_parse_request(plain) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    block3 = hpack_encode([":method", ":path", "content-type"], ["POST", "nope", "application/grpc"]) or []
+    badpath = g_cat(h2_headers(1, block3, false, true) or [], h2_data(1, grpc_frame([], false) or [], true) or [])
+    assert_eq(grpc_parse_request(badpath) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    block4 = grpc_request_headers("h", "/a/b", 0, [], []) or []
+    noend = g_cat(h2_headers(1, block4, false, true) or [], h2_data(1, grpc_frame([1], false) or [], false) or [])
+    assert_eq(grpc_parse_request(noend) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    twice = g_cat(h2_headers(1, block4, false, true) or [], h2_data(1, g_cat(grpc_frame([1], false) or [], grpc_frame([2], false) or []), true) or [])
+    assert_eq(grpc_parse_request(twice) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    none = h2_headers(1, block4, true, true) or []
+    assert_eq(grpc_parse_request(none) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    squeezed = g_cat(h2_headers(1, block4, false, true) or [], h2_data(1, grpc_frame([1], true) or [], true) or [])
+    assert_eq(grpc_parse_request(squeezed) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    mixed = g_cat(h2_headers(1, block4, false, true) or [], h2_data(3, grpc_frame([1], false) or [], true) or [])
+    assert_eq(grpc_parse_request(mixed) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    assert_eq(grpc_parse_request([]) or GrpcCall.{stream_id: -1}.stream_id, -1)
+}
+
+test "grpc request with settings frames and continuation" {
+    block = grpc_request_headers("h", "/a/b", 1000, [], []) or []
+    half = host.sys_arr_len(block) / 2
+    first = g_slice(block, 0, half)
+    rest = g_slice(block, half, host.sys_arr_len(block))
+    wire = h2_settings([H2_SET_INITIAL_WINDOW_SIZE], [65535]) or []
+    wire = g_cat(wire, h2_settings_ack())
+    wire = g_cat(wire, h2_headers(1, first, false, false) or [])
+    wire = g_cat(wire, h2_continuation(1, rest, true) or [])
+    wire = g_cat(wire, h2_data(1, grpc_frame([4, 5], false) or [], true) or [])
+    call = grpc_parse_request(wire) or GrpcCall.{stream_id: -1}
+    assert_eq(call.stream_id, 1)
+    assert_eq(call.path, "/a/b")
+    assert_eq(call.timeout_ms, 1000)
+    assert_eq(call.message, [4, 5])
+    stray = g_cat(h2_headers(1, first, false, false) or [], h2_data(1, [], true) or [])
+    assert_eq(grpc_parse_request(stray) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    orphan = g_cat(h2_continuation(1, rest, true) or [], h2_data(1, [], true) or [])
+    assert_eq(grpc_parse_request(orphan) or GrpcCall.{stream_id: -1}.stream_id, -1)
+    ping_frame = h2_ping([1, 2, 3, 4, 5, 6, 7, 8], false) or []
+    skipped = g_cat(ping_frame, wire)
+    via_ping = grpc_parse_request(skipped) or GrpcCall.{stream_id: -1}
+    assert_eq(via_ping.stream_id, 1)
+    priority = h2_frame(H2_PRIORITY, 0, 1, [0, 0, 0, 0, 16]) or []
+    assert_eq(grpc_parse_request(g_cat(wire, priority)) or GrpcCall.{stream_id: -1}.stream_id, -1)
+}
+
+test "grpc response validation" {
+    assert_eq(host.sys_arr_len(grpc_unary_response(0, [], 0, "") or []), 0)
+    assert_eq(host.sys_arr_len(grpc_unary_response(1, [], -1, "") or []), 0)
+    assert_eq(host.sys_arr_len(grpc_unary_response(1, [], 17, "") or []), 0)
+    not_200 = hpack_encode([":status", "content-type", "grpc-status"], ["500", "application/grpc", "0"]) or []
+    r = grpc_parse_response(h2_headers(1, not_200, true, true) or []) or GrpcReply.{status: -1}
+    assert_eq(r.status, -1)
+    wrong_type = hpack_encode([":status", "content-type", "grpc-status"], ["200", "text/html", "0"]) or []
+    r2 = grpc_parse_response(h2_headers(1, wrong_type, true, true) or []) or GrpcReply.{status: -1}
+    assert_eq(r2.status, -1)
+    missing = hpack_encode([":status", "content-type"], ["200", "application/grpc"]) or []
+    r3 = grpc_parse_response(h2_headers(1, missing, true, true) or []) or GrpcReply.{status: -1}
+    assert_eq(r3.status, -1)
+    letters = hpack_encode([":status", "content-type", "grpc-status"], ["200", "application/grpc", "x1"]) or []
+    r4 = grpc_parse_response(h2_headers(1, letters, true, true) or []) or GrpcReply.{status: -1}
+    assert_eq(r4.status, -1)
+    high = hpack_encode([":status", "content-type", "grpc-status"], ["200", "application/grpc", "99"]) or []
+    r5 = grpc_parse_response(h2_headers(1, high, true, true) or []) or GrpcReply.{status: -1}
+    assert_eq(r5.status, -1)
+    open_stream = g_cat(h2_headers(1, missing, false, true) or [], h2_data(1, [], false) or [])
+    r6 = grpc_parse_response(open_stream) or GrpcReply.{status: -1}
+    assert_eq(r6.status, -1)
+    good_head = grpc_response_block()
+    two_msgs = g_cat(h2_headers(1, good_head, false, true) or [], h2_data(1, g_cat(grpc_frame([1], false) or [], grpc_frame([2], false) or []), false) or [])
+    two_msgs = g_cat(two_msgs, h2_headers(1, grpc_trailer_block(0, ""), true, true) or [])
+    r7 = grpc_parse_response(two_msgs) or GrpcReply.{status: -1}
+    assert_eq(r7.status, -1)
+    zipped = g_cat(h2_headers(1, good_head, false, true) or [], h2_data(1, grpc_frame([1], true) or [], false) or [])
+    zipped = g_cat(zipped, h2_headers(1, grpc_trailer_block(0, ""), true, true) or [])
+    r8 = grpc_parse_response(zipped) or GrpcReply.{status: -1}
+    assert_eq(r8.status, -1)
+    three = g_cat(h2_headers(1, good_head, false, true) or [], h2_headers(1, grpc_trailer_block(0, ""), false, true) or [])
+    three = g_cat(three, h2_headers(1, grpc_trailer_block(0, ""), true, true) or [])
+    r9 = grpc_parse_response(three) or GrpcReply.{status: -1}
+    assert_eq(r9.status, -1)
+}
+
+test "grpc large message spans several data frames" {
+    payload = host.sys_arr_new(40000, 65)
+    wire = grpc_unary_request(1, "h", "/big.Svc/Echo", payload, 0) or []
+    frames = h2_frames(wire, H2_DEFAULT_MAX_FRAME) or []
+    #assert(host.sys_arr_len(frames) >= 4)
+    call = grpc_parse_request(wire) or GrpcCall.{stream_id: -1}
+    assert_eq(host.sys_arr_len(call.message), 40000)
+    assert_eq(call.message[0], 65)
+    assert_eq(call.message[39999], 65)
+    echoed = grpc_unary_response(call.stream_id, call.message, GRPC_OK, "") or []
+    res = grpc_parse_response(echoed) or GrpcReply.{status: -1}
+    assert_eq(res.status, 0)
+    assert_eq(host.sys_arr_len(res.message), 40000)
+}

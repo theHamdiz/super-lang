@@ -1,0 +1,13 @@
+{
+  "iconDefinitions": {
+    "super": {
+      "iconPath": "./icons/super.svg"
+    }
+  },
+  "fileExtensions": {
+    "sr": "super"
+  },
+  "languageIds": {
+    "super": "super"
+  }
+}

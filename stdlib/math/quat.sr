@@ -1,0 +1,161 @@
+//! std.math.quat — unit quaternions for 3D orientation
+//!
+//! Import with:
+//!   use std.math.quat
+//!
+//!   q = Quat.from_axis_angle(0.0, 1.0, 0.0, angle)
+//!   r = q.mul(Quat.from_euler(pitch, yaw, roll))
+//!   v = r.rotate(Vec3.{x: 1.0, y: 0.0, z: 0.0})
+
+/// `Q_EPS` is `0.000001`.
++Q_EPS = 0.000001
+
+/// `QVec3` is a 3D vector used as a quaternion axis.
++QVec3 = {
+    /// X on `QVec3` (`f64`). Defaults to `0.0`.
+    x: f64 = 0.0
+    /// Y on `QVec3` (`f64`). Defaults to `0.0`.
+    y: f64 = 0.0
+    /// Z on `QVec3` (`f64`). Defaults to `0.0`.
+    z: f64 = 0.0
+}
+
+/// `Quat` is a unit quaternion storing a 3D orientation.
++Quat: Display, Mul = {
+    /// X component of the vector part. Defaults to `0.0`.
+    x: f64 = 0.0
+
+    /// Display witness.
+    display(self) : str => "Quat({self.x}, {self.y}, {self.z}, {self.w})"
+    /// Y component of the vector part. Defaults to `0.0`.
+    y: f64 = 0.0
+    /// Z component of the vector part. Defaults to `0.0`.
+    z: f64 = 0.0
+    /// Scalar part. Defaults to `1.0`.
+    w: f64 = 1.0
+
+    /// Identity quaternion (no rotation).
+    unit() : Quat => Quat.{x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+    /// Create a fresh `Quat`.
+    new(x: f64, y: f64, z: f64, w: f64) : Quat => Quat.{x, y, z, w}
+
+    /// Quaternion for a rotation of `rad` radians about the axis (`ax`, `ay`, `az`).
+    from_axis_angle(ax: f64, ay: f64, az: f64, rad: f64) : Quat {
+        len = host.sys_hypot(host.sys_hypot(ax, ay), az)
+        ensure len > Q_EPS else { return Quat.unit() }
+        nx = ax / len
+        ny = ay / len
+        nz = az / len
+        s = host.sys_sin(rad * 0.5)
+        Quat.{x: nx * s, y: ny * s, z: nz * s, w: host.sys_cos(rad * 0.5)}
+    }
+
+    /// Intrinsic Tait–Bryan ZYX (yaw, pitch, roll) in radians.
+    from_euler(pitch: f64, yaw: f64, roll: f64) : Quat {
+        cy = host.sys_cos(yaw * 0.5)
+        sy = host.sys_sin(yaw * 0.5)
+        cp = host.sys_cos(pitch * 0.5)
+        sp = host.sys_sin(pitch * 0.5)
+        cr = host.sys_cos(roll * 0.5)
+        sr = host.sys_sin(roll * 0.5)
+        Quat.{
+            x: sr * cp * cy - cr * sp * sy,
+            y: cr * sp * cy + sr * cp * sy,
+            z: cr * cp * sy - sr * sp * cy,
+            w: cr * cp * cy + sr * sp * sy,
+        }
+    }
+
+    /// Euclidean length of this quaternion.
+    magnitude(self) : f64 => host.sys_sqrt(self.x * self.x + self.y * self.y + self.z * self.z + self.w * self.w)
+
+    /// This quaternion scaled to unit length.
+    normalized(self) : Quat {
+        l = self.magnitude()
+        ensure l > Q_EPS else { return Quat.unit() }
+        Quat.{x: self.x / l, y: self.y / l, z: self.z / l, w: self.w / l}
+    }
+
+    /// Conjugate of this `Quat`.
+    conj(self) : Quat => Quat.{x: 0.0 - self.x, y: 0.0 - self.y, z: 0.0 - self.z, w: self.w}
+
+    /// Product with `o`.
+    mul(self, o: Quat) : Quat => Quat.{
+        x: self.w * o.x + self.x * o.w + self.y * o.z - self.z * o.y,
+        y: self.w * o.y - self.x * o.z + self.y * o.w + self.z * o.x,
+        z: self.w * o.z + self.x * o.y - self.y * o.x + self.z * o.w,
+        w: self.w * o.w - self.x * o.x - self.y * o.y - self.z * o.z,
+    }
+
+    /// Rotate vector by unit quaternion: q * v * q^{-1}.
+    rotate(self, v: QVec3) : QVec3 {
+        q = self.normalized()
+        // t = 2 * cross(q.xyz, v)
+        tx = 2.0 * (q.y * v.z - q.z * v.y)
+        ty = 2.0 * (q.z * v.x - q.x * v.z)
+        tz = 2.0 * (q.x * v.y - q.y * v.x)
+        QVec3.{
+            x: v.x + q.w * tx + (q.y * tz - q.z * ty),
+            y: v.y + q.w * ty + (q.z * tx - q.x * tz),
+            z: v.z + q.w * tz + (q.x * ty - q.y * tx),
+        }
+    }
+
+    /// Spherical linear interpolation (unit quats).
+    slerp(self, o: Quat, t: f64) : Quat {
+        a = self.normalized()
+        b = o.normalized()
+        dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w
+        bx = b.x
+        by = b.y
+        bz = b.z
+        bw = b.w
+        d = dot
+        if d < 0.0 {
+            bx = 0.0 - bx
+            by = 0.0 - by
+            bz = 0.0 - bz
+            bw = 0.0 - bw
+            d = 0.0 - d
+        }
+        if d > 0.9995 {
+            return Quat.{
+                x: a.x + t * (bx - a.x),
+                y: a.y + t * (by - a.y),
+                z: a.z + t * (bz - a.z),
+                w: a.w + t * (bw - a.w),
+            }.normalized()
+        }
+        theta = host.sys_acos(d)
+        s = host.sys_sin(theta)
+        wa = host.sys_sin((1.0 - t) * theta) / s
+        wb = host.sys_sin(t * theta) / s
+        Quat.{x: wa * a.x + wb * bx, y: wa * a.y + wb * by, z: wa * a.z + wb * bz, w: wa * a.w + wb * bw}
+    }
+
+    /// Close this `Quat` and release the underlying resource.
+    close(self, o: Quat) : bool {
+        host.sys_abs(self.x - o.x) < Q_EPS && host.sys_abs(self.y - o.y) < Q_EPS && host.sys_abs(self.z - o.z) < Q_EPS && host.sys_abs(self.w - o.w) < Q_EPS
+    }
+}
+
+/// Test that identity and 90deg yaw.
+test "identity and 90deg yaw" {
+    q = Quat.unit()
+    v = q.rotate(QVec3.{x: 1.0, y: 0.0, z: 0.0})
+    #assert(host.sys_abs(v.x - 1.0) < Q_EPS)
+    yaw = Quat.from_axis_angle(0.0, 1.0, 0.0, 1.5707963267948966)
+    r = yaw.rotate(QVec3.{x: 1.0, y: 0.0, z: 0.0})
+    #assert(host.sys_abs(r.x) < 0.0001)
+    #assert(host.sys_abs(r.z + 1.0) < 0.0001 || host.sys_abs(r.z - 1.0) < 0.0001)
+}
+
+/// Test that mul norm slerp.
+test "mul norm slerp" {
+    a = Quat.from_axis_angle(0.0, 0.0, 1.0, 0.0)
+    b = Quat.from_axis_angle(0.0, 0.0, 1.0, 3.141592653589793)
+    m = a.mul(b)
+    #assert(host.sys_abs(m.magnitude() - 1.0) < 0.001)
+    s = a.slerp(b, 0.5)
+    #assert(host.sys_abs(s.magnitude() - 1.0) < 0.001)
+}

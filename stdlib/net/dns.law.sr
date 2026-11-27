@@ -1,0 +1,13 @@
+//! Laws for std.net.dns — real-body (`Dns.host_port`).
+//! Resolver / `split_host_port` paths need host strlen (docs/LAWS_STATUS.md limits).
+
+#law("host_port formats host and port")
+dns_host_port_literal() {
+    assert_eq(Dns.host_port("localhost", 80), "localhost:80")
+    assert_eq(Dns.host_port("127.0.0.1", 443), "127.0.0.1:443")
+}
+
+#law("host_port zero port still formatted")
+dns_hostport_zero() {
+    assert_eq(Dns.host_port("loop", 0), "loop:0")
+}

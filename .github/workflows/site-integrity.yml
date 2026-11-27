@@ -1,0 +1,43 @@
+name: site-integrity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build super CLI
+        run: cargo build -p super-cli --release --locked
+      - name: Regenerate static doc pages
+        run: python3 scripts/generate_site_docs.py
+      - name: generate_facts
+        run: python3 scripts/generate_facts.py
+      - name: check_version
+        run: python3 scripts/check_version.py
+      - name: check_report_tip
+        run: python3 scripts/check_report_tip.py
+      - name: laws_status
+        run: |
+          python3 scripts/laws_status.py
+          git diff --exit-code -- docs/LAWS_STATUS.md
+      - name: lint_vacuous_laws
+        run: python3 scripts/lint_vacuous_laws.py
+      - name: check_numbers
+        run: python3 scripts/check_numbers.py
+      - name: check_windows_aot_net
+        run: python3 scripts/check_windows_aot_net.py
+      - name: check_links
+        run: ./scripts/check_links.sh
+      - name: run_examples
+        run: ./scripts/run_examples.sh
+      - name: doc_examples
+        run: ./scripts/doc_examples.sh
+      - name: stdlib counts
+        run: python3 scripts/count_stdlib.py

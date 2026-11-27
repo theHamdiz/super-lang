@@ -1,0 +1,28 @@
+# Document / validate that docs/ is the GitHub Pages source.
+# Actual hosting: repo Settings → Pages → Deploy from branch → main → /docs
+# (or enable Actions-based Pages later). This workflow only sanity-checks the tree.
+name: pages-docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+jobs:
+  check-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Required Pages entrypoints exist
+        run: |
+          test -f docs/index.html
+          test -f docs/benchmarks/index.html
+          test -f docs/_config.yml
+          test -f docs/REPORT.md || test -f docs/report.html

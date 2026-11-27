@@ -1,0 +1,46 @@
+// 01_nbody — 64 bodies × 500 steps; LCG; std.math.sqrt
+use std.math.core
+
++main() {
+    n, steps, dt, rng = 64, 500, 0.001, 12648430
+    x, y, vx, vy, m = [0.0; 64], [0.0; 64], [0.0; 64], [0.0; 64], [0.0; 64]
+    for 0..n {
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        x[it] = (rng / 2147483648.0) * 2.0 - 1.0
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        y[it] = (rng / 2147483648.0) * 2.0 - 1.0
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        vx[it] = (rng / 2147483648.0 - 0.5) * 0.01
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        vy[it] = (rng / 2147483648.0 - 0.5) * 0.01
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        m[it] = 0.5 + rng / 2147483648.0
+    }
+    for 0..steps {
+        for i in 0..n {
+            ax, ay = 0.0, 0.0
+            for j in 0..n {
+                if i != j {
+                    dx = x[j] - x[i]
+                    dy = y[j] - y[i]
+                    inv = 1.0 / sqrt(dx * dx + dy * dy + 0.01)
+                    inv3 = inv * inv * inv
+                    ax += m[j] * dx * inv3
+                    ay += m[j] * dy * inv3
+                }
+            }
+            vx[i] += ax * dt
+            vy[i] += ay * dt
+        }
+        for 0..n {
+            x[it] += vx[it] * dt
+            y[it] += vy[it] * dt
+        }
+    }
+    cs = (0..n).map(
+        to_int(floor(x[it] * 1000.0)) +
+            to_int(floor(y[it] * 1000.0)) +
+            to_int(floor(vx[it] * 1000000.0))
+    ).sum()
+    print("CHECKSUM={cs}")
+}

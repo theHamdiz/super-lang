@@ -1,0 +1,21 @@
+[package]
+name = "interop_rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone example crate (not a workspace member).
+# Do NOT name this package `super` — that identifier is a Rust keyword.
+[workspace]
+
+[dependencies]
+# Embed API crate (path dep). Import as `use super_ffi::{Engine, Value}`.
+super-ffi = { path = "../../crates/super-ffi" }
+
+[[bin]]
+name = "interop_rust"
+path = "src/main.rs"
+
+[[test]]
+name = "interop_rust_test"
+path = "tests/interop.rs"

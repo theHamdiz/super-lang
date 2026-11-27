@@ -1,0 +1,574 @@
+//! std.sys.io_uring — Linux io_uring submission/completion rings
+//!
+//! Import with:
+//!   use std.sys.io_uring
+//!
+//! Real io_uring (`io_uring_setup` / `io_uring_enter` / `io_uring_register`, mmap'd
+//! SQ/CQ rings) when the kernel allows it; otherwise the same API runs on an epoll-backed
+//! bridge (ENOSYS / EPERM / sandboxes). `ring.backend()` tells you which one you got.
+//!
+//!   ring = IoUring.new() or err { return }
+//!   @ring.prep_read(fd, 4096, 0, 1)       // token 1
+//!   @ring.prep_write(out, "hello", 0, 2)  // token 2
+//!   done = @ring.submit_and_wait(2, 16, 1000) or err { return }
+//!   // done[i].token / .result / .data / .events
+//!
+//! Operations only enter the kernel on `submit` / `submit_and_wait` / `wait`, so a batch
+//! costs one syscall. `result` is the byte count (or ready events for poll_add, or the new
+//! connection handle for accept); a negative `result` is `-errno`.
+//!
+//! Descriptors are Super handles: files from std.io.fs (`sys_fd_open`) and the sockets of
+//! std.net.tcp / std.net.udp. Handles passed to `register_files` are transparently submitted as
+//! fixed-file slots.
+
+/// `IORING_POLL_IN` is `1`.
++IORING_POLL_IN = 1
+/// `IORING_POLL_OUT` is `4`.
++IORING_POLL_OUT = 4
+/// `IORING_POLL_ERR` is `8`.
++IORING_POLL_ERR = 8
+/// `IORING_POLL_HUP` is `16`.
++IORING_POLL_HUP = 16
+
+/// A Timeout operation completes with `-ETIME` when its timer fires.
++IORING_ETIME = -62
+
+/// Offset meaning "current file position".
++IORING_CUR_POS = -1
+
+/// `IoUring.with_flags` bits.
++IORING_SQPOLL = 1
+/// `IORING_FORCE_EPOLL` is `2`.
++IORING_FORCE_EPOLL = 2
+/// `IORING_FORCE_NATIVE` is `4`.
++IORING_FORCE_NATIVE = 4
+
+/// `IoUring` submits Linux io_uring operations (read, write, poll, fsync).
++IoUring = {
+    /// Fd on `IoUring` (`i64`). Defaults to `-1`.
+    fd: i64 = -1
+
+    /// Auto backend (io_uring, falling back to epoll), 256 entries.
+    new() : IoUring! {
+        fd = host.sys_iouring_create(256, 0) or err {
+            fail "{err}"
+            return
+        }
+        IoUring.{fd}
+    }
+
+    /// With entries on this `IoUring` (`entries`). Returns `IoUring`, or fails.
+    with_entries(entries: i64) : IoUring! {
+        fd = host.sys_iouring_create(entries, 0) or err {
+            fail "{err}"
+            return
+        }
+        IoUring.{fd}
+    }
+
+    /// IORING_SETUP_SQPOLL: a kernel thread drains the SQ without a syscall per batch.
+    /// Silently degrades to a plain ring when the kernel denies SQPOLL.
+    sqpoll(entries: i64) : IoUring! {
+        fd = host.sys_iouring_create(entries, 1) or err {
+            fail "{err}"
+            return
+        }
+        IoUring.{fd}
+    }
+
+    /// Force the epoll bridge (same API; for sandboxes and tests).
+    epoll_only(entries: i64) : IoUring! {
+        fd = host.sys_iouring_create(entries, 2) or err {
+            fail "{err}"
+            return
+        }
+        IoUring.{fd}
+    }
+
+    /// Require native io_uring: fails instead of falling back.
+    native_only(entries: i64) : IoUring! {
+        fd = host.sys_iouring_create(entries, 4) or err {
+            fail "{err}"
+            return
+        }
+        IoUring.{fd}
+    }
+
+    /// With flags on this `IoUring` (`entries`, `flags`). Returns `IoUring`, or fails.
+    with_flags(entries: i64, flags: i64) : IoUring! {
+        fd = host.sys_iouring_create(entries, flags) or err {
+            fail "{err}"
+            return
+        }
+        IoUring.{fd}
+    }
+
+    // --- preparing operations (queued until submit) -------------------------------
+
+    /// Prep nop on this `IoUring` (`token`). Returns `bool`, or fails.
+    prep_nop(@self, token: i64) : bool! {
+        host.sys_iouring_submit_nop(self.fd, token) or err { fail "{err}" }
+    }
+
+    /// Prep read on this `IoUring` (`file`, `len`, `offset`, `token`). Returns `bool`, or fails.
+    prep_read(@self, file: i64, len: i64, offset: i64, token: i64) : bool! {
+        host.sys_iouring_submit_read(self.fd, file, len, offset, token) or err { fail "{err}" }
+    }
+
+    /// Prep write on this `IoUring` (`file`, `data`, `offset`, `token`). Returns `bool`, or fails.
+    prep_write(@self, file: i64, data: _, offset: i64, token: i64) : bool! {
+        host.sys_iouring_submit_write(self.fd, file, data, offset, token) or err { fail "{err}" }
+    }
+
+    /// concatenated bytes that arrived.
+    prep_readv(@self, file: i64, lens: _, offset: i64, token: i64) : bool! {
+        host.sys_iouring_submit_readv(self.fd, file, lens, offset, token) or err { fail "{err}" }
+    }
+
+    /// Gather write from a list of byte/str chunks in one operation.
+    prep_writev(@self, file: i64, parts: _, offset: i64, token: i64) : bool! {
+        host.sys_iouring_submit_writev(self.fd, file, parts, offset, token) or err { fail "{err}" }
+    }
+
+    /// Registered-buffer I/O (after `register_buffers`).
+    prep_read_fixed(@self, file: i64, buf: i64, len: i64, offset: i64, token: i64) : bool! {
+        host.sys_iouring_submit_read_fixed(self.fd, file, buf, len, offset, token)
+        or err { fail "{err}" }
+    }
+
+    /// Prep write fixed on this `IoUring` (`file`, `buf`, `data`, `offset`, `token`). Returns `bool`, or fails.
+    prep_write_fixed(@self, file: i64, buf: i64, data: _, offset: i64, token: i64) : bool! {
+        host.sys_iouring_submit_write_fixed(self.fd, file, buf, data, offset, token)
+        or err { fail "{err}" }
+    }
+
+    /// Accept: the completion's `result` is a new TCP handle.
+    prep_accept(@self, listener: i64, token: i64) : bool! {
+        host.sys_iouring_submit_accept(self.fd, listener, token) or err { fail "{err}" }
+    }
+
+    /// Prep recv on this `IoUring` (`socket`, `len`, `token`). Returns `bool`, or fails.
+    prep_recv(@self, socket: i64, len: i64, token: i64) : bool! {
+        host.sys_iouring_submit_recv(self.fd, socket, len, token) or err { fail "{err}" }
+    }
+
+    /// Prep send on this `IoUring` (`socket`, `data`, `token`). Returns `bool`, or fails.
+    prep_send(@self, socket: i64, data: _, token: i64) : bool! {
+        host.sys_iouring_submit_send(self.fd, socket, data, token) or err { fail "{err}" }
+    }
+
+    /// Prep poll add on this `IoUring` (`socket`, `events`, `token`). Returns `bool`, or fails.
+    prep_poll_add(@self, socket: i64, events: i64, token: i64) : bool! {
+        host.sys_iouring_submit_poll_add(self.fd, socket, events, token)
+        or err { fail "{err}" }
+    }
+
+    /// One-shot timer; completes with `IORING_ETIME`.
+    prep_timeout(@self, millis: i64, token: i64) : bool! {
+        host.sys_iouring_submit_timeout(self.fd, millis, token) or err { fail "{err}" }
+    }
+
+    /// Prep fsync on this `IoUring` (`file`, `token`). Returns `bool`, or fails.
+    prep_fsync(@self, file: i64, token: i64) : bool! {
+        host.sys_iouring_submit_fsync(self.fd, file, token) or err { fail "{err}" }
+    }
+
+    /// Older names kept for callers of the deprecated re-export.
+    submit_nop(@self, token: i64) : bool! => @self.prep_nop(token)
+    /// Same as `prep_poll_add` on this `IoUring`, or fail.
+    poll_add(@self, socket: i64, events: i64, token: i64) : bool! => @self.prep_poll_add(socket, events, token)
+
+    // --- submitting and reaping ---------------------------------------------------
+
+    /// Hand every queued operation to the kernel; returns how many.
+    submit(@self) : i64! {
+        host.sys_iouring_submit(self.fd) or err { fail "{err}" }
+    }
+
+    /// Submit, then wait until `min` completions exist (or `timeout_ms` passes; -1 waits
+    /// forever, 0 polls). Returns up to `max` completions.
+    submit_and_wait(@self, min: i64, max: i64, timeout_ms: i64) : _! {
+        host.sys_iouring_submit_and_wait(self.fd, min, max, timeout_ms) or err { fail "{err}" }
+    }
+
+    /// Submit and wait for at least one completion (`timeout_ms == 0` never blocks).
+    wait(self, max_events: i64, timeout_ms: i64) : _! {
+        host.sys_iouring_wait(self.fd, max_events, timeout_ms) or err { fail "{err}" }
+    }
+
+    /// Reap whatever already completed.
+    poll(self, max_events: i64) : _! {
+        host.sys_iouring_wait(self.fd, max_events, 0) or err { fail "{err}" }
+    }
+
+    // --- introspection -------------------------------------------------------------
+
+    /// "io_uring" or "epoll".
+    backend(self) : str => host.sys_iouring_backend(self.fd) or "closed"
+
+    /// Is native on this `IoUring`.
+    is_native(self) : bool => host.sys_iouring_is_native(self.fd) or false
+
+    /// Sqpoll active on this `IoUring`.
+    sqpoll_active(self) : bool => host.sys_iouring_sqpoll(self.fd) or false
+
+    /// Operations submitted or queued whose completion has not been reaped.
+    inflight(self) : i64 => host.sys_iouring_inflight(self.fd) or 0
+
+    /// Operations queued but not yet handed to the kernel.
+    queued(self) : i64 => host.sys_iouring_queued(self.fd) or 0
+
+    // --- registration ----------------------------------------------------------------
+
+    /// Pin `count` buffers of `size` bytes for READ_FIXED / WRITE_FIXED.
+    register_buffers(@self, count: i64, size: i64) : bool! {
+        host.sys_iouring_register_buffers(self.fd, count, size) or err { fail "{err}" }
+    }
+
+    /// Unregister buffers on this `IoUring`. Returns `bool`, or fails.
+    unregister_buffers(@self) : bool! {
+        host.sys_iouring_unregister_buffers(self.fd) or err { fail "{err}" }
+    }
+
+    /// Register file/socket handles; later operations on them use fixed-file slots.
+    register_files(@self, handles: _) : bool! {
+        host.sys_iouring_register_files(self.fd, handles) or err { fail "{err}" }
+    }
+
+    /// Unregister files on this `IoUring`. Returns `bool`, or fails.
+    unregister_files(@self) : bool! {
+        host.sys_iouring_unregister_files(self.fd) or err { fail "{err}" }
+    }
+
+    /// Close this `IoUring` and release the underlying resource.
+    close(@self) : bool {
+        ensure self.fd >= 0 else { return false }
+        old = self.fd
+        self.fd = -1
+        host.sys_iouring_close(old)
+    }
+}
+
+/// Available.
++uring_available() : bool => host.sys_iouring_available() or false
+
+/// Payload of a read/recv/readv completion as text (lossy UTF-8).
++uring_text(c: _) : str => host.sys_bytes_to_str(c.data)
+
+/// Payload as an array of byte values (binary safe).
++uring_bytes(c: _)  => host.sys_io_bytes_to_array(c.data)
+
+/// Failed (`c`).
++uring_failed(c: _) : bool => c.result < 0
+
+/// errno of a failed completion, 0 when it succeeded.
++uring_errno(c: _) : i64 {
+    if c.result < 0 { return 0 - c.result }
+    0
+}
+
+/// Test that nop batch completes with every token.
+test "nop batch completes with every token" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    for 1..5 { @ring.prep_nop(it * 10) }
+    assert_eq(ring.queued(), 4)
+    done = @ring.submit_and_wait(4, 16, 2000) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(done), 4)
+    sum = 0
+    for done { sum += it.token }
+    assert_eq(sum, 100)
+    assert_eq(ring.inflight(), 0)
+    #assert(@ring.close())
+}
+
+/// Test that legacy nop and wait still work.
+test "legacy nop and wait still work" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    ok = @ring.submit_nop(73) or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(ok)
+    ready = ring.wait(4, 0) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(ready), 1)
+    assert_eq(ready[0].token, 73)
+    assert_eq(ready[0].result, 0)
+    #assert(@ring.close())
+}
+
+/// Test that backend reporting and forced fallback.
+test "backend reporting and forced fallback" {
+    auto = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    name = auto.backend()
+    #assert(name == "io_uring" || name == "epoll")
+    assert_eq(auto.is_native(), name == "io_uring")
+    assert_eq(auto.is_native(), uring_available())
+    bridge = IoUring.epoll_only(32) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(bridge.backend(), "epoll")
+    #assert(!(bridge.is_native()))
+    #assert(!(bridge.sqpoll_active()))
+    #assert(@auto.close())
+    #assert(@bridge.close())
+    assert_eq(auto.backend(), "closed")
+}
+
+/// Test that native_only matches availability.
+test "native_only matches availability" {
+    r = IoUring.native_only(16) or err {
+        #assert(!(uring_available()))
+        return
+    }
+    #assert(uring_available())
+    assert_eq(r.backend(), "io_uring")
+    #assert(@r.close())
+}
+
+/// Test that write then read a file on both backends.
+test "write then read a file on both backends" {
+    for [0, 2] {
+        ring = IoUring.with_flags(32, it) or err {
+            assert_eq(1, 0)
+            return
+        }
+        path = "/tmp/super-io-uring-rw.txt"
+        file = host.sys_fd_open(path, "w+") or err {
+            assert_eq(1, 0)
+            return
+        }
+        @ring.prep_write(file, "hello ", 0, 1)
+        @ring.prep_write(file, "uring", 6, 2)
+        @ring.prep_fsync(file, 3)
+        done = @ring.submit_and_wait(3, 8, 5000) or err {
+            assert_eq(1, 0)
+            return
+        }
+        assert_eq(host.sys_arr_len(done), 3)
+        @ring.prep_read(file, 64, 0, 4)
+        got = @ring.submit_and_wait(1, 4, 5000) or err {
+            assert_eq(1, 0)
+            return
+        }
+        assert_eq(got[0].token, 4)
+        assert_eq(got[0].result, 11)
+        assert_eq(uring_text(got[0]), "hello uring")
+        // reading past EOF completes with 0 bytes
+        @ring.prep_read(file, 8, 500, 5)
+        eof = @ring.submit_and_wait(1, 4, 5000) or err {
+            assert_eq(1, 0)
+            return
+        }
+        assert_eq(eof[0].result, 0)
+        host.sys_fd_close(file)
+        host.sys_remove(path)
+        #assert(@ring.close())
+    }
+}
+
+/// Test that readv and writev gather and scatter.
+test "readv and writev gather and scatter" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    path = "/tmp/super-io-uring-vec.txt"
+    file = host.sys_fd_open(path, "w+") or err {
+        assert_eq(1, 0)
+        return
+    }
+    @ring.prep_writev(file, ["ab", "cd", "ef"], 0, 1)
+    w = @ring.submit_and_wait(1, 4, 5000) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(w[0].result, 6)
+    @ring.prep_readv(file, [1, 2, 3], 0, 2)
+    r = @ring.submit_and_wait(1, 4, 5000) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(r[0].result, 6)
+    assert_eq(uring_text(r[0]), "abcdef")
+    host.sys_fd_close(file)
+    host.sys_remove(path)
+    #assert(@ring.close())
+}
+
+/// Test that fixed buffers and registered files.
+test "fixed buffers and registered files" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    path = "/tmp/super-io-uring-fixed.txt"
+    file = host.sys_fd_open(path, "w+") or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(@ring.register_buffers(2, 4096) or false)
+    #assert(@ring.register_files([file]) or false)
+    @ring.prep_write_fixed(file, 0, "fixed", 0, 1)
+    w = @ring.submit_and_wait(1, 4, 5000) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(w[0].result, 5)
+    @ring.prep_read_fixed(file, 1, 5, 0, 2)
+    r = @ring.submit_and_wait(1, 4, 5000) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(uring_text(r[0]), "fixed")
+    // slot 9 does not exist
+    bad = @ring.prep_read_fixed(file, 9, 1, 0, 3) or false
+    #assert(!(bad))
+    #assert(@ring.unregister_buffers() or false)
+    #assert(@ring.unregister_files() or false)
+    host.sys_fd_close(file)
+    host.sys_remove(path)
+    #assert(@ring.close())
+}
+
+/// Test that timeout completes with ETIME.
+test "timeout completes with ETIME" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    @ring.prep_timeout(20, 7)
+    done = @ring.submit_and_wait(1, 4, 5000) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(done[0].token, 7)
+    assert_eq(done[0].result, IORING_ETIME)
+    #assert(uring_failed(done[0]))
+    assert_eq(uring_errno(done[0]), 62)
+    #assert(@ring.close())
+}
+
+/// Test that accept recv send over loopback on both backends.
+test "accept recv send over loopback on both backends" {
+    for [0, 2] {
+        ring = IoUring.with_flags(32, it) or err {
+            assert_eq(1, 0)
+            return
+        }
+        listener = host.sys_tcp_listen("127.0.0.1:0") or err {
+            assert_eq(1, 0)
+            return
+        }
+        addr = host.sys_fd_local_addr(listener) or err {
+            assert_eq(1, 0)
+            return
+        }
+        @ring.prep_accept(listener, 1)
+        @ring.submit() or err {
+            assert_eq(1, 0)
+            return
+        }
+        client = host.sys_tcp_connect(addr) or err {
+            assert_eq(1, 0)
+            return
+        }
+        acc = @ring.submit_and_wait(1, 4, 200) or err {
+            assert_eq(1, 0)
+            return
+        }
+        conn = acc[0].result
+        #assert(conn > 0)
+        host.sys_tcp_write(client, "ping")
+        @ring.prep_recv(conn, 64, 2)
+        got = @ring.submit_and_wait(1, 4, 200) or err {
+            assert_eq(1, 0)
+            return
+        }
+        assert_eq(uring_text(got[0]), "ping")
+        @ring.prep_send(conn, "pong", 3)
+        sent = @ring.submit_and_wait(1, 4, 200) or err {
+            assert_eq(1, 0)
+            return
+        }
+        assert_eq(sent[0].result, 4)
+        back = host.sys_tcp_read(client, 4) or err {
+            assert_eq(1, 0)
+            return
+        }
+        assert_eq(host.sys_bytes_to_str(back), "pong")
+        host.sys_fd_close(conn)
+        host.sys_fd_close(client)
+        host.sys_fd_close(listener)
+        #assert(@ring.close())
+    }
+}
+
+/// Test that poll_add reports socket readiness.
+test "poll_add reports socket readiness" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    listener = host.sys_tcp_listen("127.0.0.1:0") or err {
+        assert_eq(1, 0)
+        return
+    }
+    addr = host.sys_fd_local_addr(listener) or err {
+        assert_eq(1, 0)
+        return
+    }
+    @ring.prep_poll_add(listener, IORING_POLL_IN, 9)
+    // nothing connected yet: a non-blocking poll sees no completion
+    @ring.submit() or err {
+        assert_eq(1, 0)
+        return
+    }
+    none = ring.poll(4) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(none), 0)
+    client = host.sys_tcp_connect(addr) or err {
+        assert_eq(1, 0)
+        return
+    }
+    done = ring.wait(4, 200) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(done[0].token, 9)
+    #assert((done[0].events & IORING_POLL_IN) != 0)
+    host.sys_fd_close(client)
+    host.sys_fd_close(listener)
+    #assert(@ring.close())
+}
+
+/// Test that invalid operations are errors not crashes.
+test "invalid operations are errors not crashes" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(!(@ring.prep_read(424242, 8, 0, 1) or false))
+    #assert(!(@ring.prep_timeout(-5, 1) or false))
+    assert_eq(ring.queued(), 0)
+    #assert(@ring.close())
+    #assert(!(@ring.prep_nop(1) or false))
+    #assert(!(@ring.close()))
+}

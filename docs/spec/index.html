@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/spec/"/>
+<link rel="icon" href="../assets/favicon.ico" sizes="any"/>
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png"/>
+<link rel="icon" type="image/png" href="../assets/icons/super.png"/>
+<link rel="apple-touch-icon" href="../assets/icons/super.png"/>
+<meta name="description" content="Normative Super language surface: grammar, types, stdlib contracts, diagnostics."/>
+<meta name="theme-color" content="#ff7a1f"/>
+<meta property="og:type" content="website"/>
+<meta property="og:site_name" content="Super"/>
+<meta property="og:locale" content="en_US"/>
+<meta property="og:title" content="Super · Spec"/>
+<meta property="og:description" content="Normative Super language surface: grammar, types, stdlib contracts, diagnostics."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/spec/"/>
+<meta property="og:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<meta property="og:image:width" content="1200"/>
+<meta property="og:image:height" content="630"/>
+<meta property="og:image:alt" content="Super language"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="Super · Spec"/>
+<meta name="twitter:description" content="Normative Super language surface: grammar, types, stdlib contracts, diagnostics."/>
+<meta name="twitter:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Super", "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux, macOS, FreeBSD, Windows", "softwareVersion": "0.1.0", "license": "https://opensource.org/licenses/MIT", "url": "https://thehamdiz.github.io/super-lang/", "description": "Normative Super language surface: grammar, types, stdlib contracts, diagnostics.", "downloadUrl": "https://thehamdiz.github.io/super-lang/install/", "author": {"@type": "Person", "name": "Ahmad Hamdi"}}</script>
+<title>Super · Spec</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="../site.css"/>
+<script src="../super-highlight.js" defer></script>
+
+</head>
+<body>
+
+<header class="site-nav">
+  <a class="mark" href="./">Super</a>
+  <nav><a href="../">Home</a><a href="../benchmarks/">Benchmarks</a><a href="../winners/">Winners</a><a href="../charts/">Charts</a><a href="./">Spec</a><a href="../book/">Book</a><a href="../examples/">Examples</a><a href="../install/">Install</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a><a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a></nav>
+  <a class="cta" href="../downloads/SUPER_BOOK.pdf" download>Download book</a>
+</header>
+<section class="page-hero">
+  <h1>Language surface</h1>
+  <p>Online notes from SPECIFICATION.md. Download the book for the complete text.</p>
+  <div class="hero-actions">
+    <a class="cta" href="../downloads/SUPER_BOOK.pdf" download>Download book</a>
+    <a class="cta-ghost" href="../book/">Open book viewer</a>
+  </div>
+</section>
+<section class="section band-ink">
+  <div class="ui-stage" data-reveal style="min-height:8rem;display:flex;align-items:flex-end">
+    <p style="margin:0;font-size:clamp(1.75rem,5vw,3rem);letter-spacing:-0.04em;line-height:0.95;max-width:18ch">Spec notes · full text in the online book reader</p>
+  </div>
+</section>
+<article class="spec-body" data-reveal>
+<h2 id="the-super-programming-language-specification">The Super Programming Language Specification</h2>
+<p>Language specification for Super 0.1.0 (Round 5 language revision)</p>
+<h3 id="1-status-scope-and-conformance">1. Status, scope, and conformance</h3>
+<p>This document specifies the source language accepted by the Super 0.1.0 toolchain, including the Round 5 revision (block and assertion macros, the §3.9 design rule, <code>super fmt</code>, and <code>super lint</code>). The product, crates, CLI, installer, site, and release tag are 0.1.0; the Round 5 revision is not a separate product version. Published benchmark measurements remain the frozen 0.1.0 measurement, taken on a single machine. This document is normative where it uses “shall”, “must”, or grammar productions, and explanatory where it describes implementation strategy. Super source files use the <code>.sr</code> extension. Every source file is a module; there is no <code>mod</code> declaration keyword. The reference implementation is the Rust workspace in this repository.</p>
+<p>A conforming implementation shall:</p>
+<ol><li>tokenize and parse the grammar in this document;</li><li>diagnose violations before execution where the static rules require it;</li><li>preserve observable evaluation order, integer/float results, mutation, and control flow across the VM, JIT, and C23 AOT paths;</li><li>implement module privacy, <code>@</code> mutation rules, optional/error handling, and root-lifetime checks;</li><li>accept <code>Pod.toml</code> Pods (with removed legacy <code>Super.toml</code>) and produce reproducible <code>Pod.lock</code> Git pins.</li></ol>
+<p>The implementation may optimize, fuse, specialize, vectorize, or erase constructs when the resulting behavior is unchanged. Tests are compilation units for <code>super test</code>; release builds may strip them.</p>
+<h3 id="2-source-text-and-lexical-structure">2. Source text and lexical structure</h3>
+<h4 id="21-encoding-layout-and-statement-boundaries">2.1 Encoding, layout, and statement boundaries</h4>
+<p>Source text is UTF-8. The lexer recognizes ASCII letters in identifiers; non-ASCII text is valid inside strings and comments. Horizontal and vertical whitespace separate tokens. Newlines normally have no token, but a newline before binary <code>+</code> or <code>-</code> ends the preceding expression, preventing the next statement from being consumed as an infix continuation. Statements are separated by newlines. The semicolon appears only inside array-repeat literals (<code>[0; n]</code>); using <code>;</code> as a statement separator or terminator is a syntax error.</p>
+<p>An identifier starts with <code>A</code>–<code>Z</code>, <code>a</code>–<code>z</code>, or <code>_</code>, followed by zero or more ASCII letters, digits, or <code>_</code>. Names are case-sensitive. By convention, types and sum variants use <code>UpperCamelCase</code>, exported constants may use capitals, and values use <code>snake_case</code>.</p>
+<pre><code class="language-ebnf">letter        = &quot;A&quot;…&quot;Z&quot; | &quot;a&quot;…&quot;z&quot; | &quot;_&quot; ;
+digit         = &quot;0&quot;…&quot;9&quot; ;
+hex-digit     = digit | &quot;A&quot;…&quot;F&quot; | &quot;a&quot;…&quot;f&quot; ;
+oct-digit     = &quot;0&quot;…&quot;7&quot; ;
+bin-digit     = &quot;0&quot; | &quot;1&quot; ;
+identifier    = letter, { letter | digit } ;</code></pre>
+<h4 id="22-keywords">2.2 Keywords</h4>
+<p>The reserved keywords in 0.1.0 are:</p>
+<pre><code class="language-text">after await break chan Code continue each else embed ensure err fail false
+for if in loop none or panic par parallel return rewrite scope select shared
+spawn state test trait true type use when while</code></pre>
+<p>The contextual keywords are <code>as</code>, <code>it</code>, <code>index</code>, <code>self</code>, and <code>_</code>. Each has meaning in one grammatical position only (import renames; implicit loop and closure names; method receivers; wildcards and inferred types) and is an ordinary identifier everywhere else. No other identifier is special: names such as <code>sum</code>, <code>len</code>, <code>routes</code>, <code>get</code>, <code>post</code>, <code>put</code>, and <code>delete</code> are ordinary names resolved as values, functions, or methods.</p>
+<p>The rule that governs this list is stated in §3.9.</p>
+<h4 id="23-literals">2.3 Literals</h4>
+<p>Decimal integers and floats permit <code>_</code> separators. Integer literals also support hexadecimal <code>0x</code>, binary <code>0b</code>, and octal <code>0o</code> prefixes. Separators do not affect value. A leading <code>-</code> is folded into a numeric token when it cannot be an infix subtraction; otherwise it is unary negation.</p>
+<pre><code class="language-ebnf">dec-int       = [ &quot;-&quot; ], digit, { digit | &quot;_&quot; } ;
+hex-int       = [ &quot;-&quot; ], &quot;0&quot;, (&quot;x&quot; | &quot;X&quot;), hex-digit, { hex-digit | &quot;_&quot; } ;
+bin-int       = [ &quot;-&quot; ], &quot;0&quot;, (&quot;b&quot; | &quot;B&quot;), bin-digit, { bin-digit | &quot;_&quot; } ;
+oct-int       = [ &quot;-&quot; ], &quot;0&quot;, (&quot;o&quot; | &quot;O&quot;), oct-digit, { oct-digit | &quot;_&quot; } ;
+exponent      = (&quot;e&quot; | &quot;E&quot;), [ &quot;+&quot; | &quot;-&quot; ], digit, { digit | &quot;_&quot; } ;
+float         = [ &quot;-&quot; ], digit, { digit | &quot;_&quot; },
+                (&quot;.&quot;, digit, { digit | &quot;_&quot; }, [ exponent ] | exponent) ;
+integer       = dec-int | hex-int | bin-int | oct-int ;
+boolean       = &quot;true&quot; | &quot;false&quot; ;
+none-literal  = &quot;none&quot; ;
+string        = &#x27;&quot;&#x27;, { escaped-char | interpolation | string-char }, &#x27;&quot;&#x27; | raw-string ;
+interpolation = &quot;{&quot;, expression, &quot;}&quot; ;</code></pre>
+<p>Examples:</p>
+<pre class="sr-block"><code class="language-sr">mask = 0xff_00_ff
+limit = 1_000_000
+ratio = 6.022e23
+message = &quot;entity {id} at {pos.x}&quot;</code></pre>
+<p>Strings are immutable language values. Interpolation is retained in the string token and lowered by the compiler. Each hole is rendered with <code>Display</code>: arrays, maps, records, structs, and commands have a witness, and a type that declares <code>Display</code> or <code>ToString</code> replaces it with a direct call. A hole that is not an expression (<code>{}</code>, <code>{1, 2}</code>, <code>\{</code>) stays literal text. Raw strings do not interpolate.</p>
+<h5 id="231-escape-sequences">2.3.1 Escape sequences</h5>
+<p>Inside an ordinary string literal a backslash begins an escape sequence, which the lexer validates and the compiler decodes. An unrecognized or malformed escape is a syntax error (E0001).</p>
+<pre><code class="language-ebnf">escaped-char  = &quot;\&quot;, ( &quot;n&quot; | &quot;r&quot; | &quot;t&quot; | &quot;0&quot; | &quot;\&quot; | &#x27;&quot;&#x27; | &quot;&#x27;&quot; | &quot;{&quot; | &quot;}&quot;
+                     | &quot;x&quot;, hex-digit, hex-digit
+                     | &quot;u&quot;, &quot;{&quot;, hex-digit, { hex-digit }, &quot;}&quot; ) ;</code></pre>
+<div class="table-wrap"><table class="data"><thead><tr><th>Escape</th><th>Value</th></tr></thead><tbody><tr><td><code>\n</code>, <code>\r</code>, <code>\t</code></td><td>U+000A, U+000D, U+0009</td></tr><tr><td><code>\0</code></td><td>U+0000</td></tr><tr><td><code>\\</code>, <code>\&quot;</code>, <code>\&#x27;</code></td><td>backslash, double quote, single quote</td></tr><tr><td><code>\{</code>, <code>\}</code></td><td>literal braces; they never start an interpolation</td></tr><tr><td><code>\xNN</code></td><td>the code point <code>NN</code>, which must be at most <code>7F</code></td></tr><tr><td><code>\u{H…}</code></td><td>a Unicode scalar value written with 1–6 hex digits</td></tr></tbody></table></div>
+<h5 id="232-raw-strings">2.3.2 Raw strings</h5>
+<p>A raw string literal is <code>r</code>, zero or more <code>#</code>, <code>&quot;</code>, a body, <code>&quot;</code>, and the same number of <code>#</code>. The body ends at the first <code>&quot;</code> followed by that many <code>#</code>. It contains no escapes and no interpolation (<code>\</code> , <code>{</code>, and <code>}</code> are ordinary bytes), may span lines, and has type <code>str</code> like any other string. <code>r</code> not followed by <code>#*&quot;</code> is an ordinary identifier.</p>
+<pre><code class="language-ebnf">raw-string    = &quot;r&quot;, { &quot;#&quot; }, &#x27;&quot;&#x27;, { any-char }, &#x27;&quot;&#x27;, { &quot;#&quot; } ;   (* hash counts equal *)</code></pre>
+<pre class="sr-block"><code class="language-sr">path    = r&quot;C:\Users\admin\notes.txt&quot;
+pattern = r&quot;^\d+\.\d+$&quot;
+quoted  = r#&quot;say &quot;hi&quot; \d+&quot;#</code></pre>
+<p>Lexically a raw string is stored as the equivalent escaped string (<code>\</code> → <code>\\</code>, <code>&quot;</code> → <code>\&quot;</code>, <code>{</code> → <code>\{</code>, <code>}</code> → <code>\}</code>), so every later phase treats it as an ordinary string whose decoded value equals the source bytes.</p>
+<h4 id="24-comments-and-documentation">2.4 Comments and documentation</h4>
+<p><code>//</code> begins an inert line comment. <code>/* … */</code> is an inert block comment. Block comments are not nested.</p>
+<p>Documentation comments are tokens, not trivia. The parser attaches them to the next declaration (module item, field, method, variant, or local binding) and <code>super doc</code> renders that text as Markdown. The language server shows the same text on hover, completion, signature help, and outline detail. Editors highlight the forms below as documentation rather than as ordinary comments.</p>
+<div class="table-wrap"><table class="data"><thead><tr><th>Form</th><th>Attached to</th></tr></thead><tbody><tr><td><code>/// text</code></td><td>the next declaration</td></tr><tr><td><code>/** text */</code></td><td>the next declaration</td></tr><tr><td><code>//! text</code></td><td>the enclosing module, or the enclosing type when written inside its body</td></tr><tr><td><code>/*! text */</code></td><td>the enclosing module, or the enclosing type when written inside its body</td></tr></tbody></table></div>
+<p><code>////</code> and <code>/***</code> stay ordinary comments. A documentation comment that is not followed by a declaration is a syntax error.</p>
+<p>Two legacy executable meta-comment forms are tokens rather than trivia: <code>//# directive</code> and <code>/*# directive #*/</code>. First-class <code>#inline</code>, <code>#simd</code>, and related attributes are preferred.</p>
+<pre class="sr-block"><code class="language-sr">/// Adds two values.
++add(a: i64, b: i64) =&gt; a + b
+
+//# unroll(4)
+for values { consume(it) }</code></pre>
+<h4 id="25-operators-and-punctuation">2.5 Operators and punctuation</h4>
+<p>The lexical operators are:</p>
+<pre><code class="language-text">+  -  *  /  %  =  ==  !=  &lt;  &lt;=  &gt;  &gt;=
++= -= *= /=  .  ..  ,  ;  :  ?  !  @  #
+$  &#x27;{  ${  =&gt;  |  &amp;  ^  ~  &amp;&amp;  ||  &lt;&lt;  &gt;&gt;  &gt;&gt;&gt;
+( ) { } [ ]</code></pre>
+<p><code>+</code> has two declaration roles in addition to addition: at module scope it exports the following declaration, and in a public struct redundant <code>+field</code> explicitly marks a public field. <code>-field</code> marks a private struct field. <code>@</code> creates or forwards an in-place mutable borrow and is also required at mutation-capable parameters and selected loop targets. <code>#</code> introduces compile-time declarations, references, blocks, conditions, loops, and recognized attributes.</p>
+<p>Expression precedence, from strongest to weakest, is postfix call/field/index, unary (<code>-</code>, <code>!</code>, <code>~</code>, <code>@</code>, <code>await</code>, <code>spawn</code>, <code>shared</code>), multiplicative, additive, shifts, comparisons/equality, bitwise, logical <code>&amp;&amp;</code>, logical <code>||</code>, range <code>..</code>, ternary <code>?:</code>, assignment, then <code>or</code>. Assignments associate right-to-left; ordinary binary operators associate left-to-right.</p>
+<h3 id="3-complete-syntactic-grammar">3. Complete syntactic grammar</h3>
+<p>The EBNF is descriptive of the accepted 0.1.0 surface. <code>NL</code> denotes a source newline where statement separation is needed. Braced bodies remove most newline ambiguity.</p>
+<h4 id="31-modules-and-items">3.1 Modules and items</h4>
+<pre><code class="language-ebnf">module          = { item } ;
+item            = { meta-attribute },
+                  ( use-item | test-item | state-item | route-item
+                  | rewrite-item | comptime-item | declaration ) ;
+
+visibility      = [ &quot;+&quot; ] ;
+declaration     = visibility,
+                  ( function-def | type-def | binding | multi-binding )
+                | multi-binding ;
+
+use-item        = &quot;use&quot;, module-path, [ &quot;.&quot;, &quot;{&quot;, use-name,
+                  { &quot;,&quot;, use-name }, &quot;}&quot; ], [ &quot;as&quot;, identifier ] ;
+use-name        = identifier, [ &quot;as&quot;, identifier ] ;
+module-path     = identifier, { &quot;.&quot;, identifier } ;
+
+binding         = identifier, [ &quot;:&quot;, type-expr ], &quot;=&quot;, expression ;
+multi-binding   = multi-bind-target, { &quot;,&quot;, multi-bind-target }, &quot;=&quot;,
+                  expression, { &quot;,&quot;, expression } ;
+multi-bind-target = [ &quot;+&quot; ], identifier, [ &quot;:&quot;, type-expr ] ;
+comptime-item   = &quot;#&quot;, ( binding | comptime-if | comptime-for
+                  | comptime-block ) ;
+
+state-item      = &quot;state&quot;, identifier, &quot;=&quot;, expression ;
+test-item       = &quot;test&quot;, string, block ;
+
+route-item      = route-method, string, &quot;|&quot;, identifier, &quot;|&quot;,
+                  [ &quot;:&quot;, type-expr ], block ;
+route-method    = &quot;get&quot; | &quot;post&quot; | &quot;put&quot; | &quot;delete&quot; ;
+
+rewrite-item    = &quot;rewrite&quot;, string, &quot;(&quot;, [ parameter-list ], &quot;)&quot;,
+                  &quot;{&quot;, expression, &quot;=&gt;&quot;, expression, &quot;}&quot; ;</code></pre>
+<p>Every <code>.sr</code> file is a module. Items are private unless prefixed by <code>+</code>. <code>use auth</code> resolves a sibling <code>auth.sr</code>; <code>use models.{User, Task}</code> imports selected exports; <code>use std.net.http</code> resolves an embedded or installed standard-library module (canonical manifest path <code>layer.module</code>; short aliases like <code>use std.http</code> still resolve but are deprecated in new code). <strong>Braced multi-import:</strong> when every name in <code>use std.data.{column, frame, plan}</code> resolves as a <em>loadable sibling module</em> under the path prefix, the brace expands to the same bindings as separate <code>use std.data.column</code> / <code>use std.data.frame</code> / <code>use std.data.plan</code> lines (LoC-friendly). If no selector is a loadable module, braces keep export-select semantics (<code>use models.{User}</code>, <code>use std.poll.{POLL_READ}</code>). A mix of loadable modules and unknown names is an error (<code>braced multi-import</code>). <code>use std.gui as App</code> binds that module under the local name <code>App</code>, so <code>App.Gui.new(...)</code> and <code>App.byte_len(...)</code> resolve through the alias. <code>use std.gui.{Gui as Desk}</code> adds <code>Desk</code> as another name for the exported type or function; <code>Desk.new(...)</code> calls <code>Gui.new</code>. <code>as</code> is contextual and is not a reserved word. The original export stays available. An unused import is still <code>E0305</code>, and using either the alias or an imported name counts as a use. <code>state</code> is module-root mutable storage intended to survive hot reload where the selected runtime supports persistence.</p>
+<h4 id="32-types-structs-and-sums">3.2 Types, structs, and sums</h4>
+<pre><code class="language-ebnf">type-expr       = primary-type, { &quot;?&quot; | &quot;!&quot; } ;
+primary-type    = module-path | &quot;type&quot; | &quot;Code&quot;, &quot;[&quot;, type-expr, &quot;]&quot;
+                | &quot;chan&quot;, &quot;[&quot;, type-expr, &quot;]&quot; ;
+
+type-def        = identifier, [ &quot;:&quot;, identifier, { &quot;,&quot;, identifier } ],
+                  &quot;=&quot;, &quot;{&quot;, ( struct-body | sum-body ), &quot;}&quot; ;
+struct-body     = { struct-member, [ &quot;,&quot; ] } ;
+struct-member   = field-def | method-def ;
+field-def       = [ &quot;+&quot; | &quot;-&quot; ], identifier, &quot;:&quot;, type-expr,
+                  [ &quot;=&quot;, expression ] ;
+
+sum-body        = variant-def, { [ &quot;,&quot; ], variant-def } ;
+variant-def     = identifier,
+                  [ &quot;(&quot;, identifier, &quot;:&quot;, type-expr,
+                    { &quot;,&quot;, identifier, &quot;:&quot;, type-expr }, &quot;)&quot; ] ;
+
+method-def      = [ &quot;+&quot; | &quot;-&quot; ], function-def ;</code></pre>
+<p>The built-in scalar names are <code>bool</code>, <code>i8</code>, <code>i16</code>, <code>i32</code>, <code>i64</code>, <code>i128</code>, <code>u8</code>, <code>u16</code>, <code>u32</code>, <code>u64</code>, <code>f32</code>, <code>f64</code>, and <code>str</code>. Unannotated integer literals default to <code>i64</code>; unannotated floats default to <code>f64</code>. Fixed-width integers coerce among themselves and with <code>i64</code> at assignment and call boundaries (numeric widen/narrow). Overflow of signed <code>i64</code> arithmetic wraps with two's-complement semantics (<code>-fwrapv</code> / VM wrap) in all profiles; division by zero is a runtime error. Explicit wrapping, checked, and saturating helpers for narrower widths live in <code>std.core.int</code>. C23 mapping: <code>u8</code>→<code>uint8_t</code>, <code>u16</code>→<code>uint16_t</code>, <code>u32</code>→<code>uint32_t</code>, <code>u64</code>→<code>uint64_t</code>, <code>i8</code>→<code>int8_t</code>, <code>i16</code>→<code>int16_t</code>, <code>i32</code>→<code>int32_t</code>, <code>i64</code>→<code>int64_t</code>, <code>i128</code>→<code>__int128</code>. <code>_</code> in a parameter type position requests inference/specialization. A named struct uses flat C-compatible field layout. In an exported struct, fields and methods are public by default; prefix a member with <code>-</code> to keep it file-private (this module and <code>test</code> blocks). A leading <code>+</code> on a field or method is redundant and ignored — only top-level declarations use <code>+</code> to export. Sum variants have a discriminant and an inline payload sized to the largest variant.</p>
+<pre class="sr-block"><code class="language-sr">+User = {
+    id: i64
+    name: str
+    balance: f64 = 0.0
+    -secret: str = &quot;&quot;
+
+    credit(@self, amount: f64) {
+        self.balance += amount
+    }
+
+    -recompute(@self) {
+        // file-private helper
+    }
+}
+
+Status = {
+    Pending
+    Paid(amount: f64)
+    Failed(reason: str)
+}</code></pre>
+<h5 id="traits-declared-inline">Traits, declared inline</h5>
+<h3>Stage-1 language and stdlib (0.1.0)</h3>
+<ul><li><code>std.html.template</code> — Html/Text templates with comptime T001–T004.</li><li><code>std.sec.secret</code> vs <code>std.sec.vault</code> — process-local Secret/FileKeyring vs Vault-shaped named store.</li><li>Fixed-width ints <code>i8</code>…<code>u64</code>; channel multiplexing via <code>select { … }</code>.</li><li><code>std.datetime</code> (civil/TZ/ISO) distinct from <code>std.sys.time</code>.</li><li>Multiple dispatch: <code>FuncFamily</code>, <code>#symmetric</code>, multi-subject <code>when</code>.</li><li><code>std.math</code> scientific suite; <code>std.data</code> + <code>std.fmt.xlsx</code>.</li><li><code>super pod pack</code> / <code>verify</code>; toolchain under <code>~/.super</code> (<code>SUPER_HOME</code>).</li><li>Stdlib ships <strong>150</strong> <code>.sr</code> files / <strong>127</strong> implementation modules.</li></ul>
+<p class="note">Opening excerpt plus Stage-1 highlights from SPECIFICATION.md. <a href="../downloads/SUPER_BOOK.pdf">Download the book PDF</a> or open the <a href="../book/">online book reader</a> for the full text.</p>
+</article>
+<footer class="site-footer">
+  <div class="footer-links">
+    <a href="../benchmarks/">Benchmarks</a>
+    <a href="../winners/">Winners</a>
+    <a href="../charts/">Charts</a>
+    <a href="../book/">Book</a>
+    <a href="../install/">Install</a>
+    <a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a>
+    <a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a>
+    <a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a>
+  </div>
+  <div class="footer-mark" aria-hidden="true">
+    <span>S</span><span>u</span><span>p</span><span>e</span><span>r</span>
+  </div>
+  <div class="footer-legal">
+    <span>Super language</span>
+  </div>
+</footer>
+<script>(function () {
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((e) => {
+      if (e.isIntersecting) {
+        e.target.classList.add("in");
+        const delayKids = e.target.querySelectorAll(":scope > [data-reveal], :scope [data-stagger] > *");
+        delayKids.forEach((kid, i) => {
+          kid.style.transitionDelay = (i * 70) + "ms";
+          kid.classList.add("in");
+        });
+      }
+    });
+  }, { threshold: 0.12 });
+  document.querySelectorAll("[data-reveal]").forEach((el) => io.observe(el));
+})();
+(function () {
+  document.querySelectorAll("[data-copy-target]").forEach((btn) => {
+    const label = btn.textContent || "Copy";
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-copy-target");
+      const el = id ? document.getElementById(id) : null;
+      if (!el) return;
+      const text = el.textContent || "";
+      const done = () => {
+        btn.textContent = "Copied";
+        setTimeout(() => { btn.textContent = label; }, 1800);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(() => {
+          window.prompt("Copy install command", text);
+        });
+      } else {
+        window.prompt("Copy install command", text);
+      }
+    });
+  });
+})();</script>
+</body>
+</html>

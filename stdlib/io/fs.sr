@@ -1,0 +1,544 @@
+//! std.io.fs — file I/O driven by std.sys.io_uring (batched, async-ready)
+//!
+//! Import with:
+//!   use std.io.fs
+//!
+//! `IoFile` wraps a raw descriptor handle (the same handles std.sys.io_uring operates on).
+//! The `io_*` helpers run through a short-lived ring: several reads share one submit, and
+//! the epoll bridge keeps the behaviour identical where native io_uring is unavailable.
+//!
+//!   text = io_read_file("app.toml") or "port = 8080"
+//!   n = io_write_file("out.txt", body) or err { return }
+//!   both = io_read_many(["a.txt", "b.txt"]) or err { return }   // one batched submit
+//!
+//! For plain synchronous helpers (exists, mkdir, list_dir, MemFs) see std.sys.fs.
+
+use std.sys.io_uring
+
+/// Per-read chunk used by `io_read_file` / `io_copy_file`.
++IO_CHUNK = 65536
+
+/// `IoFile` is an open file descriptor with size, sync, and close.
++IoFile = {
+    /// Fd on `IoFile` (`i64`). Defaults to `-1`.
+    fd: i64 = -1
+
+    /// mode: "r" read, "w" create/truncate, "a" append, "rw" read+write (create),
+    ///       "w+" read+write truncating, "x" create new (fails if present).
+    open(path: str, mode: str) : IoFile! {
+        fd = host.sys_fd_open(path, mode) or err {
+            fail "{err}"
+            return
+        }
+        IoFile.{fd}
+    }
+
+    /// Size on this `IoFile`. Returns `i64`, or fails.
+    size(self) : i64! {
+        host.sys_fd_size(self.fd) or err { fail "{err}" }
+    }
+
+    /// Blocking positional read; offset -1 reads at the current position.
+    read_at(self, len: i64, offset: i64) : _! {
+        host.sys_fd_read(self.fd, len, offset) or err { fail "{err}" }
+    }
+
+    /// Blocking positional write; offset -1 writes at the current position.
+    write_at(self, data: _, offset: i64) : i64! {
+        host.sys_fd_write(self.fd, data, offset) or err { fail "{err}" }
+    }
+
+    /// Sync on this `IoFile`. Returns `bool`, or fails.
+    sync(self) : bool! {
+        host.sys_fd_sync(self.fd) or err { fail "{err}" }
+    }
+
+    /// Truncate on this `IoFile` (`len`). Returns `bool`, or fails.
+    truncate(self, len: i64) : bool! {
+        host.sys_fd_truncate(self.fd, len) or err { fail "{err}" }
+    }
+
+    /// Close this `IoFile` and release the underlying resource.
+    close(@self) : bool {
+        ensure self.fd >= 0 else { return false }
+        old = self.fd
+        self.fd = -1
+        host.sys_fd_close(old)
+    }
+}
+
+/// Io exists (`path`).
++io_exists(path: str) : bool => host.sys_exists(path) or false
+
+/// Wait for the single completion of a one-op ring and return its byte count (or -errno).
+io_await_one(ring: IoUring) : i64 {
+    done = ring.wait(1, 5000) or false
+    if host.sys_arr_len(done) == 0 { return -110 }
+    done[0].result
+}
+
+/// Io read file (`path`). Returns `str`, or fails.
++io_read_file(path: str) : str! {
+    ensure path != "" else {
+        fail "io.fs: empty path"
+        return
+    }
+    file = host.sys_fd_open(path, "r") or err {
+        fail "io.fs: cannot open {path}"
+        return
+    }
+    ring = IoUring.new() or err {
+        host.sys_fd_close(file)
+        fail "{err}"
+        return
+    }
+    out = ""
+    offset = 0
+    failed = false
+    for 0..1048576 {
+        @ring.prep_read(file, IO_CHUNK, offset, 1)
+        done = ring.wait(1, 5000) or false
+        if host.sys_arr_len(done) == 0 {
+            failed = true
+            break
+        }
+        res = done[0].result
+        if res < 0 {
+            failed = true
+            break
+        }
+        if res == 0 { break }
+        out = out + host.sys_bytes_to_str(done[0].data)
+        offset += res
+    }
+    host.sys_fd_close(file)
+    @ring.close()
+    ensure !failed else {
+        fail "io.fs: cannot read {path}"
+        return
+    }
+    out
+}
+
+/// Io read bytes (`path`, `max`), or fail.
++io_read_bytes(path: str, max: i64) : _! {
+    file = host.sys_fd_open(path, "r") or err {
+        fail "io.fs: cannot open {path}"
+        return
+    }
+    ring = IoUring.new() or err {
+        host.sys_fd_close(file)
+        fail "{err}"
+        return
+    }
+    @ring.prep_read(file, max, 0, 1)
+    done = ring.wait(1, 5000) or false
+    host.sys_fd_close(file)
+    @ring.close()
+    ensure host.sys_arr_len(done) == 1 && done[0].result >= 0 else {
+        fail "io.fs: cannot read {path}"
+        return
+    }
+    done[0].data
+}
+
+/// Create/truncate `path` and write `data` (str, bytes or byte array). Returns bytes written.
++io_write_file(path: str, data: _) : i64! {
+    ensure path != "" else {
+        fail "io.fs: empty path"
+        return
+    }
+    file = host.sys_fd_open(path, "w") or err {
+        fail "io.fs: cannot open {path}"
+        return
+    }
+    ring = IoUring.new() or err {
+        host.sys_fd_close(file)
+        fail "{err}"
+        return
+    }
+    @ring.prep_write(file, data, 0, 1)
+    n = io_await_one(ring)
+    host.sys_fd_close(file)
+    @ring.close()
+    ensure n >= 0 else {
+        fail "io.fs: cannot write {path}"
+        return
+    }
+    n
+}
+
+/// Like `io_write_file`, then fsync before returning.
++io_write_file_durable(path: str, data: _) : i64! {
+    ensure path != "" else {
+        fail "io.fs: empty path"
+        return
+    }
+    file = host.sys_fd_open(path, "w") or err {
+        fail "io.fs: cannot open {path}"
+        return
+    }
+    ring = IoUring.new() or err {
+        host.sys_fd_close(file)
+        fail "{err}"
+        return
+    }
+    @ring.prep_write(file, data, 0, 1)
+    n = io_await_one(ring)
+    synced = -1
+    if n >= 0 {
+        @ring.prep_fsync(file, 2)
+        synced = io_await_one(ring)
+    }
+    host.sys_fd_close(file)
+    @ring.close()
+    ensure n >= 0 && synced >= 0 else {
+        fail "io.fs: cannot write {path}"
+        return
+    }
+    n
+}
+
+/// Append `data` to `path` (created if missing). Returns bytes written.
++io_append_file(path: str, data: _) : i64! {
+    file = host.sys_fd_open(path, "a") or err {
+        fail "io.fs: cannot open {path}"
+        return
+    }
+    ring = IoUring.new() or err {
+        host.sys_fd_close(file)
+        fail "{err}"
+        return
+    }
+    @ring.prep_write(file, data, IORING_CUR_POS, 1)
+    n = io_await_one(ring)
+    host.sys_fd_close(file)
+    @ring.close()
+    ensure n >= 0 else {
+        fail "io.fs: cannot append {path}"
+        return
+    }
+    n
+}
+
+/// Read several files with ONE submit: every read is queued, then the batch is waited on.
+/// Returns the contents in input order (each file read up to `max` bytes, default 1 MiB).
++io_read_many(paths: _) : _! {
+    n = host.sys_arr_len(paths)
+    results = []
+    ensure n > 0 else { return results }
+    entries = n
+    if entries < 8 { entries = 8 }
+    ring = IoUring.with_entries(entries) or err {
+        fail "{err}"
+        return
+    }
+    files = []
+    bad = ""
+    for paths {
+        f = host.sys_fd_open(it, "r") or -1
+        files = host.sys_arr_push(files, f)
+        if f < 0 && bad == "" { bad = it }
+    }
+    texts = []
+    if bad == "" {
+        for 0..n { @ring.prep_read(files[it], 1048576, 0, it) }
+        done = @ring.submit_and_wait(n, n, 5000) or false
+        texts = host.sys_arr_new(n, "")
+        if host.sys_arr_len(done) == n {
+            for done {
+                if it.result < 0 { bad = "token {it.token}" }
+                texts = host.sys_arr_set(texts, it.token, host.sys_bytes_to_str(it.data))
+            }
+        } else {
+            bad = "timeout"
+        }
+    }
+    for files {
+        if it >= 0 { host.sys_fd_close(it) }
+    }
+    @ring.close()
+    ensure bad == "" else {
+        fail "io.fs: cannot read {bad}"
+        return
+    }
+    texts
+}
+
+/// Copy `src` to `dst` chunk by chunk through the ring. Returns bytes copied.
++io_copy_file(src: str, dst: str) : i64! {
+    input = host.sys_fd_open(src, "r") or err {
+        fail "io.fs: cannot open {src}"
+        return
+    }
+    output = host.sys_fd_open(dst, "w") or err {
+        host.sys_fd_close(input)
+        fail "io.fs: cannot open {dst}"
+        return
+    }
+    ring = IoUring.new() or err {
+        host.sys_fd_close(input)
+        host.sys_fd_close(output)
+        fail "{err}"
+        return
+    }
+    total = 0
+    failed = false
+    for 0..1048576 {
+        @ring.prep_read(input, IO_CHUNK, total, 1)
+        done = ring.wait(1, 5000) or false
+        if host.sys_arr_len(done) == 0 || done[0].result < 0 {
+            failed = true
+            break
+        }
+        got = done[0].result
+        if got == 0 { break }
+        @ring.prep_write(output, done[0].data, total, 2)
+        wrote = io_await_one(ring)
+        if wrote != got {
+            failed = true
+            break
+        }
+        total += got
+    }
+    host.sys_fd_close(input)
+    host.sys_fd_close(output)
+    @ring.close()
+    ensure !failed else {
+        fail "io.fs: copy failed {src} -> {dst}"
+        return
+    }
+    total
+}
+
+// --- in-memory reader/writer adapters (Go io.LimitReader / MultiWriter / Pipe) ---------
+
+/// `IoPipe` is a one-way in-memory byte pipe.
++IoPipe = {
+    /// Left on `IoPipe` (`str`). Defaults to `""`.
+    left: str = ""
+    /// Closed on `IoPipe` (`bool`). Defaults to `false`.
+    closed: bool = false
+}
+
+/// A new in-memory byte pipe.
++io_pipe_new() : IoPipe => IoPipe.{left: "", closed: false}
+
+/// Io pipe write (`p`, `data`). Returns `i64`.
++io_pipe_write(@p: IoPipe, data: str) : i64 {
+    ensure !p.closed else { return -1 }
+    p.left = p.left + data
+    host.sys_str_len(data)
+}
+
+/// Io pipe read (`p`, `max`). Returns `str`.
++io_pipe_read(@p: IoPipe, max: i64) : str {
+    ensure !p.closed else { return "" }
+    n = host.sys_str_len(p.left)
+    if n <= max {
+        out = p.left
+        p.left = ""
+        return out
+    }
+    out = p.left[0..max]
+    p.left = p.left[max..n]
+    out
+}
+
+/// Io pipe close (`p`).
++io_pipe_close(@p: IoPipe) {
+    p.closed = true
+}
+
+/// Io limit reader (`data`, `limit`). Returns `str`.
++io_limit_reader(data: str, limit: i64) : str {
+    n = host.sys_str_len(data)
+    if limit < n { n = limit }
+    data[0..n]
+}
+
+/// Io multi write (`targets`, `data`). Returns `i64`.
++io_multi_write(targets: _, data: str) : i64 {
+    n = host.sys_arr_len(targets)
+    wrote = 0
+    for 0..n {
+        w = targets[it].write_at(data, -1) or 0
+        if w > wrote { wrote = w }
+    }
+    wrote
+}
+
+/// Io copy string (`dst`, `src`). Returns `i64`, or fails.
++io_copy_string(dst: IoFile, src: str) : i64! {
+    dst.write_at(src, -1) or err {
+        fail "io.fs: copy failed"
+        return
+    }
+    host.sys_str_len(src)
+}
+
+/// Test that io_exists mirrors the host.
+test "io_exists mirrors the host" {
+    #assert(io_exists("/"))
+    #assert(!(io_exists("/definitely/not/here")))
+}
+
+/// Test that IoFile blocking positional io.
+test "IoFile blocking positional io" {
+    path = "/tmp/super-io-fs-file.txt"
+    f = IoFile.open(path, "w+") or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(f.write_at("hello world", 0) or -1, 11)
+    assert_eq(f.size() or -1, 11)
+    assert_eq(host.sys_bytes_to_str(f.read_at(5, 6) or ""), "world")
+    assert_eq(f.write_at("W", 6) or -1, 1)
+    assert_eq(host.sys_bytes_to_str(f.read_at(64, 0) or ""), "hello World")
+    #assert(f.sync() or false)
+    #assert(f.truncate(5) or false)
+    assert_eq(f.size() or -1, 5)
+    #assert(@f.close())
+    #assert(!(@f.close()))
+    assert_eq(f.size() or -1, -1)
+    host.sys_remove(path)
+}
+
+/// Test that IoFile open modes.
+test "IoFile open modes" {
+    path = "/tmp/super-io-fs-modes.txt"
+    host.sys_remove(path)
+    assert_eq(IoFile.open(path, "r") or 0, 0)
+    assert_eq(IoFile.open(path, "bogus") or 0, 0)
+    created = IoFile.open(path, "x") or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(IoFile.open(path, "x") or 0, 0)
+    #assert(@created.close())
+    host.sys_remove(path)
+}
+
+/// Test that write then read through the ring.
+test "write then read through the ring" {
+    path = "/tmp/super-io-fs-roundtrip.txt"
+    n = io_write_file(path, "alpha\nbeta\n") or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(n, 11)
+    assert_eq(io_read_file(path) or "?", "alpha\nbeta\n")
+    #assert(io_exists(path))
+    host.sys_remove(path)
+}
+
+/// Test that io_read_file handles empty and multi-chunk files.
+test "io_read_file handles empty and multi-chunk files" {
+    path = "/tmp/super-io-fs-chunks.txt"
+    assert_eq(io_write_file(path, "") or -1, 0)
+    assert_eq(io_read_file(path) or "?", "")
+    // three chunks: 2 * IO_CHUNK + a tail
+    block = "0123456789abcdef"
+    big = ""
+    for 0..(IO_CHUNK / 16 * 2 + 3) { big = big + block }
+    expect = host.sys_str_len(big)
+    assert_eq(io_write_file(path, big) or -1, expect)
+    back = io_read_file(path) or ""
+    assert_eq(host.sys_str_len(back), expect)
+    #assert(back == big)
+    host.sys_remove(path)
+}
+
+/// Test that durable write and append.
+test "durable write and append" {
+    path = "/tmp/super-io-fs-append.txt"
+    assert_eq(io_write_file_durable(path, "one") or -1, 3)
+    assert_eq(io_append_file(path, "-two") or -1, 4)
+    assert_eq(io_append_file(path, "-three") or -1, 6)
+    assert_eq(io_read_file(path) or "?", "one-two-three")
+    host.sys_remove(path)
+}
+
+/// Test that io_read_bytes returns raw bytes.
+test "io_read_bytes returns raw bytes" {
+    path = "/tmp/super-io-fs-bytes.bin"
+    assert_eq(io_write_file(path, [0, 1, 255, 128]) or -1, 4)
+    data = io_read_bytes(path, 16) or err {
+        assert_eq(1, 0)
+        return
+    }
+    arr = host.sys_io_bytes_to_array(data)
+    assert_eq(host.sys_arr_len(arr), 4)
+    assert_eq(arr[0], 0)
+    assert_eq(arr[2], 255)
+    assert_eq(arr[3], 128)
+    host.sys_remove(path)
+}
+
+/// Test that io_read_many batches reads in input order.
+test "io_read_many batches reads in input order" {
+    names = ["/tmp/super-io-fs-m0.txt", "/tmp/super-io-fs-m1.txt", "/tmp/super-io-fs-m2.txt"]
+    bodies = ["first", "second file", "3rd"]
+    for 0..3 { io_write_file(names[it], bodies[it]) }
+    got = io_read_many(names) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_arr_len(got), 3)
+    assert_eq(got[0], "first")
+    assert_eq(got[1], "second file")
+    assert_eq(got[2], "3rd")
+    // a missing file fails the whole batch cleanly
+    missing = io_read_many([names[0], "/tmp/super-io-fs-missing.txt"]) or ["failed"]
+    assert_eq(missing[0], "failed")
+    assert_eq(host.sys_arr_len(io_read_many([]) or ["failed"]), 0)
+    for names { host.sys_remove(it) }
+}
+
+/// Test that io_copy_file copies across chunks.
+test "io_copy_file copies across chunks" {
+    src = "/tmp/super-io-fs-src.txt"
+    dst = "/tmp/super-io-fs-dst.txt"
+    block = "abcdefghijklmnop"
+    big = ""
+    for 0..(IO_CHUNK / 16 + 5) { big = big + block }
+    assert_eq(io_write_file(src, big) or -1, host.sys_str_len(big))
+    assert_eq(io_copy_file(src, dst) or -1, host.sys_str_len(big))
+    #assert((io_read_file(dst) or "") == big)
+    assert_eq(io_copy_file("/tmp/super-io-fs-none.txt", dst) or -1, -1)
+    host.sys_remove(src)
+    host.sys_remove(dst)
+}
+
+/// Test that pipe limit and multi writer.
+test "pipe limit and multi writer" {
+    p = io_pipe_new()
+    assert_eq(io_pipe_write(@p, "ab"), 2)
+    assert_eq(io_pipe_read(@p, 1), "a")
+    assert_eq(io_limit_reader("hello", 3), "hel")
+    path = "/tmp/super-io-fs-multi.txt"
+    io_write_file(path, "") or 0
+    f1 = IoFile.open(path, "w+") or err {
+        assert_eq(1, 0)
+        return
+    }
+    f2 = IoFile.open(path, "w+") or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(io_multi_write([f1, f2], "z") >= 1)
+    @f1.close()
+    @f2.close()
+    io_pipe_close(@p)
+    host.sys_remove(path)
+}
+
+/// Test that error paths are values.
+test "error paths are values" {
+    assert_eq(io_read_file("") or "e", "e")
+    assert_eq(io_read_file("/definitely/not/here") or "e", "e")
+    assert_eq(io_write_file("", "x") or -1, -1)
+    assert_eq(io_write_file("/definitely/not/here/x", "x") or -1, -1)
+    assert_eq(io_append_file("/definitely/not/here/x", "x") or -1, -1)
+    assert_eq(io_read_bytes("/definitely/not/here", 4) or "e", "e")
+}

@@ -1,0 +1,16 @@
+//! std.sys.platform — compile-time platform capabilities.
+
+#cfg(target_os = "linux")
++READINESS_BACKEND = "epoll"
+#cfg(any(target_os = "macos", target_os = "freebsd"))
++READINESS_BACKEND = "kqueue"
+#cfg(target_os = "windows")
++READINESS_BACKEND = "poll"
+
+#cfg(target_os = "linux")
++HAS_IO_URING = true
+#cfg(not(target_os = "linux"))
++HAS_IO_URING = false
+
++readiness_backend() : str => READINESS_BACKEND
++has_io_uring() : bool => HAS_IO_URING

@@ -1,0 +1,164 @@
+//! std.fmt.mime — media types (Go mime / net/http helpers)
+//!
+//! Import with:
+//!   use std.fmt.mime
+//!
+//!   mt = parse_media_type("text/html; charset=UTF-8") or none
+//!   ext = type_by_extension(".json")   // application/json
+
+use std.core.str
+use std.core.collections
+
+/// `MimeType` is a media type, charset, and parameter list.
++MimeType = {
+    /// Media on `MimeType` (`str`). Defaults to `""`.
+    media: str = ""
+    /// Charset on `MimeType` (`str`). Defaults to `""`.
+    charset: str = ""
+    /// Params on `MimeType`. Defaults to `[]`.
+    params: _ = []
+}
+
+/// Go mime.TypeByExtension — `ext` may include a leading dot.
++type_by_extension(ext: str) : str {
+    e = to_lower(ext)
+    if char_count(e) > 0 && e[0] == "." { e = e[1..char_count(e)] }
+    if e == "html" || e == "htm" { return "text/html; charset=utf-8" }
+    if e == "css" { return "text/css; charset=utf-8" }
+    if e == "js" || e == "mjs" { return "text/javascript; charset=utf-8" }
+    if e == "json" { return "application/json" }
+    if e == "txt" || e == "text" || e == "log" || e == "md" { return "text/plain; charset=utf-8" }
+    if e == "csv" { return "text/csv; charset=utf-8" }
+    if e == "xml" { return "application/xml" }
+    if e == "svg" { return "image/svg+xml" }
+    if e == "png" { return "image/png" }
+    if e == "jpg" || e == "jpeg" { return "image/jpeg" }
+    if e == "gif" { return "image/gif" }
+    if e == "webp" { return "image/webp" }
+    if e == "ico" { return "image/x-icon" }
+    if e == "pdf" { return "application/pdf" }
+    if e == "wasm" { return "application/wasm" }
+    if e == "sr" { return "text/plain; charset=utf-8" }
+    "application/octet-stream"
+}
+
+/// Type for path (`path`). Returns `str`.
++type_for_path(path: str) : str {
+    n = char_count(path)
+    dot = -1
+    for 0..n {
+        if path[it] == "/" { dot = -1 }
+        if path[it] == "." { dot = it }
+    }
+    if dot < 0 { return "application/octet-stream" }
+    type_by_extension(path[(dot + 1)..n])
+}
+
+/// Media type only (`content_type`). Returns `str`.
++media_type_only(content_type: str) : str {
+    cut = find(content_type, ";", 0)
+    if cut < 0 { return trim(content_type) }
+    trim(content_type[0..cut])
+}
+
+/// Parse media type (`v`). Returns `MimeType`, or `none`.
++parse_media_type(v: str) : MimeType? {
+    if v == "" { return none }
+    prim = media_type_only(v)
+    if prim == "" { return none }
+    slash = find(prim, "/", 0)
+    if slash <= 0 { return none }
+    params = []
+    n = char_count(v)
+    pos = 0
+    for 0..n {
+        if v[it] == ";" {
+            pos = it + 1
+            break
+        }
+    }
+    guard = 0
+    for 0..64 {
+        if pos >= n { break }
+        skip = 0
+        for 0..n {
+            if pos >= n { break }
+            if v[pos] != " " && v[pos] != ";" { break }
+            pos += 1
+            skip += 1
+            if skip >= 64 { break }
+        }
+        if pos >= n { break }
+        eq = find(v, "=", pos)
+        if eq < 0 { break }
+        key = trim(v[pos..eq])
+        pos = eq + 1
+        val = ""
+        if pos < n && v[pos] == "\"" {
+            pos += 1
+            start = pos
+            for pos..n {
+                if v[it] == "\"" {
+                    pos = it
+                    break
+                }
+            }
+            val = v[start..pos]
+            if pos < n { pos += 1 }
+        } else {
+            start = pos
+            stop = n
+            for pos..n {
+                if v[it] == ";" {
+                    stop = it
+                    break
+                }
+            }
+            pos = stop
+            val = trim(v[start..pos])
+        }
+        if key != "" {
+            params = arr_push(params, key)
+            params = arr_push(params, val)
+        }
+        guard += 1
+        if guard >= 32 { break }
+    }
+    charset = ""
+    m = len(params) / 2
+    for 0..m {
+        if to_lower(params[it * 2]) == "charset" { charset = to_lower(params[it * 2 + 1]) }
+    }
+    MimeType.{media: to_lower(prim), charset, params}
+}
+
+/// Format media type (`media`, `params`). Returns `str`.
++format_media_type(media: str, params: _) : str {
+    out = media
+    n = len(params) / 2
+    for 0..n {
+        k = params[it * 2]
+        val = params[it * 2 + 1]
+        out = out + "; " + k + "=\"" + val + "\""
+    }
+    out
+}
+
+/// Test that type_by_extension and path.
+test "type_by_extension and path" {
+    assert_eq(type_by_extension(".json"), "application/json")
+    assert_eq(type_by_extension("png"), "image/png")
+    assert_eq(type_for_path("/static/app.WASM"), "application/wasm")
+    assert_eq(type_for_path("noext"), "application/octet-stream")
+}
+
+/// Test that parse and format media types.
+test "parse and format media types" {
+    p = parse_media_type("Text/HTML; charset=UTF-8; boundary=foo") or MimeType.{}
+    assert_eq(p.media, "text/html")
+    assert_eq(p.charset, "utf-8")
+    #assert(len(p.params) >= 2)
+    assert_eq(parse_media_type("bogus") or 1, 1)
+    f = format_media_type("application/json", ["charset", "utf-8"])
+    #assert(find(f, "charset", 0) >= 0)
+}

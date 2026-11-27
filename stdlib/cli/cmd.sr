@@ -1,0 +1,1280 @@
+//! std.cli.cmd — command-line programs in the shape of clap
+//!
+//! Import with (preferred — also `use std.cli` or `use std.clap`):
+//!   use std.cli.cmd
+//!
+//!   m = Command.new("tasks")
+//!     .about("task tracker")
+//!     .version("1.0")
+//!     .flag("verbose", "v", "more logs")
+//!     .opt("port", "p", "PORT", "8080", "listen port", false)
+//!     .as_int()
+//!     .from_env("PORT")
+//!     .pos("file", true, "input file")
+//!     .sub(Command.new("add").about("add a task").pos("title", true, "task title"))
+//!     .parse_env() or err { return }
+//!
+//! Builder methods take `self` by value and return `Command` so UFCS chains need
+//! no `@` and no `cmd = cmd.…` reassignment. `cli_args` / `cli_parse` / `CliArgs`
+//! are re-exported from the argv tokenizer (`std.sys.cli`). `parse` takes argv
+//! after the program name; `parse_env` / `parse_args` call `cli_args` and drop
+//! argv[0]. Length, slicing, integer and float parsing, padding, and environment
+//! lookup come from `std.core.str`, `std.core.collections`, and `std.sys.env`.
+//! One left-to-right walk resolves every token; help and version skip required-
+//! argument checks.
+//!
+//! A parent positional is required only when no subcommand was selected.
+//! Flags defined on a parent are accepted before or after the subcommand
+//! name. A flag the child also defines stays on the child. `--` ends options.
+//! `-abc` is three
+//! flags until a character that takes a value, which consumes the rest of the
+//! cluster (`-p8080`) or the next argument (`-p 8080`).
+//!
+//! `counts` turns a flag into a number. `alias` adds subcommand names.
+//! `conflicts` and `requires` relate options. `group` heads a help section.
+//! `author` and `after_help` frame the text. A near miss suggests the option.
+//! `complete_bash` lists the words a shell should offer.
+
+use std.core.str
+use std.core.collections
+use std.sys.cli
+use std.sys.env
+
+/// `Arg` is one flag, option, or positional on a `Command`.
++Arg = {
+    /// `flag`, `opt`, or `pos`.
+    kind: str = "flag"
+    /// Long name, without the leading dashes.
+    name: str = ""
+    /// One-character short name, or empty.
+    short: str = ""
+    /// Placeholder printed in help, such as `PORT`.
+    value_name: str = ""
+    /// Used when the user omits the option and no environment variable is set.
+    fallback: str = ""
+    /// Fail the parse when the user omits it.
+    required: bool = false
+    /// Help line.
+    help: str = ""
+    /// Repeatable option. Values join with a newline.
+    multi: bool = false
+    /// Comma-separated allowed values. Empty allows anything.
+    choices: str = ""
+    /// Environment variable read when the option is absent on the command line.
+    env_key: str = ""
+    /// `""`, `"int"`, or `"float"`.
+    parse_as: str = ""
+    /// Help heading. Empty options stay under `Options`.
+    group: str = ""
+    /// Comma-separated option names that cannot be set together with this one.
+    conflicts: str = ""
+    /// Comma-separated option names that must also be set.
+    requires: str = ""
+    /// Repeated flags increment a count (`-vvv` is `3`) instead of storing `true`.
+    counts: bool = false
+}
+
+/// `Matches` is a successful parse: options, positionals, and at most one child command.
++Matches = {
+    /// Option and flag names.
+    names: _ = []
+    /// Values parallel to `names`.
+    values: _ = []
+    /// `cli`, `env`, or `default`, parallel to `names`.
+    sources: _ = []
+    /// Positional values, in order.
+    positional: _ = []
+    /// Selected subcommand, or empty.
+    sub_name: str = ""
+    /// Zero or one child `Matches`.
+    sub_m: _ = []
+    /// The user asked for help.
+    help: bool = false
+    /// The user asked for the version.
+    show_ver: bool = false
+
+    /// Empty matches.
+    new() : Matches => Matches.{
+        names: [],
+        values: [],
+        sources: [],
+        positional: [],
+        sub_name: "",
+        sub_m: [],
+        help: false,
+        show_ver: false
+    }
+
+    /// Store `name`. A repeatable command-line value appends with a newline.
+    put(@self, name: str, value: str, source: str, multi: bool) : i64 {
+        at = cmd_index(self.names, name)
+        if at >= 0 {
+            next = value
+            cur = self.values[at]
+            if multi && source == "cli" && cur != "" {
+                next = "{cur}\n{value}"
+            }
+            self.values = arr_set(self.values, at, next)
+            self.sources = arr_set(self.sources, at, source)
+            at
+        } else {
+            self.names = arr_push(self.names, name)
+            self.values = arr_push(self.values, value)
+            self.sources = arr_push(self.sources, source)
+            len(self.names) - 1
+        }
+    }
+
+    /// Value of `name`, or empty when it was never set.
+    get(self, name: str) : str {
+        at = cmd_index(self.names, name)
+        ensure at >= 0 else { return "" }
+        self.values[at]
+    }
+
+    /// True when the user or the environment set `name` (a default does not count).
+    given(self, name: str) : bool {
+        at = cmd_index(self.names, name)
+        ensure at >= 0 else { return false }
+        src = self.sources[at]
+        src == "cli" || src == "env"
+    }
+
+    /// True when `name` is `true`, `1`, or `yes`.
+    flag(self, name: str) : bool {
+        v = self.get(name)
+        v == "true" || v == "1" || v == "yes"
+    }
+
+    /// Integer value of `name`, or `default` when it is absent or not an integer.
+    get_int(self, name: str, default: i64) : i64 {
+        v = self.get(name)
+        ensure v != "" else { return default }
+        to_i64(v) or err { return default }
+    }
+
+    /// Float value of `name`, or `default` when it is absent or not a float.
+    get_float(self, name: str, default: f64) : f64 {
+        v = self.get(name)
+        ensure v != "" else { return default }
+        to_f64(v) or err { return default }
+    }
+
+    /// Pieces of a repeatable option.
+    get_many(self, name: str) {
+        v = self.get(name)
+        ensure v != "" else { return [] }
+        split(v, "\n")
+    }
+
+    /// How many positionals were present.
+    pos_count(self) : i64 => len(self.positional)
+
+    /// Positional at `i`, or `default`.
+    pos(self, i: i64, default: str) : str {
+        ensure i >= 0 && i < len(self.positional) else { return default }
+        self.positional[i]
+    }
+
+    /// Child matches. Empty matches when this command had no subcommand.
+    child(self) : Matches {
+        ensure len(self.sub_m) > 0 else { return Matches.new() }
+        self.sub_m[0]
+    }
+}
+
+/// One step of a walk: the matches so far, the next argv index, and any error.
++Step = {
+    /// Matches accumulated so far.
+    matched: Matches
+    /// Next argv index.
+    i: i64 = 0
+    /// Empty when the step succeeded.
+    bad: str = ""
+    /// Help or version ended the walk.
+    stop: bool = false
+}
+
+/// `Command` is a structured command: flags, options, positionals, and subcommands.
++Command: Display = {
+    /// Program or subcommand name.
+    name: str = ""
+
+    /// Display witness. Commands interpolate as their name, plus the about line when set.
+    display(self) : str {
+        if self.about == "" { return self.name }
+        return self.name + " - " + self.about
+    }
+    /// One-line description.
+    about: str = ""
+    /// Version printed by `--version`.
+    ver: str = ""
+    /// `Arg` values, in definition order.
+    args: _ = []
+    /// Child commands.
+    subs: _ = []
+    /// Accept positionals beyond those declared.
+    trailing: bool = false
+    /// Extra names that select this command when it is a subcommand.
+    aliases: str = ""
+    /// Shown under the version line.
+    author: str = ""
+    /// Paragraph printed after the option list.
+    epilogue: str = ""
+
+    /// Command named `name`.
+    new(name: str) : Command => Command.{
+        name,
+        about: "",
+        ver: "",
+        args: [],
+        subs: [],
+        trailing: false,
+        aliases: "",
+        author: "",
+        epilogue: ""
+    }
+
+    /// Set the description.
+    about(self, text: str) : Command {
+        self.about = text
+        self
+    }
+
+    /// Set the version string.
+    version(self, text: str) : Command {
+        self.ver = text
+        self
+    }
+
+    /// Allow extra positionals.
+    trailing_var_arg(self) : Command {
+        self.trailing = true
+        self
+    }
+
+    /// Boolean flag. `short` is one character, or empty.
+    flag(self, name: str, short: str, help: str) : Command {
+        self.args = arr_push(self.args, Arg.{
+            kind: "flag",
+            name,
+            short,
+            value_name: "",
+            fallback: "",
+            required: false,
+            help,
+            multi: false,
+            choices: "",
+            env_key: "",
+            parse_as: "",
+            group: "",
+            conflicts: "",
+            requires: "",
+            counts: false
+        })
+        self
+    }
+
+    /// Option that takes a value. `fallback` is the default, empty when there is none.
+    opt(self, name: str, short: str, value_name: str, fallback: str, help: str, required: bool) : Command {
+        self.args = arr_push(self.args, Arg.{
+            kind: "opt",
+            name,
+            short,
+            value_name,
+            fallback,
+            required,
+            help,
+            multi: false,
+            choices: "",
+            env_key: "",
+            parse_as: "",
+            group: "",
+            conflicts: "",
+            requires: "",
+            counts: false
+        })
+        self
+    }
+
+    /// Positional argument.
+    pos(self, name: str, required: bool, help: str) : Command {
+        self.args = arr_push(self.args, Arg.{
+            kind: "pos",
+            name,
+            short: "",
+            value_name: "",
+            fallback: "",
+            required,
+            help,
+            multi: false,
+            choices: "",
+            env_key: "",
+            parse_as: "",
+            group: "",
+            conflicts: "",
+            requires: "",
+            counts: false
+        })
+        self
+    }
+
+    /// Mark the last argument repeatable.
+    multi(self) : Command {
+        self.args = cmd_mark_last(self.args, "multi")
+        self
+    }
+
+    /// Restrict the last argument to comma-separated `list`.
+    choices(self, list: str) : Command {
+        self.args = cmd_mark_last_text(self.args, "choices", list)
+        self
+    }
+
+    /// Read the last option from environment variable `key` when the flag is absent.
+    from_env(self, key: str) : Command {
+        self.args = cmd_mark_last_text(self.args, "env", key)
+        self
+    }
+
+    /// Parse the last argument as an integer.
+    as_int(self) : Command {
+        self.args = cmd_mark_last_text(self.args, "parse", "int")
+        self
+    }
+
+    /// Parse the last argument as a float.
+    as_float(self) : Command {
+        self.args = cmd_mark_last_text(self.args, "parse", "float")
+        self
+    }
+
+    /// File the last option under help heading `name`.
+    group(self, name: str) : Command {
+        self.args = cmd_mark_last_text(self.args, "group", name)
+        self
+    }
+
+    /// The last option cannot be combined with these comma-separated names.
+    conflicts(self, names: str) : Command {
+        self.args = cmd_mark_last_text(self.args, "conflicts", names)
+        self
+    }
+
+    /// The last option requires these comma-separated names.
+    requires(self, names: str) : Command {
+        self.args = cmd_mark_last_text(self.args, "requires", names)
+        self
+    }
+
+    /// Repeated uses of the last flag increment a count.
+    counts(@self) : Command {
+        self.args = cmd_mark_last(self.args, "counts")
+        self
+    }
+
+    /// Extra subcommand names, comma-separated.
+    alias(self, names: str) : Command {
+        self.aliases = names
+        self
+    }
+
+    /// Author line shown in help.
+    author(self, text: str) : Command {
+        self.author = text
+        self
+    }
+
+    /// Paragraph printed after the option list.
+    after_help(self, text: str) : Command {
+        self.epilogue = text
+        self
+    }
+
+    /// Bash completion script for this command.
+    complete_bash(self) : str {
+        out = "complete -W \""
+        n = len(self.subs)
+        for 0..n {
+            child = self.subs[it]
+            if it > 0 { out = "{out} " }
+            out = "{out}{child.name}"
+        }
+        an = len(self.args)
+        for 0..an {
+            a = self.args[it]
+            if a.kind != "pos" { out = "{out} --{a.name}" }
+        }
+        "{out}\" {self.name}"
+    }
+
+    /// Add a subcommand.
+    sub(@self, child: Command) : Command {
+        self.subs = arr_push(self.subs, child)
+        self
+    }
+
+    /// `name version`, or just the name.
+    version_line(self) : str {
+        ensure self.ver != "" else { return self.name }
+        "{self.name} {self.ver}"
+    }
+
+    /// Usage line starting at `prefix` (`tasks`, or `tasks add`).
+    usage(self, prefix: str) : str {
+        line = "Usage: {prefix}"
+        if cmd_has_switch(self.args) { line = "{line} [OPTIONS]" }
+        n = len(self.args)
+        for 0..n {
+            a = self.args[it]
+            if a.kind == "pos" {
+                if (a.required) { line = "{line} <{a.name}>" }
+                else { line = "{line} [{a.name}]" }
+            }
+        }
+        if len(self.subs) > 0 { line = "{line} [COMMAND]" }
+        line
+    }
+
+    /// Full help for this command invoked as `prefix`.
+    help_text(self, prefix: str) : str {
+        out = self.version_line()
+        if self.author != "" { out = "{out}\n{self.author}" }
+        if self.about != "" { out = "{out}\n{self.about}" }
+        use_line = self.usage(prefix)
+        out = "{out}\n\n{use_line}\n"
+        sn = len(self.subs)
+        if sn > 0 {
+            out = "{out}\nCommands:\n"
+            for 0..sn {
+                child = self.subs[it]
+                left = pad_right(child.name, 16, " ")
+                out = "{out}  {left}{child.about}\n"
+            }
+        }
+        an = len(self.args)
+        pos_n = 0
+        for 0..an {
+            a = self.args[it]
+            if a.kind == "pos" { pos_n = pos_n + 1 }
+        }
+        if pos_n > 0 {
+            out = "{out}\nArguments:\n"
+            for 0..an {
+                a = self.args[it]
+                if a.kind == "pos" {
+                    label = a.name
+                    if (a.required) { label = "<{a.name}>" }
+                    else { label = "[{a.name}]" }
+                    left = pad_right(label, 24, " ")
+                    out = "{out}  {left}{a.help}\n"
+                }
+            }
+        }
+        out = "{out}\nOptions:\n"
+        block = cmd_option_block(self.args, "")
+        out = "{out}{block}"
+        groups = cmd_groups(self.args)
+        gn = len(groups)
+        for 0..gn {
+            heading = groups[it]
+            out = "{out}\n{heading}:\n"
+            out = "{out}{cmd_option_block(self.args, heading)}"
+        }
+        help_left = pad_right("-h, --help", 24, " ")
+        ver_left = pad_right("-V, --version", 24, " ")
+        out = "{out}  {help_left}Print help\n  {ver_left}Print version\n"
+        if self.epilogue != "" { out = "{out}\n{self.epilogue}\n" }
+        out
+    }
+
+    /// Help for this command.
+    help(self) : str => self.help_text(self.name)
+
+    /// Help for subcommand `name`, or this command's help when `name` is unknown.
+    sub_help(self, name: str) : str {
+        at = cmd_find_sub(self.subs, name)
+        ensure at >= 0 else { return self.help() }
+        child = self.subs[at]
+        child.help_text("{self.name} {name}")
+    }
+
+    /// Parse `argv` (no program name). Fails with a usage error.
+    parse(self, argv: _) : Matches! {
+        step = self.walk(argv, self.name)
+        ensure step.bad == "" else {
+            fail step.bad
+            return
+        }
+        step.matched
+    }
+
+    /// Parse the process arguments, skipping the program name.
+    parse_args(self) : Matches! {
+        argv = cli_args()
+        n = len(argv)
+        if n <= 1 { return self.parse([]) }
+        self.parse(argv[1..n])
+    }
+
+    /// Alias of `parse_args` — preferred spelling for application code.
+    parse_env(self) : Matches! {
+        self.parse_args()
+    }
+
+    /// Alias of `parse_env` / `parse_args` (strips `argv[0]`).
+    parse_cli(self) : Matches! {
+        self.parse_args()
+    }
+
+    /// Walk `argv`. `prefix` is the usage path (`tasks add`).
+    walk(self, argv: _, _prefix: str) : Step {
+        m = Matches.new()
+        child_m = Matches.new()
+        child_cmd = Command.new("")
+        child_on = false
+        bad = ""
+        only_pos = false
+        n = len(argv)
+        i = 0
+        for 0..n {
+            if (i >= n || bad != "" || m.help || m.show_ver || child_m.help || child_m.show_ver) { break }
+            arg = argv[i]
+            i = i + 1
+            if only_pos {
+                if child_on {
+                    child_m.positional = arr_push(child_m.positional, arg)
+                } else {
+                    m.positional = arr_push(m.positional, arg)
+                }
+            } else {
+                if arg == "--" {
+                    only_pos = true
+                } else {
+                    if starts_with(arg, "--") {
+                        body = strip_prefix(arg, "--")
+                        if child_on {
+                            step = child_cmd.apply_long(@child_m, body, argv, i, n)
+                            if step.bad != "" && starts_with(step.bad, "unexpected argument") {
+                                parent = self.apply_long(@m, body, argv, i, n)
+                                if parent.bad == "" {
+                                    i = parent.i
+                                    bad = ""
+                                    m = parent.matched
+                                } else {
+                                    i = step.i
+                                    bad = step.bad
+                                    child_m = step.matched
+                                }
+                            } else {
+                                i = step.i
+                                bad = step.bad
+                                child_m = step.matched
+                            }
+                        } else {
+                            step = self.apply_long(@m, body, argv, i, n)
+                            i = step.i
+                            bad = step.bad
+                            m = step.matched
+                        }
+                    } else {
+                        if starts_with(arg, "-") && byte_len(arg) > 1 {
+                            cluster = strip_prefix(arg, "-")
+                            if child_on {
+                                step = child_cmd.apply_short(@child_m, cluster, argv, i, n)
+                                if step.bad != "" && starts_with(step.bad, "unexpected argument") {
+                                    parent = self.apply_short(@m, cluster, argv, i, n)
+                                    if parent.bad == "" {
+                                        i = parent.i
+                                        bad = ""
+                                        m = parent.matched
+                                    } else {
+                                        i = step.i
+                                        bad = step.bad
+                                        child_m = step.matched
+                                    }
+                                } else {
+                                    i = step.i
+                                    bad = step.bad
+                                    child_m = step.matched
+                                }
+                            } else {
+                                step = self.apply_short(@m, cluster, argv, i, n)
+                                i = step.i
+                                bad = step.bad
+                                m = step.matched
+                            }
+                        } else {
+                            sub_at = cmd_find_sub(self.subs, arg)
+                            if sub_at >= 0 && child_on == false && m.sub_name == "" {
+                                m.sub_name = arg
+                                child_cmd = self.subs[sub_at]
+                                child_on = true
+                            } else {
+                                if child_on {
+                                    child_m.positional = arr_push(child_m.positional, arg)
+                                } else {
+                                    m.positional = arr_push(m.positional, arg)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ensure bad == "" else { return Step.{matched: m, i, bad, stop: false} }
+        if child_on {
+            done = child_cmd.finish(@child_m)
+            ensure done.bad == "" else { return Step.{matched: m, i, bad: done.bad, stop: false} }
+            m.sub_m = [done.matched]
+        }
+        self.finish(@m)
+    }
+
+    /// Apply one `--name` or `--name=value` token. `i` is the next argv index.
+    apply_long(self, @m: Matches, body: str, argv: _, i: i64, n: i64) : Step {
+        eq = find(body, "=")
+        name = body
+        value = ""
+        has_eq = false
+        if eq >= 0 {
+            name = substr(body, 0, eq)
+            value = substr(body, eq + 1, byte_len(body))
+            has_eq = true
+        }
+        slot = cmd_find_named(self.args, name)
+        if slot < 0 {
+            if name == "help" {
+                m.help = true
+                return Step.{matched: m, i, bad: "", stop: true}
+            }
+            if name == "version" {
+                m.show_ver = true
+                return Step.{matched: m, i, bad: "", stop: true}
+            }
+            bad = "unexpected argument --{name}"
+            hint = cmd_suggest(self.args, name)
+            if hint != "" { bad = "{bad} (did you mean --{hint}?)" }
+            return Step.{matched: m, i, bad, stop: false}
+        }
+        a = self.args[slot]
+        if a.kind == "flag" {
+            flag_v = "true"
+            if a.counts == true {
+                cur = 0
+                if m.given(a.name) { cur = m.get_int(a.name, 0) }
+                flag_v = "{cur + 1}"
+            }
+            if has_eq { flag_v = value }
+            @m.put(a.name, flag_v, "cli", false)
+            return Step.{matched: m, i, bad: "", stop: false}
+        }
+        if !has_eq {
+            if i >= n {
+                return Step.{matched: m, i, bad: "option --{name} requires a value", stop: false}
+            }
+            value = argv[i]
+            i = i + 1
+        }
+        @m.put(a.name, value, "cli", a.multi)
+        Step.{matched: m, i, bad: "", stop: false}
+    }
+
+    /// Apply a short cluster such as `-vq` or `-p8080`.
+    apply_short(self, @m: Matches, cluster: str, argv: _, i: i64, n: i64) : Step {
+        k = 0
+        kn = byte_len(cluster)
+        bad = ""
+        for 0..kn {
+            if (k >= kn || bad != "" || m.help || m.show_ver) { break }
+            ch = cluster[k]
+            k = k + 1
+            slot = cmd_find_short(self.args, ch)
+            if slot < 0 {
+                if ch == "h" {
+                    m.help = true
+                } else {
+                    if ch == "V" {
+                        m.show_ver = true
+                    } else {
+                        bad = "unexpected argument -{ch}"
+                    }
+                }
+            } else {
+                a = self.args[slot]
+                if a.kind == "flag" {
+                    flag_v = "true"
+                    if a.counts == true {
+                        cur = 0
+                        if m.given(a.name) { cur = m.get_int(a.name, 0) }
+                        flag_v = "{cur + 1}"
+                    }
+                    @m.put(a.name, flag_v, "cli", false)
+                } else {
+                    rest = substr(cluster, k, kn)
+                    value = rest
+                    if rest == "" {
+                        if i >= n {
+                            bad = "option -{ch} requires a value"
+                        } else {
+                            value = argv[i]
+                            i = i + 1
+                        }
+                    } else {
+                        k = kn
+                    }
+                    if bad == "" { @m.put(a.name, value, "cli", a.multi) }
+                }
+            }
+        }
+        Step.{matched: m, i, bad, stop: m.help || m.show_ver}
+    }
+
+    /// Fill defaults, read the environment, and report anything still missing.
+    finish(self, @m: Matches) : Step {
+        if (m.help || m.show_ver) {
+            return Step.{matched: m, i: 0, bad: "", stop: true}
+        }
+        bad = ""
+        n = len(self.args)
+        for 0..n {
+            if bad != "" { break }
+            a = self.args[it]
+            kind = a.kind
+            nm = a.name
+            req = a.required
+            envk = a.env_key
+            fb = a.fallback
+            if kind == "flag" {
+                if !m.given(nm) {
+                    fill = "false"
+                    if a.counts == true { fill = "0" }
+                    @m.put(nm, fill, "default", false)
+                }
+            }
+            if kind == "opt" {
+                if m.given(nm) {
+                    bad = cmd_check_value(a, m.get(nm))
+                } else {
+                    filled = false
+                    if envk != "" {
+                        ev = env_get(envk) or ""
+                        if ev != "" {
+                            bad = cmd_check_value(a, ev)
+                            if bad == "" { @m.put(nm, ev, "env", false) }
+                            filled = true
+                        }
+                    }
+                    if bad == "" && !filled && fb != "" {
+                        @m.put(nm, fb, "default", false)
+                        filled = true
+                    }
+                    if bad == "" && !filled && req {
+                        bad = "missing required option --{nm}"
+                    }
+                }
+            }
+        }
+        if bad == "" {
+            for 0..n {
+                if bad != "" { break }
+                a = self.args[it]
+                if m.given(a.name) && a.conflicts != "" {
+                    parts = split_count(a.conflicts, ",")
+                    listed = a.conflicts
+                    owner = a.name
+                    for 0..parts {
+                        other = trim(split_nth(listed, ",", it))
+                        if other != "" && m.given(other) {
+                            bad = "--{owner} conflicts with --{other}"
+                        }
+                    }
+                }
+                if bad == "" && m.given(a.name) && a.requires != "" {
+                    parts = split_count(a.requires, ",")
+                    for 0..parts {
+                        other = trim(split_nth(a.requires, ",", it))
+                        if other != "" && !m.given(other) {
+                            bad = "--{a.name} requires --{other}"
+                        }
+                    }
+                }
+            }
+        }
+        if bad == "" && m.sub_name == "" {
+            got = len(m.positional)
+            seen = 0
+            for 0..n {
+                if bad != "" { break }
+                a = self.args[it]
+                kind = a.kind
+                req = a.required
+                nm = a.name
+                fb = a.fallback
+                if kind == "pos" {
+                    if seen >= got {
+                        if req {
+                            bad = "missing required argument <{nm}>"
+                        } else {
+                            if fb != "" { m.positional = arr_push(m.positional, fb) }
+                        }
+                    }
+                    seen = seen + 1
+                }
+            }
+            if (bad == "" && got > seen && !self.trailing) {
+                extra = m.positional[seen]
+                bad = "unexpected argument {extra}"
+            }
+        }
+        Step.{matched: m, i: 0, bad, stop: false}
+    }
+}
+
+/// Index of `name` in `names`, or -1.
+cmd_index(names: _, name: str) : i64 {
+    pos = -1
+    n = len(names)
+    for 0..n {
+        if pos < 0 && names[it] == name { pos = it }
+    }
+    pos
+}
+
+/// Index of the argument named `name`, or -1.
+cmd_find_named(args: _, name: str) : i64 {
+    pos = -1
+    n = len(args)
+    for 0..n {
+        if pos < 0 {
+            a = args[it]
+            if a.name == name && a.kind != "pos" { pos = it }
+        }
+    }
+    pos
+}
+
+/// Index of the argument whose short name is `ch`, or -1.
+cmd_find_short(args: _, ch: str) : i64 {
+    pos = -1
+    n = len(args)
+    for 0..n {
+        if pos < 0 {
+            a = args[it]
+            if a.short != "" && a.short == ch { pos = it }
+        }
+    }
+    pos
+}
+
+/// Index of the subcommand named `name`, or -1.
+cmd_find_sub(subs: _, name: str) : i64 {
+    pos = -1
+    n = len(subs)
+    for 0..n {
+        if pos < 0 {
+            child = subs[it]
+            if child.name == name || cmd_one_of(child.aliases, name) { pos = it }
+        }
+    }
+    pos
+}
+
+/// True when `args` contains a flag or an option.
+cmd_has_switch(args: _) : bool {
+    hit = false
+    n = len(args)
+    for 0..n {
+        a = args[it]
+        if a.kind != "pos" { hit = true }
+    }
+    hit
+}
+
+/// Help label for a flag or option.
+cmd_switch_label(a: Arg) : str {
+    long = "--{a.name}"
+    if a.kind == "opt" && a.value_name != "" { long = "{long} <{a.value_name}>" }
+    ensure a.short != "" else { return long }
+    "-{a.short}, {long}"
+}
+
+/// Set a boolean marker on the last argument.
+cmd_mark_last(args: _, which: str) {
+    n = len(args)
+    ensure n > 0 else { return args }
+    a = args[n - 1]
+    if which == "multi" { a.multi = true }
+    if which == "counts" { a.counts = true }
+    arr_set(args, n - 1, a)
+}
+
+/// Set a text marker on the last argument.
+cmd_mark_last_text(args: _, which: str, text: str) {
+    n = len(args)
+    ensure n > 0 else { return args }
+    a = args[n - 1]
+    if which == "choices" { a.choices = text }
+    if which == "env" { a.env_key = text }
+    if which == "parse" { a.parse_as = text }
+    if which == "group" { a.group = text }
+    if which == "conflicts" { a.conflicts = text }
+    if which == "requires" { a.requires = text }
+    arr_set(args, n - 1, a)
+}
+
+/// Empty when `value` is acceptable for `a`.
+cmd_check_value(a: Arg, value: str) : str {
+    if a.multi && contains(value, "\n") {
+        bad = ""
+        parts = split_count(value, "\n")
+        for 0..parts {
+            if bad == "" {
+                piece = split_nth(value, "\n", it)
+                bad = cmd_check_one(a, piece)
+            }
+        }
+        return bad
+    }
+    cmd_check_one(a, value)
+}
+
+/// Empty when one value matches the declared parser and choices.
+cmd_check_one(a: Arg, value: str) : str {
+    if a.parse_as == "int" {
+        n = to_i64(value) or err { return "invalid integer for --{a.name}" }
+        if n == 0 && value != "0" && !starts_with(trim(value), "-") && !starts_with(trim(value), "+") {
+            return "invalid integer for --{a.name}"
+        }
+    }
+    if a.parse_as == "float" {
+        n = to_f64(value) or err { return "invalid float for --{a.name}" }
+        if n != n { return "invalid float for --{a.name}" }
+    }
+    if a.choices != "" && !cmd_one_of(a.choices, value) {
+        return "invalid value for --{a.name}"
+    }
+    ""
+}
+
+/// Option lines whose `group` equals `heading`. An empty heading is the ungrouped set.
+cmd_option_block(args: _, heading: str) : str {
+    out = ""
+    n = len(args)
+    for 0..n {
+        a = args[it]
+        if a.kind != "pos" && a.group == heading {
+            left = pad_right(cmd_switch_label(a), 24, " ")
+            extra = ""
+            if a.fallback != "" { extra = "{extra} [default: {a.fallback}]" }
+            if a.env_key != "" { extra = "{extra} [env: {a.env_key}]" }
+            if a.required && a.fallback == "" { extra = "{extra} [required]" }
+            if a.counts == true { extra = "{extra} [count]" }
+            out = "{out}  {left}{a.help}{extra}\n"
+        }
+    }
+    out
+}
+
+/// Distinct non-empty group names, in first-seen order.
+cmd_groups(args: _) {
+    out = []
+    n = len(args)
+    for 0..n {
+        a = args[it]
+        if a.group != "" && cmd_index(out, a.group) < 0 {
+            out = arr_push(out, a.group)
+        }
+    }
+    out
+}
+
+/// Closest option name within one edit, or empty.
+cmd_suggest(args: _, typed: str) : str {
+    best = ""
+    best_d = 2
+    n = len(args)
+    for 0..n {
+        a = args[it]
+        if a.kind != "pos" {
+            dist = cmd_distance(typed, a.name)
+            if dist > 0 && dist < best_d {
+                best_d = dist
+                best = a.name
+            }
+        }
+    }
+    best
+}
+
+/// Levenshtein distance. Names longer than 24 count as far apart.
+cmd_distance(left: str, right: str) : i64 {
+    na = byte_len(left)
+    nb = byte_len(right)
+    if na > 24 || nb > 24 { return 9 }
+    if na == 0 { return nb }
+    if nb == 0 { return na }
+    width = nb + 1
+    prev = arr_new(width, 0)
+    cur = arr_new(width, 0)
+    for 0..width { prev = arr_set(prev, it, it) }
+    i = 0
+    j = 0
+    for 0..na {
+        i = it
+        cur = arr_set(cur, 0, i + 1)
+        for 0..nb {
+            j = it
+            cost = 1
+            if left[i] == right[j] { cost = 0 }
+            del = prev[j + 1] + 1
+            ins = cur[j] + 1
+            sub = prev[j] + cost
+            best = del
+            if ins < best { best = ins }
+            if sub < best { best = sub }
+            cur = arr_set(cur, j + 1, best)
+        }
+        hold = prev
+        prev = cur
+        cur = hold
+    }
+    prev[nb]
+}
+
+/// True when `value` is one of the comma-separated `list` entries.
+cmd_one_of(list: str, value: str) : bool {
+    hit = false
+    n = split_count(list, ",")
+    for 0..n {
+        if trim(split_nth(list, ",", it)) == value { hit = true }
+    }
+    hit
+}
+
+/// Test that long options, equals form, and short flags.
+test "long options, equals form, and short flags" {
+    cmd = Command.new("tasks")
+    cmd = cmd.flag("verbose", "v", "more logs")
+    cmd = cmd.flag("quiet", "q", "less logs")
+    cmd = cmd.opt("port", "p", "PORT", "8080", "listen port", false)
+    m = cmd.parse(["-vq", "--port=9090"]) or err { fail "{err}"
+        return }
+    #assert(m.flag("verbose"))
+    #assert(m.flag("quiet"))
+    assert_eq(m.get("port"), "9090")
+    #assert(m.given("port"))
+    #assert(!(m.flag("absent")))
+}
+
+/// Test that short and long options take the next argument.
+test "short and long options take the next argument" {
+    cmd = Command.new("tasks")
+    cmd = cmd.opt("port", "p", "PORT", "", "listen port", true)
+    cmd = cmd.as_int()
+    a = cmd.parse(["-p", "8080"]) or err { fail "{err}"
+        return }
+    b = cmd.parse(["--port", "9090"]) or err { fail "{err}"
+        return }
+    c = cmd.parse(["-p8081"]) or err { fail "{err}"
+        return }
+    assert_eq(a.get_int("port", 0), 8080)
+    assert_eq(b.get_int("port", 0), 9090)
+    assert_eq(c.get("port"), "8081")
+}
+
+/// Test that later values replace earlier ones and repeatable options append.
+test "later values replace earlier ones and repeatable options append" {
+    cmd = Command.new("tasks")
+    cmd = cmd.opt("mode", "m", "MODE", "dev", "mode", false)
+    cmd = cmd.opt("tag", "t", "TAG", "", "tag", false)
+    cmd = cmd.multi()
+    m = cmd.parse(["--mode=dev", "--mode", "prod", "-t", "a", "-t", "b"]) or err { fail "{err}"
+        return }
+    assert_eq(m.get("mode"), "prod")
+    assert_eq(m.get("tag"), "a\nb")
+    assert_eq(len(m.get_many("tag")), 2)
+}
+
+/// Test that defaults, environment, and required options.
+test "defaults, environment, and required options" {
+    host.sys_env_set("SUPER_CMD_PORT", "4040")
+    cmd = Command.new("tasks")
+    cmd = cmd.opt("port", "p", "PORT", "8080", "listen port", false)
+    cmd = cmd.from_env("SUPER_CMD_PORT")
+    cmd = cmd.opt("name", "n", "NAME", "", "name", true)
+    missed = cmd.parse([]) or err { "{err}" }
+    assert_eq(missed, "missing required option --name")
+    m = cmd.parse(["--name", "ada"]) or err { fail "{err}"
+        return }
+    assert_eq(m.get("port"), "4040")
+    #assert(m.given("port"))
+    bare = Command.new("tasks")
+    bare = bare.opt("port", "p", "PORT", "8080", "listen port", false)
+    d = bare.parse([]) or err { fail "{err}"
+        return }
+    assert_eq(d.get("port"), "8080")
+    #assert(!(d.given("port")))
+}
+
+/// Test that positionals, double dash, and unexpected arguments.
+test "positionals, double dash, and unexpected arguments" {
+    cmd = Command.new("tasks")
+    cmd = cmd.pos("file", true, "input file")
+    cmd = cmd.pos("out", false, "output")
+    m = cmd.parse(["--", "--not-a-flag", "out.sr"]) or err { fail "{err}"
+        return }
+    assert_eq(m.pos(0, ""), "--not-a-flag")
+    assert_eq(m.pos(1, ""), "out.sr")
+    missing = cmd.parse([]) or err { "{err}" }
+    assert_eq(missing, "missing required argument <file>")
+    extra = cmd.parse(["a.sr", "b.sr", "c.sr"]) or err { "{err}" }
+    assert_eq(extra, "unexpected argument c.sr")
+    open = Command.new("tasks")
+    open = open.pos("file", true, "input")
+    open = open.trailing_var_arg()
+    many = open.parse(["a.sr", "b.sr"]) or err { fail "{err}"
+        return }
+    assert_eq(many.pos_count(), 2)
+}
+
+/// Test that subcommands keep parent flags and their own arguments.
+test "subcommands keep parent flags and their own arguments" {
+    add = Command.new("add")
+    add = add.about("add a task")
+    add = add.pos("title", true, "task title")
+    cmd = Command.new("tasks")
+    cmd = cmd.flag("verbose", "v", "more logs")
+    cmd = @cmd.sub(add)
+    m = cmd.parse(["-v", "add", "ship it"]) or err { fail "{err}"
+        return }
+    #assert(m.flag("verbose"))
+    assert_eq(m.sub_name, "add")
+    assert_eq(m.child().pos(0, ""), "ship it")
+    later = cmd.parse(["add", "-v", "ship it"]) or err { fail "{err}"
+        return }
+    #assert(later.flag("verbose"))
+    assert_eq(later.child().pos(0, ""), "ship it")
+    missed = cmd.parse(["add"]) or err { "{err}" }
+    assert_eq(missed, "missing required argument <title>")
+}
+
+/// Test that help and version succeed without required arguments.
+test "help and version succeed without required arguments" {
+    cmd = Command.new("tasks")
+    cmd = cmd.version("1.2")
+    cmd = cmd.about("task tracker")
+    cmd = cmd.pos("file", true, "input file")
+    cmd = cmd.opt("port", "p", "PORT", "8080", "listen port", false)
+    h = cmd.parse(["--help"]) or err { fail "{err}"
+        return }
+    #assert(h.help)
+    s = cmd.parse(["-h"]) or err { fail "{err}"
+        return }
+    #assert(s.help)
+    v = cmd.parse(["-V"]) or err { fail "{err}"
+        return }
+    #assert(v.show_ver)
+    assert_eq(cmd.version_line(), "tasks 1.2")
+    text = cmd.help()
+    #assert(contains(text, "Usage: tasks [OPTIONS] <file>"))
+    #assert(contains(text, "--port <PORT>"))
+    #assert(contains(text, "[default: 8080]"))
+    #assert(contains(text, "-h, --help"))
+}
+
+/// Test that subcommand help uses the parent prefix.
+test "subcommand help uses the parent prefix" {
+    add = Command.new("add")
+    add = add.about("add a task")
+    add = add.pos("title", true, "task title")
+    cmd = Command.new("tasks")
+    cmd = @cmd.sub(add)
+    m = cmd.parse(["add", "--help"]) or err { fail "{err}"
+        return }
+    #assert(m.child().help)
+    #assert(contains(cmd.sub_help("add"), "Usage: tasks add <title>"))
+}
+
+/// Test that integers, floats, and choices are checked while parsing.
+test "integers, floats, and choices are checked while parsing" {
+    cmd = Command.new("tasks")
+    cmd = cmd.opt("port", "p", "PORT", "1", "port", false)
+    cmd = cmd.as_int()
+    cmd = cmd.opt("rate", "r", "RATE", "1.5", "rate", false)
+    cmd = cmd.as_float()
+    cmd = cmd.opt("mode", "m", "MODE", "dev", "mode", false)
+    cmd = cmd.choices("dev, prod")
+    bad_i = cmd.parse(["--port", "nope"]) or err { "{err}" }
+    assert_eq(bad_i, "invalid integer for --port")
+    bad_c = cmd.parse(["--mode", "ship"]) or err { "{err}" }
+    assert_eq(bad_c, "invalid value for --mode")
+    m = cmd.parse(["--port", "-4", "--rate", "2.5", "--mode", "prod"]) or err { fail "{err}"
+        return }
+    assert_eq(m.get_int("port", 0), -4)
+    assert_eq(m.get_float("rate", 0.0), 2.5)
+    unknown = cmd.parse(["--nope"]) or err { "{err}" }
+    assert_eq(unknown, "unexpected argument --nope")
+    missing = cmd.parse(["--port"]) or err { "{err}" }
+    assert_eq(missing, "option --port requires a value")
+}
+
+/// Test that a defined -h is a user flag and --help still asks for help.
+test "a defined short help flag still leaves --help alone" {
+    cmd = Command.new("tasks")
+    cmd = cmd.flag("human", "h", "human units")
+    m = cmd.parse(["-h"]) or err { fail "{err}"
+        return }
+    #assert(m.flag("human"))
+    #assert(!(m.help))
+    asked = cmd.parse(["--help"]) or err { fail "{err}"
+        return }
+    #assert(asked.help)
+}
+
+/// Test that parse_args skips the program name.
+test "parse_args skips the program name" {
+    cmd = Command.new("tasks")
+    cmd = cmd.flag("verbose", "v", "more logs")
+    m = cmd.parse_args() or err { fail "{err}"
+        return }
+    #assert(m.flag("verbose") == true || m.flag("verbose") == false)
+}
+
+/// Test that counts, aliases, conflicts, requirements, groups, and suggestions parse.
+test "counts, aliases, conflicts, requirements, and suggestions" {
+    add = Command.new("add")
+    add = add.alias("create, new")
+    add = add.pos("title", true, "task title")
+    cmd = Command.new("tasks")
+    cmd = cmd.author("Super")
+    cmd = cmd.after_help("See the book.")
+    cmd = cmd.flag("verbose", "v", "more logs")
+    cmd = @cmd.counts()
+    cmd = cmd.flag("json", "j", "json output")
+    cmd = cmd.group("format")
+    cmd = cmd.flag("quiet", "q", "less logs")
+    cmd = cmd.conflicts("verbose")
+    cmd = cmd.opt("config", "c", "FILE", "", "config file", false)
+    cmd = cmd.requires("json")
+    cmd = @cmd.sub(add)
+    loud = cmd.parse(["-vv", "add", "ship"]) or err { fail "{err}"
+        return }
+    assert_eq(loud.get_int("verbose", 0), 2)
+    assert_eq(loud.sub_name, "add")
+    named = cmd.parse(["create", "ship"]) or err { fail "{err}"
+        return }
+    assert_eq(named.sub_name, "create")
+    clash = cmd.parse(["-v", "-q"]) or err { "{err}" }
+    assert_eq(clash, "--quiet conflicts with --verbose")
+    need = cmd.parse(["--config", "a.toml"]) or err { "{err}" }
+    assert_eq(need, "--config requires --json")
+    hint = cmd.parse(["--verbos"]) or err { "{err}" }
+    assert_eq(hint, "unexpected argument --verbos (did you mean --verbose?)")
+    text = cmd.help()
+    #assert(contains(text, "Super"))
+    #assert(contains(text, "format:"))
+    #assert(contains(text, "See the book."))
+    #assert(contains(cmd.complete_bash(), "--verbose"))
+    assert_eq(cmd_distance("port", "por"), 1)
+}

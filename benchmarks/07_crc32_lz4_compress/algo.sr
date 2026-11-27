@@ -1,0 +1,21 @@
+// 07_crc32 — IEEE CRC32 on expanded LCG-scrambled block (parity checksum)
+use std.fmt.compress
+use std.core.str
+
+#SEED = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.."
+
++main() {
+    block = #SEED
+    for 0..6 { block = block + block }
+    block_len = 64 * 64
+    rng = 8137778
+    acc = 0
+    for 0..4096 {
+        rng = (rng * 1103515245 + 12345) % 2147483648
+        acc += (rng % 255) + ord(block[it % block_len])
+    }
+    payload = block
+    for 0..8 { payload = payload + block }
+    cs = crc32_str(payload) + crc32_str(block) + acc % 1000
+    print("CHECKSUM={cs}")
+}

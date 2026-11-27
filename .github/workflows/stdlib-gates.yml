@@ -1,0 +1,121 @@
+# Stdlib conformance gates (Appendix B + template fuzz + secret/vault boundary).
+# Fails the job when tree / SPEC / count script disagree, shared secret/vault
+# names appear, template build diags regress, or the template fuzzer crashes.
+name: stdlib-gates
+
+on:
+  push:
+    paths:
+      - "examples/**"
+      - "pods/**"
+      - "crates/super-cli/**"
+      - "stdlib/**"
+      - "scripts/count_stdlib.py"
+      - "scripts/law_coverage.py"
+      - "scripts/lint_vacuous_laws.py"
+      - "docs/law_coverage_floor.json"
+      - "scripts/assert_secret_vault_names.py"
+      - "scripts/fuzz_template.py"
+      - "crates/super-frontend/**"
+      - "crates/super-core/**"
+      - "SPECIFICATION.md"
+      - "BOOK.md"
+      - "book/parts/**"
+      - "docs/*.md"
+      - "scripts/check_doc_code.py"
+      - ".github/workflows/stdlib-gates.yml"
+  pull_request:
+    paths:
+      - "examples/**"
+      - "pods/**"
+      - "crates/super-cli/**"
+      - "stdlib/**"
+      - "scripts/count_stdlib.py"
+      - "scripts/law_coverage.py"
+      - "scripts/lint_vacuous_laws.py"
+      - "docs/law_coverage_floor.json"
+      - "scripts/assert_secret_vault_names.py"
+      - "scripts/fuzz_template.py"
+      - "crates/super-frontend/**"
+      - "crates/super-core/**"
+      - "SPECIFICATION.md"
+      - "BOOK.md"
+      - "book/parts/**"
+      - "docs/*.md"
+      - "scripts/check_doc_code.py"
+      - ".github/workflows/stdlib-gates.yml"
+  workflow_dispatch:
+
+jobs:
+  counts-and-names:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tree / SPEC / mod.sr must agree
+        run: python3 scripts/count_stdlib.py
+      - name: Law coverage floor
+        run: python3 scripts/law_coverage.py
+      - name: Lint vacuous or unanchored laws
+        run: python3 scripts/lint_vacuous_laws.py
+      - name: No shared public names between secret and vault
+        run: python3 scripts/assert_secret_vault_names.py
+
+  template-diags:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build-time T001–T004 diagnostics
+        run: cargo test -p super-frontend --test template_diags --lib template -- --nocapture
+
+  template-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fuzz template parser for 10 minutes
+        env:
+          SUPER_TEMPLATE_FUZZ_SECS: "600"
+        run: python3 scripts/fuzz_template.py
+
+  stdlib-modules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build super CLI
+        run: cargo build -p super-cli --release
+      - name: Test html.template + sec.secret
+        run: |
+          ./target/release/super test stdlib/html/template.sr
+          ./target/release/super test stdlib/sec/secret.sr
+          ./target/release/super test stdlib/sec/vault.sr
+      - name: Verify template + secret laws
+        run: |
+          ./target/release/super verify stdlib/html/template.sr
+          ./target/release/super verify stdlib/sec/secret.sr
+
+  style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build super CLI
+        run: cargo build -p super-cli --release
+      - name: super fmt --check (stdlib, examples, pods)
+        run: ./target/release/super fmt --check stdlib examples pods
+      - name: super lint (stdlib policy in stdlib/lint.toml)
+        run: ./target/release/super lint --config stdlib/lint.toml stdlib
+      - name: super lint (examples and pods use their Pod.toml [lint])
+        run: ./target/release/super lint examples pods
+
+  doc-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Super CLI
+        run: cargo build -p super-cli
+      - name: Compile complete documentation modules
+        run: python3 scripts/check_doc_code.py

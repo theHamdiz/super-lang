@@ -1,0 +1,18 @@
+//! Laws for std.fmt.xml — real-body (`xml_is_ws` / `xml_char_ok`).
+//! Escape/parse loops remain host-heavy (docs/LAWS_STATUS.md).
+//! AI agents must not edit this file; put discharges in `xml.proof.sr`.
+
+#law("xml_is_ws marks space newline tab")
+xml_is_ws_space() {
+    #assert(xml_is_ws(" "))
+    #assert(xml_is_ws("\n"))
+    #assert(xml_is_ws("\t"))
+}
+
+#law("xml_char_ok accepts tab newline return")
+xml_char_ok_tab() {
+    #assert(xml_char_ok(9))
+    #assert(xml_char_ok(10))
+    #assert(xml_char_ok(13))
+    #assert(!xml_char_ok(0))
+}

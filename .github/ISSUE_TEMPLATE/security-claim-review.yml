@@ -1,0 +1,33 @@
+name: Security claim review
+description: Challenge overstated safety, crypto, or platform support in docs or spec
+labels: ["security", "documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For exploitable bugs use [private advisories](https://github.com/theHamdiz/super-lang/security/advisories/new). This template is for **wording and scope** reviews — see [docs/SAFETY_CLAIMS.md](https://github.com/theHamdiz/super-lang/blob/main/docs/SAFETY_CLAIMS.md).
+  - type: textarea
+    id: claim
+    attributes:
+      label: Claim quoted
+      description: Exact sentence from README, spec, or site
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: File path or URL
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Why it is overstated or untested
+    validations:
+      required: true
+  - type: textarea
+    id: fix
+    attributes:
+      label: Suggested honest wording
+    validations:
+      required: false

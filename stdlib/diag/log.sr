@@ -1,0 +1,684 @@
+//! std.diag.log — leveled, structured logging (logfmt or JSON lines) with redaction
+//!
+//! Import with:
+//!   use std.diag.log
+//!
+//! Then:  lg = Logger.new("api")
+//!        @lg.info("server started")
+//!        @lg.infof("request", [field("path", "/orders"), field_int("ms", 12)])
+//!        @lg.set_json(true)
+//!        print(lg.dump())
+//!
+//! Text:  2023-11-14T22:13:20.000Z INFO  [api] request path=/orders ms=12
+//! JSON:  {"ts":"2023-11-14T22:13:20.000Z","level":"info","logger":"api","msg":"request","path":"/orders","ms":12}
+//!
+//! A `Logger` is a plain value that collects formatted lines in a bounded buffer
+//! (oldest dropped past `cap`), optionally echoing each line with `print`. Every
+//! emit mutates the logger, so call sites use `@lg.info(...)` etc. Time is a
+//! logical clock when `set_clock(ms)` is used (deterministic tests, replays) and
+//! the wall clock (`wall_clock_ns`) otherwise. Values of fields named like
+//! secrets (password, token, secret, authorization, api_key, cookie) are
+//! replaced by `***` so credentials cannot leak into logs by accident.
+
+use std.core.collections
+use std.core.str
+use std.sys.time
+use std.io.console
+use std.io.stdio
+
+/// `LOG_TRACE` is `10`.
++LOG_TRACE = 10
+/// `LOG_DEBUG` is `20`.
++LOG_DEBUG = 20
+/// `LOG_INFO` is `30`.
++LOG_INFO = 30
+/// `LOG_WARN` is `40`.
++LOG_WARN = 40
+/// `LOG_ERROR` is `50`.
++LOG_ERROR = 50
+/// `LOG_OFF` is `100`.
++LOG_OFF = 100
+
+/// Sink kinds: 0 = buffer only, 1 = stdout, 2 = stderr, 3 = both console, 4 = headless (buffer, no echo).
++LOG_SINK_BUFFER = 0
++LOG_SINK_STDOUT = 1
++LOG_SINK_STDERR = 2
++LOG_SINK_CONSOLE = 3
++LOG_SINK_HEADLESS = 4
+
+/// `LogField` is one structured logging field.
++LogField = {
+    /// K on `LogField` (`str`). Defaults to `""`.
+    k: str = ""
+    /// V on `LogField` (`str`). Defaults to `""`.
+    v: str = ""
+    /// Raw on `LogField` (`bool`). Defaults to `false`.
+    raw: bool = false
+}
+
+/// `Logger` emits structured log lines, with level, JSON mode, redaction, color, and sinks.
++Logger = {
+    /// Logger name included on each line. Defaults to `""`.
+    name: str = ""
+    /// Minimum level that is emitted. Defaults to `30`.
+    level: i64 = 30
+    /// True when lines are JSON objects. Defaults to `false`.
+    json: bool = false
+    /// Clock source used to stamp each line. Defaults to `-1`.
+    clock: i64 = -1
+    /// Echo on `Logger` (`bool`). Defaults to `false`.
+    echo: bool = false
+    /// Cap on `Logger` (`i64`). Defaults to `1000`.
+    cap: i64 = 1000
+    /// Lines on `Logger`. Defaults to `[]`.
+    lines: _ = []
+    /// Ctx on `Logger`. Defaults to `[]`.
+    ctx: _ = []
+    /// Emitted on `Logger` (`i64`). Defaults to `0`.
+    emitted: i64 = 0
+    /// Dropped on `Logger` (`i64`). Defaults to `0`.
+    dropped: i64 = 0
+    /// Counts on `Logger`. Defaults to `[]`.
+    counts: _ = []
+    /// Sink: buffer / stdout / stderr / console / headless. Defaults to `0`.
+    sink: i64 = 0
+    /// Colorize echoed lines when the terminal wants color. Defaults to `true`.
+    color: bool = true
+    /// Optional HTTP / TSDB ingest URL (empty = disabled). Defaults to `""`.
+    ingest_url: str = ""
+    /// Batched remote lines waiting for flush. Defaults to `[]`.
+    remote: _ = []
+
+    /// Create a fresh `Logger`.
+    new(name: str) : Logger {
+        Logger.{name, level: 30, json: false, clock: -1, echo: false, cap: 1000, lines: [], ctx: [], emitted: 0, dropped: 0, counts: [0, 0, 0, 0, 0], sink: 0, color: true, ingest_url: "", remote: []}
+    }
+
+    /// Headless logger: buffers only, never writes streams.
+    headless(name: str) : Logger {
+        lg = Logger.new(name)
+        lg.sink = LOG_SINK_HEADLESS
+        lg.echo = false
+        lg
+    }
+
+    /// Console logger: colored stderr echo at info+.
+    console(name: str) : Logger {
+        lg = Logger.new(name)
+        lg.sink = LOG_SINK_CONSOLE
+        lg.echo = true
+        lg
+    }
+
+    /// Set the minimum level that is emitted to `lvl`.
+    set_level(@self, lvl: i64) : i64 {
+        self.level = lvl
+        lvl
+    }
+
+    /// Emit JSON lines when `on` is true, and plain text when it is false.
+    set_json(@self, on: bool) : bool {
+        self.json = on
+        on
+    }
+
+    /// Also print each line when `on` is true.
+    set_echo(@self, on: bool) : bool {
+        self.echo = on
+        on
+    }
+
+    /// Select the output sink (`LOG_SINK_*`).
+    set_sink(@self, sink: i64) : i64 {
+        self.sink = sink
+        if sink == LOG_SINK_HEADLESS { self.echo = false }
+        if sink == LOG_SINK_CONSOLE || sink == LOG_SINK_STDOUT || sink == LOG_SINK_STDERR {
+            self.echo = true
+        }
+        sink
+    }
+
+    /// Enable or disable ANSI color on echoed lines.
+    set_color(@self, on: bool) : bool {
+        self.color = on
+        on
+    }
+
+    /// Point remote ingest at an HTTP/TSDB endpoint (flushed by `flush_remote`).
+    set_ingest(@self, url: str) : str {
+        self.ingest_url = url
+        url
+    }
+
+    /// Pin the timestamp (unix ms); pass -1 to go back to the wall clock.
+    set_clock(@self, ms: i64) : i64 {
+        self.clock = ms
+        ms
+    }
+
+    /// Keep at most `cap` lines in memory.
+    set_cap(@self, cap: i64) : i64 {
+        self.cap = cap
+        cap
+    }
+
+    /// Attach the structured field `f` to every later line.
+    context(@self, f: LogField) : i64 {
+        self.ctx = arr_push(self.ctx, f)
+        len(self.ctx)
+    }
+
+    /// Drop the fields attached by `context`.
+    clear_context(@self) : i64 {
+        self.ctx = []
+        0
+    }
+
+    /// Enabled on this `Logger` (`lvl`).
+    enabled(self, lvl: i64) : bool => lvl >= self.level && self.level < 100
+
+    /// Emit one line when `lvl` passes the filter. Returns true when emitted.
+    emit(@self, lvl: i64, msg: str, extra: _) : bool {
+        ensure lvl >= self.level && self.level < 100 else { return false }
+        ms = self.clock
+        if ms < 0 { ms = wall_clock_ns() / 1000000 }
+        ts = iso8601(ms)
+        all = self.ctx
+        for extra { all = arr_push(all, it) }
+        line = log_text_line(ts, lvl, self.name, msg, all)
+        if (self.json) { line = log_json_line(ts, lvl, self.name, msg, all) }
+        self.lines = arr_push(self.lines, line)
+        self.emitted += 1
+        slot = lvl / 10 - 1
+        if slot < 0 { slot = 0 }
+        if slot > 4 { slot = 4 }
+        self.counts = arr_set(self.counts, slot, self.counts[slot] + 1)
+        n = len(self.lines)
+        if n > (self.cap) {
+            self.lines = self.lines[(n - self.cap)..n]
+            self.dropped += n - self.cap
+        }
+        if self.ingest_url != "" {
+            self.remote = arr_push(self.remote, line)
+        }
+        if (self.echo) && self.sink != LOG_SINK_HEADLESS {
+            painted = line
+            if self.color {
+                if lvl >= LOG_ERROR { painted = paint(CONSOLE_ERR, line) }
+                if lvl >= LOG_WARN && lvl < LOG_ERROR { painted = paint(CONSOLE_WARN, line) }
+                if lvl >= LOG_INFO && lvl < LOG_WARN { painted = paint(CONSOLE_INFO, line) }
+                if lvl < LOG_INFO { painted = paint(CONSOLE_DIM, line) }
+            }
+            if self.sink == LOG_SINK_STDOUT {
+                stdout.write_str("{painted}\n") or 0
+            } else {
+                stderr.write_str("{painted}\n") or 0
+            }
+        }
+        true
+    }
+
+    /// How many remote lines are queued.
+    remote_len(self) : i64 => len(self.remote)
+
+    /// Drain remote queue into a single payload (for HTTP/TSDB sinks). Clears the queue.
+    flush_remote(@self) : str {
+        out = ""
+        rs = self.remote
+        for rs {
+            if index > 0 { out = out + "\n" }
+            out = out + it
+        }
+        self.remote = []
+        out
+    }
+
+    /// Emit `msg` at trace level.
+    trace(@self, msg: str) : bool => @self.emit(10, msg, [])
+    /// Emit `msg` at debug level.
+    debug(@self, msg: str) : bool => @self.emit(20, msg, [])
+    /// Emit `msg` at info level.
+    info(@self, msg: str) : bool => @self.emit(30, msg, [])
+    /// Emit `msg` at warn level.
+    warn(@self, msg: str) : bool => @self.emit(40, msg, [])
+    /// Emit `msg` at error level.
+    error(@self, msg: str) : bool => @self.emit(50, msg, [])
+
+    /// Emit `msg` at trace level, with structured fields `extra`.
+    tracef(@self, msg: str, extra: _) : bool => @self.emit(10, msg, extra)
+    /// Emit `msg` at debug level, with structured fields `extra`.
+    debugf(@self, msg: str, extra: _) : bool => @self.emit(20, msg, extra)
+    /// Emit `msg` at info level, with structured fields `extra`.
+    infof(@self, msg: str, extra: _) : bool => @self.emit(30, msg, extra)
+    /// Emit `msg` at warn level, with structured fields `extra`.
+    warnf(@self, msg: str, extra: _) : bool => @self.emit(40, msg, extra)
+    /// Emit `msg` at error level, with structured fields `extra`.
+    errorf(@self, msg: str, extra: _) : bool => @self.emit(50, msg, extra)
+
+    /// Same as `len`.
+    count(self) : i64 => len(self.lines)
+
+    /// Lines emitted at exactly `lvl` (10..50) since creation.
+    count_level(self, lvl: i64) : i64 {
+        slot = lvl / 10 - 1
+        ensure slot >= 0 && slot <= 4 else { return 0 }
+        self.counts[slot]
+    }
+
+    /// Newest buffered line ("" when empty).
+    last(self) : str {
+        n = len(self.lines)
+        ensure n > 0 else { return "" }
+        self.lines[n - 1]
+    }
+
+    /// Dump on this `Logger`. Returns `str`.
+    dump(self) : str {
+        out = ""
+        ls = self.lines
+        for ls {
+            if index > 0 { out = out + "\n" }
+            out = out + it
+        }
+        out
+    }
+
+    /// Clear on this `Logger`. Returns `i64`.
+    clear(@self) : i64 {
+        self.lines = []
+        0
+    }
+
+    /// Number of buffered lines containing `needle`.
+    grep(self, needle: str) : i64 {
+        hits = 0
+        nn = byte_len(needle)
+        ls = self.lines
+        for ls {
+            line = it
+            n = byte_len(line)
+            found = false
+            for 0..(n - nn + 1) {
+                if !found && line[it..(it + nn)] == needle { found = true }
+            }
+            if found { hits += 1 }
+        }
+        hits
+    }
+}
+
+// --- fields ------------------------------------------------------------------------------
+
+/// Field (`k`, `v`). Returns `LogField`.
++field(k: str, v: str) : LogField => LogField.{k, v, raw: false}
+/// Field int (`k`, `n`). Returns `LogField`.
++field_int(k: str, n: i64) : LogField => LogField.{k, v: "" + n, raw: true}
+/// Field float (`k`, `x`). Returns `LogField`.
++field_float(k: str, x: f64) : LogField => LogField.{k, v: "" + x, raw: true}
+/// Field bool (`k`, `b`). Returns `LogField`.
++field_bool(k: str, b: bool) : LogField {
+    if b { return LogField.{k, v: "true", raw: true} }
+    LogField.{k, v: "false", raw: true}
+}
+
+// --- levels ------------------------------------------------------------------------------
+
+/// Log level name (`level`). Returns `str`.
++log_level_name(level: i64) : str {
+    if level <= 10 { return "trace" }
+    if level <= 20 { return "debug" }
+    if level <= 30 { return "info" }
+    if level <= 40 { return "warn" }
+    if level <= 50 { return "error" }
+    "off"
+}
+
+/// "INFO " style tag padded to 5 characters.
++log_level_tag(level: i64) : str {
+    if level <= 10 { return "TRACE" }
+    if level <= 20 { return "DEBUG" }
+    if level <= 30 { return "INFO " }
+    if level <= 40 { return "WARN " }
+    "ERROR"
+}
+
+/// Level from a name (any case of trace/debug/info/warn/error/off); `dflt` otherwise.
++log_level_parse(name: str, dflt: i64) : i64 {
+    n = byte_len(name)
+    low = ""
+    for 0..n {
+        cp = ord(name[it])
+        if cp >= 65 && cp <= 90 { low = low + chr(cp + 32) } else { low = low + name[it] }
+    }
+    if low == "trace" { return 10 }
+    if low == "debug" { return 20 }
+    if low == "info" { return 30 }
+    if low == "warn" || low == "warning" { return 40 }
+    if low == "error" { return 50 }
+    if low == "off" || low == "none" { return 100 }
+    dflt
+}
+
+// --- time --------------------------------------------------------------------------------
+
+/// Log pad (`v`, `width`). Returns `str`.
++log_pad(v: i64, width: i64) : str {
+    s = "" + v
+    for 0..width {
+        if byte_len(s) < width { s = "0" + s }
+    }
+    s
+}
+
+/// Floor division for possibly negative numerators.
++log_fdiv(a: i64, b: i64) : i64 {
+    q = a / b
+    if a % b < 0 { return q - 1 }
+    q
+}
+
+/// Unix milliseconds -> "YYYY-MM-DDTHH:MM:SS.mmmZ" (proleptic Gregorian, UTC).
++iso8601(ms: i64) : str {
+    days = log_fdiv(ms, 86400000)
+    rem = ms - days * 86400000
+    z = days + 719468
+    era = log_fdiv(z, 146097)
+    doe = z - era * 146097
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp = (5 * doy + 2) / 153
+    d = doy - (153 * mp + 2) / 5 + 1
+    m = mp + 3
+    if mp >= 10 { m = mp - 9 }
+    if m <= 2 { y = y + 1 }
+    hh = rem / 3600000
+    mm = (rem / 60000) % 60
+    ss = (rem / 1000) % 60
+    mmm = rem % 1000
+    log_pad(y, 4) + "-" + log_pad(m, 2) + "-" + log_pad(d, 2) + "T" + log_pad(hh, 2) + ":" + log_pad(mm, 2) + ":" + log_pad(ss, 2) + "." + log_pad(mmm, 3) + "Z"
+}
+
+// --- formatting --------------------------------------------------------------------------
+
+/// Log is secret (`key`).
++log_is_secret(key: str) : bool {
+    names = ["password", "passwd", "secret", "token", "authorization", "api_key", "apikey", "cookie", "credential"]
+    hit = false
+    n = byte_len(key)
+    low = ""
+    for 0..n {
+        cp = ord(key[it])
+        if cp >= 65 && cp <= 90 { low = low + chr(cp + 32) } else { low = low + key[it] }
+    }
+    for names {
+        word = it
+        wn = byte_len(word)
+        for 0..(n - wn + 1) {
+            if low[it..(it + wn)] == word { hit = true }
+        }
+    }
+    hit
+}
+
+/// Log needs quote (`v`).
++log_needs_quote(v: str) : bool {
+    n = byte_len(v)
+    if n == 0 { return true }
+    need = false
+    for 0..n {
+        c = v[it]
+        if c == " " || c == "\"" || c == "=" || c == "\t" || c == "\n" { need = true }
+    }
+    need
+}
+
+/// Log escape (`v`). Returns `str`.
++log_escape(v: str) : str {
+    out = ""
+    n = byte_len(v)
+    for 0..n {
+        c = v[it]
+        if c == "\"" {
+            out = out + "\\\""
+        } else {
+            if c == "\\" {
+                out = out + "\\\\"
+            } else {
+                if c == "\n" {
+                    out = out + "\\n"
+                } else {
+                    if c == "\t" {
+                        out = out + "\\t"
+                    } else {
+                        if c == "\r" {
+                            out = out + "\\r"
+                        } else {
+                            out = out + c
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Log json str (`v`). Returns `str`.
++log_json_str(v: str) : str => "\"" + log_escape(v) + "\""
+
+/// Log shown (`f`). Returns `str`.
++log_shown(f: LogField) : str {
+    if log_is_secret(f.k) { return "***" }
+    f.v
+}
+
+/// Log text line (`ts`, `level`, `name`, `msg`, `extra`). Returns `str`.
++log_text_line(ts: str, level: i64, name: str, msg: str, extra: _) : str {
+    line = ts + " " + log_level_tag(level) + " "
+    if name != "" { line = line + "[" + name + "] " }
+    line = line + msg
+    for extra {
+        f = it
+        v = log_shown(f)
+        if log_needs_quote(v) && !(f.raw && !log_is_secret(f.k)) { v = "\"" + log_escape(v) + "\"" }
+        line = line + " " + f.k + "=" + v
+    }
+    line
+}
+
+/// Log json line (`ts`, `level`, `name`, `msg`, `extra`). Returns `str`.
++log_json_line(ts: str, level: i64, name: str, msg: str, extra: _) : str {
+    line = "\{\"ts\":" + log_json_str(ts) + ",\"level\":" + log_json_str(log_level_name(level))
+    if name != "" { line = line + ",\"logger\":" + log_json_str(name) }
+    line = line + ",\"msg\":" + log_json_str(msg)
+    for extra {
+        f = it
+        v = log_shown(f)
+        if f.raw && !log_is_secret(f.k) {
+            line = line + "," + log_json_str(f.k) + ":" + v
+        } else {
+            line = line + "," + log_json_str(f.k) + ":" + log_json_str(v)
+        }
+    }
+    line + "\}"
+}
+
+// --- tests -------------------------------------------------------------------------------
+
+/// Test that iso8601 known instants.
+test "iso8601 known instants" {
+    assert_eq(iso8601(0), "1970-01-01T00:00:00.000Z")
+    assert_eq(iso8601(1700000000000), "2023-11-14T22:13:20.000Z")
+    assert_eq(iso8601(951782400000), "2000-02-29T00:00:00.000Z")
+    assert_eq(iso8601(1709164800123), "2024-02-29T00:00:00.123Z")
+    assert_eq(iso8601(86399999), "1970-01-01T23:59:59.999Z")
+    assert_eq(iso8601(-1), "1969-12-31T23:59:59.999Z")
+    assert_eq(iso8601(4102444800000), "2100-01-01T00:00:00.000Z")
+    assert_eq(iso8601(1767225600000), "2026-01-01T00:00:00.000Z")
+}
+
+/// Test that levels: names, tags and parsing.
+test "levels: names, tags and parsing" {
+    assert_eq(log_level_name(10), "trace")
+    assert_eq(log_level_name(30), "info")
+    assert_eq(log_level_name(50), "error")
+    assert_eq(log_level_name(100), "off")
+    assert_eq(log_level_tag(30), "INFO ")
+    assert_eq(log_level_tag(40), "WARN ")
+    assert_eq(log_level_tag(50), "ERROR")
+    assert_eq(log_level_parse("WARN", 0), 40)
+    assert_eq(log_level_parse("Info", 0), 30)
+    assert_eq(log_level_parse("warning", 0), 40)
+    assert_eq(log_level_parse("off", 0), 100)
+    assert_eq(log_level_parse("loud", 30), 30)
+}
+
+/// Test that text line format.
+test "text line format" {
+    lg = Logger.new("api")
+    @lg.set_clock(1700000000000)
+    #assert(@lg.info("started"))
+    assert_eq(lg.last(), "2023-11-14T22:13:20.000Z INFO  [api] started")
+    @lg.set_clock(1700000001500)
+    @lg.errorf("failed", [field("path", "/orders"), field_int("status", 500)])
+    assert_eq(lg.last(), "2023-11-14T22:13:21.500Z ERROR [api] failed path=/orders status=500")
+}
+
+/// Test that anonymous logger omits the name.
+test "anonymous logger omits the name" {
+    lg = Logger.new("")
+    @lg.set_clock(0)
+    @lg.warn("careful")
+    assert_eq(lg.last(), "1970-01-01T00:00:00.000Z WARN  careful")
+}
+
+/// Test that logfmt quoting.
+test "logfmt quoting" {
+    lg = Logger.new("t")
+    @lg.set_clock(0)
+    @lg.infof("m", [field("who", "Amina Hassan"), field("q", "a=b"), field("e", ""), field("quote", "say \"hi\"")])
+    _line = lg.last()
+    assert_eq(lg.grep("who=\"Amina Hassan\""), 1)
+    assert_eq(lg.grep("q=\"a=b\""), 1)
+    assert_eq(lg.grep("e=\"\""), 1)
+    assert_eq(lg.grep("quote=\"say \\\"hi\\\"\""), 1)
+    #assert(!(log_needs_quote("plain")))
+    #assert(log_needs_quote("two words"))
+    #assert(log_needs_quote(""))
+}
+
+/// Test that json lines.
+test "json lines" {
+    lg = Logger.new("api")
+    @lg.set_clock(1700000000000)
+    @lg.set_json(true)
+    @lg.infof("request", [field("path", "/x"), field_int("ms", 12), field_bool("cached", true), field_float("ratio", 0.5)])
+    assert_eq(lg.last(), "\{\"ts\":\"2023-11-14T22:13:20.000Z\",\"level\":\"info\",\"logger\":\"api\",\"msg\":\"request\",\"path\":\"/x\",\"ms\":12,\"cached\":true,\"ratio\":0.5\}")
+    @lg.info("say \"hi\"\n")
+    assert_eq(lg.grep("\"msg\":\"say \\\"hi\\\"\\n\""), 1)
+}
+
+/// Test that level filtering.
+test "level filtering" {
+    lg = Logger.new("x")
+    @lg.set_clock(0)
+    #assert(!(@lg.trace("t")))
+    #assert(!(@lg.debug("d")))
+    #assert(@lg.info("i"))
+    #assert(@lg.warn("w"))
+    #assert(@lg.error("e"))
+    assert_eq(lg.count(), 3)
+    @lg.set_level(10)
+    #assert(@lg.trace("t"))
+    assert_eq(lg.count(), 4)
+    @lg.set_level(50)
+    #assert(!(@lg.warn("w")))
+    #assert(@lg.error("e"))
+    @lg.set_level(100)
+    #assert(!(@lg.error("e")))
+    #assert(!(lg.enabled( 50)))
+    assert_eq(lg.count(), 5)
+}
+
+/// Test that per-level counters survive buffer trimming.
+test "per-level counters survive buffer trimming" {
+    lg = Logger.new("x")
+    @lg.set_clock(0)
+    @lg.set_cap(2)
+    @lg.info("1")
+    @lg.info("2")
+    @lg.warn("3")
+    @lg.error("4")
+    assert_eq(lg.count(), 2)
+    assert_eq(lg.dropped, 2)
+    assert_eq(lg.emitted, 4)
+    assert_eq(lg.count_level(30), 2)
+    assert_eq(lg.count_level(40), 1)
+    assert_eq(lg.count_level(50), 1)
+    assert_eq(lg.count_level(10), 0)
+    assert_eq(lg.count_level(99), 0)
+    assert_eq(lg.grep("] 1"), 0)
+    assert_eq(lg.grep("4"), 1)
+}
+
+/// Test that context fields ride on every line.
+test "context fields ride on every line" {
+    lg = Logger.new("svc")
+    @lg.set_clock(0)
+    @lg.context(field("req", "abc123"))
+    @lg.info("one")
+    @lg.infof("two", [field_int("n", 2)])
+    assert_eq(lg.grep("req=abc123"), 2)
+    assert_eq(lg.grep("n=2"), 1)
+    @lg.clear_context()
+    @lg.info("three")
+    assert_eq(lg.grep("req=abc123"), 2)
+    assert_eq(lg.last(), "1970-01-01T00:00:00.000Z INFO  [svc] three")
+}
+
+/// Test that secrets are redacted in both formats.
+test "secrets are redacted in both formats" {
+    lg = Logger.new("auth")
+    @lg.set_clock(0)
+    @lg.infof("login", [field("user", "amina"), field("password", "hunter2"), field("Authorization", "Bearer abc"), field_int("api_key", 12345)])
+    assert_eq(lg.grep("hunter2"), 0)
+    assert_eq(lg.grep("Bearer"), 0)
+    assert_eq(lg.grep("12345"), 0)
+    assert_eq(lg.grep("password=***"), 1)
+    assert_eq(lg.grep("user=amina"), 1)
+    @lg.set_json(true)
+    @lg.infof("login", [field("session_token", "tok"), field("note", "ok")])
+    assert_eq(lg.grep("\"session_token\":\"***\""), 1)
+    assert_eq(lg.grep("\"note\":\"ok\""), 1)
+    #assert(log_is_secret("MyPassword"))
+    #assert(!(log_is_secret("username")))
+}
+
+/// Test that buffer helpers.
+test "buffer helpers" {
+    lg = Logger.new("b")
+    @lg.set_clock(0)
+    assert_eq(lg.last(), "")
+    assert_eq(lg.dump(), "")
+    @lg.info("a")
+    @lg.info("b")
+    assert_eq(lg.grep("INFO"), 2)
+    dump = lg.dump()
+    assert_eq(lg.grep("[b] a"), 1)
+    #assert(byte_len(dump) > 40)
+    @lg.clear()
+    assert_eq(lg.count(), 0)
+    assert_eq(lg.emitted, 2)
+}
+
+/// Test that wall clock stamps look like ISO times.
+test "wall clock stamps look like ISO times" {
+    lg = Logger.new("live")
+    @lg.info("now")
+    line = lg.last()
+    assert_eq(line[4], "-")
+    assert_eq(line[10], "T")
+    assert_eq(line[23], "Z")
+    assert_eq(line[0..2], "20")
+}

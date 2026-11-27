@@ -1,0 +1,129 @@
+// Game #3 — High-density tower defense (50k creeps, parallel targeting)
+//
+// Run: super test examples/05_tower_defense/
+
+use std.core.collections
+use std.math.noise
+
+#NEIGHBOR_OFFSETS = #for i in 0..8 { i - 4 }
+#NEIGHBOR_COUNT = 8
+
++Creep = {
+    id: i64 = 0
+    hp: i64 = 10
+    x: f64 = 0.0
+    y: f64 = 0.0
+    speed: f64 = 1.0
+}
+
++Tower = {
+    id: i64 = 0
+    x: f64 = 0.0
+    y: f64 = 0.0
+    range: f64 = 5.0
+    damage: i64 = 2
+}
+
++Projectile = {
+    tx: f64 = 0.0
+    ty: f64 = 0.0
+    dmg: i64 = 1
+}
+
++spawn_wave(n: i64) : i64 {
+    creeps = 0
+    for 0..n {
+        creeps += 1
+    }
+    creeps
+}
+
++grid_cell(x: f64, y: f64, cell: f64) : i64 {
+    (x / cell) + (y / cell) * 1000
+}
+
++grid_neighbors(cell: i64) : i64 {
+    span = 0
+    for off in #NEIGHBOR_OFFSETS {
+        span += off + cell
+    }
+    span
+}
+
++retarget(creeps: i64, towers: i64) : i64 {
+    // Parallel spatial pass — counts targeting pairs.
+    pairs = 0
+    #simd
+    par 0..creeps {
+        pairs += towers
+    }
+    creeps * towers
+}
+
++fire_projectiles(n: i64) : i64 {
+    q = chan[Projectile](128)
+    hits = shared 0
+    scope {
+        tracker = spawn {
+            n = 0
+            for _p in q {
+                @hits += 1
+                n += 1
+            }
+            n
+        }
+        for 0..n {
+            q.send(Projectile{tx: 1.0, ty: 1.0, dmg: 1})
+        }
+        q.close()
+        tracked = await tracker
+        tracked
+    }
+}
+
++economy(wave: i64) : i64 {
+    gold = 100
+    for 0..wave {
+        gold += 25
+    }
+    gold
+}
+
+test "spawn 50k creeps" {
+    assert_eq(spawn_wave(50000), 50000)
+}
+
+test "grid cell deterministic" {
+    assert_eq(grid_cell(12.0, 8.0, 4.0), 2003)
+}
+
+test "parallel retarget pairs" {
+    assert_eq(retarget(10, 3), 30)
+}
+
+test "projectile channel tracking" {
+    assert_eq(fire_projectiles(20), 20)
+}
+
+test "wave economy" {
+    assert_eq(economy(4), 200)
+}
+
+test "comptime neighbor offsets" {
+    assert_eq(#NEIGHBOR_COUNT, 8)
+    assert_eq(grid_neighbors(100), 796)
+}
+
+test "stdlib: collections priority queue + noise determinism" {
+    q = PriorityQueue.new()
+    @q.push(5, 50)
+    @q.push(1, 10)
+    @q.push(3, 30)
+    assert_eq(q.size, 3)
+    assert_eq(@q.pop() or 0 - 1, 10)
+    assert_eq(@q.pop() or 0 - 1, 30)
+    assert_eq(perlin2(1.5, 2.5, 7), perlin2(1.5, 2.5, 7))
+    n = value2(3.3, 4.4, 1)
+    #assert(n >= 0.0)
+    #assert(n <= 1.0)
+}

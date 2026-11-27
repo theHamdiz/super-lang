@@ -1,0 +1,7 @@
+//! Human-locked laws for the ledger example.
+//! Put discharges in `ledger.proof.sr`.
+
+#law("a transfer moves money without creating or destroying it")
+transfer_conserves(src: i64, dst: i64, amount: i64) {
+    #assert((src - amount) + (dst + amount) == src + dst)
+}

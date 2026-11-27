@@ -1,0 +1,780 @@
+//! std.data.column — typed, null-aware columns for data frames
+//!
+//! Import with:
+//!   use std.data.column
+//!
+//!   ids = int_col("id", [1, 2, 3])
+//!   price = float_col("price", [9.5, 2.25, 4.0])
+//!   @price.push_null()                        // a missing value
+//!   price.total()                               // 15.75 (nulls are skipped)
+//!   price.average() or 0.0
+//!   tags = str_col("tag", ["a", "b", "a"])
+//!   tags.n_unique()                           // 2
+//!   ok = bool_col("ok", [true, false, true])
+//!   ok.count_true()                           // 2
+//!
+//! A column is a name, a flat value array and a parallel `nulls` array (`1` marks a missing value;
+//! the stored value at a null position is the type's zero and is never read by the aggregates).
+//! `IntCol`, `FloatCol`, `BoolCol` and `StrCol` expose the same method names, so call them through
+//! typed locals (the VM resolves methods statically). `take(idx)` gathers rows, with `-1` producing a
+//! null (used by outer joins). Dtype tags (`DT_INT` ...) identify a column kind inside a frame.
+//! Public helpers are prefixed `dt_`.
+
+use std.core.str
+use std.core.collections
+
+/// Dtype tag for `IntCol`.
++DT_INT = 0
+/// Dtype tag for `FloatCol`.
++DT_FLOAT = 1
+/// Dtype tag for `BoolCol`.
++DT_BOOL = 2
+/// Dtype tag for `StrCol`.
++DT_STR = 3
+
+/// Human-readable dtype name.
++dt_kind_name(kind: i64) : str {
+    if kind == DT_INT { return "int" }
+    if kind == DT_FLOAT { return "float" }
+    if kind == DT_BOOL { return "bool" }
+    "str"
+}
+
+/// An all-`fill` array of length `n`.
++dt_repeat(n: i64, fill: i64) => host.sys_arr_new(n, fill)
+
+/// 31-bit polynomial string hash (for group and join keys).
++dt_hash_str(s: str) : i64 {
+    h = 5381
+    n = host.sys_str_len(s)
+    i = 0
+    while i < n {
+        h = (h * 33 + host.sys_ord(s[i])) & 2147483647
+        i += 1
+    }
+    h
+}
+
+/// Float absolute value.
++dt_abs(x: f64) : f64 {
+    if x < 0.0 { return -x }
+    x
+}
+
+/// Exact float equality (`==` on floats is tolerance-based on the VM).
++dt_same(a: f64, b: f64) : bool => !(a < b) && !(a > b)
+
+// --- IntCol -------------------------------------------------------------------------------------
+
+/// A nullable column of `i64`.
++IntCol = {
+    name: str = ""
+    vals: _ = []
+    nulls: _ = []
+
+    /// Empty column called `name`.
+    new(name: str) : IntCol => IntCol.{name, vals: [], nulls: []}
+
+    /// Number of rows (null or not).
+    size(self) : i64 => host.sys_arr_len(self.vals)
+
+    /// True when row `i` is missing.
+    is_null(self, i: i64) : bool => self.nulls[i] == 1
+
+    /// Value at row `i` (zero for a null).
+    get(self, i: i64) : i64 => self.vals[i]
+
+    /// Append a value.
+    push(@self, v: i64) : i64 {
+        self.vals = host.sys_arr_push(self.vals, v)
+        self.nulls = host.sys_arr_push(self.nulls, 0)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Append a missing value.
+    push_null(@self) : i64 {
+        self.vals = host.sys_arr_push(self.vals, 0)
+        self.nulls = host.sys_arr_push(self.nulls, 1)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Text of row `i` (`""` for a null).
+    text_at(self, i: i64) : str {
+        if self.nulls[i] == 1 { return "" }
+        "{self.vals[i]}"
+    }
+
+    /// Same data under another name.
+    named(self, name: str) : IntCol => IntCol.{name, vals: self.vals, nulls: self.nulls}
+
+    /// Gather rows by index; `-1` (or any out-of-range index) yields a null.
+    take(self, idx: _) : IntCol {
+        m = host.sys_arr_len(idx)
+        n = host.sys_arr_len(self.vals)
+        vals = host.sys_arr_new(m, 0)
+        nulls = host.sys_arr_new(m, 0)
+        i = 0
+        while i < m {
+            it = idx[i]
+            if it < 0 || it >= n || self.nulls[it] == 1 {
+                nulls = host.sys_arr_set(nulls, i, 1)
+            } else {
+                vals = host.sys_arr_set(vals, i, self.vals[it])
+            }
+            i += 1
+        }
+        IntCol.{name: self.name, vals, nulls}
+    }
+
+    /// Gather when every `idx[i]` is in `0..n` (filter/keep paths — no `-1` / bounds checks).
+    take_dense(self, idx: _) : IntCol {
+        m = host.sys_arr_len(idx)
+        vals = host.sys_arr_new(m, 0)
+        nulls = host.sys_arr_new(m, 0)
+        i = 0
+        while i < m {
+            it = idx[i]
+            if self.nulls[it] == 1 {
+                nulls = host.sys_arr_set(nulls, i, 1)
+            } else {
+                vals = host.sys_arr_set(vals, i, self.vals[it])
+            }
+            i += 1
+        }
+        IntCol.{name: self.name, vals, nulls}
+    }
+
+    /// Number of non-null rows.
+    valid(self) : i64 {
+        c = 0
+        for self.nulls { if it == 0 { c += 1 } }
+        c
+    }
+
+    /// Number of null rows.
+    null_count(self) : i64 => host.sys_arr_len(self.vals) - self.valid()
+
+    /// Sum of the non-null rows.
+    total(self) : i64 {
+        s = 0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 { s += self.vals[i] }
+            i += 1
+        }
+        s
+    }
+
+    /// Smallest non-null value, or `none`.
+    smallest(self) : i64? {
+        found = false
+        best = 0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                if !found || self.vals[i] < best {
+                    best = self.vals[i]
+                    found = true
+                }
+            }
+            i += 1
+        }
+        ensure found else { return none }
+        best
+    }
+
+    /// Largest non-null value, or `none`.
+    largest(self) : i64? {
+        found = false
+        best = 0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                if !found || self.vals[i] > best {
+                    best = self.vals[i]
+                    found = true
+                }
+            }
+            i += 1
+        }
+        ensure found else { return none }
+        best
+    }
+
+    /// Arithmetic mean of the non-null rows, or `none`.
+    average(self) : f64? {
+        c = self.valid()
+        ensure c > 0 else { return none }
+        host.sys_to_float(self.total()) / host.sys_to_float(c)
+    }
+
+    /// Float copy (nulls preserved).
+    to_float(self) : FloatCol {
+        out = FloatCol.new(self.name)
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 1 { @out.push_null() } else { @out.push(host.sys_to_float(self.vals[i])) }
+            i += 1
+        }
+        out
+    }
+}
+
+/// Integer column from a literal array (no nulls).
++int_col(name: str, vals: _) : IntCol => IntCol.{name, vals, nulls: dt_repeat(host.sys_arr_len(vals), 0)}
+
+// --- FloatCol -----------------------------------------------------------------------------------
+
+/// A nullable column of `f64`.
++FloatCol = {
+    name: str = ""
+    vals: _ = []
+    nulls: _ = []
+
+    /// Empty column called `name`.
+    new(name: str) : FloatCol => FloatCol.{name, vals: [], nulls: []}
+
+    /// Number of rows (null or not).
+    size(self) : i64 => host.sys_arr_len(self.vals)
+
+    /// True when row `i` is missing.
+    is_null(self, i: i64) : bool => self.nulls[i] == 1
+
+    /// Value at row `i` (zero for a null).
+    get(self, i: i64) : f64 => self.vals[i]
+
+    /// Append a value.
+    push(@self, v: f64) : i64 {
+        self.vals = host.sys_arr_push(self.vals, v)
+        self.nulls = host.sys_arr_push(self.nulls, 0)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Append a missing value.
+    push_null(@self) : i64 {
+        self.vals = host.sys_arr_push(self.vals, 0.0)
+        self.nulls = host.sys_arr_push(self.nulls, 1)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Text of row `i` (`""` for a null).
+    text_at(self, i: i64) : str {
+        if self.nulls[i] == 1 { return "" }
+        "{self.vals[i]}"
+    }
+
+    /// Same data under another name.
+    named(self, name: str) : FloatCol => FloatCol.{name, vals: self.vals, nulls: self.nulls}
+
+    /// Gather rows by index; `-1` (or any out-of-range index) yields a null.
+    take(self, idx: _) : FloatCol {
+        m = host.sys_arr_len(idx)
+        n = host.sys_arr_len(self.vals)
+        vals = host.sys_arr_new(m, 0.0)
+        nulls = host.sys_arr_new(m, 0)
+        i = 0
+        while i < m {
+            it = idx[i]
+            if it < 0 || it >= n || self.nulls[it] == 1 {
+                nulls = host.sys_arr_set(nulls, i, 1)
+            } else {
+                vals = host.sys_arr_set(vals, i, self.vals[it])
+            }
+            i += 1
+        }
+        FloatCol.{name: self.name, vals, nulls}
+    }
+
+    /// Gather when every `idx[i]` is in range (see `IntCol.take_dense`).
+    take_dense(self, idx: _) : FloatCol {
+        m = host.sys_arr_len(idx)
+        vals = host.sys_arr_new(m, 0.0)
+        nulls = host.sys_arr_new(m, 0)
+        i = 0
+        while i < m {
+            it = idx[i]
+            if self.nulls[it] == 1 {
+                nulls = host.sys_arr_set(nulls, i, 1)
+            } else {
+                vals = host.sys_arr_set(vals, i, self.vals[it])
+            }
+            i += 1
+        }
+        FloatCol.{name: self.name, vals, nulls}
+    }
+
+    /// Number of non-null rows.
+    valid(self) : i64 {
+        c = 0
+        for self.nulls { if it == 0 { c += 1 } }
+        c
+    }
+
+    /// Number of null rows.
+    null_count(self) : i64 => host.sys_arr_len(self.vals) - self.valid()
+
+    /// Sum of the non-null rows.
+    total(self) : f64 {
+        s = 0.0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 { s += self.vals[i] }
+            i += 1
+        }
+        s
+    }
+
+    /// Smallest non-null value, or `none`.
+    smallest(self) : f64? {
+        found = false
+        best = 0.0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                if !found || self.vals[i] < best {
+                    best = self.vals[i]
+                    found = true
+                }
+            }
+            i += 1
+        }
+        ensure found else { return none }
+        best
+    }
+
+    /// Largest non-null value, or `none`.
+    largest(self) : f64? {
+        found = false
+        best = 0.0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                if !found || self.vals[i] > best {
+                    best = self.vals[i]
+                    found = true
+                }
+            }
+            i += 1
+        }
+        ensure found else { return none }
+        best
+    }
+
+    /// Arithmetic mean of the non-null rows, or `none`.
+    average(self) : f64? {
+        c = self.valid()
+        ensure c > 0 else { return none }
+        self.total() / host.sys_to_float(c)
+    }
+
+    /// Sample variance (Welford, `n - 1` denominator), or `none` with fewer than two values.
+    sample_var(self) : f64? {
+        seen_n = 0
+        run_mean = 0.0
+        m2 = 0.0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                seen_n += 1
+                delta = self.vals[i] - run_mean
+                run_mean += delta / host.sys_to_float(seen_n)
+                m2 += delta * (self.vals[i] - run_mean)
+            }
+            i += 1
+        }
+        ensure seen_n > 1 else { return none }
+        m2 / host.sys_to_float(seen_n - 1)
+    }
+
+    /// Sample standard deviation, or `none` with fewer than two values.
+    sample_std(self) : f64? {
+        v = self.sample_var() or -1.0
+        ensure v >= 0.0 else { return none }
+        host.sys_sqrt(v)
+    }
+}
+
+/// Float column from a literal array (no nulls).
++float_col(name: str, vals: _) : FloatCol => FloatCol.{name, vals, nulls: dt_repeat(host.sys_arr_len(vals), 0)}
+
+// --- BoolCol ------------------------------------------------------------------------------------
+
+/// A nullable column of `bool`.
++BoolCol = {
+    name: str = ""
+    vals: _ = []
+    nulls: _ = []
+
+    /// Empty column called `name`.
+    new(name: str) : BoolCol => BoolCol.{name, vals: [], nulls: []}
+
+    /// Number of rows (null or not).
+    size(self) : i64 => host.sys_arr_len(self.vals)
+
+    /// True when row `i` is missing.
+    is_null(self, i: i64) : bool => self.nulls[i] == 1
+
+    /// Value at row `i` (false for a null).
+    get(self, i: i64) : bool => self.vals[i]
+
+    /// Append a value.
+    push(@self, v: bool) : i64 {
+        self.vals = host.sys_arr_push(self.vals, v)
+        self.nulls = host.sys_arr_push(self.nulls, 0)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Append a missing value.
+    push_null(@self) : i64 {
+        self.vals = host.sys_arr_push(self.vals, false)
+        self.nulls = host.sys_arr_push(self.nulls, 1)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Text of row `i` (`""` for a null).
+    text_at(self, i: i64) : str {
+        if self.nulls[i] == 1 { return "" }
+        if self.vals[i] { return "true" }
+        "false"
+    }
+
+    /// Same data under another name.
+    named(self, name: str) : BoolCol => BoolCol.{name, vals: self.vals, nulls: self.nulls}
+
+    /// Gather rows by index; `-1` (or any out-of-range index) yields a null.
+    take(self, idx: _) : BoolCol {
+        m = host.sys_arr_len(idx)
+        n = host.sys_arr_len(self.vals)
+        vals = host.sys_arr_new(m, false)
+        nulls = host.sys_arr_new(m, 0)
+        i = 0
+        while i < m {
+            it = idx[i]
+            if it < 0 || it >= n || self.nulls[it] == 1 {
+                nulls = host.sys_arr_set(nulls, i, 1)
+            } else {
+                vals = host.sys_arr_set(vals, i, self.vals[it])
+            }
+            i += 1
+        }
+        BoolCol.{name: self.name, vals, nulls}
+    }
+
+    /// Number of non-null rows.
+    valid(self) : i64 {
+        c = 0
+        for self.nulls { if it == 0 { c += 1 } }
+        c
+    }
+
+    /// Number of null rows.
+    null_count(self) : i64 => host.sys_arr_len(self.vals) - self.valid()
+
+    /// Number of non-null `true` rows.
+    count_true(self) : i64 {
+        c = 0
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 && self.vals[i] { c += 1 }
+            i += 1
+        }
+        c
+    }
+}
+
+/// Boolean column from a literal array (no nulls).
++bool_col(name: str, vals: _) : BoolCol => BoolCol.{name, vals, nulls: dt_repeat(host.sys_arr_len(vals), 0)}
+
+// --- StrCol -------------------------------------------------------------------------------------
+
+/// A nullable column of `str`.
++StrCol = {
+    name: str = ""
+    vals: _ = []
+    nulls: _ = []
+
+    /// Empty column called `name`.
+    new(name: str) : StrCol => StrCol.{name, vals: [], nulls: []}
+
+    /// Number of rows (null or not).
+    size(self) : i64 => host.sys_arr_len(self.vals)
+
+    /// True when row `i` is missing.
+    is_null(self, i: i64) : bool => self.nulls[i] == 1
+
+    /// Value at row `i` (`""` for a null).
+    get(self, i: i64) : str => self.vals[i]
+
+    /// Append a value.
+    push(@self, v: str) : i64 {
+        self.vals = host.sys_arr_push(self.vals, v)
+        self.nulls = host.sys_arr_push(self.nulls, 0)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Append a missing value.
+    push_null(@self) : i64 {
+        self.vals = host.sys_arr_push(self.vals, "")
+        self.nulls = host.sys_arr_push(self.nulls, 1)
+        host.sys_arr_len(self.vals)
+    }
+
+    /// Text of row `i` (`""` for a null).
+    text_at(self, i: i64) : str => self.vals[i]
+
+    /// Same data under another name.
+    named(self, name: str) : StrCol => StrCol.{name, vals: self.vals, nulls: self.nulls}
+
+    /// Gather rows by index; `-1` (or any out-of-range index) yields a null.
+    take(self, idx: _) : StrCol {
+        m = host.sys_arr_len(idx)
+        n = host.sys_arr_len(self.vals)
+        vals = host.sys_arr_new(m, "")
+        nulls = host.sys_arr_new(m, 0)
+        i = 0
+        while i < m {
+            it = idx[i]
+            if it < 0 || it >= n || self.nulls[it] == 1 {
+                nulls = host.sys_arr_set(nulls, i, 1)
+            } else {
+                vals = host.sys_arr_set(vals, i, self.vals[it])
+            }
+            i += 1
+        }
+        StrCol.{name: self.name, vals, nulls}
+    }
+
+    /// Number of non-null rows.
+    valid(self) : i64 {
+        c = 0
+        for self.nulls { if it == 0 { c += 1 } }
+        c
+    }
+
+    /// Number of null rows.
+    null_count(self) : i64 => host.sys_arr_len(self.vals) - self.valid()
+
+    /// Lexicographically smallest non-null value, or `none`.
+    smallest(self) : str? {
+        found = false
+        best = ""
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                if !found || compare(self.vals[i], best) < 0 {
+                    best = self.vals[i]
+                    found = true
+                }
+            }
+            i += 1
+        }
+        ensure found else { return none }
+        best
+    }
+
+    /// Lexicographically largest non-null value, or `none`.
+    largest(self) : str? {
+        found = false
+        best = ""
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                if !found || compare(self.vals[i], best) > 0 {
+                    best = self.vals[i]
+                    found = true
+                }
+            }
+            i += 1
+        }
+        ensure found else { return none }
+        best
+    }
+
+    /// Number of distinct non-null values (hash set with collision probing).
+    n_unique(self) : i64 {
+        seen = HashMap.new()
+        firsts = []
+        i = 0
+        n = host.sys_arr_len(self.vals)
+        while i < n {
+            if self.nulls[i] == 0 {
+                probe = dt_hash_str(self.vals[i])
+                done = false
+                while !done {
+                    slot = seen.get(probe) or -1
+                    if slot < 0 {
+                        @seen.put(probe, host.sys_arr_len(firsts))
+                        firsts = host.sys_arr_push(firsts, self.vals[i])
+                        done = true
+                    } else {
+                        if firsts[slot] == self.vals[i] {
+                            done = true
+                        } else {
+                            probe += 1
+                        }
+                    }
+                }
+            }
+            i += 1
+        }
+        host.sys_arr_len(firsts)
+    }
+}
+
+/// String column from a literal array (no nulls).
++str_col(name: str, vals: _) : StrCol => StrCol.{name, vals, nulls: dt_repeat(host.sys_arr_len(vals), 0)}
+
+// --- tests ----------------------------------------------------------------------------------------
+
+test "IntCol aggregates skip nulls" {
+    c = int_col("n", [4, -2, 9, 7])
+    assert_eq(c.size(), 4)
+    assert_eq(c.total(), 18)
+    assert_eq(c.smallest() or 99, -2)
+    assert_eq(c.largest() or 99, 9)
+    assert_eq(c.valid(), 4)
+    assert_eq(c.null_count(), 0)
+    assert_eq(c.average() or 0.0, 4.5)
+    @c.push_null()
+    @c.push(100)
+    assert_eq(c.size(), 6)
+    #assert(c.is_null(4))
+    #assert(!(c.is_null(5)))
+    assert_eq(c.get(5), 100)
+    assert_eq(c.total(), 118)
+    assert_eq(c.largest() or 0, 100)
+    assert_eq(c.valid(), 5)
+    assert_eq(c.null_count(), 1)
+    assert_eq(c.text_at(0), "4")
+    assert_eq(c.text_at(1), "-2")
+    assert_eq(c.text_at(4), "")
+    empty = IntCol.new("e")
+    assert_eq(empty.size(), 0)
+    assert_eq(empty.total(), 0)
+    assert_eq(empty.smallest() or -1, -1)
+    assert_eq(empty.largest() or -1, -1)
+    assert_eq(empty.average() or -1.0, -1.0)
+    only_null = IntCol.new("z")
+    @only_null.push_null()
+    assert_eq(only_null.smallest() or -7, -7)
+    assert_eq(only_null.total(), 0)
+    assert_eq(c.named("m").name, "m")
+    assert_eq(c.name, "n")
+}
+
+test "IntCol take gathers and nulls out of range" {
+    c = int_col("n", [10, 20, 30])
+    @c.push_null()
+    t = c.take([2, 0, -1, 3, 1, 9])
+    assert_eq(t.size(), 6)
+    assert_eq(t.get(0), 30)
+    assert_eq(t.get(1), 10)
+    #assert(t.is_null(2))
+    #assert(t.is_null(3))
+    assert_eq(t.get(4), 20)
+    #assert(t.is_null(5))
+    assert_eq(t.name, "n")
+    assert_eq(c.take([]).size(), 0)
+    f = c.to_float()
+    assert_eq(f.size(), 4)
+    assert_eq(f.get(1), 20.0)
+    #assert(f.is_null(3))
+    assert_eq(f.total(), 60.0)
+}
+
+test "FloatCol aggregates" {
+    c = float_col("x", [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0])
+    assert_eq(c.total(), 40.0)
+    assert_eq(c.average() or 0.0, 5.0)
+    assert_eq(c.smallest() or 0.0, 2.0)
+    assert_eq(c.largest() or 0.0, 9.0)
+    // sample variance = 32 / 7
+    v = c.sample_var() or -1.0
+    #assert(dt_abs(v - 32.0 / 7.0) < 1.0e-12)
+    sd = c.sample_std() or -1.0
+    #assert(dt_abs(sd - host.sys_sqrt(32.0 / 7.0)) < 1.0e-12)
+    @c.push_null()
+    assert_eq(c.total(), 40.0)
+    assert_eq(c.valid(), 8)
+    assert_eq(c.null_count(), 1)
+    assert_eq(c.text_at(0), "2")
+    assert_eq(c.text_at(8), "")
+    one = float_col("o", [3.0])
+    assert_eq(one.sample_var() or -1.0, -1.0)
+    assert_eq(one.sample_std() or -1.0, -1.0)
+    assert_eq(one.average() or 0.0, 3.0)
+    none_col = FloatCol.new("n")
+    assert_eq(none_col.smallest() or -5.0, -5.0)
+    assert_eq(none_col.largest() or -5.0, -5.0)
+    t = c.take([8, 7, 0])
+    #assert(t.is_null(0))
+    assert_eq(t.get(1), 9.0)
+    assert_eq(t.get(2), 2.0)
+    assert_eq(c.named("y").name, "y")
+}
+
+test "BoolCol and StrCol" {
+    b = bool_col("ok", [true, false, true, true])
+    assert_eq(b.count_true(), 3)
+    @b.push_null()
+    @b.push(true)
+    assert_eq(b.size(), 6)
+    assert_eq(b.count_true(), 4)
+    assert_eq(b.null_count(), 1)
+    assert_eq(b.text_at(0), "true")
+    assert_eq(b.text_at(1), "false")
+    assert_eq(b.text_at(4), "")
+    bt = b.take([5, 4, 1])
+    #assert(bt.get(0))
+    #assert(bt.is_null(1))
+    #assert(!(bt.get(2)))
+    assert_eq(b.named("k").name, "k")
+
+    s = str_col("tag", ["pear", "apple", "fig", "apple", "pear", "kiwi"])
+    assert_eq(s.size(), 6)
+    assert_eq(s.smallest() or "?", "apple")
+    assert_eq(s.largest() or "?", "pear")
+    assert_eq(s.n_unique(), 4)
+    @s.push_null()
+    @s.push("fig")
+    assert_eq(s.n_unique(), 4)
+    assert_eq(s.valid(), 7)
+    assert_eq(s.null_count(), 1)
+    assert_eq(s.text_at(1), "apple")
+    assert_eq(s.text_at(6), "")
+    st = s.take([1, 6, -1, 2])
+    assert_eq(st.get(0), "apple")
+    #assert(st.is_null(1))
+    #assert(st.is_null(2))
+    assert_eq(st.get(3), "fig")
+    empty = StrCol.new("e")
+    assert_eq(empty.smallest() or "none", "none")
+    assert_eq(empty.n_unique(), 0)
+    assert_eq(s.named("t").name, "t")
+}
+
+test "helpers: dtype names, hashing, equality" {
+    assert_eq(dt_kind_name(DT_INT), "int")
+    assert_eq(dt_kind_name(DT_FLOAT), "float")
+    assert_eq(dt_kind_name(DT_BOOL), "bool")
+    assert_eq(dt_kind_name(DT_STR), "str")
+    assert_eq(dt_hash_str("abc"), dt_hash_str("abc"))
+    #assert(dt_hash_str("abc") != dt_hash_str("abd"))
+    #assert(dt_hash_str("") > 0)
+    #assert(dt_hash_str("some longer text value") >= 0)
+    #assert(dt_same(1.5, 1.5))
+    #assert(!(dt_same(1.5, 1.5000000001)))
+    assert_eq(dt_abs(-2.5), 2.5)
+    assert_eq(host.sys_arr_len(dt_repeat(4, 0)), 4)
+}

@@ -1,0 +1,70 @@
+// Complete JSON API and its tests.
+//
+//   super test .
+//   SUPER_ADDR=127.0.0.1:3011 super run src/main.sr
+
+use std.net.http
+use std.sys.env
+
+// Durable escape target for Promote-classified births (escape analysis).
+state g_escape = {note: "init"}
+
++build_app() : App {
+    #routes {
+        get "/health" { ok({ok: true, service: "super-hello-api"}) }
+        get "/ping" { ok("pong") }
+        post "/echo" |req| {
+            body = req.body
+            ensure body != "" else {
+                return bad_request({error: "empty body"})
+            }
+            ok({echo: body})
+        }
+        // Request-scoped births: list + record Stay; escaped note → Promote.
+        post "/alloc" |req| {
+            items = [{id: 1, name: "a"}, {id: 2, name: "b"}]
+            payload = {ok: true, items, echo: req.body, label: "alloc"}
+            escaped = {note: payload.label}
+            g_escape = escaped
+            ok(payload)
+        }
+    }
+}
+
++main() {
+    addr = env_get_or("SUPER_ADDR", "127.0.0.1:3011")
+    app = build_app()
+    print("listening on {addr}")
+    handled = @app.serve(addr) or err {
+        print("serve failed on {addr}: {err}")
+        return 1
+    }
+    print("shutdown after {handled} requests")
+    0
+}
+
+test "health via TestClient" {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.get("/health")
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, "super-hello-api"))
+}
+
+test "echo requires body" {
+    app = build_app()
+    tc = TestClient.new(app)
+    bad = @tc.post("/echo", "")
+    assert_eq(bad.status, 400)
+    ok_res = @tc.post("/echo", "{\"msg\":\"ping\"}")
+    assert_eq(ok_res.status, 200)
+    #assert(contains(ok_res.body, "ping"))
+}
+
+test "alloc route returns payload" {
+    app = build_app()
+    tc = TestClient.new(app)
+    res = @tc.post("/alloc", "{\"x\":1}")
+    assert_eq(res.status, 200)
+    #assert(contains(res.body, "alloc"))
+}

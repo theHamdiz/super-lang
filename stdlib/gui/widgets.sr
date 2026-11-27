@@ -1,0 +1,321 @@
+//! std.gui.widgets — controls that declare `Widget` inline
+//!
+//! Import with:
+//!   use std.gui.widgets
+//!
+//!   +Badge: Widget = {
+//!       label: str = ""
+//!       +paint(self) : str => "text 0 0 230 230 236 |{self.label}\n"
+//!       +hit(self, x: i64, y: i64) : bool => widget_hit(x, y, 0, 0, 80, 24)
+//!       +measure(self, max_w: i64) : i64 => widget_measure(max_w, 80)
+//!   }
+//!
+//! A trait is a list of signatures. The type names it in the header
+//! (`+Toggle: Widget = { … }`) and writes the methods there. `std.gui`
+//! mounts those paint strings in the retained tree.
+
+use std.core.str
+
+/// Shared hit test for a pixel rectangle.
++widget_hit(x: i64, y: i64, left: i64, top: i64, w: i64, h: i64) : bool {
+    x >= left && x < left + w && y >= top && y < top + h
+}
+
+/// Width the control wants, clamped to `max_w`.
++widget_measure(max_w: i64, w: i64) : i64 {
+    if max_w < w { return max_w }
+    w
+}
+
+/// `paint` writes a display list. `hit` tests a pixel. `measure` reports width.
++Widget = trait {
+    paint(self) : str
+    hit(self, x: i64, y: i64) : bool
+    measure(self, max_w: i64) : i64
+}
+
+/// On/off switch.
++Toggle: Widget = {
+    label: str = ""
+    on: bool = false
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 140
+    h: i64 = 28
+
+    paint(self) : str {
+        mark = " "
+        on = self.on
+        if on { mark = "o" }
+        "fill {self.x} {self.y} {self.w} {self.h} 36 40 48\ntext {self.x + 8} {self.y + 6} 230 230 236 |({mark}) {self.label}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+
+    flip(@self) : bool {
+        on = self.on
+        if on { self.on = false } else { self.on = true }
+        self.on
+    }
+}
+
+/// Box that shows a check when `on` is true.
++CheckBox: Widget = {
+    label: str = ""
+    on: bool = false
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 160
+    h: i64 = 28
+
+    paint(self) : str {
+        mark = " "
+        on = self.on
+        if on { mark = "x" }
+        "text {self.x + 8} {self.y + 6} 230 230 236 |[{mark}] {self.label}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+
+    flip(@self) : bool {
+        on = self.on
+        if on { self.on = false } else { self.on = true }
+        self.on
+    }
+}
+
+/// One choice in a group. The group name is `group`.
++Radio: Widget = {
+    label: str = ""
+    group: str = ""
+    on: bool = false
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 160
+    h: i64 = 28
+
+    paint(self) : str {
+        mark = " "
+        on = self.on
+        if on { mark = "*" }
+        "text {self.x + 8} {self.y + 6} 230 230 236 |({mark}) {self.label}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+
+    pick(@self) : bool {
+        self.on = true
+        self.on
+    }
+}
+
+/// Modal card. Empty `body` means it is closed.
++Dialog: Widget = {
+    title: str = ""
+    body: str = ""
+    open: bool = false
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 240
+    h: i64 = 96
+
+    paint(self) : str {
+        ensure self.open else { return "" }
+        "fill {self.x} {self.y} {self.w} {self.h} 20 22 32\nrect {self.x} {self.y} {self.w} {self.h} 180 160 90\ntext {self.x + 12} {self.y + 10} 240 220 160 |{self.title}\ntext {self.x + 12} {self.y + 36} 230 230 236 |{self.body}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool {
+        ensure self.open else { return false }
+        widget_hit(x, y, self.x, self.y, self.w, self.h)
+    }
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+
+    show(@self, body: str) : str {
+        self.body = body
+        self.open = true
+        self.body
+    }
+
+    close(@self) : bool {
+        self.open = false
+        self.open
+    }
+}
+
+/// Single-line text field. `hint` shows when `value` is empty.
++Field: Widget = {
+    hint: str = ""
+    value: str = ""
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 200
+    h: i64 = 36
+
+    paint(self) : str {
+        shown = self.value
+        if shown == "" { shown = self.hint }
+        "fill {self.x} {self.y} {self.w} {self.h} 24 24 32\nrect {self.x} {self.y} {self.w} {self.h} 90 90 110\ntext {self.x + 8} {self.y + 8} 230 230 236 |{shown}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+}
+
+/// Short message that fades in the layout. Empty `text` paints nothing.
++Toast: Widget = {
+    text: str = ""
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 220
+    h: i64 = 28
+
+    paint(self) : str {
+        ensure self.text != "" else { return "" }
+        "fill {self.x} {self.y} {self.w} {self.h} 48 36 24\ntext {self.x + 8} {self.y + 6} 255 220 160 |{self.text}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+}
+
+/// Banner across the top of a view.
++Flash: Widget = {
+    text: str = ""
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 280
+    h: i64 = 24
+
+    paint(self) : str {
+        ensure self.text != "" else { return "" }
+        "fill {self.x} {self.y} {self.w} {self.h} 40 28 28\ntext {self.x + 8} {self.y + 4} 255 180 180 |{self.text}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+}
+
+/// Filled or stroked rectangle. `form` is `fill` or `rect`.
++Shape: Widget = {
+    form: str = "fill"
+    r: i64 = 80
+    g: i64 = 120
+    b: i64 = 180
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 40
+    h: i64 = 40
+
+    paint(self) : str {
+        op = self.form
+        if op != "rect" { op = "fill" }
+        "{op} {self.x} {self.y} {self.w} {self.h} {self.r} {self.g} {self.b}\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+}
+
+/// Custom window title strip.
++TitleBar: Widget = {
+    title: str = ""
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 320
+    h: i64 = 32
+
+    paint(self) : str => "fill {self.x} {self.y} {self.w} {self.h} 28 30 40\ntext {self.x + 12} {self.y + 8} 230 230 236 |{self.title}\n"
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+}
+
+/// Minimize, maximize, and close, drawn as three marks.
++WindowButtons: Widget = {
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 72
+    h: i64 = 28
+
+    paint(self) : str {
+        y = self.y + 8
+        "fill {self.x} {y} 12 12 180 160 60\nfill {self.x + 20} {y} 12 12 80 150 90\nfill {self.x + 40} {y} 12 12 180 70 70\n"
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+}
+
+/// Small label decoration.
++Badge: Widget = {
+    label: str = ""
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 72
+    h: i64 = 22
+
+    paint(self) : str => "fill {self.x} {self.y} {self.w} {self.h} 60 48 90\ntext {self.x + 6} {self.y + 4} 230 220 255 |{self.label}\n"
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+}
+
+test "toggle, checkbox, and radio paint their marks" {
+    sw = Toggle{label: "Sound", on: false, x: 4, y: 8, w: 120, h: 28}
+    #assert(@sw.flip())
+    #assert(contains(sw.paint(), "(o) Sound"))
+    #assert(sw.hit(10, 12))
+    #assert(!(sw.hit(0, 0)))
+    assert_eq(sw.measure(40), 40)
+    box = CheckBox{label: "Done", on: true, x: 0, y: 0, w: 80, h: 28}
+    #assert(contains(box.paint(), "[x] Done"))
+    choice = Radio{label: "Open", group: "filter", on: false, x: 0, y: 0, w: 80, h: 28}
+    #assert(@choice.pick())
+    #assert(contains(choice.paint(), "(*) Open"))
+}
+
+test "dialog, field, toast, and flash follow their state" {
+    card = Dialog{title: "Delete", body: "", open: false, x: 10, y: 20, w: 200, h: 80}
+    assert_eq(card.paint(), "")
+    #assert(!(card.hit(12, 24)))
+    @card.show("Remove milk?")
+    #assert(contains(card.paint(), "Delete"))
+    #assert(contains(card.paint(), "Remove milk?"))
+    #assert(!(@card.close()))
+    field = Field{hint: "New todo", value: "", x: 0, y: 0, w: 160, h: 36}
+    #assert(contains(field.paint(), "New todo"))
+    filled = Field{hint: "New todo", value: "Milk", x: 0, y: 0, w: 160, h: 36}
+    #assert(contains(filled.paint(), "Milk"))
+    note = Toast{text: "", x: 0, y: 0, w: 180, h: 28}
+    assert_eq(note.paint(), "")
+    sent = Toast{text: "Title required", x: 0, y: 0, w: 180, h: 28}
+    #assert(contains(sent.paint(), "Title required"))
+    banner = Flash{text: "Saved", x: 0, y: 0, w: 200, h: 24}
+    #assert(contains(banner.paint(), "Saved"))
+}
+
+test "shape, title bar, window buttons, and badge paint" {
+    block = Shape{form: "rect", r: 10, g: 20, b: 30, x: 1, y: 2, w: 16, h: 16}
+    #assert(contains(block.paint(), "rect 1 2 16 16 10 20 30"))
+    bar = TitleBar{title: "Todos", x: 0, y: 0, w: 200, h: 32}
+    #assert(contains(bar.paint(), "Todos"))
+    chrome = WindowButtons{x: 100, y: 4, w: 72, h: 28}
+    #assert(contains(chrome.paint(), "fill 140"))
+    pin = Badge{label: "new", x: 0, y: 0, w: 48, h: 22}
+    #assert(contains(pin.paint(), "new"))
+    assert_eq(pin.measure(200), 48)
+}

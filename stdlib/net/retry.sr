@@ -1,0 +1,153 @@
+//! std.net.retry — exponential backoff and circuit breaker
+//!
+//! Import with:
+//!   use std.net.retry
+
+use std.math.core
+
+/// `Backoff` is exponential retry delay with a cap.
++Backoff = {
+    /// Delay of the first retry, in milliseconds. Defaults to `50`.
+    initial_ms: i64 = 50
+    /// Cap on the delay. Defaults to `5000`.
+    max_ms: i64 = 5000
+    /// Multiplier applied after each attempt. Defaults to `2.0`.
+    factor: f64 = 2.0
+    /// How many delays have been issued. Defaults to `0`.
+    attempt: i64 = 0
+
+    /// Create a fresh `Backoff`.
+    new(initial_ms: i64, max_ms: i64, factor: f64) : Backoff {
+        Backoff.{initial_ms, max_ms, factor, attempt: 0}
+    }
+
+    /// Reset on this `Backoff`. Returns `i64`.
+    reset(@self) : i64 {
+        self.attempt = 0
+        0
+    }
+
+    /// Next delay on this `Backoff`. Returns `i64`.
+    next_delay(@self) : i64 {
+        delay = to_float(self.initial_ms) * pow(self.factor, to_float(self.attempt))
+        if delay > to_float(self.max_ms) { delay = to_float(self.max_ms) }
+        ms = to_int(delay)
+        self.attempt = self.attempt + 1
+        ms
+    }
+}
+
+/// `Circuit` is a circuit breaker: closed, open, or half-open.
++Circuit = {
+    /// Consecutive failures toward the open threshold. Defaults to `0`.
+    failures: i64 = 0
+    /// Failures required before the circuit opens. Defaults to `5`.
+    threshold: i64 = 5
+    /// Monotonic time when the open circuit may try again. Defaults to `0`.
+    open_until_ms: i64 = 0
+    /// How long the circuit stays open. Defaults to `1000`.
+    cooldown_ms: i64 = 1000
+    /// Closed, open, or half-open. Defaults to `0`.
+    phase: i64 = 0
+    /// Clock ms on `Circuit` (`i64`). Defaults to `0`.
+    clock_ms: i64 = 0
+}
+
+/// New (`threshold`, `cooldown_ms`). Returns `Circuit`.
++circuit_new(threshold: i64, cooldown_ms: i64) : Circuit {
+    Circuit.{failures: 0, threshold, open_until_ms: 0, cooldown_ms, phase: 0, clock_ms: 0}
+}
+
+/// Can pass (`c`).
++circuit_can_pass(c: Circuit) : bool {
+    p = c.phase
+    if p == 0 { return true }
+    if p == 2 { return true }
+    false
+}
+
+/// Is open (`c`).
++circuit_is_open(c: Circuit) : bool {
+    p = c.phase
+    p == 1
+}
+
+/// Is closed (`c`).
++circuit_is_closed(c: Circuit) : bool {
+    p = c.phase
+    p == 0
+}
+
+/// Is half open (`c`).
++circuit_is_half_open(c: Circuit) : bool {
+    p = c.phase
+    p == 2
+}
+
+/// Success (`c`). Returns `Circuit`.
++circuit_success(c: Circuit) : Circuit {
+    Circuit.{failures: 0, threshold: c.threshold, open_until_ms: c.open_until_ms, cooldown_ms: c.cooldown_ms, phase: 0, clock_ms: c.clock_ms}
+}
+
+/// Failure (`c`). Returns `Circuit`.
++circuit_failure(c: Circuit) : Circuit {
+    failures = c.failures + 1
+    phase = c.phase
+    open_until = c.open_until_ms
+    thr = c.threshold
+    if failures >= thr {
+        phase = 1
+        open_until = c.clock_ms + c.cooldown_ms
+    }
+    Circuit.{failures, threshold: thr, open_until_ms: open_until, cooldown_ms: c.cooldown_ms, phase, clock_ms: c.clock_ms}
+}
+
+/// Tick (`c`, `now_ms`). Returns `Circuit`.
++circuit_tick(c: Circuit, now_ms: i64) : Circuit {
+    phase = c.phase
+    failures = c.failures
+    p = c.phase
+    until = c.open_until_ms
+    if p == 1 {
+        if now_ms >= until {
+            phase = 2
+            failures = 0
+        }
+    }
+    Circuit.{failures, threshold: c.threshold, open_until_ms: c.open_until_ms, cooldown_ms: c.cooldown_ms, phase, clock_ms: now_ms}
+}
+
+/// Test that backoff grows and caps.
+test "backoff grows and caps" {
+    b = Backoff.new(100, 1000, 2.0)
+    d0 = @b.next_delay()
+    d1 = @b.next_delay()
+    d2 = @b.next_delay()
+    d3 = @b.next_delay()
+    d4 = @b.next_delay()
+    assert_eq(d0, 100)
+    assert_eq(d1, 200)
+    assert_eq(d2, 400)
+    assert_eq(d3, 800)
+    assert_eq(d4, 1000)
+    @b.reset()
+    assert_eq(@b.next_delay(), 100)
+}
+
+/// Test that circuit opens and cools down.
+test "circuit opens and cools down" {
+    c = circuit_new(3, 500)
+    #assert(circuit_can_pass(c))
+    c = circuit_failure(c)
+    c = circuit_failure(c)
+    #assert(!(circuit_is_open(c)))
+    c = circuit_tick(c, 0)
+    c = circuit_failure(c)
+    #assert(circuit_is_open(c))
+    #assert(!(circuit_can_pass(c)))
+    c = circuit_tick(c, 500)
+    #assert(circuit_is_half_open(c))
+    #assert(circuit_can_pass(c))
+    c = circuit_success(c)
+    #assert(circuit_is_closed(c))
+}

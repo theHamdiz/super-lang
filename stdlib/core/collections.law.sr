@@ -1,0 +1,24 @@
+//! Laws for std.core.collections — bit/word helpers and signed div (Round 7).
+//! Implementation: `i_sdiv` / `word_has` / `popcount32` in `collections.sr`.
+
+#law("i_sdiv truncates toward zero for negatives")
+collections_i_sdiv() {
+    #assert(i_sdiv(7, 2) == 3)
+    #assert(i_sdiv(0 - 7, 2) == 0 - 3)
+    #assert(i_sdiv(42, 1) == 42)
+}
+
+#law("word_has reads a single bit")
+collections_word_has() {
+    #assert(word_has(1, 0))
+    #assert(!word_has(1, 1))
+    #assert(word_has(8, 3))
+}
+
+#law("popcount32 counts set bits")
+collections_popcount() {
+    #assert(popcount32(0) == 0)
+    #assert(popcount32(1) == 1)
+    #assert(popcount32(7) == 3)
+    #assert(popcount32(255) == 8)
+}

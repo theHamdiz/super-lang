@@ -1,0 +1,143 @@
+// 20_game_server_ws_sync — 60 Hz authoritative simulation with WS snapshots.
+
+use std.net.ws
+use std.math.core
+use std.core.collections
+use std.diag.log
+
++PLAYER_CAPACITY = 48
++SERVER_TICKS = 240
++TICK_DT = 1.0 / 60.0
++SNAPSHOT_EVERY = 3
++MAX_PACKET = 512
+
++Input = {
+    player: i64 = 0
+    axis_x: i64 = 0
+    axis_y: i64 = 0
+    sequence: i64 = 0
+}
+
++apply_input(@vx, @vy, input: Input) {
+    vx[input.player] = input.axis_x * 0.01
+    vy[input.player] = input.axis_y * 0.01
+}
+
++simulate_tick(@x, @y, vx, vy) {
+    for player in 0..PLAYER_CAPACITY {
+        x[player] += vx[player] * TICK_DT
+        y[player] += vy[player] * TICK_DT
+        if x[player] < 0.0 { x[player] += 256.0 }
+        if x[player] >= 256.0 { x[player] -= 256.0 }
+        if y[player] < 0.0 { y[player] += 256.0 }
+        if y[player] >= 256.0 { y[player] -= 256.0 }
+    }
+}
+
++quantize(value: f64) : i64 {
+    (value * 16.0).to_int()
+}
+
++encode_snapshot(@packet, tick: i64, x, y) : i64 {
+    packet[0] = 130
+    packet[1] = PLAYER_CAPACITY * 6 + 4
+    packet[2] = tick / 256
+    packet[3] = tick % 256
+    cursor = 4
+    for player in 0..PLAYER_CAPACITY {
+        qx = quantize(x[player])
+        qy = quantize(y[player])
+        packet[cursor] = player
+        packet[cursor + 1] = qx / 256
+        packet[cursor + 2] = qx % 256
+        packet[cursor + 3] = qy / 256
+        packet[cursor + 4] = qy % 256
+        packet[cursor + 5] = tick % 251
+        cursor += 6
+    }
+    cursor
+}
+
++snapshot_checksum(packet, length: i64) : i64 {
+    checksum = 0
+    for i in 0..length {
+        checksum += packet[i] * (i % 17 + 1)
+    }
+    checksum
+}
+
++make_input(tick: i64, player: i64) : Input {
+    Input{
+        player,
+        axis_x: ((tick + player * 3) % 201) - 100,
+        axis_y: ((tick * 7 + player) % 201) - 100,
+        sequence: tick,
+    }
+}
+
++run_server(ticks: i64) : i64 {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    for player in 0..PLAYER_CAPACITY {
+        x[player] = player * 3.0
+        y[player] = player * 2.0
+    }
+
+    packet = [0; MAX_PACKET]
+    sync_checksum = 0
+    snapshot_count = 0
+    for tick in 0..ticks {
+        for player in 0..PLAYER_CAPACITY {
+            input = make_input(tick, player)
+            apply_input(@vx, @vy, input)
+        }
+        simulate_tick(@x, @y, vx, vy)
+        if tick % SNAPSHOT_EVERY == 0 {
+            length = encode_snapshot(@packet, tick, x, y)
+            sync_checksum += snapshot_checksum(packet, length)
+            snapshot_count += 1
+        }
+    }
+    sync_checksum + snapshot_count * 1009 + (0..PLAYER_CAPACITY).map(quantize(x[it]) + quantize(y[it]) * 3).sum()
+}
+
++main() {
+    lg = Logger.console("game_ws")
+    checksum = run_server(SERVER_TICKS)
+    @lg.info("CHECKSUM={checksum}")
+}
+
+test "input changes authoritative velocity" {
+    vx, vy = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    apply_input(@vx, @vy, Input{player: 2, axis_x: 50, axis_y: -25, sequence: 1})
+    assert_eq(vx[2], 0.5)
+    assert_eq(vy[2], -0.25)
+}
+
+test "fixed tick advances players" {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [1.0; PLAYER_CAPACITY], [2.0; PLAYER_CAPACITY]
+    simulate_tick(@x, @y, vx, vy)
+    #assert(x[0] > 0.0)
+    #assert(y[0] > x[0])
+}
+
+test "snapshot encodes all players" {
+    packet = [0; MAX_PACKET]
+    x, y = [1.0; PLAYER_CAPACITY], [2.0; PLAYER_CAPACITY]
+    length = encode_snapshot(@packet, 300, x, y)
+    assert_eq(length, PLAYER_CAPACITY * 6 + 4)
+    assert_eq(packet[0], 130)
+    assert_eq(packet[2] * 256 + packet[3], 300)
+    #assert(snapshot_checksum(packet, length) > 0)
+}
+
+test "stdlib WebSocket binary frame encodes" {
+    encoded = ws_encode(ws_binary([1, 2, 3, 4]), 0) or []
+    #assert(len(encoded) > 4)
+}
+
+test "authoritative server is deterministic" {
+    assert_eq(run_server(30), run_server(30))
+    #assert(run_server(30) > 0)
+}

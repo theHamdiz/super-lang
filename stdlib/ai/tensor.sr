@@ -1,0 +1,672 @@
+//! std.ai.tensor — strided f64 tensors, zero-copy views, int8 quantization and small matmul
+//!
+//! Import with:
+//!   use std.ai.tensor
+//!
+//!   a = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]) or Tensor.zeros([2, 3])
+//!   t = a.transpose()                         // view: shape [3, 2], strides swapped, no copy
+//!   c = tn_matmul(a, t) or Tensor.zeros([2, 2])
+//!   x = c.at([1, 1]) or 0.0                   // 77.0
+//!   q = tn_quantize_i8(a)                     // symmetric int8: q.data in -127..127, q.scale
+//!   back = tn_dequant(q)                      // within scale / 2 of `a`
+//!
+//! A `Tensor` is `{data, shape, strides, offset}`: `data` is a flat f64 array, `shape` the
+//! extent per axis, `strides` the element step per axis, `offset` where element 0 starts.
+//! Views (`transpose`, `row`, `slice0`, `reshape` of a contiguous tensor) only rewrite
+//! shape/strides/offset, so they never copy. Everything is row-major by default.
+//! `tn_matmul` handles 2-D operands of any stride (so transposed views work). It runs in i-k-j
+//! order with hoisted strides: the inner loop streams one row of `b` and one row of the result. Public helpers are prefixed
+//! `tn_` (modules merge flat).
+
+/// `TN_EPS` is `0.000001`.
++TN_EPS = 0.000001
+/// `TN_QMAX` is the int8 magnitude limit used by symmetric quantization (`127`).
++TN_QMAX = 127
+
+/// Product of the dimensions in `shape` (1 for an empty shape).
++tn_product(shape: _) : i64 {
+    p = 1
+    for shape { p = p * it }
+    p
+}
+
+/// Row-major strides for `shape`.
++tn_row_major(shape: _) {
+    n = host.sys_arr_len(shape)
+    rev = []
+    acc = 1
+    k = n - 1
+    while k >= 0 {
+        rev = host.sys_arr_push(rev, acc)
+        acc = acc * shape[k]
+        k -= 1
+    }
+    out = []
+    for 0..n { out = host.sys_arr_push(out, rev[n - 1 - it]) }
+    out
+}
+
+/// `QTensor` is an int8-quantized tensor: `value ~= data[i] * scale`.
++QTensor = {
+    /// Quantized values in -127..127, row-major. Defaults to `[]`.
+    data: _ = []
+    /// Extent per axis. Defaults to `[]`.
+    shape: _ = []
+    /// Dequantization multiplier. Defaults to `1.0`.
+    scale: f64 = 1.0
+}
+
+/// `Tensor` is a strided view over a flat f64 array.
++Tensor = {
+    /// Flat element storage. Defaults to `[]`.
+    data: _ = []
+    /// Extent per axis. Defaults to `[]`.
+    shape: _ = []
+    /// Element step per axis. Defaults to `[]`.
+    strides: _ = []
+    /// Index of logical element 0 inside `data`. Defaults to `0`.
+    offset: i64 = 0
+
+    /// Contiguous row-major tensor over `data`; fails when the element count does not match `shape`.
+    new(data: _, shape: _) : Tensor! {
+        ensure tn_product(shape) == host.sys_arr_len(data) else {
+            fail "tensor: shape does not match element count"
+            return
+        }
+        Tensor.{data, shape, strides: tn_row_major(shape), offset: 0}
+    }
+
+    /// Tensor of `shape` filled with `v` (negative extents count as 0).
+    full(shape: _, v: f64) : Tensor {
+        dims = []
+        for shape {
+            d = it
+            if d < 0 { d = 0 }
+            dims = host.sys_arr_push(dims, d)
+        }
+        data = []
+        for 0..tn_product(dims) { data = host.sys_arr_push(data, v) }
+        Tensor.{data, shape: dims, strides: tn_row_major(dims), offset: 0}
+    }
+
+    /// All-zero tensor of `shape`.
+    zeros(shape: _) : Tensor => Tensor.full(shape, 0.0)
+
+    /// All-one tensor of `shape`.
+    ones(shape: _) : Tensor => Tensor.full(shape, 1.0)
+
+    /// Number of axes.
+    ndim(self) : i64 => host.sys_arr_len(self.shape)
+
+    /// Total number of logical elements.
+    numel(self) : i64 => tn_product(self.shape)
+
+    /// True when every coordinate in `idx` is inside the shape (and the rank matches).
+    in_bounds(self, idx: _) : bool {
+        n = host.sys_arr_len(self.shape)
+        ensure host.sys_arr_len(idx) == n else { return false }
+        ok = true
+        for 0..n {
+            if idx[it] < 0 { ok = false }
+            if idx[it] >= self.shape[it] { ok = false }
+        }
+        ok
+    }
+
+    /// Flat position in `data` of the element at `idx`, or -1 when out of bounds.
+    flat_index(self, idx: _) : i64 {
+        ensure self.in_bounds(idx) else { return -1 }
+        pos = self.offset
+        for 0..host.sys_arr_len(idx) { pos += idx[it] * self.strides[it] }
+        pos
+    }
+
+    /// Element at `idx`, or fail when out of bounds.
+    at(self, idx: _) : f64! {
+        pos = self.flat_index(idx)
+        ensure pos >= 0 else {
+            fail "tensor: index out of bounds"
+            return
+        }
+        self.data[pos]
+    }
+
+    /// 2-D element at row `i`, column `j` (0.0 when out of bounds or not 2-D).
+    at2(self, i: i64, j: i64) : f64 {
+        pos = self.flat_index([i, j])
+        ensure pos >= 0 else { return 0.0 }
+        self.data[pos]
+    }
+
+    /// Store `v` at `idx`; returns false when out of bounds.
+    set(@self, idx: _, v: f64) : bool {
+        pos = self.flat_index(idx)
+        ensure pos >= 0 else { return false }
+        self.data = host.sys_arr_set(self.data, pos, v)
+        true
+    }
+
+    /// True when elements are laid out row-major with no gaps (offset ignored).
+    is_contiguous(self) : bool {
+        want = tn_row_major(self.shape)
+        ok = true
+        for 0..host.sys_arr_len(want) {
+            if self.shape[it] > 1 && self.strides[it] != want[it] { ok = false }
+        }
+        ok
+    }
+
+    /// Logical elements flattened in row-major order.
+    to_array(self) {
+        n = self.numel()
+        rank = host.sys_arr_len(self.shape)
+        out = []
+        for 0..n {
+            rest = it
+            pos = self.offset
+            k = rank - 1
+            while k >= 0 {
+                dim = self.shape[k]
+                pos += (rest % dim) * self.strides[k]
+                rest = rest / dim
+                k -= 1
+            }
+            out = host.sys_arr_push(out, self.data[pos])
+        }
+        out
+    }
+
+    /// Row-major copy with fresh storage.
+    contiguous(self) : Tensor => Tensor.{data: self.to_array(), shape: self.shape, strides: tn_row_major(self.shape), offset: 0}
+
+    /// Same data viewed as `shape`; fails unless contiguous and the element count matches.
+    reshape(self, shape: _) : Tensor! {
+        ensure tn_product(shape) == self.numel() else {
+            fail "tensor: reshape changes element count"
+            return
+        }
+        ensure self.is_contiguous() else {
+            fail "tensor: reshape needs a contiguous tensor"
+            return
+        }
+        Tensor.{data: self.data, shape, strides: tn_row_major(shape), offset: self.offset}
+    }
+
+    /// Axis-swapped view of a 2-D tensor (no copy); other ranks reverse all axes.
+    transpose(self) : Tensor {
+        n = host.sys_arr_len(self.shape)
+        shape = []
+        strides = []
+        for 0..n {
+            shape = host.sys_arr_push(shape, self.shape[n - 1 - it])
+            strides = host.sys_arr_push(strides, self.strides[n - 1 - it])
+        }
+        Tensor.{data: self.data, shape, strides, offset: self.offset}
+    }
+
+    /// Sub-tensor at position `i` along axis 0 (a view); fails when out of range or 0-D.
+    row(self, i: i64) : Tensor! {
+        n = host.sys_arr_len(self.shape)
+        ensure n > 0 else {
+            fail "tensor: scalar has no rows"
+            return
+        }
+        ensure i >= 0 && i < self.shape[0] else {
+            fail "tensor: row out of range"
+            return
+        }
+        shape = []
+        strides = []
+        for 1..n {
+            shape = host.sys_arr_push(shape, self.shape[it])
+            strides = host.sys_arr_push(strides, self.strides[it])
+        }
+        Tensor.{data: self.data, shape, strides, offset: self.offset + i * self.strides[0]}
+    }
+
+    /// View of positions `lo..hi` along axis 0; fails on a bad range.
+    slice0(self, lo: i64, hi: i64) : Tensor! {
+        n = host.sys_arr_len(self.shape)
+        ensure n > 0 else {
+            fail "tensor: scalar cannot be sliced"
+            return
+        }
+        ensure lo >= 0 && lo <= hi && hi <= self.shape[0] else {
+            fail "tensor: slice out of range"
+            return
+        }
+        shape = [hi - lo]
+        for 1..n { shape = host.sys_arr_push(shape, self.shape[it]) }
+        Tensor.{data: self.data, shape, strides: self.strides, offset: self.offset + lo * self.strides[0]}
+    }
+}
+
+/// Flat position in `t.data` of the element at `idx` (free-function form of `Tensor.flat_index`), or -1.
++tn_index(t: Tensor, idx: _) : i64 => t.flat_index(idx)
+
+/// Sum of all elements.
++tn_sum(t: Tensor) : f64 {
+    acc = 0.0
+    for t.to_array() { acc += it }
+    acc
+}
+
+/// Largest absolute element (0.0 for an empty tensor).
++tn_max_abs(t: Tensor) : f64 {
+    m = 0.0
+    for t.to_array() {
+        a = host.sys_abs(it)
+        if a > m { m = a }
+    }
+    m
+}
+
+/// Elementwise product with the scalar `k`.
++tn_scale(t: Tensor, k: f64) : Tensor {
+    out = []
+    for t.to_array() { out = host.sys_arr_push(out, it * k) }
+    Tensor.{data: out, shape: t.shape, strides: tn_row_major(t.shape), offset: 0}
+}
+
+/// Elementwise sum; fails when the shapes differ.
++tn_add(a: Tensor, b: Tensor) : Tensor! {
+    ensure tn_same_shape(a, b) else {
+        fail "tensor: add needs equal shapes"
+        return
+    }
+    xs = a.to_array()
+    ys = b.to_array()
+    out = []
+    for 0..host.sys_arr_len(xs) { out = host.sys_arr_push(out, xs[it] + ys[it]) }
+    Tensor.{data: out, shape: a.shape, strides: tn_row_major(a.shape), offset: 0}
+}
+
+/// True when both tensors have the same rank and extents.
++tn_same_shape(a: Tensor, b: Tensor) : bool {
+    n = host.sys_arr_len(a.shape)
+    ensure n == host.sys_arr_len(b.shape) else { return false }
+    ok = true
+    for 0..n {
+        if a.shape[it] != b.shape[it] { ok = false }
+    }
+    ok
+}
+
+/// True when every element of `a` and `b` is within `tol` (same shape required).
++tn_close(a: Tensor, b: Tensor, tol: f64) : bool {
+    ensure tn_same_shape(a, b) else { return false }
+    xs = a.to_array()
+    ys = b.to_array()
+    ok = true
+    for 0..host.sys_arr_len(xs) {
+        if host.sys_abs(xs[it] - ys[it]) > tol { ok = false }
+    }
+    ok
+}
+
+/// Matrix product of 2-D tensors `a` [m, k] and `b` [k, n] -> [m, n]; works on strided views.
+/// Cache-friendly i-k-j loop order; accumulation order per element matches the naive form.
++tn_matmul(a: Tensor, b: Tensor) : Tensor! {
+    ensure a.ndim() == 2 && b.ndim() == 2 else {
+        fail "tensor: matmul needs 2-D operands"
+        return
+    }
+    ensure a.shape[1] == b.shape[0] else {
+        fail "tensor: matmul inner dimensions differ"
+        return
+    }
+    tn_matmul_kernel(a, b)
+}
+
+/// `tn_matmul`, or `fallback` when the operands are not conformable 2-D tensors.
+/// Non-failing twin for hot paths.
++tn_matmul_or(a: Tensor, b: Tensor, fallback: Tensor) : Tensor {
+    ensure a.ndim() == 2 && b.ndim() == 2 && a.shape[1] == b.shape[0] else { return fallback }
+    tn_matmul_kernel(a, b)
+}
+
+// [m, k] x [k, n] for operands already checked to be conformable 2-D tensors.
+tn_matmul_kernel(a: Tensor, b: Tensor) : Tensor {
+    m = a.shape[0]
+    k = a.shape[1]
+    n = b.shape[1]
+    // i-k-j order: the inner loop walks one row of `b` and one row of `out`, so contiguous
+    // operands are read sequentially; strides and offsets are hoisted (no per-element index
+    // vectors or bounds checks). Each out[i][j] still sums over k ascending, so results are
+    // bit-identical to the naive dot-product form.
+    ad = a.data
+    bd = b.data
+    as0 = a.strides[0]
+    as1 = a.strides[1]
+    bs0 = b.strides[0]
+    bs1 = b.strides[1]
+    out = [0.0; m * n]
+    for 0..m {
+        i = it
+        arow = a.offset + i * as0
+        orow = i * n
+        for 0..k {
+            kk = it
+            av = ad[arow + kk * as1]
+            brow = b.offset + kk * bs0
+            #simd
+            for 0..n { out[orow + it] += av * bd[brow + it * bs1] }
+        }
+    }
+    Tensor.{data: out, shape: [m, n], strides: [n, 1], offset: 0}
+}
+
+/// Symmetric per-tensor int8 quantization: `scale = max|x| / 127` (1.0 for an all-zero tensor).
++tn_quantize_i8(t: Tensor) : QTensor {
+    peak = tn_max_abs(t)
+    scale = 1.0
+    if peak > 0.0 { scale = peak / host.sys_to_float(TN_QMAX) }
+    out = []
+    for t.to_array() {
+        q = host.sys_to_int(host.sys_round(it / scale))
+        if q > TN_QMAX { q = TN_QMAX }
+        if q < 0 - TN_QMAX { q = 0 - TN_QMAX }
+        out = host.sys_arr_push(out, q)
+    }
+    QTensor.{data: out, shape: t.shape, scale}
+}
+
+/// Float tensor reconstructed from `q` (`data[i] * scale`).
++tn_dequant(q: QTensor) : Tensor {
+    out = []
+    qs = q.data
+    for qs { out = host.sys_arr_push(out, host.sys_to_float(it) * q.scale) }
+    Tensor.{data: out, shape: q.shape, strides: tn_row_major(q.shape), offset: 0}
+}
+
+/// Largest absolute reconstruction error of quantizing `t` to int8 and back.
++tn_quant_error(t: Tensor) : f64 {
+    back = tn_dequant(tn_quantize_i8(t)).to_array()
+    src = t.to_array()
+    worst = 0.0
+    for 0..host.sys_arr_len(src) {
+        e = host.sys_abs(src[it] - back[it])
+        if e > worst { worst = e }
+    }
+    worst
+}
+
+/// Dot product of two 1-D tensors; fails on a rank or length mismatch.
++tn_dot(a: Tensor, b: Tensor) : f64! {
+    ensure a.ndim() == 1 && b.ndim() == 1 && a.shape[0] == b.shape[0] else {
+        fail "tensor: dot needs equal-length vectors"
+        return
+    }
+    acc = 0.0
+    n = a.shape[0]
+    for 0..n { acc += a.data[a.offset + it * a.strides[0]] * b.data[b.offset + it * b.strides[0]] }
+    acc
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+/// Test that shapes, strides, numel and indexing agree.
+test "shapes, strides, numel and indexing agree" {
+    t = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0], [2, 3, 2]) or Tensor.zeros([0])
+    assert_eq(t.ndim(), 3)
+    assert_eq(t.numel(), 12)
+    assert_eq(t.strides[0], 6)
+    assert_eq(t.strides[1], 2)
+    assert_eq(t.strides[2], 1)
+    assert_eq(t.flat_index([0, 0, 0]), 0)
+    assert_eq(t.flat_index([1, 2, 1]), 11)
+    assert_eq(t.flat_index([1, 0, 0]), 6)
+    assert_eq(t.flat_index([2, 0, 0]), -1)
+    assert_eq(t.flat_index([0, 0]), -1)
+    assert_eq(t.flat_index([0, -1, 0]), -1)
+    assert_eq(tn_index(t, [1, 1, 1]), 9)
+    assert_eq(t.at([1, 2, 1]) or -1.0, 12.0)
+    assert_eq(t.at([9, 0, 0]) or -1.0, -1.0)
+    #assert(t.is_contiguous())
+    assert_eq(tn_product([]), 1)
+    assert_eq(host.sys_arr_len(tn_row_major([])), 0)
+    bad = Tensor.new([1.0, 2.0], [3]) or Tensor.zeros([7])
+    assert_eq(bad.numel(), 7)
+}
+
+/// Test that set, full, zeros and ones build and mutate.
+test "set, full, zeros and ones build and mutate" {
+    z = Tensor.zeros([2, 2])
+    assert_eq(tn_sum(z), 0.0)
+    o = Tensor.ones([3])
+    assert_eq(tn_sum(o), 3.0)
+    f = Tensor.full([2, 2], 2.5)
+    assert_eq(tn_sum(f), 10.0)
+    #assert(@z.set([1, 0], 4.0))
+    assert_eq(z.at2(1, 0), 4.0)
+    #assert(!(@z.set([2, 0], 1.0)))
+    assert_eq(z.at2(5, 5), 0.0)
+    neg = Tensor.zeros([-3, 2])
+    assert_eq(neg.numel(), 0)
+}
+
+/// Test that transpose is a copy-free view.
+test "transpose is a copy-free view" {
+    a = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]) or Tensor.zeros([0])
+    t = a.transpose()
+    assert_eq(t.shape[0], 3)
+    assert_eq(t.shape[1], 2)
+    assert_eq(t.strides[0], 1)
+    assert_eq(t.strides[1], 3)
+    assert_eq(host.sys_arr_len(t.data), 6)
+    assert_eq(t.at2(2, 1), 6.0)
+    assert_eq(t.at2(0, 1), 4.0)
+    #assert(!(t.is_contiguous()))
+    flat = t.to_array()
+    assert_eq(flat[0], 1.0)
+    assert_eq(flat[1], 4.0)
+    assert_eq(flat[5], 6.0)
+    c = t.contiguous()
+    #assert(c.is_contiguous())
+    assert_eq(c.at2(2, 1), 6.0)
+    assert_eq(t.transpose().at2(1, 2), 6.0)
+}
+
+/// Test that row and slice0 are zero-copy views.
+test "row and slice0 are zero-copy views" {
+    a = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [3, 2]) or Tensor.zeros([0])
+    r = a.row(1) or Tensor.zeros([0])
+    assert_eq(r.ndim(), 1)
+    assert_eq(r.offset, 2)
+    assert_eq(r.at([0]) or -1.0, 3.0)
+    assert_eq(r.at([1]) or -1.0, 4.0)
+    assert_eq(host.sys_arr_len(r.data), 6)
+    s = a.slice0(1, 3) or Tensor.zeros([0])
+    assert_eq(s.shape[0], 2)
+    assert_eq(s.at2(0, 0), 3.0)
+    assert_eq(s.at2(1, 1), 6.0)
+    assert_eq(s.numel(), 4)
+    assert_eq(host.sys_arr_len((a.slice0(2, 1) or Tensor.zeros([4])).shape), 1)
+    assert_eq((a.slice0(0, 4) or Tensor.zeros([9])).numel(), 9)
+    assert_eq((a.row(3) or Tensor.zeros([9])).numel(), 9)
+    assert_eq((a.row(-1) or Tensor.zeros([9])).numel(), 9)
+    scalar = Tensor.zeros([])
+    assert_eq((scalar.row(0) or Tensor.zeros([9])).numel(), 9)
+    col = a.transpose().row(1) or Tensor.zeros([0])
+    assert_eq(col.at([2]) or -1.0, 6.0)
+}
+
+/// Test that reshape requires contiguous storage and a matching count.
+test "reshape requires contiguous storage and a matching count" {
+    a = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]) or Tensor.zeros([0])
+    r = a.reshape([3, 2]) or Tensor.zeros([0])
+    assert_eq(r.at2(2, 1), 6.0)
+    assert_eq(r.at2(1, 0), 3.0)
+    flat = a.reshape([6]) or Tensor.zeros([0])
+    assert_eq(flat.at([4]) or -1.0, 5.0)
+    assert_eq((a.reshape([4]) or Tensor.zeros([9])).numel(), 9)
+    assert_eq((a.transpose().reshape([6]) or Tensor.zeros([9])).numel(), 9)
+    assert_eq((a.transpose().contiguous().reshape([6]) or Tensor.zeros([9])).numel(), 6)
+}
+
+/// Test that matmul multiplies 2-D tensors including transposed views.
+test "matmul multiplies 2-D tensors including transposed views" {
+    a = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]) or Tensor.zeros([0])
+    b = Tensor.new([7.0, 8.0, 9.0, 10.0, 11.0, 12.0], [3, 2]) or Tensor.zeros([0])
+    c = tn_matmul(a, b) or Tensor.zeros([0])
+    assert_eq(c.shape[0], 2)
+    assert_eq(c.shape[1], 2)
+    assert_eq(c.at2(0, 0), 58.0)
+    assert_eq(c.at2(0, 1), 64.0)
+    assert_eq(c.at2(1, 0), 139.0)
+    assert_eq(c.at2(1, 1), 154.0)
+    g = tn_matmul(a, a.transpose()) or Tensor.zeros([0])
+    assert_eq(g.at2(0, 0), 14.0)
+    assert_eq(g.at2(0, 1), 32.0)
+    assert_eq(g.at2(1, 0), 32.0)
+    assert_eq(g.at2(1, 1), 77.0)
+    ident = Tensor.new([1.0, 0.0, 0.0, 1.0], [2, 2]) or Tensor.zeros([0])
+    same = tn_matmul(ident, a) or Tensor.zeros([0])
+    #assert(tn_close(same, a, 0.000001))
+    assert_eq((tn_matmul(a, a) or Tensor.zeros([9])).numel(), 9)
+    assert_eq((tn_matmul(Tensor.ones([3]), b) or Tensor.zeros([9])).numel(), 9)
+}
+
+/// Test that tn_matmul_or matches tn_matmul and falls back on bad shapes.
+test "tn_matmul_or matches tn_matmul and falls back on bad shapes" {
+    a = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]) or Tensor.zeros([0])
+    b = Tensor.new([7.0, 8.0, 9.0, 10.0, 11.0, 12.0], [3, 2]) or Tensor.zeros([0])
+    none9 = Tensor.zeros([9])
+    c = tn_matmul_or(a, b, none9)
+    #assert(tn_close(c, tn_matmul(a, b) or none9, 0.0))
+    assert_eq(c.at2(1, 1), 154.0)
+    g = tn_matmul_or(a, a.transpose(), none9)
+    assert_eq(g.at2(0, 1), 32.0)
+    #assert(tn_close(g, tn_matmul(a, a.transpose()) or none9, 0.0))
+    assert_eq(tn_matmul_or(a, a, none9).numel(), 9)
+    assert_eq(tn_matmul_or(Tensor.ones([3]), b, none9).numel(), 9)
+    assert_eq(tn_matmul_or(a, Tensor.ones([3]), none9).numel(), 9)
+}
+
+/// Reference matrix product using indexed reads (the pre-optimisation form).
++tn_matmul_naive(a: Tensor, b: Tensor) : Tensor {
+    m = a.shape[0]
+    k = a.shape[1]
+    n = b.shape[1]
+    out = []
+    for 0..m {
+        i = it
+        for 0..n {
+            j = it
+            acc = 0.0
+            for 0..k { acc += a.at2(i, it) * b.at2(it, j) }
+            out = host.sys_arr_push(out, acc)
+        }
+    }
+    Tensor.{data: out, shape: [m, n], strides: [n, 1], offset: 0}
+}
+
+/// Deterministic filler tensor of `shape`: element `i` is `((i * 7 + seed) % 11) - 5` halves.
++tn_test_fill(shape: _, seed: i64) : Tensor {
+    n = tn_product(shape)
+    data = []
+    for 0..n { data = host.sys_arr_push(data, host.sys_to_float(((it * 7 + seed) % 11) - 5) * 0.5) }
+    Tensor.{data, shape, strides: tn_row_major(shape), offset: 0}
+}
+
+/// Test that the cache-friendly matmul is bit-identical to the indexed reference.
+test "matmul matches the indexed reference on rectangular and strided operands" {
+    a = tn_test_fill([7, 5], 3)
+    b = tn_test_fill([5, 6], 8)
+    fast = tn_matmul(a, b) or Tensor.zeros([0])
+    slow = tn_matmul_naive(a, b)
+    assert_eq(fast.shape[0], 7)
+    assert_eq(fast.shape[1], 6)
+    #assert(tn_close(fast, slow, 0.0))
+    at = tn_test_fill([5, 7], 3).transpose()
+    bt = tn_test_fill([6, 5], 8).transpose()
+    #assert(tn_close(tn_matmul(at, bt) or Tensor.zeros([0]), tn_matmul_naive(at, bt), 0.0))
+    mixed = tn_matmul(a, bt) or Tensor.zeros([0])
+    assert_eq(mixed.numel(), 42)
+    #assert(tn_close(mixed, tn_matmul_naive(a, bt), 0.0))
+    big = tn_test_fill([6, 5], 1)
+    sub = big.slice0(2, 5) or Tensor.zeros([0])
+    row_view = tn_matmul(sub, b) or Tensor.zeros([0])
+    assert_eq(row_view.shape[0], 3)
+    #assert(tn_close(row_view, tn_matmul_naive(sub, b), 0.0))
+    col = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0], [5, 1]) or Tensor.zeros([0])
+    mv = tn_matmul(a, col) or Tensor.zeros([0])
+    assert_eq(mv.shape[1], 1)
+    #assert(tn_close(mv, tn_matmul_naive(a, col), 0.0))
+}
+
+/// Test that degenerate shapes and identities are safe.
+test "matmul degenerate shapes and identity" {
+    z = tn_matmul(Tensor.zeros([0, 3]), Tensor.zeros([3, 4])) or Tensor.zeros([9])
+    assert_eq(z.numel(), 0)
+    assert_eq(z.shape[1], 4)
+    inner0 = tn_matmul(Tensor.zeros([2, 0]), Tensor.zeros([0, 3])) or Tensor.zeros([9])
+    assert_eq(inner0.numel(), 6)
+    assert_eq(tn_sum(inner0), 0.0)
+    a = tn_test_fill([4, 4], 5)
+    id = Tensor.zeros([4, 4])
+    for 0..4 { @id.set([it, it], 1.0) }
+    #assert(tn_close(tn_matmul(a, id) or Tensor.zeros([0]), a, 0.0))
+    #assert(tn_close(tn_matmul(id, a) or Tensor.zeros([0]), a, 0.0))
+    one = tn_matmul(Tensor.ones([1, 1]), Tensor.full([1, 1], 3.5)) or Tensor.zeros([0])
+    assert_eq(one.at2(0, 0), 3.5)
+    ab = tn_matmul(a, tn_test_fill([4, 4], 2)) or Tensor.zeros([0])
+    abt = tn_matmul(tn_test_fill([4, 4], 2).transpose(), a.transpose()) or Tensor.zeros([0])
+    #assert(tn_close(ab.transpose(), abt, 0.0))
+}
+
+/// Test that elementwise helpers validate shapes.
+test "elementwise helpers validate shapes" {
+    a = Tensor.new([1.0, 2.0, 3.0, 4.0], [2, 2]) or Tensor.zeros([0])
+    s = tn_add(a, a) or Tensor.zeros([0])
+    assert_eq(tn_sum(s), 20.0)
+    assert_eq(tn_sum(tn_scale(a, 0.5)), 5.0)
+    assert_eq((tn_add(a, Tensor.ones([4])) or Tensor.zeros([9])).numel(), 9)
+    #assert(tn_same_shape(a, Tensor.ones([2, 2])))
+    #assert(!(tn_same_shape(a, Tensor.ones([4]))))
+    #assert(!(tn_close(a, Tensor.ones([4]), 1.0)))
+    assert_eq(tn_max_abs(tn_scale(a, -2.0)), 8.0)
+    v = Tensor.new([1.0, 2.0, 3.0], [3]) or Tensor.zeros([0])
+    w = Tensor.new([4.0, 5.0, 6.0], [3]) or Tensor.zeros([0])
+    assert_eq(tn_dot(v, w) or -1.0, 32.0)
+    assert_eq(tn_dot(v, a) or -1.0, -1.0)
+    assert_eq(tn_dot(v, Tensor.ones([2])) or -1.0, -1.0)
+}
+
+/// Test that int8 quantization round-trips within half a step.
+test "int8 quantization round-trips within half a step" {
+    a = Tensor.new([0.5, -1.27, 0.0, 1.27, 0.635, -0.1], [2, 3]) or Tensor.zeros([0])
+    q = tn_quantize_i8(a)
+    #assert(host.sys_abs(q.scale - 0.01) < 0.0000001)
+    assert_eq(q.data[1], -127)
+    assert_eq(q.data[3], 127)
+    assert_eq(q.data[2], 0)
+    assert_eq(q.data[0], 50)
+    assert_eq(q.data[4], 64)
+    assert_eq(q.shape[1], 3)
+    back = tn_dequant(q)
+    assert_eq(back.shape[0], 2)
+    #assert(tn_close(a, back, q.scale * 0.5 + 0.000001))
+    #assert(tn_quant_error(a) <= q.scale * 0.5 + 0.000001)
+    big = Tensor.new([100.0, -50.0, 25.0, 0.0], [4]) or Tensor.zeros([0])
+    bq = tn_quantize_i8(big)
+    assert_eq(bq.data[0], 127)
+    #assert(tn_quant_error(big) <= bq.scale * 0.5 + 0.000001)
+    codes = bq.data
+    for codes { #assert(it >= -127 && it <= 127) }
+}
+
+/// Test that quantizing zeros and views is safe.
+test "quantizing zeros and views is safe" {
+    z = tn_quantize_i8(Tensor.zeros([3]))
+    assert_eq(z.scale, 1.0)
+    assert_eq(z.data[0], 0)
+    assert_eq(tn_sum(tn_dequant(z)), 0.0)
+    a = Tensor.new([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2, 3]) or Tensor.zeros([0])
+    qt = tn_quantize_i8(a.transpose())
+    assert_eq(qt.shape[0], 3)
+    assert_eq(qt.data[1], 85)
+    assert_eq(qt.data[5], 127)
+    back = tn_dequant(qt)
+    #assert(host.sys_abs(back.at2(2, 1) - 6.0) < 0.0001)
+}

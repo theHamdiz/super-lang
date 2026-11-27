@@ -1,0 +1,590 @@
+//! std.diag.metrics — counters, gauges, histograms, Prometheus text and descriptive stats
+//!
+//! Import with:
+//!   use std.diag.metrics
+//!
+//! Then:  m = Metrics.new()
+//!        @m.inc("http_requests_total", 1)
+//!        @m.gauge_set("queue_depth", 12)
+//!        @m.observe("latency_seconds", 0.042)
+//!        print(m.render())                        // Prometheus text exposition
+//!        p99 = m.quantile("latency_seconds", 0.99)
+//!
+//! Labelled series are keyed by `metric_key("http_requests_total", ["route", "/x"])`
+//! which yields `http_requests_total{route="/x"}`. `Metrics` is a plain value; every
+//! update mutates it, so call sites use `@m.inc(...)` etc. Histograms keep per-bucket
+//! counts (default latency buckets, or `histogram` to choose your own) and answer
+//! quantiles by linear interpolation inside the owning bucket, like Prometheus'
+//! `histogram_quantile`. For exact figures over raw samples use `mt_percentile` etc.
+//!
+//! Timers use the monotonic host clock: `t = timer_start()` ... `@m.time("x", t)`.
+
+use std.core.collections
+use std.core.str
+use std.math.core
+use std.sys.time
+
+/// `MT_COUNTER` is `0`.
++MT_COUNTER = 0
+/// `MT_GAUGE` is `1`.
++MT_GAUGE = 1
+/// `MT_HIST` is `2`.
++MT_HIST = 2
+
+/// `Metrics` holds counters, gauges, and histograms.
++Metrics = {
+    /// Names on `Metrics`. Defaults to `[]`.
+    names: _ = []
+    /// Kinds on `Metrics`. Defaults to `[]`.
+    kinds: _ = []
+    /// Vals on `Metrics`. Defaults to `[]`.
+    vals: _ = []
+    /// Counts on `Metrics`. Defaults to `[]`.
+    counts: _ = []
+    /// Bounds on `Metrics`. Defaults to `[]`.
+    bounds: _ = []
+    /// Totals on `Metrics`. Defaults to `[]`.
+    totals: _ = []
+
+    /// Create a fresh `Metrics`.
+    new() : Metrics => Metrics.{names: [], kinds: [], vals: [], counts: [], bounds: [], totals: []}
+
+    /// Find on this `Metrics` (`name`). Returns `i64`.
+    find(self, name: str) : i64 {
+        pos = -1
+        ns = self.names
+        for ns {
+            if pos < 0 && it == name { pos = index }
+        }
+        pos
+    }
+
+    /// Register a series of `kind` (no-op when it already exists). Returns its id.
+    register(@self, name: str, kind: i64, bounds: _) : i64 {
+        at = self.find(name)
+        if at >= 0 { return at }
+        self.names = arr_push(self.names, name)
+        self.kinds = arr_push(self.kinds, kind)
+        self.vals = arr_push(self.vals, 0)
+        self.bounds = arr_push(self.bounds, bounds)
+        if kind == 2 {
+            self.counts = arr_push(self.counts, arr_new(len(bounds) + 1, 0))
+        } else {
+            self.counts = arr_push(self.counts, [])
+        }
+        self.totals = arr_push(self.totals, 0)
+        len(self.names) - 1
+    }
+
+    /// Same as `len`.
+    len(self) : i64 => len(self.names)
+
+    /// Update or read the metric named `name`.
+    inc(@self, name: str, by: f64) : f64 {
+        id = @self.register(name, 0, [])
+        if by > 0.0 { self.vals = arr_set(self.vals, id, self.vals[id] + by) }
+        self.vals[id]
+    }
+
+    /// Update or read the metric named `name`.
+    counter(self, name: str) : f64 {
+        at = self.find(name)
+        ensure at >= 0 else { return 0 }
+        self.vals[at]
+    }
+
+    /// Update or read the metric named `name`.
+    gauge_set(@self, name: str, v: f64) : f64 {
+        id = @self.register(name, 1, [])
+        self.vals = arr_set(self.vals, id, v)
+        v
+    }
+
+    /// Update or read the metric named `name`.
+    gauge_add(@self, name: str, d: f64) : f64 {
+        id = @self.register(name, 1, [])
+        self.vals = arr_set(self.vals, id, self.vals[id] + d)
+        self.vals[id]
+    }
+
+    /// Update or read the metric named `name`.
+    gauge(self, name: str) : f64 {
+        at = self.find(name)
+        ensure at >= 0 else { return 0 }
+        self.vals[at]
+    }
+
+    /// Declare a histogram with explicit ascending upper bounds.
+    histogram(@self, name: str, bounds: _) : i64 => @self.register(name, 2, bounds)
+
+    /// Record one observation (creates the histogram with default buckets if needed).
+    observe(@self, name: str, v: f64) : f64 {
+        id = @self.register(name, 2, mt_default_bounds())
+        bs = self.bounds[id]
+        nb = len(bs)
+        slot = nb
+        for 0..nb {
+            if slot == nb && v <= bs[it] { slot = it }
+        }
+        row = self.counts[id]
+        row = arr_set(row, slot, row[slot] + 1)
+        self.counts = arr_set(self.counts, id, row)
+        self.vals = arr_set(self.vals, id, self.vals[id] + v)
+        self.totals = arr_set(self.totals, id, self.totals[id] + 1)
+        v
+    }
+
+    /// Hist count on this `Metrics` (`name`). Returns `i64`.
+    hist_count(self, name: str) : i64 {
+        at = self.find(name)
+        ensure at >= 0 else { return 0 }
+        self.totals[at]
+    }
+
+    /// Hist sum on this `Metrics` (`name`). Returns `f64`.
+    hist_sum(self, name: str) : f64 {
+        at = self.find(name)
+        ensure at >= 0 else { return 0 }
+        self.vals[at]
+    }
+
+    /// Hist mean on this `Metrics` (`name`). Returns `f64`.
+    hist_mean(self, name: str) : f64 {
+        n = self.hist_count(name)
+        ensure n > 0 else { return 0 }
+        self.hist_sum(name) / n
+    }
+
+    /// Quantile q in [0, 1] by linear interpolation within the owning bucket.
+    quantile(self, name: str, q: f64) : f64 {
+        at = self.find(name)
+        ensure at >= 0 else { return 0 }
+        total = self.totals[at]
+        ensure total > 0 else { return 0 }
+        bs = self.bounds[at]
+        row = self.counts[at]
+        nb = len(bs)
+        rank = q * total
+        cum = 0
+        result = -1.0
+        lower = 0.0
+        for 0..nb {
+            c = row[it]
+            upper = bs[it]
+            if result < 0.0 && cum + c >= rank && c > 0 {
+                return result = lower + (upper - lower) * (rank - cum) / c
+            }
+            cum += c
+            lower = upper
+        }
+        if result < 0.0 {
+            if nb > 0 { return bs[nb - 1] }
+            0
+        }
+        result
+    }
+
+    /// Observe the seconds elapsed since `start_ns` into a histogram.
+    time(@self, name: str, start_ns: i64) : f64 {
+        s = timer_elapsed_secs(start_ns)
+        @self.observe(name, s)
+    }
+
+    /// Render on this `Metrics`. Returns `str`.
+    render(self) : str {
+        out = ""
+        seen = []
+        ns = self.names
+        for ns {
+            id = index
+            key = it
+            base = mt_base(key)
+            labels = mt_labels(key)
+            kind = self.kinds[id]
+            fresh = true
+            for seen { if it == base { fresh = false } }
+            if fresh {
+                seen = arr_push(seen, base)
+                out = out + "# TYPE " + base + " " + mt_kind_name(kind) + "\n"
+            }
+            if kind == 2 {
+                bs = self.bounds[id]
+                row = self.counts[id]
+                nb = len(bs)
+                cum = 0
+                for 0..nb {
+                    cum += row[it]
+                    out = out + base + "_bucket" + mt_with_label(labels, "le=\"" + bs[it] + "\"") + " " + cum + "\n"
+                }
+                out = out + base + "_bucket" + mt_with_label(labels, "le=\"+Inf\"") + " " + self.totals[id] + "\n"
+                out = out + base + "_sum" + mt_suffix_labels(labels) + " " + self.vals[id] + "\n"
+                out = out + base + "_count" + mt_suffix_labels(labels) + " " + self.totals[id] + "\n"
+            } else {
+                out = out + key + " " + self.vals[id] + "\n"
+            }
+        }
+        out
+    }
+}
+
+/// Default histogram bucket edges.
++mt_default_bounds()  => [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+// --- series keys -----------------------------------------------------------------------
+
+/// name{k1="v1",k2="v2"} from a flat [k1, v1, k2, v2] list.
++metric_key(name: str, labels: _) : str {
+    n = len(labels)
+    ensure n >= 2 else { return name }
+    out = name + "\{"
+    for 0..(n / 2) {
+        if it > 0 { out = out + "," }
+        out = out + labels[it * 2] + "=\"" + labels[it * 2 + 1] + "\""
+    }
+    out + "\}"
+}
+
+/// Text before the first '{' (the metric family name).
++mt_base(key: str) : str {
+    n = byte_len(key)
+    cut = n
+    for 0..n {
+        if cut == n && key[it] == "{" { cut = it }
+    }
+    key[0..cut]
+}
+
+/// Label list inside the braces ("" when unlabelled).
++mt_labels(key: str) : str {
+    n = byte_len(key)
+    open = -1
+    for 0..n {
+        if open < 0 && key[it] == "{" { open = it }
+    }
+    ensure open >= 0 else { return "" }
+    key[(open + 1)..(n - 1)]
+}
+
+// --- timers ------------------------------------------------------------------------------
+
+/// Same as `monotonic_ns`.
++timer_start() : i64 => monotonic_ns()
+/// Timer elapsed ns (`start`). Returns `i64`.
++timer_elapsed_ns(start: i64) : i64 => monotonic_ns() - start
+/// Timer elapsed secs (`start`). Returns `f64`.
++timer_elapsed_secs(start: i64) : f64 => (monotonic_ns() - start) / 1000000000.0
+
+// --- Prometheus text exposition -----------------------------------------------------------
+
+/// Mt kind name (`kind`). Returns `str`.
++mt_kind_name(kind: i64) : str {
+    if kind == 0 { return "counter" }
+    if kind == 1 { return "gauge" }
+    "histogram"
+}
+
+/// Mt with label (`labels`, `extra`). Returns `str`.
++mt_with_label(labels: str, extra: str) : str {
+    if labels == "" { return "\{" + extra + "\}" }
+    "\{" + labels + "," + extra + "\}"
+}
+
+/// Mt suffix labels (`labels`). Returns `str`.
++mt_suffix_labels(labels: str) : str {
+    if labels == "" { return "" }
+    "\{" + labels + "\}"
+}
+
+// --- descriptive statistics over raw samples ------------------------------------------------
+
+/// Mt sum (`a`). Returns `f64`.
++mt_sum(a: _) : f64 => a.sum()
+
+/// Mt mean (`a`). Returns `f64`.
++mt_mean(a: _) : f64 {
+    n = len(a)
+    ensure n > 0 else { return 0 }
+    mt_sum(a) / n
+}
+
+/// Population variance.
++mt_variance(a: _) : f64 {
+    n = len(a)
+    ensure n > 0 else { return 0 }
+    mu = mt_mean(a)
+    acc = 0.0
+    for a { acc += (it - mu) * (it - mu) }
+    acc / n
+}
+
+/// Same as `sqrt`.
++mt_stddev(a: _) : f64 => sqrt(mt_variance(a))
+
+/// Mt min (`a`). Returns `f64`.
++mt_min(a: _) : f64 {
+    n = len(a)
+    ensure n > 0 else { return 0 }
+    best = a[0]
+    for a { if it < best { best = it } }
+    best
+}
+
+/// Mt max (`a`). Returns `f64`.
++mt_max(a: _) : f64 {
+    n = len(a)
+    ensure n > 0 else { return 0 }
+    best = a[0]
+    for a { if it > best { best = it } }
+    best
+}
+
+/// Merge sort (ascending); returns a new array.
++mt_sort(a: _) {
+    n = len(a)
+    ensure n > 1 else { return a }
+    mid = n / 2
+    left = mt_sort(a[0..mid])
+    right = mt_sort(a[mid..n])
+    nl = len(left)
+    nr = len(right)
+    out = []
+    i = 0
+    j = 0
+    for 0..n {
+        take_left = false
+        if i < nl && (j >= nr || left[i] <= right[j]) { take_left = true }
+        if take_left {
+            out = arr_push(out, left[i])
+            i += 1
+        } else {
+            out = arr_push(out, right[j])
+            j += 1
+        }
+    }
+    out
+}
+
+/// Exact percentile p in [0, 100] with linear interpolation between ranks.
++mt_percentile(a: _, p: f64) : f64 {
+    n = len(a)
+    ensure n > 0 else { return 0 }
+    s = mt_sort(a)
+    ensure n > 1 else { return s[0] }
+    pos = p / 100.0 * (n - 1)
+    if pos <= 0.0 { return s[0] }
+    if pos >= n - 1 { return s[n - 1] }
+    lo = to_int(pos)
+    frac = pos - lo
+    s[lo] + (s[lo + 1] - s[lo]) * frac
+}
+
+/// Same as `mt_percentile`.
++mt_median(a: _) : f64 => mt_percentile(a, 50.0)
+
+/// Exponentially weighted moving average step; `alpha` in (0, 1].
++ewma_update(prev: f64, x: f64, alpha: f64) : f64 => alpha * x + (1.0 - alpha) * prev
+
+// --- tests -----------------------------------------------------------------------------------
+
+/// Test that counters only go up.
+test "counters only go up" {
+    m = Metrics.new()
+    assert_eq(m.counter( "hits"), 0)
+    assert_eq(@m.inc("hits", 1), 1)
+    assert_eq(@m.inc("hits", 2), 3)
+    assert_eq(@m.inc("hits", -5), 3)
+    assert_eq(@m.inc("hits", 0), 3)
+    assert_eq(m.counter( "hits"), 3)
+    assert_eq(@m.inc("other", 1.5), 1.5)
+    assert_eq(m.len(), 2)
+}
+
+/// Test that gauges move both ways.
+test "gauges move both ways" {
+    m = Metrics.new()
+    assert_eq(m.gauge( "depth"), 0)
+    assert_eq(@m.gauge_set("depth", 10), 10)
+    assert_eq(@m.gauge_add("depth", 5), 15)
+    assert_eq(@m.gauge_add("depth", -20), -5)
+    assert_eq(m.gauge( "depth"), -5)
+    assert_eq(@m.gauge_add("fresh", 2), 2)
+    assert_eq(m.len(), 2)
+}
+
+/// Test that series keys and labels.
+test "series keys and labels" {
+    assert_eq(metric_key("req", []), "req")
+    assert_eq(metric_key("req", ["route", "/x"]), "req\{route=\"/x\"\}")
+    assert_eq(metric_key("req", ["a", "1", "b", "2"]), "req\{a=\"1\",b=\"2\"\}")
+    assert_eq(mt_base("req\{a=\"1\"\}"), "req")
+    assert_eq(mt_base("plain"), "plain")
+    assert_eq(mt_labels("req\{a=\"1\",b=\"2\"\}"), "a=\"1\",b=\"2\"")
+    assert_eq(mt_labels("plain"), "")
+}
+
+/// Test that labelled series are independent.
+test "labelled series are independent" {
+    m = Metrics.new()
+    a = metric_key("req", ["route", "/a"])
+    b = metric_key("req", ["route", "/b"])
+    @m.inc(a, 1)
+    @m.inc(a, 1)
+    @m.inc(b, 1)
+    assert_eq(m.counter( a), 2)
+    assert_eq(m.counter( b), 1)
+    assert_eq(m.counter( "req"), 0)
+}
+
+/// Test that histogram buckets and totals.
+test "histogram buckets and totals" {
+    m = Metrics.new()
+    @m.histogram("lat", [0.1, 0.5, 1.0])
+    @m.observe("lat", 0.05)
+    @m.observe("lat", 0.1)
+    @m.observe("lat", 0.3)
+    @m.observe("lat", 2.0)
+    assert_eq(m.hist_count( "lat"), 4)
+    assert_eq(m.hist_sum( "lat"), 2.45)
+    assert_eq(m.hist_mean( "lat"), 0.6125)
+    id = m.find("lat")
+    row = m.counts[id]
+    assert_eq(row[0], 2)
+    assert_eq(row[1], 1)
+    assert_eq(row[2], 0)
+    assert_eq(row[3], 1)
+    assert_eq(m.hist_count( "missing"), 0)
+    assert_eq(m.hist_mean( "missing"), 0)
+}
+
+/// Test that histogram quantiles interpolate inside the bucket.
+test "histogram quantiles interpolate inside the bucket" {
+    m = Metrics.new()
+    @m.histogram("h", [10.0, 20.0, 30.0])
+    for 0..10 { @m.observe("h", 5) }
+    for 0..10 { @m.observe("h", 15) }
+    assert_eq(m.quantile( "h", 0.25), 5.0)
+    assert_eq(m.quantile( "h", 0.5), 10.0)
+    assert_eq(m.quantile( "h", 0.75), 15.0)
+    assert_eq(m.quantile( "h", 1.0), 20.0)
+    assert_eq(m.quantile( "nope", 0.5), 0)
+    @m.observe("h", 99)
+    assert_eq(m.quantile( "h", 1.0), 30.0)
+}
+
+/// Test that default buckets cover typical latencies.
+test "default buckets cover typical latencies" {
+    m = Metrics.new()
+    for 0..100 { @m.observe("lat", 0.004) }
+    assert_eq(m.hist_count( "lat"), 100)
+    q = m.quantile( "lat", 0.5)
+    #assert(q > 0.0 && q <= 0.005)
+    @m.observe("slow", 50.0)
+    assert_eq(m.quantile( "slow", 0.5), 10.0)
+}
+
+/// Test that prometheus exposition.
+test "prometheus exposition" {
+    m = Metrics.new()
+    @m.inc("jobs_total", 3)
+    @m.gauge_set("depth", 7)
+    @m.histogram("lat", [0.5, 1.0])
+    @m.observe("lat", 0.2)
+    @m.observe("lat", 0.7)
+    @m.observe("lat", 3)
+    text = m.render()
+    want = "# TYPE jobs_total counter\njobs_total 3\n# TYPE depth gauge\ndepth 7\n# TYPE lat histogram\nlat_bucket\{le=\"0.5\"\} 1\nlat_bucket\{le=\"1\"\} 2\nlat_bucket\{le=\"+Inf\"\} 3\nlat_sum 3.9\nlat_count 3\n"
+    assert_eq(text, want)
+}
+
+/// Test that exposition groups labelled series under one TYPE line.
+test "exposition groups labelled series under one TYPE line" {
+    m = Metrics.new()
+    @m.inc(metric_key("req", ["route", "/a"]), 2)
+    @m.inc(metric_key("req", ["route", "/b"]), 5)
+    text = m.render()
+    assert_eq(text, "# TYPE req counter\nreq\{route=\"/a\"\} 2\nreq\{route=\"/b\"\} 5\n")
+}
+
+/// Test that labelled histogram merges le into the label set.
+test "labelled histogram merges le into the label set" {
+    m = Metrics.new()
+    key = metric_key("lat", ["route", "/x"])
+    @m.histogram(key, [1.0])
+    @m.observe(key, 0.5)
+    text = m.render()
+    want = "# TYPE lat histogram\nlat_bucket\{route=\"/x\",le=\"1\"\} 1\nlat_bucket\{route=\"/x\",le=\"+Inf\"\} 1\nlat_sum\{route=\"/x\"\} 0.5\nlat_count\{route=\"/x\"\} 1\n"
+    assert_eq(text, want)
+    assert_eq(Metrics.new().render(), "")
+}
+
+/// Test that timers measure forward time.
+test "timers measure forward time" {
+    t = timer_start()
+    spin = 0
+    for 0..2000 { spin += it }
+    #assert(timer_elapsed_ns(t) > 0)
+    #assert(timer_elapsed_secs(t) >= 0.0)
+    m = Metrics.new()
+    @m.time("work_seconds", t)
+    assert_eq(m.hist_count( "work_seconds"), 1)
+    #assert(m.hist_sum( "work_seconds") >= 0.0)
+}
+
+/// Test that sample statistics.
+test "sample statistics" {
+    xs = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    assert_eq(mt_sum(xs), 40.0)
+    assert_eq(mt_mean(xs), 5.0)
+    assert_eq(mt_variance(xs), 4.0)
+    assert_eq(mt_stddev(xs), 2.0)
+    assert_eq(mt_min(xs), 2.0)
+    assert_eq(mt_max(xs), 9.0)
+    assert_eq(mt_mean([]), 0)
+    assert_eq(mt_variance([]), 0)
+    assert_eq(mt_min([]), 0)
+    assert_eq(mt_max([]), 0)
+    assert_eq(mt_stddev([5.0]), 0.0)
+}
+
+/// Test that merge sort.
+test "merge sort" {
+    s = mt_sort([5, 2, 9, 1, 5, 6, 0])
+    expect = [0, 1, 2, 5, 5, 6, 9]
+    ok = len(s) == 7
+    for expect { if s[index] != it { ok = false } }
+    #assert(ok)
+    assert_eq(len(mt_sort([])), 0)
+    assert_eq(mt_sort([3])[0], 3)
+    sorted = mt_sort([1, 2, 3, 4])
+    assert_eq(sorted[3], 4)
+    rev = mt_sort([4, 3, 2, 1])
+    assert_eq(rev[0], 1)
+    assert_eq(rev[3], 4)
+    dup = mt_sort([2, 2, 2])
+    assert_eq(dup[1], 2)
+}
+
+/// Test that exact percentiles.
+test "exact percentiles" {
+    xs = [15.0, 20.0, 35.0, 40.0, 50.0]
+    assert_eq(mt_percentile(xs, 0.0), 15.0)
+    assert_eq(mt_percentile(xs, 100.0), 50.0)
+    assert_eq(mt_median(xs), 35.0)
+    assert_eq(mt_percentile(xs, 25.0), 20.0)
+    assert_eq(mt_percentile(xs, 40.0), 29.0)
+    shuffled = [50.0, 15.0, 40.0, 20.0, 35.0]
+    assert_eq(mt_median(shuffled), 35.0)
+    assert_eq(mt_percentile([7.0], 99.0), 7.0)
+    assert_eq(mt_percentile([], 50.0), 0)
+    assert_eq(mt_median([1.0, 2.0]), 1.5)
+}
+
+/// Test that ewma smooths toward new samples.
+test "ewma smooths toward new samples" {
+    assert_eq(ewma_update(10.0, 20.0, 0.5), 15.0)
+    assert_eq(ewma_update(10.0, 20.0, 1.0), 20.0)
+    assert_eq(ewma_update(10.0, 20.0, 0.1), 11.0)
+    v = 0.0
+    for 0..50 { v = ewma_update(v, 8.0, 0.3) }
+    #assert(v > 7.99 && v < 8.0)
+}

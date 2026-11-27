@@ -1,0 +1,451 @@
+//! std.sys.time — wall clock, monotonic Instant, Duration, DateTime, fiber sleep
+//!
+//! Import: use std.sys.time
+//!
+//!   t0 = Instant.now()
+//!   sleep(Duration.ms(5))
+//!   elapsed = t0.elapsed()          // Duration
+//!   dt = DateTime.utc_now()
+//!   s = dt.format_rfc3339()
+//!   p = DateTime.parse("2024-01-15T12:00:00Z") or DateTime.unix(0)
+
+/// `Duration` is a span of time stored in nanoseconds.
++Duration: Display, Eq, Ord, Add, Sub = {
+    /// Length of the duration in nanoseconds. Defaults to `0`.
+    ns: i64 = 0
+
+    /// Display witness: nanoseconds, so "{d}" and string + agree.
+    display(self) : str => "{self.ns}ns"
+
+    /// Duration of `n` nanoseconds.
+    from_ns(n: i64) : Duration => Duration.{ns: n}
+    /// Duration of `n` nanoseconds.
+    ns(n: i64) : Duration => Duration.{ns: n}
+    /// Duration of `n` microseconds.
+    us(n: i64) : Duration => Duration.{ns: n * 1000}
+    /// Duration of `n` milliseconds.
+    ms(n: i64) : Duration => Duration.{ns: n * 1000000}
+    /// Duration of `n` seconds.
+    s(n: i64) : Duration => Duration.{ns: n * 1000000000}
+    /// Duration of `n` minutes.
+    min(n: i64) : Duration => Duration.{ns: n * 60000000000}
+
+    /// This duration in nanoseconds.
+    as_ns(self) : i64 => self.ns
+    /// This duration in microseconds.
+    as_us(self) : i64 => self.ns / 1000
+    /// This duration in milliseconds.
+    as_ms(self) : i64 => self.ns / 1000000
+    /// This duration in seconds.
+    as_s(self) : f64 => self.ns / 1000000000.0
+    /// This duration in minutes.
+    as_min(self) : f64 => self.ns / 60000000000.0
+
+    /// Sum of the two durations or timestamps.
+    add(self, other: Duration) : Duration => Duration.{ns: self.ns + other.ns}
+    /// Difference of the two durations or timestamps.
+    sub(self, other: Duration) : Duration => Duration.{ns: self.ns - other.ns}
+    /// True when this value is strictly before `other`.
+    lt(self, other: Duration) : bool => self.ns < other.ns
+    /// True when this duration is zero.
+    is_zero(self) : bool => self.ns == 0
+    /// True when this value is strictly after `other`.
+    gt(self, other: Duration) : bool => self.ns > other.ns
+    /// True when this value is after or equal to `other`.
+    gte(self, other: Duration) : bool => self.ns >= other.ns
+    /// True when the two values are the same instant or duration.
+    eq(self, other: Duration) : bool => self.ns == other.ns
+    /// Order witness. -1 when this duration is shorter, 1 when it is longer.
+    cmp(self, other: Duration) : i64 => if self.ns < other.ns { 0 - 1 } else { if self.ns > other.ns { 1 } else { 0 } }
+
+    /// Go time.Duration.String (e.g. "1.5s", "300ms").
+    format(self) : str {
+        if self.ns == 0 { return "0s" }
+        neg = false
+        n = self.ns
+        if n < 0 {
+            neg = true
+            n = 0 - n
+        }
+        sign = ""
+        if neg { sign = "-" }
+        if n < 1000 { return sign + "{n}ns" }
+        if n < 1000000 { return sign + "{n / 1000}µs" }
+        if n < 1000000000 { return sign + "{n / 1000000}ms" }
+        secs = n / 1000000000
+        frac = (n % 1000000000) / 100000000
+        base = sign + "{secs}s"
+        if frac > 0 { base = base + ".{frac}" }
+        base
+    }
+}
+
+/// Current monotonic clock in nanoseconds.
++monotonic_ns() : i64 => host.sys_mono_ns()
+/// Current monotonic clock in milliseconds.
++monotonic_ms() : i64 => host.sys_mono_ns() / 1000000
+/// Current wall clock in Unix nanoseconds.
++wall_clock_ns() : i64 => host.sys_unix_ns()
+
+/// `Instant` is a monotonic timestamp.
++Instant = {
+    /// Mono ns on `Instant` (`i64`). Defaults to `0`.
+    mono_ns: i64 = 0
+
+    /// Instant at the current monotonic time.
+    now() : Instant => Instant.{mono_ns: monotonic_ns()}
+
+    /// Duration since this instant.
+    elapsed(self) : Duration {
+        now = monotonic_ns()
+        Duration.{ns: now - self.mono_ns}
+    }
+
+    /// Milliseconds since this instant.
+    elapsed_ms(self) : i64 => self.elapsed().as_ms()
+
+    /// Reset the start time to now (Go time.Now for timers).
+    reset(@self) {
+        self.mono_ns = monotonic_ns()
+    }
+}
+
+/// Duration from `t` until this instant.
++since(t: Instant) : Duration => t.elapsed()
+
+/// `Timer` measures elapsed monotonic time from a start instant.
++Timer = {
+    /// Start on `Timer` (`Instant`). Defaults to `Instant.{mono_ns: 0}`.
+    start: Instant = Instant.{mono_ns: 0}
+
+    /// Timer started at the current monotonic time.
+    start() : Timer => Timer.{start: Instant.now()}
+
+    /// Duration since this instant.
+    elapsed(self) : Duration => self.start.elapsed()
+
+    /// Reset on this `Timer`.
+    reset(@self) {
+        @self.start.reset()
+    }
+}
+
+/// `DateTime` is a civil UTC time stored as Unix nanoseconds.
++DateTime: Display, Add, Sub = {
+    /// Unix ns on `DateTime` (`i64`). Defaults to `0`.
+    unix_ns: i64 = 0
+
+    /// Display witness: Unix nanoseconds.
+    display(self) : str => "{self.unix_ns}ns"
+
+    /// DateTime at Unix seconds `secs`.
+    unix(secs: i64) : DateTime => DateTime.{unix_ns: secs * 1000000000}
+    /// DateTime at Unix milliseconds `ms`.
+    unix_ms(ms: i64) : DateTime => DateTime.{unix_ns: ms * 1000000}
+    /// DateTime at Unix nanoseconds `ns`.
+    unix_ns(ns: i64) : DateTime => DateTime.{unix_ns: ns}
+    /// Current UTC time.
+    utc_now() : DateTime => DateTime.{unix_ns: host.sys_unix_ns()}
+
+    /// Unix seconds.
+    as_unix(self) : i64 => self.unix_ns / 1000000000
+    /// Unix milliseconds.
+    as_unix_ms(self) : i64 => self.unix_ns / 1000000
+    /// Unix nanoseconds.
+    as_unix_ns(self) : i64 => self.unix_ns
+
+    /// Civil fields (UTC). Algorithm from civil_from_days (Howard Hinnant).
+    year(self) : i64 {
+        z = self.as_unix() / 86400 + 719468
+        era = 0
+        if z >= 0 { era = z / 146097 } else { era = (z - 146096) / 146097 }
+        doe = z - era * 146097
+        yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        y = yoe + era * 400
+        doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        mp = (5 * doy + 2) / 153
+        m = mp + 3
+        if m > 12 { m = m - 12 }
+        if m <= 2 { y = y + 1 }
+        y
+    }
+
+    /// Month number, 1..12.
+    month(self) : i64 {
+        z = self.as_unix() / 86400 + 719468
+        era = 0
+        if z >= 0 { era = z / 146097 } else { era = (z - 146096) / 146097 }
+        doe = z - era * 146097
+        yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        mp = (5 * doy + 2) / 153
+        m = mp + 3
+        if m > 12 { m = m - 12 }
+        m
+    }
+
+    /// Day of the month, 1..31.
+    day(self) : i64 {
+        z = self.as_unix() / 86400 + 719468
+        era = 0
+        if z >= 0 { era = z / 146097 } else { era = (z - 146096) / 146097 }
+        doe = z - era * 146097
+        yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+        doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+        mp = (5 * doy + 2) / 153
+        doy - (153 * mp + 2) / 5 + 1
+    }
+
+    /// Hour, 0..23.
+    hour(self) : i64 {
+        s = self.as_unix() % 86400
+        if s < 0 { s = s + 86400 }
+        s / 3600
+    }
+
+    /// Minute, 0..59.
+    minute(self) : i64 {
+        s = self.as_unix() % 86400
+        if s < 0 { s = s + 86400 }
+        mins = (s % 3600) / 60
+        mins
+    }
+
+    /// Second, 0..60.
+    second(self) : i64 {
+        s = self.as_unix() % 86400
+        if s < 0 { s = s + 86400 }
+        s % 60
+    }
+
+    /// RFC 3339 text for this UTC time.
+    format_rfc3339(self) : str {
+        y = self.year()
+        mo = self.month()
+        d = self.day()
+        h = self.hour()
+        mi = self.minute()
+        se = self.second()
+        time_pad2(y, 4) + "-" + time_pad2(mo, 2) + "-" + time_pad2(d, 2) + "T" + time_pad2(h, 2) + ":" + time_pad2(mi, 2) + ":" + time_pad2(se, 2) + "Z"
+    }
+
+    /// DateTime parsed from RFC 3339 text `s`, or fail.
+    parse(s: str) : DateTime! {
+        n = host.sys_str_len(s)
+        ensure n >= 19 else {
+            fail "time: RFC-3339 too short"
+            return
+        }
+        y = time_parse_int(s, 0, 4) or err {
+            fail "time: bad year"
+            return
+        }
+        mo = time_parse_int(s, 5, 7) or err {
+            fail "time: bad month"
+            return
+        }
+        d = time_parse_int(s, 8, 10) or err {
+            fail "time: bad day"
+            return
+        }
+        h = time_parse_int(s, 11, 13) or err {
+            fail "time: bad hour"
+            return
+        }
+        mi = time_parse_int(s, 14, 16) or err {
+            fail "time: bad minute"
+            return
+        }
+        se = time_parse_int(s, 17, 19) or err {
+            fail "time: bad second"
+            return
+        }
+        ensure mo >= 1 && mo <= 12 else {
+            fail "time: month out of range"
+            return
+        }
+        ensure d >= 1 && d <= 31 else {
+            fail "time: day out of range"
+            return
+        }
+        ensure h >= 0 && h <= 23 else {
+            fail "time: hour out of range"
+            return
+        }
+        ensure mi >= 0 && mi <= 59 else {
+            fail "time: minute out of range"
+            return
+        }
+        ensure se >= 0 && se <= 60 else {
+            fail "time: second out of range"
+            return
+        }
+        days = time_days_from_civil(y, mo, d)
+        unix = days * 86400 + h * 3600 + mi * 60 + se
+        DateTime.{unix_ns: unix * 1000000000}
+    }
+
+    /// Sum of the two durations or timestamps.
+    add(self, d: Duration) : DateTime => DateTime.{unix_ns: self.unix_ns + d.ns}
+
+    /// Difference of the two durations or timestamps.
+    sub(self, other: DateTime) : Duration => Duration.{ns: self.unix_ns - other.unix_ns}
+
+    /// True when this time is strictly before `other`.
+    is_before(self, other: DateTime) : bool => self.unix_ns < other.unix_ns
+
+    /// True when this time is strictly after `other`.
+    is_after(self, other: DateTime) : bool => self.unix_ns > other.unix_ns
+
+    /// True when both times are the same nanosecond.
+    equal(self, other: DateTime) : bool => self.unix_ns == other.unix_ns
+}
+
+/// Fiber-yielding sleep via host clock (M:N scheduler parks on long sleeps).
++sleep(d: Duration) : bool {
+    ns = d.ns
+    ensure ns >= 0 else { return false }
+    host.sys_sleep_ns(ns)
+    true
+}
+
+/// Sleep the current thread for `ms` milliseconds.
++sleep_ms(ms: i64) : bool => sleep(Duration.ms(ms))
+
+/// `n` formatted as two digits.
++time_pad2(n: i64, width: i64) : str {
+    s = "{n}"
+    if n < 0 { return s }
+    out = s
+    for 0..width {
+        if host.sys_str_len(out) < width { out = "0" + out }
+    }
+    out
+}
+
+/// Integer parsed from `s`, or fail.
++time_parse_int(s: str, lo: i64, hi: i64) : i64! {
+    acc = 0
+    for lo..hi {
+        c = s[it]
+        d = -1
+        for 0..10 {
+            if d < 0 && "0123456789"[it] == c { d = it }
+        }
+        ensure d >= 0 else {
+            fail "time: expected digit"
+            return
+        }
+        acc = acc * 10 + d
+    }
+    acc
+}
+
+/// Days since Unix epoch for civil Y-M-D (UTC), Howard Hinnant algorithm.
++time_days_from_civil(y: i64, m: i64, d: i64) : i64 {
+    yy = y
+    if m <= 2 { yy = yy - 1 }
+    era = 0
+    if yy >= 0 { era = yy / 400 } else { era = (yy - 399) / 400 }
+    yoe = yy - era * 400
+    mp = m + 9
+    if m > 2 { mp = m - 3 }
+    doy = (153 * mp + 2) / 5 + d - 1
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+/// Test that stdlib.time duration units.
+test "stdlib.time duration units" {
+    assert_eq(Duration.ns(1000).as_us(), 1)
+    assert_eq(Duration.us(1000).as_ms(), 1)
+    assert_eq(Duration.ms(1000).as_s(), 1.0)
+    assert_eq(Duration.s(60).as_min(), 1.0)
+    assert_eq(Duration.min(1).as_ns(), 60000000000)
+    assert_eq(Duration.ms(5).add(Duration.ms(7)).as_ms(), 12)
+    #assert(!(Duration.ms(3).is_zero()))
+    #assert(Duration.ns(0).is_zero())
+}
+
+/// Test that stdlib.time instant elapsed non-negative.
+test "stdlib.time instant elapsed non-negative" {
+    t0 = Instant.now()
+    sleep(Duration.ns(1000))
+    d = t0.elapsed()
+    #assert(d.ns >= 0)
+}
+
+/// Test that stdlib.time rfc3339 roundtrip.
+test "stdlib.time rfc3339 roundtrip" {
+    dt = DateTime.unix(1705320000)
+    s = dt.format_rfc3339()
+    #assert(host.sys_str_len(s) >= 20)
+    back = DateTime.parse(s) or DateTime.unix(0)
+    assert_eq(back.as_unix(), 1705320000)
+    p = DateTime.parse("2024-01-15T12:00:00Z") or DateTime.unix(0)
+    assert_eq(p.year(), 2024)
+    assert_eq(p.month(), 1)
+    assert_eq(p.day(), 15)
+    assert_eq(p.hour(), 12)
+}
+
+/// Test that stdlib.time parse rejects garbage.
+test "stdlib.time parse rejects garbage" {
+    bad = DateTime.parse("not-a-date") or DateTime.unix(-1)
+    assert_eq(bad.as_unix(), -1)
+}
+
+/// Test that monotonic clocks are non-decreasing.
+test "monotonic clocks are non-decreasing" {
+    a = monotonic_ns()
+    b = monotonic_ns()
+    #assert(b >= a)
+    #assert(a >= 0)
+    ms0 = monotonic_ms()
+    ms1 = monotonic_ms()
+    #assert(ms1 >= ms0)
+    #assert(monotonic_ms() <= monotonic_ns() / 1000000 + 1)
+}
+
+/// Test that stdlib.time duration format and compare.
+test "stdlib.time duration format and compare" {
+    assert_eq(Duration.ms(500).format(), "500ms")
+    assert_eq(Duration.s(2).format(), "2s")
+    assert_eq(Duration.ns(0).format(), "0s")
+    #assert(Duration.ms(5).gt(Duration.ms(3)))
+    #assert(Duration.ms(5).eq(Duration.ms(5)))
+}
+
+/// Test that stdlib.time timer and since.
+test "stdlib.time timer and since" {
+    t = Timer.start()
+    sleep(Duration.ms(1))
+    e = t.elapsed()
+    #assert(e.ns >= 0)
+    #assert(since(t.start).ns >= 0)
+    @t.reset()
+    #assert(t.elapsed().as_ms() >= 0)
+}
+
+/// Test that stdlib.time datetime arithmetic.
+test "stdlib.time datetime arithmetic" {
+    a = DateTime.unix(100)
+    b = DateTime.unix(110)
+    #assert(a.is_before(b))
+    #assert(b.is_after(a))
+    c = a.add(Duration.s(10))
+    #assert(c.equal(b))
+    assert_eq(b.sub(a).as_s(), 10.0)
+}
+
+/// Test that stdlib.time wall-clock fields at a known instant.
+test "stdlib.time wall-clock fields at a known instant" {
+    // 1994-11-06 08:49:37 UTC — minutes must come back as 49, not 0.
+    dt = DateTime.unix(784111777)
+    assert_eq(dt.year(), 1994)
+    assert_eq(dt.month(), 11)
+    assert_eq(dt.day(), 6)
+    assert_eq(dt.hour(), 8)
+    assert_eq(dt.minute(), 49)
+    assert_eq(dt.second(), 37)
+}

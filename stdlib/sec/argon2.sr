@@ -1,0 +1,524 @@
+//! std.sec.argon2 — Argon2id parameters, PHC string encoding/parsing and an offline test derive
+//!
+//! Import with:
+//!   use std.sec.argon2
+//!
+//!   p   = Argon2Params.owasp()                          // m=19456 KiB, t=2, p=1, 32-byte tag
+//!   enc = a2_fake_hash("hunter2", a2_new_salt(16), p)   // "$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>"
+//!   ok  = a2_fake_verify("hunter2", enc)                // true
+//!   rec = a2_parse(enc) or err { return }               // Argon2Record with params, salt, hash
+//!   old = a2_needs_rehash(enc, Argon2Params.recommended())
+//!
+//! Three separate jobs live here:
+//!   1. `Argon2Params` — the cost parameters (memory in KiB, passes, lanes, tag length) with the
+//!      RFC 9106 validity rules and two named profiles (`recommended`, `owasp`).
+//!   2. The PHC string format `$argon2id$v=19$m=..,t=..,p=..$<salt>$<hash>` (unpadded standard
+//!      base64): `a2_encode` / `a2_parse` read and write it. `a2_parse` also accepts records
+//!      produced by the host primitive behind `std.sec.crypto.argon2id_hash`, so you can
+//!      inspect or rehash real stored hashes offline.
+//!   3. `a2_fake_derive` — a deterministic BLAKE3 stand-in for the memory-hard function. It is
+//!      NOT Argon2: it uses no memory and costs one hash, so it must never protect real
+//!      passwords. It exists so tests, fixtures and sandboxes can exercise the encoding,
+//!      verification and rehash policy without 19 MiB of work per call. Production code derives
+//!      with `std.sec.crypto.argon2id_hash` / `argon2id_verify`.
+//! Public helpers are prefixed `a2_` (modules merge flat).
+
+/// `A2_VERSION` is the Argon2 version number written as `v=19` (0x13).
++A2_VERSION = 19
+/// `A2_B64` is the standard base64 alphabet used by PHC strings (no padding).
++A2_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+/// `A2_HEX` is the lowercase hex alphabet.
++A2_HEX = "0123456789abcdef"
+/// `A2_MAX_LANES` is the largest legal parallelism (`16777215`).
++A2_MAX_LANES = 16777215
+/// `A2_MIN_TAG` is the smallest legal tag length in bytes (`4`).
++A2_MIN_TAG = 4
+
+// --- parameters -------------------------------------------------------------------------------
+
+/// `Argon2Params` are the Argon2id cost parameters.
++Argon2Params = {
+    /// Memory cost in KiB. Defaults to `19456`.
+    m_kib: i64 = 19456
+    /// Number of passes. Defaults to `2`.
+    t_cost: i64 = 2
+    /// Degree of parallelism (lanes). Defaults to `1`.
+    lanes: i64 = 1
+    /// Tag (hash) length in bytes. Defaults to `32`.
+    out_len: i64 = 32
+
+    /// Parameters from explicit values.
+    of(m_kib: i64, t_cost: i64, lanes: i64, out_len: i64) : Argon2Params => Argon2Params.{m_kib, t_cost, lanes, out_len}
+
+    /// OWASP minimum profile: 19 MiB, 2 passes, 1 lane (also the host default).
+    owasp() : Argon2Params => Argon2Params.{m_kib: 19456, t_cost: 2, lanes: 1, out_len: 32}
+
+    /// RFC 9106 second recommended option: 64 MiB, 3 passes, 4 lanes.
+    recommended() : Argon2Params => Argon2Params.{m_kib: 65536, t_cost: 3, lanes: 4, out_len: 32}
+
+    /// Cheap profile for tests: 8 KiB, 1 pass, 1 lane, 16-byte tag (still passes `check`).
+    testing() : Argon2Params => Argon2Params.{m_kib: 8, t_cost: 1, lanes: 1, out_len: 16}
+
+    /// Memory the function would use, in bytes.
+    memory_bytes(self) : i64 => self.m_kib * 1024
+
+    /// Validate against RFC 9106 section 3.1; fails with the first violated rule.
+    check(self) : bool! {
+        ensure self.lanes >= 1 && self.lanes <= A2_MAX_LANES else {
+            fail "argon2: lanes must be 1..16777215"
+            return
+        }
+        ensure self.t_cost >= 1 else {
+            fail "argon2: passes must be at least 1"
+            return
+        }
+        ensure self.m_kib >= 8 * self.lanes else {
+            fail "argon2: memory must be at least 8 KiB per lane"
+            return
+        }
+        ensure self.m_kib <= 4294967295 else {
+            fail "argon2: memory exceeds 2^32-1 KiB"
+            return
+        }
+        ensure self.out_len >= A2_MIN_TAG && self.out_len <= 4294967295 else {
+            fail "argon2: tag length must be at least 4 bytes"
+            return
+        }
+        true
+    }
+
+    /// True when `check` passes.
+    is_valid(self) : bool => self.check() or false
+
+    /// True when every cost of this profile is at least as strong as `floor`.
+    covers(self, floor: Argon2Params) : bool {
+        self.m_kib >= floor.m_kib && self.t_cost >= floor.t_cost && self.lanes >= floor.lanes && self.out_len >= floor.out_len
+    }
+
+    /// The `m=..,t=..,p=..` segment of a PHC string.
+    phc(self) : str => "m={self.m_kib},t={self.t_cost},p={self.lanes}"
+}
+
+// --- base64 / hex -------------------------------------------------------------------------------
+
+/// Unpadded standard base64 of a byte array.
++a2_b64_encode(bytes: _) : str {
+    out = ""
+    n = host.sys_arr_len(bytes)
+    i = 0
+    while i < n {
+        b0 = bytes[i]
+        b1 = 0
+        b2 = 0
+        if i + 1 < n { b1 = bytes[i + 1] }
+        if i + 2 < n { b2 = bytes[i + 2] }
+        out = out + A2_B64[b0 / 4]
+        out = out + A2_B64[(b0 % 4) * 16 + b1 / 16]
+        if i + 1 < n { out = out + A2_B64[(b1 % 16) * 4 + b2 / 64] }
+        if i + 2 < n { out = out + A2_B64[b2 % 64] }
+        i += 3
+    }
+    out
+}
+
+/// Index of `c` in the base64 alphabet, or -1.
++a2_b64_index(c: str) : i64 {
+    pos = -1
+    for 0..64 {
+        if pos < 0 && A2_B64[it] == c { pos = it }
+    }
+    pos
+}
+
+/// Bytes of unpadded standard base64 text; fails on a bad character or an impossible length.
++a2_b64_decode(s: str) : _! {
+    n = host.sys_str_len(s)
+    ensure n % 4 != 1 else {
+        fail "argon2: bad base64 length"
+        return
+    }
+    out = []
+    acc = 0
+    bits = 0
+    bad = false
+    for 0..n {
+        v = a2_b64_index(s[it])
+        if v < 0 { bad = true } else {
+            acc = acc * 64 + v
+            bits += 6
+            if bits >= 8 {
+                shift = 1
+                for 0..(bits - 8) { shift = shift * 2 }
+                out = host.sys_arr_push(out, (acc / shift) % 256)
+                acc = acc % shift
+                bits -= 8
+            }
+        }
+    }
+    ensure !bad else {
+        fail "argon2: bad base64 character"
+        return
+    }
+    out
+}
+
+/// Lowercase hex of a byte array.
++a2_hex(bytes: _) : str {
+    out = ""
+    for bytes { out = out + A2_HEX[(it / 16) % 16] + A2_HEX[it % 16] }
+    out
+}
+
+/// Hex text -> bytes (invalid digits count as 0).
++a2_unhex(h: str) {
+    out = []
+    for 0..(host.sys_str_len(h) / 2) {
+        hi = host.sys_ord(h[it * 2])
+        lo = host.sys_ord(h[it * 2 + 1])
+        if hi >= 97 { hi = hi - 87 } else { hi = hi - 48 }
+        if lo >= 97 { lo = lo - 87 } else { lo = lo - 48 }
+        out = host.sys_arr_push(out, hi * 16 + lo)
+    }
+    out
+}
+
+/// A fresh random salt of `n` bytes (clamped to 8..64; RFC 9106 recommends 16).
++a2_new_salt(n: i64) {
+    size = n
+    if size < 8 { size = 8 }
+    if size > 64 { size = 64 }
+    a2_unhex(host.sys_hex_encode(host.sys_rand_bytes(size)))
+}
+
+/// Constant-shape equality of two byte arrays.
++a2_ct_eq(a: _, b: _) : bool {
+    na = host.sys_arr_len(a)
+    nb = host.sys_arr_len(b)
+    diff = 0
+    if na != nb { diff = 1 }
+    n = na
+    if nb > n { n = nb }
+    for 0..n {
+        x = 0
+        y = 0
+        if it < na { x = a[it] }
+        if it < nb { y = b[it] }
+        if x != y { diff = 1 }
+    }
+    diff == 0
+}
+
+// --- PHC string -----------------------------------------------------------------------------------
+
+/// `$argon2id$v=19$m=..,t=..,p=..$<salt>$<hash>` for the given bytes.
++a2_encode(params: Argon2Params, salt: _, hash: _) : str {
+    "$argon2id$v=" + A2_VERSION + "$" + params.phc() + "$" + a2_b64_encode(salt) + "$" + a2_b64_encode(hash)
+}
+
+/// `Argon2Record` is a parsed PHC string.
++Argon2Record = {
+    /// The cost parameters (`out_len` is the decoded hash length). Defaults to the OWASP profile.
+    params: Argon2Params = Argon2Params.owasp()
+    /// Salt bytes. Defaults to `[]`.
+    salt: _ = []
+    /// Hash (tag) bytes. Defaults to `[]`.
+    hash: _ = []
+}
+
+/// Split `s` on `$` into its fields (a leading `$` yields an empty first field).
++a2_split_dollar(s: str) {
+    out = []
+    cur = ""
+    for 0..host.sys_str_len(s) {
+        c = s[it]
+        if c == "$" {
+            out = host.sys_arr_push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+    }
+    out = host.sys_arr_push(out, cur)
+    out
+}
+
+/// Non-negative integer in decimal text, or -1 when empty or not all digits.
++a2_to_int(s: str) : i64 {
+    n = host.sys_str_len(s)
+    ensure n > 0 && n <= 18 else { return -1 }
+    v = 0
+    ok = true
+    for 0..n {
+        d = host.sys_ord(s[it]) - 48
+        if d < 0 || d > 9 { ok = false }
+        v = v * 10 + d
+    }
+    if ok { return v }
+    -1
+}
+
+/// Value of `key=` inside a comma-separated `m=..,t=..,p=..` segment, or -1.
++a2_param(segment: str, key: str) : i64 {
+    n = host.sys_str_len(segment)
+    found = -1
+    start = 0
+    for 0..(n + 1) {
+        pos = it
+        if pos == n || segment[pos] == "," {
+            part = segment[start..pos]
+            if host.sys_str_len(part) > 2 && part[0..2] == key + "=" && found < 0 {
+                found = a2_to_int(part[2..host.sys_str_len(part)])
+            }
+            start = pos + 1
+        }
+    }
+    found
+}
+
+/// Parse a PHC argon2id string (version 19 only); fails on any malformed field.
++a2_parse(encoded: str) : Argon2Record! {
+    f = a2_split_dollar(encoded)
+    ensure host.sys_arr_len(f) == 6 else {
+        fail "argon2: expected 5 fields"
+        return
+    }
+    ensure f[0] == "" && f[1] == "argon2id" else {
+        fail "argon2: not an argon2id string"
+        return
+    }
+    ensure f[2] == "v=" + A2_VERSION else {
+        fail "argon2: unsupported version"
+        return
+    }
+    m = a2_param(f[3], "m")
+    t = a2_param(f[3], "t")
+    p = a2_param(f[3], "p")
+    ensure m >= 0 && t >= 0 && p >= 0 else {
+        fail "argon2: bad m/t/p parameters"
+        return
+    }
+    salt = a2_b64_decode(f[4]) or err {
+        fail "{err}"
+        return
+    }
+    hash = a2_b64_decode(f[5]) or err {
+        fail "{err}"
+        return
+    }
+    ensure host.sys_arr_len(hash) >= A2_MIN_TAG else {
+        fail "argon2: hash too short"
+        return
+    }
+    Argon2Record.{params: Argon2Params.{m_kib: m, t_cost: t, lanes: p, out_len: host.sys_arr_len(hash)}, salt, hash}
+}
+
+// --- offline derive (NOT Argon2) --------------------------------------------------------------------------
+
+/// Deterministic BLAKE3-based stand-in for Argon2id: `out_len` bytes from password, salt and parameters.
+/// Different passwords, salts or costs give unrelated output. For tests and fixtures only.
++a2_fake_derive(password: str, salt: _, params: Argon2Params) {
+    seed = "argon2id-fake|{params.m_kib}|{params.t_cost}|{params.lanes}|{params.out_len}|" + a2_hex(salt) + "|" + password
+    block = host.sys_blake3(seed)
+    out = []
+    counter = 0
+    while host.sys_arr_len(out) < params.out_len {
+        for a2_unhex(block) {
+            if host.sys_arr_len(out) < params.out_len { out = host.sys_arr_push(out, it) }
+        }
+        counter += 1
+        block = host.sys_blake3(block + seed + counter)
+    }
+    out
+}
+
+/// PHC string for `password` using the offline derive; fails on invalid parameters.
++a2_fake_hash(password: str, salt: _, params: Argon2Params) : str! {
+    params.check() or err {
+        fail "{err}"
+        return
+    }
+    a2_encode(params, salt, a2_fake_derive(password, salt, params))
+}
+
+/// True when `password` reproduces the hash in an offline-derived PHC string.
++a2_fake_verify(password: str, encoded: str) : bool {
+    rec = a2_parse(encoded) or Argon2Record.{params: Argon2Params.{m_kib: 0, t_cost: 0, lanes: 0, out_len: 0}, salt: [], hash: []}
+    ensure rec.params.out_len >= A2_MIN_TAG else { return false }
+    a2_ct_eq(a2_fake_derive(password, rec.salt, rec.params), rec.hash)
+}
+
+/// True when `encoded` is unparsable, or any of its costs is weaker than `target`.
++a2_needs_rehash(encoded: str, target: Argon2Params) : bool {
+    rec = a2_parse(encoded) or Argon2Record.{params: Argon2Params.{m_kib: 0, t_cost: 0, lanes: 0, out_len: 0}, salt: [], hash: []}
+    ensure rec.params.out_len >= A2_MIN_TAG else { return true }
+    !rec.params.covers(target)
+}
+
+// --- tests ----------------------------------------------------------------------------------------------------
+
+/// Test that parameter profiles are valid and ordered.
+test "parameter profiles are valid and ordered" {
+    own = Argon2Params.owasp()
+    rec = Argon2Params.recommended()
+    low = Argon2Params.testing()
+    #assert(own.is_valid())
+    #assert(rec.is_valid())
+    #assert(low.is_valid())
+    assert_eq(own.m_kib, 19456)
+    assert_eq(rec.m_kib, 65536)
+    assert_eq(rec.lanes, 4)
+    assert_eq(own.memory_bytes(), 19922944)
+    #assert(rec.covers(own))
+    #assert(!(own.covers(rec)))
+    #assert(own.covers(own))
+    #assert(!(low.covers(own)))
+    assert_eq(own.phc(), "m=19456,t=2,p=1")
+    assert_eq(rec.phc(), "m=65536,t=3,p=4")
+}
+
+/// Test that invalid parameters are rejected with a reason.
+test "invalid parameters are rejected with a reason" {
+    #assert(Argon2Params.of(8, 1, 1, 4).is_valid())
+    #assert(!(Argon2Params.of(7, 1, 1, 16).is_valid()))
+    #assert(!(Argon2Params.of(64, 0, 1, 16).is_valid()))
+    #assert(!(Argon2Params.of(64, 1, 0, 16).is_valid()))
+    #assert(!(Argon2Params.of(64, 1, 16777216, 16).is_valid()))
+    #assert(!(Argon2Params.of(15, 1, 2, 16).is_valid()))
+    #assert(Argon2Params.of(16, 1, 2, 16).is_valid())
+    #assert(!(Argon2Params.of(64, 1, 1, 3).is_valid()))
+    #assert(!(Argon2Params.of(4294967296, 1, 1, 16).is_valid()))
+    msg = Argon2Params.of(64, 0, 1, 16).check() or err { "{err}" }
+    #assert(host.sys_str_len("{msg}") > 4)
+}
+
+/// Test that base64 matches RFC 4648 and rejects bad input.
+test "base64 matches RFC 4648 and rejects bad input" {
+    assert_eq(a2_b64_encode([]), "")
+    assert_eq(a2_b64_encode([102]), "Zg")
+    assert_eq(a2_b64_encode([102, 111]), "Zm8")
+    assert_eq(a2_b64_encode([102, 111, 111]), "Zm9v")
+    assert_eq(a2_b64_encode([102, 111, 111, 98, 97, 114]), "Zm9vYmFy")
+    assert_eq(a2_b64_encode([251, 255, 254]), "+//+")
+    back = a2_b64_decode("Zm9vYmE") or []
+    assert_eq(host.sys_arr_len(back), 5)
+    assert_eq(back[4], 97)
+    assert_eq(host.sys_arr_len(a2_b64_decode("") or [1]), 0)
+    assert_eq(host.sys_arr_len(a2_b64_decode("Z") or [1]), 1)
+    assert_eq(host.sys_arr_len(a2_b64_decode("Zm9v!") or [1]), 1)
+    assert_eq(host.sys_arr_len(a2_b64_decode("Zm9v=") or [1]), 1)
+    all = []
+    for 0..256 { all = host.sys_arr_push(all, it) }
+    rt = a2_b64_decode(a2_b64_encode(all)) or []
+    assert_eq(host.sys_arr_len(rt), 256)
+    assert_eq(rt[255], 255)
+    assert_eq(rt[128], 128)
+    assert_eq(a2_hex([0, 255, 16]), "00ff10")
+    assert_eq(a2_unhex("00ff10")[1], 255)
+}
+
+/// Test that a PHC string encodes in the documented format.
+test "a PHC string encodes in the documented format" {
+    enc = a2_encode(Argon2Params.owasp(), host.sys_str_to_bytes("saltsalt"), [1, 2, 3, 4, 5, 6])
+    assert_eq(enc, "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$AQIDBAUG")
+    fields = a2_split_dollar(enc)
+    assert_eq(host.sys_arr_len(fields), 6)
+    assert_eq(fields[0], "")
+    assert_eq(fields[1], "argon2id")
+    assert_eq(fields[2], "v=19")
+}
+
+/// Test that parsing recovers every field.
+test "parsing recovers every field" {
+    enc = a2_encode(Argon2Params.recommended(), [9, 8, 7, 6, 5, 4, 3, 2], [10, 20, 30, 40])
+    rec = a2_parse(enc) or Argon2Record.{params: Argon2Params.testing(), salt: [], hash: []}
+    assert_eq(rec.params.m_kib, 65536)
+    assert_eq(rec.params.t_cost, 3)
+    assert_eq(rec.params.lanes, 4)
+    assert_eq(rec.params.out_len, 4)
+    assert_eq(host.sys_arr_len(rec.salt), 8)
+    assert_eq(rec.salt[0], 9)
+    assert_eq(rec.hash[3], 40)
+    assert_eq(a2_param("m=1,t=2,p=3", "t"), 2)
+    assert_eq(a2_param("m=1,t=2,p=3", "x"), -1)
+    assert_eq(a2_param("m=,t=2", "m"), -1)
+    assert_eq(a2_to_int("0042"), 42)
+    assert_eq(a2_to_int("4x"), -1)
+    assert_eq(a2_to_int(""), -1)
+}
+
+/// Test that malformed PHC strings are rejected.
+test "malformed PHC strings are rejected" {
+    bad = ["", "nope", "$argon2i$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$AQIDBAUG", "$argon2id$v=16$m=8,t=1,p=1$c2FsdHNhbHQ$AQIDBAUG", "$argon2id$v=19$m=8,t=1$c2FsdHNhbHQ$AQIDBAUG", "$argon2id$v=19$m=x,t=1,p=1$c2FsdHNhbHQ$AQIDBAUG", "$argon2id$v=19$m=8,t=1,p=1$c2Fs!HNhbHQ$AQIDBAUG", "$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$AQ", "$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ", "$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$AQIDBAUG$extra"]
+    for bad {
+        rec = a2_parse(it) or Argon2Record.{params: Argon2Params.{m_kib: -1, t_cost: 0, lanes: 0, out_len: 0}, salt: [], hash: []}
+        assert_eq(rec.params.m_kib, -1)
+    }
+}
+
+/// Test that the offline derive is deterministic and input-sensitive.
+test "the offline derive is deterministic and input-sensitive" {
+    p = Argon2Params.testing()
+    salt = host.sys_str_to_bytes("0123456789abcdef")
+    a = a2_fake_derive("pw", salt, p)
+    assert_eq(host.sys_arr_len(a), 16)
+    #assert(a2_ct_eq(a, a2_fake_derive("pw", salt, p)))
+    #assert(!(a2_ct_eq(a, a2_fake_derive("pw2", salt, p))))
+    #assert(!(a2_ct_eq(a, a2_fake_derive("pw", host.sys_str_to_bytes("0123456789abcdeX"), p))))
+    #assert(!(a2_ct_eq(a, a2_fake_derive("pw", salt, Argon2Params.{m_kib: 16, t_cost: 1, lanes: 1, out_len: 16}))))
+    long = a2_fake_derive("pw", salt, Argon2Params.{m_kib: 8, t_cost: 1, lanes: 1, out_len: 100})
+    assert_eq(host.sys_arr_len(long), 100)
+    #assert(!(a2_ct_eq([1, 2], [1, 2, 0])))
+    #assert(a2_ct_eq([], []))
+    assert_eq(host.sys_arr_len(a2_new_salt(16)), 16)
+    assert_eq(host.sys_arr_len(a2_new_salt(1)), 8)
+    assert_eq(host.sys_arr_len(a2_new_salt(500)), 64)
+    #assert(!(a2_ct_eq(a2_new_salt(16), a2_new_salt(16))))
+}
+
+/// Test that fake hash and verify round trip.
+test "fake hash and verify round trip" {
+    p = Argon2Params.testing()
+    salt = a2_new_salt(16)
+    enc = a2_fake_hash("hunter2", salt, p) or ""
+    assert_eq(enc[0..17], "$argon2id$v=19$m=")
+    #assert(a2_fake_verify("hunter2", enc))
+    #assert(!(a2_fake_verify("hunter3", enc)))
+    #assert(!(a2_fake_verify("", enc)))
+    #assert(!(a2_fake_verify("hunter2", "garbage")))
+    #assert(!(a2_fake_verify("hunter2", "")))
+    again = a2_fake_hash("hunter2", salt, p) or ""
+    assert_eq(again, enc)
+    other = a2_fake_hash("hunter2", a2_new_salt(16), p) or ""
+    #assert(other != enc)
+    rec = a2_parse(enc) or Argon2Record.{params: Argon2Params.owasp(), salt: [], hash: []}
+    assert_eq(rec.params.out_len, 16)
+    assert_eq(host.sys_arr_len(rec.salt), 16)
+    assert_eq(a2_fake_hash("pw", salt, Argon2Params.{m_kib: 4, t_cost: 1, lanes: 1, out_len: 16}) or "invalid", "invalid")
+}
+
+/// Test that the rehash policy compares each cost.
+test "the rehash policy compares each cost" {
+    low = a2_fake_hash("pw", [1, 2, 3, 4, 5, 6, 7, 8], Argon2Params.testing()) or ""
+    own = a2_fake_hash("pw", [1, 2, 3, 4, 5, 6, 7, 8], Argon2Params.owasp()) or ""
+    #assert(a2_needs_rehash(low, Argon2Params.owasp()))
+    #assert(!(a2_needs_rehash(own, Argon2Params.owasp())))
+    #assert(a2_needs_rehash(own, Argon2Params.recommended()))
+    #assert(!(a2_needs_rehash(low, Argon2Params.testing())))
+    #assert(a2_needs_rehash("garbage", Argon2Params.testing()))
+    #assert(a2_needs_rehash("", Argon2Params.testing()))
+}
+
+/// Test that records from the host Argon2id primitive parse offline.
+test "records from the host Argon2id primitive parse offline" {
+    enc = host.sys_argon2id_hash("pw", "salty")
+    rec = a2_parse(enc) or Argon2Record.{params: Argon2Params.testing(), salt: [], hash: []}
+    assert_eq(rec.params.m_kib, 19456)
+    assert_eq(rec.params.t_cost, 2)
+    assert_eq(rec.params.lanes, 1)
+    assert_eq(rec.params.out_len, 32)
+    assert_eq(rec.salt[0], 115)
+    assert_eq(a2_encode(rec.params, rec.salt, rec.hash), enc)
+    #assert(!(a2_needs_rehash(enc, Argon2Params.owasp())))
+    #assert(a2_needs_rehash(enc, Argon2Params.recommended()))
+    #assert(host.sys_argon2id_verify("pw", enc))
+}

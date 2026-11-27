@@ -1,0 +1,217 @@
+//! std.io.stdio — process stdin, stdout, and stderr
+//!
+//! Import with:
+//!   use std.io.stdio
+//!
+//!   host.sys_stdin_feed("line one\n")   // tests only — simulates typed input
+//!   line = stdin.read_line() or "eof"
+//!   stdout.write_str("hello")
+//!   eprint("warn: {line}")
+//!
+//! `print` remains the builtin for newline-terminated debug output; this module is
+//! for binary-safe writes, stderr, and interactive / piped stdin.
+
+/// `STDIO_CHUNK` is `65536`.
++STDIO_CHUNK = 65536
+/// `STDIO_READ_MAX` is `1048576`.
++STDIO_READ_MAX = 1048576
+
+/// Chunk empty (`chunk`).
++stdio_chunk_empty(chunk: _) : bool => host.sys_bytes_to_str(chunk) == ""
+
+/// `Stdout` writes to the process standard output.
++Stdout = {
+    /// Tag on `Stdout` (`i64`). Defaults to `1`.
+    tag: i64 = 1
+
+    /// Create a fresh `Stdout`.
+    new() : Stdout => Stdout.{tag: 1}
+
+    /// Write str on this `Stdout` (`_self`, `text`). Returns `i64`, or fails.
+    write_str(_self, text: str) : i64! {
+        host.sys_stdout_write(text) or err {
+            fail "stdio: stdout write failed: {err}"
+            return
+        }
+    }
+
+    /// Write bytes on this `Stdout` (`_self`, `data`). Returns `i64`, or fails.
+    write_bytes(_self, data: _) : i64! {
+        host.sys_stdout_write(data) or err {
+            fail "stdio: stdout write failed: {err}"
+            return
+        }
+    }
+
+    /// Flush on this `Stdout` (`_self`). Returns `bool`, or fails.
+    flush(_self) : bool! {
+        host.sys_stdio_flush() or err {
+            fail "stdio: flush failed: {err}"
+        }
+    }
+}
+
+/// `Stderr` writes to the process standard error.
++Stderr = {
+    /// Tag on `Stderr` (`i64`). Defaults to `2`.
+    tag: i64 = 2
+
+    /// Create a fresh `Stderr`.
+    new() : Stderr => Stderr.{tag: 2}
+
+    /// Write str on this `Stderr` (`_self`, `text`). Returns `i64`, or fails.
+    write_str(_self, text: str) : i64! {
+        host.sys_stderr_write(text) or err {
+            fail "stdio: stderr write failed: {err}"
+            return
+        }
+    }
+
+    /// Write bytes on this `Stderr` (`_self`, `data`). Returns `i64`, or fails.
+    write_bytes(_self, data: _) : i64! {
+        host.sys_stderr_write(data) or err {
+            fail "stdio: stderr write failed: {err}"
+            return
+        }
+    }
+
+    /// Flush on this `Stderr` (`_self`). Returns `bool`, or fails.
+    flush(_self) : bool! {
+        host.sys_stdio_flush() or err {
+            fail "stdio: flush failed: {err}"
+        }
+    }
+}
+
+/// `Stdin` reads the process standard input.
++Stdin = {
+    /// Tag on `Stdin` (`i64`). Defaults to `0`.
+    tag: i64 = 0
+
+    /// Create a fresh `Stdin`.
+    new() : Stdin => Stdin.{tag: 0}
+
+    /// Read on this `Stdin` (`_self`, `n`). Returns `str`, or fails.
+    read(_self, n: i64) : str! {
+        want = n
+        if want < 1 { want = 1 }
+        if want > STDIO_CHUNK { want = STDIO_CHUNK }
+        chunk = host.sys_stdin_read(want) or err {
+            fail "stdio: stdin read failed: {err}"
+            return
+        }
+        host.sys_bytes_to_str(chunk)
+    }
+
+    /// Read line on this `Stdin` (`_self`). Returns `str`, or `none`.
+    read_line(_self) : str? {
+        out = ""
+        for 0..STDIO_READ_MAX {
+            chunk = host.sys_stdin_read(1) or err {
+                fail "stdio: stdin read failed: {err}"
+                return
+            }
+            if stdio_chunk_empty(chunk) {
+                ensure out != "" else { return none }
+                return out
+            }
+            ch = host.sys_bytes_to_str(chunk)
+            if ch == "\n" { return out }
+            out = out + ch
+        }
+        fail "stdio: read_line exceeded limit"
+        return out
+    }
+
+    /// Read all on this `Stdin` (`_self`). Returns `str`, or fails.
+    read_all(_self) : str! {
+        out = ""
+        for 0..STDIO_READ_MAX {
+            chunk = host.sys_stdin_read(STDIO_CHUNK) or err {
+                fail "stdio: stdin read failed: {err}"
+                return
+            }
+            if stdio_chunk_empty(chunk) { break }
+            out = out + host.sys_bytes_to_str(chunk)
+        }
+        out
+    }
+}
+
+/// `stdout` is `Stdout.new()`.
++stdout = Stdout.new()
+/// `stderr` is `Stderr.new()`.
++stderr = Stderr.new()
+/// `stdin` is `Stdin.new()`.
++stdin = Stdin.new()
+
+/// Eprint (`msg`). Returns `i64`, or fails.
++eprint(msg: str) : i64! => stderr.write_str(msg)
+
+/// Eprintln (`msg`). Returns `i64`, or fails.
++eprintln(msg: str) : i64! => stderr.write_str("{msg}\n")
+
+/// UFCS alias matching common `stdout.write` spelling.
++write(self: Stdout, text: str) : i64! => self.write_str(text)
+
+// --- tests ------------------------------------------------------------------------------
+
+/// Test that stdout and stderr capture.
+test "stdout and stderr capture" {
+    host.sys_stdio_capture_begin() or err {
+        assert_eq(1, 0)
+        return
+    }
+    n = stdout.write_str("alpha") or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(n, 5)
+    m = stderr.write_str("beta\n") or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(m, 5)
+    #assert(stdout.flush() or false)
+    assert_eq(host.sys_stdio_capture_drain(0), "alpha")
+    assert_eq(host.sys_stdio_capture_drain(1), "beta\n")
+    #assert(host.sys_stdio_capture_end())
+}
+
+/// Test that stdin feed read and read_line.
+test "stdin feed read and read_line" {
+    host.sys_stdin_feed("abc\ndef\n")
+    assert_eq(stdin.read(2), "ab")
+    assert_eq(stdin.read_line() or "?", "c")
+    assert_eq(stdin.read_line() or "?", "def")
+    assert_eq(stdin.read_line() or "eof", "eof")
+}
+
+/// Test that stdin read_all slurps remainder.
+test "stdin read_all slurps remainder" {
+    host.sys_stdin_feed("head\ntail-bytes")
+    _ = stdin.read_line()
+    assert_eq(stdin.read_all(), "tail-bytes")
+}
+
+/// Test that write_bytes eprint and ufcs write alias.
+test "write_bytes eprint and ufcs write alias" {
+    host.sys_stdio_capture_begin() or err {
+        assert_eq(1, 0)
+        return
+    }
+    bytes = host.sys_str_to_bytes("AB")
+    assert_eq(stdout.write_bytes(bytes) or -1, 2)
+    assert_eq(@stdout.write("C") or -1, 1)
+    assert_eq(eprint("!") or -1, 1)
+    assert_eq(eprintln("x") or -1, 2)
+    assert_eq(host.sys_stdio_capture_drain(0), "ABC")
+    assert_eq(host.sys_stdio_capture_drain(1), "!x\n")
+    host.sys_stdio_capture_end()
+}
+
+/// Test that read clamps sub-one counts to one byte.
+test "read clamps sub-one counts to one byte" {
+    host.sys_stdin_feed("z")
+    assert_eq(stdin.read(0), "z")
+}

@@ -1,0 +1,12 @@
+//! Laws for std.core.unicode — UTF-8 helpers (verify-friendly).
+
+#law("utf8_is_cont recognizes continuation bytes")
+unicode_utf8_cont() {
+    #assert(utf8_is_cont(128))
+    #assert(!utf8_is_cont(65))
+}
+
+#law("utf8_is_cont matches bitmask definition")
+unicode_utf8_mask(b: i64) {
+    #assert(utf8_is_cont(b) == ((b & 192) == 128))
+}

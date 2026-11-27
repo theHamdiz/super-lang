@@ -1,0 +1,145 @@
+// 17_ai_tensor_hnsw_search — Q10 transformer + brute top-K (integer-only).
+// LAW-BENCH-001: no host FFI in this file.
+use std.math.core
+use std.core.collections
+
+MOD = 1000000007
+BIAS = 1099511627776
+D = 32
+T = 16
+FF = 64
+LAYERS = 2
+SEQS = 12
+NV = 4096
+K = 10
+
+normalize(raw) {
+    ss = 0
+    for raw { ss += it * it }
+    inv = (1 << 20) / (i_sqrt(ss) + 1)
+    out = [0; D]
+    for d in 0..D { out[d] = (raw[d] * inv) >> 10 }
+    out
+}
+
+block(wq, wk, wv, wo, w1, w2, @h, e1: i64) {
+    q = [0; T * D]
+    k = [0; T * D]
+    v = [0; T * D]
+    at = [0; T * D]
+    o = [0; T * D]
+    f = [0; T * FF]
+    g = [0; T * D]
+    matmul_q10(h, wq, @q, T, D, D)
+    matmul_q10(h, wk, @k, T, D, D)
+    matmul_q10(h, wv, @v, T, D, D)
+    sc = [0; T]
+    pr = [0; T]
+    for t in 0..T {
+        mx = 0 - 1152921504606846976
+        for j in 0..(t + 1) {
+            s = 0
+            for d in 0..D { s += q[t * D + d] * k[j * D + d] }
+            sc[j] = s >> 13
+            mx = i_max(mx, sc[j])
+        }
+        sum = 0
+        for j in 0..(t + 1) {
+            pr[j] = exp_q10(sc[j] - mx, e1)
+            sum += pr[j]
+        }
+        for j in 0..(t + 1) { pr[j] = pr[j] * 1024 / sum }
+        for d in 0..D {
+            s = 0
+            for j in 0..(t + 1) { s += pr[j] * v[j * D + d] }
+            at[t * D + d] = s >> 10
+        }
+    }
+    matmul_q10(at, wo, @o, T, D, D)
+    for i in 0..(T * D) { h[i] += o[i] }
+    rms_norm_q10(@h, T, D)
+    matmul_q10(h, w1, @f, T, D, FF)
+    for i in 0..(T * FF) {
+        if f[i] < 0 { f[i] = 0 }
+    }
+    matmul_q10(f, w2, @g, T, FF, D)
+    for i in 0..(T * D) { h[i] += g[i] }
+    rms_norm_q10(@h, T, D)
+}
+
++main() {
+    rng = Lcg.{s: 17017}
+    e1 = exp_frac_q10(1024)
+    wq0 = [0; D * D]
+    wk0 = [0; D * D]
+    wv0 = [0; D * D]
+    wo0 = [0; D * D]
+    w10 = [0; D * FF]
+    w20 = [0; FF * D]
+    wq1 = [0; D * D]
+    wk1 = [0; D * D]
+    wv1 = [0; D * D]
+    wo1 = [0; D * D]
+    w11 = [0; D * FF]
+    w21 = [0; FF * D]
+    fill_w_pm128(@rng, @wq0, D * D)
+    fill_w_pm128(@rng, @wk0, D * D)
+    fill_w_pm128(@rng, @wv0, D * D)
+    fill_w_pm128(@rng, @wo0, D * D)
+    fill_w_pm128(@rng, @w10, D * FF)
+    fill_w_pm128(@rng, @w20, FF * D)
+    fill_w_pm128(@rng, @wq1, D * D)
+    fill_w_pm128(@rng, @wk1, D * D)
+    fill_w_pm128(@rng, @wv1, D * D)
+    fill_w_pm128(@rng, @wo1, D * D)
+    fill_w_pm128(@rng, @w11, D * FF)
+    fill_w_pm128(@rng, @w21, FF * D)
+    db = [0; NV * D]
+    for i in 0..NV {
+        raw = [0; D]
+        for d in 0..D { raw[d] = @rng.roll() % 2049 - 1024 }
+        row = normalize(raw)
+        base = i * D
+        for d in 0..D { db[base + d] = row[d] }
+    }
+    cs = 0
+    for 0..SEQS {
+        h = [0; T * D]
+        for i in 0..(T * D) { h[i] = @rng.roll() % 2049 - 1024 }
+        block(wq0, wk0, wv0, wo0, w10, w20, @h, e1)
+        block(wq1, wk1, wv1, wo1, w11, w21, @h, e1)
+        pooled = [0; D]
+        for d in 0..D {
+            sum = 0
+            for t in 0..T { sum += h[t * D + d] }
+            pooled[d] = sum >> 4
+            cs = (cs * 131 + pooled[d] + BIAS) % MOD
+        }
+        query = normalize(pooled)
+        top_s = [0; K]
+        top_i = [0; K]
+        cnt = 0
+        for i in 0..NV {
+            sc = 0
+            base = i * D
+            for d in 0..D { sc += query[d] * db[base + d] }
+            if cnt < K || sc > top_s[K - 1] {
+                p = cnt
+                if cnt >= K { p = K - 1 }
+                while p > 0 && top_s[p - 1] < sc {
+                    top_s[p] = top_s[p - 1]
+                    top_i[p] = top_i[p - 1]
+                    p -= 1
+                }
+                top_s[p] = sc
+                top_i[p] = i
+                if cnt < K { cnt += 1 }
+            }
+        }
+        for j in 0..cnt {
+            cs = (cs * 131 + top_i[j] + BIAS) % MOD
+            cs = (cs * 131 + top_s[j] + BIAS) % MOD
+        }
+    }
+    print("CHECKSUM={cs}")
+}

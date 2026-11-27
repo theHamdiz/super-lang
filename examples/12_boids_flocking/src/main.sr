@@ -1,0 +1,79 @@
+// 12_boids_flocking — data-oriented particle / boids flocking (fixed capacity)
+use std.math.core
+
++N = 128
++TICKS = 40
++PERCEPTION = 12.0
+
++limit(@vx, @vy, max_v: f64) {
+    for 0..N {
+        sp = sqrt(vx[it] * vx[it] + vy[it] * vy[it])
+        if sp > max_v {
+            vx[it] = vx[it] / sp * max_v
+            vy[it] = vy[it] / sp * max_v
+        }
+    }
+}
+
++step(@px, @py, @vx, @vy) {
+    ax, ay = [0.0; N], [0.0; N]
+    for i in 0..N {
+        cx, cy, sx, sy, fx, fy, n = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        for j in 0..N {
+            continue if i == j
+            dx = px[j] - px[i]
+            dy = py[j] - py[i]
+            d2 = dx * dx + dy * dy
+            continue if d2 > PERCEPTION * PERCEPTION || d2 < 0.0001
+            cx += px[j]
+            cy += py[j]
+            sx += vx[j]
+            sy += vy[j]
+            fx -= dx / d2
+            fy -= dy / d2
+            n += 1
+        }
+        if n > 0 {
+            inv = 1.0 / n
+            ax[i] += (cx * inv - px[i]) * 0.01 + (sx * inv - vx[i]) * 0.05 + fx * 0.5
+            ay[i] += (cy * inv - py[i]) * 0.01 + (sy * inv - vy[i]) * 0.05 + fy * 0.5
+        }
+    }
+    for 0..N {
+        vx[it] += ax[it]
+        vy[it] += ay[it]
+    }
+    limit(@vx, @vy, 2.5)
+    for 0..N {
+        px[it] += vx[it]
+        py[it] += vy[it]
+        if px[it] < 0.0 { px[it] += 200.0 }
+        if px[it] > 200.0 { px[it] -= 200.0 }
+        if py[it] < 0.0 { py[it] += 200.0 }
+        if py[it] > 200.0 { py[it] -= 200.0 }
+    }
+}
+
++main() {
+    px, py, vx, vy = [0.0; N], [0.0; N], [0.0; N], [0.0; N]
+    rng = [42]
+    for 0..N {
+        px[it] = (to_int(rng[0]) % 200) * 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+        py[it] = (to_int(rng[0]) % 200) * 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+        vx[it] = (to_int(rng[0]) % 100) * 0.02 - 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+        vy[it] = (to_int(rng[0]) % 100) * 0.02 - 1.0
+        rng[0] = (rng[0] * 1103515245 + 12345) % 2147483648
+    }
+    for 0..TICKS { step(@px, @py, @vx, @vy) }
+    cs = (0..N).map(to_int(px[it]) + to_int(py[it])).sum()
+    print("CHECKSUM={cs}")
+}
+
+test "limit clamps speed" {
+    vx, vy = [10.0; N], [0.0; N]
+    limit(@vx, @vy, 2.0)
+    assert_eq(to_int(vx[0]), 2)
+}

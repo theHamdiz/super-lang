@@ -1,0 +1,14 @@
+//! Compile-time table folded into the program (comptime constants).
+//! Run: super check examples/doc_comptime/main.sr
+
++TABLE = [0, 1, 4, 9, 16]
+
++square(n: i64) : i64 {
+    if n < 0 { return 0 }
+    if n >= host.sys_arr_len(TABLE) { return n * n }
+    TABLE[n]
+}
+
++main() {
+    print("square(4)={square(4)}")
+}

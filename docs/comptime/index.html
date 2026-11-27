@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/comptime/"/>
+<meta name="description" content="Compile-time evaluation in Super."/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="Super · Comptime"/>
+<meta property="og:description" content="Compile-time evaluation in Super."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/comptime/"/>
+<link rel="stylesheet" href="../site.css"/>
+<title>Super · Comptime</title>
+</head>
+<body>
+<header class="site-nav">
+  <a class="mark" href="../">Super</a>
+  <nav><a href="../">Home</a><a href="../quickstart/">Quickstart</a><a href="../docs-hub/" aria-current="page">Docs</a><a href="../spec/">Spec</a><a href="../benchmarks/">Benchmarks</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a></nav>
+  <a class="cta" href="../quickstart/">Quickstart</a>
+</header>
+<section class="section">
+<h1>Comptime</h1>
+<p>Constants, table literals, and compile-time branches are evaluated before AOT C23 emission or VM bytecode load. Restrictions: no I/O, no host calls in pure comptime tables unless explicitly allowed by the module.</p>
+<pre class="sr-block"><code class="language-sr">+TABLE = [0, 1, 4, 9, 16]
+
++square(n: i64) : i64 {
+  if n &lt; 0 { return 0 }
+  if n &gt;= len(TABLE) { return n * n }
+  TABLE[n]
+}</code></pre>
+<p>Run: <code>super check examples/doc_comptime/main.sr</code></p>
+<p><strong>Next:</strong> <a href="../macros-pods/">Macros &amp; Pods</a> · <strong>Related:</strong> <a href="../spec/">Spec</a></p>
+</section>
+<footer class="site-footer"><p>Super 0.1.0 · <a href="../">Home</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,408 @@
+//! std.sys.ffi — dynamic library handles, C-string views and pointer arithmetic
+//!
+//! Import with:
+//!   use std.sys.ffi
+//!
+//!   reg = FfiRegistry.new()
+//!   @reg.define("libm", "cos", 4096)            // seed the offline symbol table
+//!   lib = @reg.open("libm") or err { return }   // DynLib{handle: 1}
+//!   addr = reg.sym(lib, "cos") or 0              // 4096
+//!   @reg.close(lib)
+//!
+//!   s = ffi_cstr_to_str(buf, 8)                  // text up to the first 0 byte
+//!   p = ffi_ptr_align_up(ffi_ptr_add(base, 13), 8)
+//!
+//! The Tier-1 host kernel exposes no `dlopen`/`dlsym` primitive (0.1.0), so `DynLib` is a
+//! plain `{handle: i64}` value resolved against an `FfiRegistry`: an in-memory table of
+//! libraries and symbol addresses. Embedders fill it from their own loader (`define`),
+//! tests fill it by hand, and the open/close/sym surface stays identical either way.
+//! Handles start at 1; 0 is the null handle. Pointers are plain `i64` addresses, and C
+//! strings are views over byte arrays (values 0..255) such as zero-copy host slices.
+//! Public helpers are prefixed `ffi_` because modules merge flat.
+
+/// `FFI_NULL` is the null address and the null library handle (`0`).
++FFI_NULL = 0
+
+/// `DynLib` is an opened dynamic library; `handle` 0 is invalid.
++DynLib = {
+    /// Registry handle, 1-based. Defaults to `0` (invalid).
+    handle: i64 = 0
+
+    /// A library that was never opened.
+    invalid() : DynLib => DynLib.{handle: 0}
+
+    /// True when this handle can refer to an open library.
+    is_valid(self) : bool => self.handle > 0
+}
+
+/// `FfiRegistry` is the offline library and symbol table behind `DynLib`.
++FfiRegistry = {
+    /// Library names; handle `h` is index `h - 1`. Defaults to `[]`.
+    names: _ = []
+    /// 1 while the library is open, 0 once closed. Defaults to `[]`.
+    opened: _ = []
+    /// Handle that owns symbol `i`. Defaults to `[]`.
+    sym_libs: _ = []
+    /// Symbol names. Defaults to `[]`.
+    sym_names: _ = []
+    /// Symbol addresses. Defaults to `[]`.
+    sym_addrs: _ = []
+
+    /// An empty registry.
+    new() : FfiRegistry => FfiRegistry.{names: [], opened: [], sym_libs: [], sym_names: [], sym_addrs: []}
+
+    /// Index of the library called `name` (any state), or -1.
+    find_lib(self, name: str) : i64 {
+        pos = -1
+        ns = self.names
+        for ns {
+            if pos < 0 && it == name { pos = index }
+        }
+        pos
+    }
+
+    /// Declare that `lib` exports `sym` at `addr`, creating the library when it is new.
+    define(@self, lib: str, sym: str, addr: i64) : i64 {
+        at = self.find_lib(lib)
+        if at < 0 {
+            self.names = host.sys_arr_push(self.names, lib)
+            self.opened = host.sys_arr_push(self.opened, 0)
+            at = host.sys_arr_len(self.names) - 1
+        }
+        self.sym_libs = host.sys_arr_push(self.sym_libs, at + 1)
+        self.sym_names = host.sys_arr_push(self.sym_names, sym)
+        self.sym_addrs = host.sys_arr_push(self.sym_addrs, addr)
+        addr
+    }
+
+    /// Open `name`, or fail when it was never defined. Re-opening returns the same handle.
+    open(@self, name: str) : DynLib! {
+        at = self.find_lib(name)
+        ensure at >= 0 else {
+            fail "ffi: library not found: {name}"
+            return
+        }
+        self.opened = host.sys_arr_set(self.opened, at, 1)
+        DynLib.{handle: at + 1}
+    }
+
+    /// True while `lib` refers to an open library.
+    is_open(self, lib: DynLib) : bool {
+        ensure lib.handle > 0 else { return false }
+        ensure lib.handle <= host.sys_arr_len(self.opened) else { return false }
+        self.opened[lib.handle - 1] == 1
+    }
+
+    /// Close `lib`; returns false when it was not open.
+    close(@self, lib: DynLib) : bool {
+        ensure self.is_open(lib) else { return false }
+        self.opened = host.sys_arr_set(self.opened, lib.handle - 1, 0)
+        true
+    }
+
+    /// Address of `sym` in the open library `lib`, or fail.
+    sym(self, lib: DynLib, sym: str) : i64! {
+        ensure self.is_open(lib) else {
+            fail "ffi: library handle {lib.handle} is not open"
+            return
+        }
+        found = -1
+        n = host.sys_arr_len(self.sym_names)
+        for 0..n {
+            if found < 0 && self.sym_libs[it] == lib.handle && self.sym_names[it] == sym { found = self.sym_addrs[it] }
+        }
+        ensure found >= 0 else {
+            fail "ffi: symbol not found: {sym}"
+            return
+        }
+        found
+    }
+
+    /// Number of libraries that are currently open.
+    open_count(self) : i64 {
+        c = 0
+        flags = self.opened
+        for flags { c += it }
+        c
+    }
+}
+
+/// Open `name` in `reg` (free-function form of `FfiRegistry.open`).
++ffi_open(@reg: FfiRegistry, name: str) : DynLib! => @reg.open(name)
+
+/// Close `lib` in `reg`.
++ffi_close(@reg: FfiRegistry, lib: DynLib) : bool => @reg.close(lib)
+
+/// Resolve `sym` in `lib`.
++ffi_sym(reg: FfiRegistry, lib: DynLib, sym: str) : i64! => reg.sym(lib, sym)
+
+// --- C strings -----------------------------------------------------------------------
+
+/// `CStr` is a borrowed view of a NUL-terminated string inside a byte array.
++CStr = {
+    /// Backing bytes. Defaults to `[]`.
+    buf: _ = []
+    /// Offset of the first character. Defaults to `0`.
+    off: i64 = 0
+    /// Length in bytes, not counting the terminator. Defaults to `0`.
+    size: i64 = 0
+
+    /// Byte `i` of the string (0 when out of range).
+    at(self, i: i64) : i64 {
+        if i < 0 { return 0 }
+        if i >= self.size { return 0 }
+        self.buf[self.off + i]
+    }
+
+    /// The text of the view (UTF-8, lossy on invalid bytes).
+    text(self) : str {
+        out = []
+        for 0..self.size { out = host.sys_arr_push(out, self.buf[self.off + it]) }
+        host.sys_bytes_to_str(out)
+    }
+
+    /// True when the view has no characters.
+    is_empty(self) : bool => self.size == 0
+}
+
+/// Bytes from `off` up to (not including) the first 0, or to the end of `buf` when unterminated.
++ffi_cstr_len(buf: _, off: i64) : i64 {
+    n = host.sys_arr_len(buf)
+    if off < 0 { return 0 }
+    i = off
+    while i < n {
+        if buf[i] == 0 { break }
+        i += 1
+    }
+    i - off
+}
+
+/// True when a 0 byte terminates the string that starts at `off`.
++ffi_cstr_terminated(buf: _, off: i64) : bool {
+    n = host.sys_arr_len(buf)
+    ensure off >= 0 else { return false }
+    ensure off + ffi_cstr_len(buf, off) < n else { return false }
+    true
+}
+
+/// View of the C string at `off`.
++ffi_cstr_view(buf: _, off: i64) : CStr {
+    start = off
+    if start < 0 { start = 0 }
+    CStr.{buf, off: start, size: ffi_cstr_len(buf, start)}
+}
+
+/// Text of the C string at `off`.
++ffi_cstr_to_str(buf: _, off: i64) : str => ffi_cstr_view(buf, off).text()
+
+/// `buf` with the bytes of `s` and a 0 terminator written at `off` (zero-extends the array when needed).
++ffi_cstr_write(buf: _, off: i64, s: str) {
+    out = []
+    for buf { out = host.sys_arr_push(out, it) }
+    data = host.sys_str_to_bytes(s)
+    need = off + host.sys_arr_len(data) + 1
+    while host.sys_arr_len(out) < need {
+        out = host.sys_arr_push(out, 0)
+    }
+    for 0..host.sys_arr_len(data) { out = host.sys_arr_set(out, off + it, data[it]) }
+    host.sys_arr_set(out, off + host.sys_arr_len(data), 0)
+}
+
+/// Offset just past the terminator of the string at `off`: where the next packed C string starts.
++ffi_cstr_next(buf: _, off: i64) : i64 => off + ffi_cstr_len(buf, off) + 1
+
+/// Number of packed C strings in `buf` (a trailing unterminated tail counts as one).
++ffi_cstr_count(buf: _) : i64 {
+    n = host.sys_arr_len(buf)
+    c = 0
+    i = 0
+    while i < n {
+        c += 1
+        i = ffi_cstr_next(buf, i)
+    }
+    c
+}
+
+// --- pointer arithmetic ------------------------------------------------------------------
+
+/// True for the null address.
++ffi_ptr_is_null(p: i64) : bool => p == FFI_NULL
+
+/// `p` advanced by `n` bytes.
++ffi_ptr_add(p: i64, n: i64) : i64 => p + n
+
+/// `p` moved back by `n` bytes.
++ffi_ptr_sub(p: i64, n: i64) : i64 => p - n
+
+/// Byte distance from `b` to `a` (`a - b`).
++ffi_ptr_diff(a: i64, b: i64) : i64 => a - b
+
+/// Address of element `index` of an array of `stride`-byte elements starting at `base`.
++ffi_ptr_elem(base: i64, index: i64, stride: i64) : i64 => base + index * stride
+
+/// Address of a struct field at byte offset `field_off` inside the struct at `base`.
++ffi_ptr_field(base: i64, field_off: i64) : i64 => base + field_off
+
+/// Smallest address at or above `p` that is a multiple of `align` (`align` must be positive).
++ffi_ptr_align_up(p: i64, align: i64) : i64 {
+    ensure align > 0 else { return p }
+    rem = p % align
+    if rem == 0 { return p }
+    p + (align - rem)
+}
+
+/// Largest address at or below `p` that is a multiple of `align` (`align` must be positive).
++ffi_ptr_align_down(p: i64, align: i64) : i64 {
+    ensure align > 0 else { return p }
+    p - p % align
+}
+
+/// True when `p` is a multiple of `align`.
++ffi_ptr_is_aligned(p: i64, align: i64) : bool {
+    ensure align > 0 else { return false }
+    p % align == 0
+}
+
+/// Padding bytes needed to align `p` to `align`.
++ffi_ptr_padding(p: i64, align: i64) : i64 => ffi_ptr_align_up(p, align) - p
+
+/// True when `[p, p + len)` lies inside `[base, base + size)`.
++ffi_ptr_in_range(p: i64, len: i64, base: i64, size: i64) : bool {
+    ensure len >= 0 else { return false }
+    ensure p >= base else { return false }
+    p + len <= base + size
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+/// Test that open, sym and close walk the offline table.
+test "open, sym and close walk the offline table" {
+    reg = FfiRegistry.new()
+    @reg.define("libm", "cos", 4096)
+    @reg.define("libm", "sin", 4160)
+    @reg.define("libc", "strlen", 8192)
+    assert_eq(reg.open_count(), 0)
+    lib = @reg.open("libm") or DynLib.invalid()
+    assert_eq(lib.handle, 1)
+    #assert(lib.is_valid())
+    #assert(reg.is_open(lib))
+    assert_eq(reg.sym(lib, "cos") or -1, 4096)
+    assert_eq(reg.sym(lib, "sin") or -1, 4160)
+    assert_eq(reg.sym(lib, "strlen") or -1, -1)
+    assert_eq(reg.open_count(), 1)
+    libc = @reg.open("libc") or DynLib.invalid()
+    assert_eq(libc.handle, 2)
+    assert_eq(reg.sym(libc, "strlen") or -1, 8192)
+    assert_eq(reg.sym(libc, "cos") or -1, -1)
+    #assert(@reg.close(lib))
+    #assert(!(@reg.close(lib)))
+    assert_eq(reg.sym(lib, "cos") or -1, -1)
+    assert_eq(reg.open_count(), 1)
+}
+
+/// Test that missing libraries fail and handles stay stable on re-open.
+test "missing libraries fail and handles stay stable on re-open" {
+    reg = FfiRegistry.new()
+    assert_eq(@reg.open("nope") or DynLib.invalid(), DynLib.invalid())
+    #assert(!((@reg.open("nope") or DynLib.invalid()).is_valid()))
+    @reg.define("libz", "deflate", 7)
+    a = @reg.open("libz") or DynLib.invalid()
+    b = @reg.open("libz") or DynLib.invalid()
+    assert_eq(a.handle, b.handle)
+    assert_eq(reg.open_count(), 1)
+    #assert(!(reg.is_open(DynLib.invalid())))
+    #assert(!(reg.is_open(DynLib.{handle: 99})))
+    assert_eq(reg.find_lib("libz"), 0)
+    assert_eq(reg.find_lib("none"), -1)
+    #assert(!(@reg.close(DynLib.invalid())))
+    msg = reg.sym(DynLib.invalid(), "x") or err { "{err}" }
+    #assert(host.sys_str_len(msg) > 0)
+}
+
+/// Test that free-function wrappers match the methods.
+test "free-function wrappers match the methods" {
+    reg = FfiRegistry.new()
+    @reg.define("libgl", "glClear", 555)
+    lib = @reg.ffi_open("libgl") or DynLib.invalid()
+    assert_eq(lib.handle, 1)
+    assert_eq(ffi_sym(reg, lib, "glClear") or -1, 555)
+    #assert(@reg.ffi_close(lib))
+    assert_eq(ffi_sym(reg, lib, "glClear") or -1, -1)
+}
+
+/// Test that C string length stops at the first zero.
+test "C string length stops at the first zero" {
+    buf = [104, 105, 0, 121, 111, 0, 55]
+    assert_eq(ffi_cstr_len(buf, 0), 2)
+    assert_eq(ffi_cstr_len(buf, 3), 2)
+    assert_eq(ffi_cstr_len(buf, 6), 1)
+    assert_eq(ffi_cstr_len(buf, 2), 0)
+    assert_eq(ffi_cstr_len(buf, -4), 0)
+    assert_eq(ffi_cstr_len(buf, 99), 0)
+    #assert(ffi_cstr_terminated(buf, 0))
+    #assert(!(ffi_cstr_terminated(buf, 6)))
+    #assert(!(ffi_cstr_terminated(buf, -1)))
+    assert_eq(ffi_cstr_next(buf, 0), 3)
+    assert_eq(ffi_cstr_count(buf), 3)
+    assert_eq(ffi_cstr_count([]), 0)
+}
+
+/// Test that C string views read and write text.
+test "C string views read and write text" {
+    buf = [104, 105, 0, 121, 111, 0]
+    v = ffi_cstr_view(buf, 3)
+    assert_eq(v.size, 2)
+    assert_eq(v.at(0), 121)
+    assert_eq(v.at(1), 111)
+    assert_eq(v.at(2), 0)
+    assert_eq(v.at(-1), 0)
+    #assert(!(v.is_empty()))
+    assert_eq(v.text(), "yo")
+    assert_eq(ffi_cstr_to_str(buf, 0), "hi")
+    #assert(ffi_cstr_view(buf, 2).is_empty())
+    written = ffi_cstr_write([], 2, "abc")
+    assert_eq(host.sys_arr_len(written), 6)
+    assert_eq(written[0], 0)
+    assert_eq(written[2], 97)
+    assert_eq(written[4], 99)
+    assert_eq(written[5], 0)
+    assert_eq(ffi_cstr_to_str(written, 2), "abc")
+    over = ffi_cstr_write([1, 1, 1, 1, 1, 1], 1, "xy")
+    assert_eq(host.sys_arr_len(over), 6)
+    assert_eq(ffi_cstr_to_str(over, 1), "xy")
+    assert_eq(over[4], 1)
+    e = ffi_cstr_to_str(ffi_cstr_write([], 0, "é"), 0)
+    assert_eq(e, "é")
+}
+
+/// Test that pointer helpers offset and align.
+test "pointer helpers offset and align" {
+    #assert(ffi_ptr_is_null(0))
+    #assert(!(ffi_ptr_is_null(8)))
+    assert_eq(ffi_ptr_add(100, 28), 128)
+    assert_eq(ffi_ptr_sub(100, 4), 96)
+    assert_eq(ffi_ptr_diff(128, 100), 28)
+    assert_eq(ffi_ptr_elem(1000, 3, 16), 1048)
+    assert_eq(ffi_ptr_field(1000, 8), 1008)
+    assert_eq(ffi_ptr_align_up(13, 8), 16)
+    assert_eq(ffi_ptr_align_up(16, 8), 16)
+    assert_eq(ffi_ptr_align_up(0, 8), 0)
+    assert_eq(ffi_ptr_align_up(5, 0), 5)
+    assert_eq(ffi_ptr_align_down(13, 8), 8)
+    assert_eq(ffi_ptr_align_down(16, 8), 16)
+    #assert(ffi_ptr_is_aligned(24, 8))
+    #assert(!(ffi_ptr_is_aligned(25, 8)))
+    #assert(!(ffi_ptr_is_aligned(25, 0)))
+    assert_eq(ffi_ptr_padding(13, 8), 3)
+    assert_eq(ffi_ptr_padding(16, 8), 0)
+}
+
+/// Test that range checks guard out-of-bounds access.
+test "range checks guard out-of-bounds access" {
+    #assert(ffi_ptr_in_range(100, 28, 100, 64))
+    #assert(ffi_ptr_in_range(100, 64, 100, 64))
+    #assert(!(ffi_ptr_in_range(100, 65, 100, 64)))
+    #assert(!(ffi_ptr_in_range(99, 1, 100, 64)))
+    #assert(ffi_ptr_in_range(120, 0, 100, 64))
+    #assert(!(ffi_ptr_in_range(120, -1, 100, 64)))
+}

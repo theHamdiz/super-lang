@@ -1,0 +1,304 @@
+# Build and publish Super language release bundles (CLI + stdlib), not just stdlib gates.
+name: release-bundle
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version stamp (default 0.1.0)"
+        required: false
+        default: "0.1.0"
+      soak_full:
+        description: "Run HTTP RSS soak at 1_000_000 requests (manual/scheduled; default 10k on smoke)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+env:
+  SUPER_VERSION: ${{ github.event.inputs.version || '0.1.0' }}
+
+jobs:
+  # Always prove the host bundle builds on main/PRs (and manual runs).
+  smoke:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build + package host bundle
+        run: |
+          chmod +x scripts/package_release.sh install.sh scripts/verify_release_assets.sh
+          ./scripts/package_release.sh
+          ./scripts/verify_release_assets.sh
+          ARCHIVE=$(ls dist/super-${{ env.SUPER_VERSION }}-*.tar.gz | head -1)
+          tar -tzf "$ARCHIVE" > "$RUNNER_TEMP/archive-manifest.txt"
+          awk 'NR <= 20' "$RUNNER_TEMP/archive-manifest.txt"
+          test -f "$ARCHIVE"
+      - name: Install-critical crate tests
+        run: |
+          cargo test -p super-cli --tests --locked
+          cargo test -p super-ffi --lib --locked
+          cargo test -p super-frontend --lib --locked
+          cargo test -p super-runtime --test type_soundness --locked
+      - name: cargo build release CLI
+        run: cargo build --release -p super-cli --locked
+      # RSS soak: default 10k requests; full 1M via workflow_dispatch `soak_full=1` (manual/scheduled).
+      - name: HTTP RSS soak (AOT, linux)
+        env:
+          SUPER_SOAK_REQUESTS: ${{ github.event.inputs.soak_full == '1' && '1000000' || '10000' }}
+          SUPER_SOAK_FULL: ${{ github.event.inputs.soak_full == '1' && '1' || '' }}
+        run: |
+          set -o pipefail
+          cargo test -p super-cli --test http_rss_soak --release --locked -- --nocapture 2>&1 | tee soak.log
+          sample="$(grep '^SUPER_SOAK_SAMPLES=' soak.log | tail -1 | cut -d= -f2-)"
+          if [ -n "$sample" ] && [ -f "$sample" ]; then
+            cp -f "$sample" "$RUNNER_TEMP/rss_samples.tsv"
+            echo "RSS samples: $RUNNER_TEMP/rss_samples.tsv"
+          fi
+      - name: Upload RSS soak samples
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http-rss-soak-samples
+          path: ${{ runner.temp }}/rss_samples.tsv
+          if-no-files-found: ignore
+
+  package-native:
+    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      SUPER_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Package release bundle
+        shell: bash
+        run: |
+          chmod +x scripts/package_release.sh scripts/verify_release_assets.sh
+          ./scripts/package_release.sh
+          ./scripts/verify_release_assets.sh
+          "dist/super-${SUPER_VERSION}-${SUPER_TARGET}/bin/super" --version
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: super-${{ env.SUPER_VERSION }}-${{ matrix.target }}
+          path: |
+            dist/super-${{ env.SUPER_VERSION }}-${{ matrix.target }}.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-${{ matrix.target }}.zip
+            dist/super-${{ env.SUPER_VERSION }}-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  package-musl:
+    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # aarch64 musl is not in the 0.1.0 installer matrix.
+    runs-on: ${{ matrix.runner }}
+    env:
+      SUPER_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Package musl bundle (Alpine toolchain)
+        run: |
+          chmod +x scripts/package_release.sh scripts/verify_release_assets.sh
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e SUPER_VERSION="${SUPER_VERSION}" -e SUPER_TARGET="${SUPER_TARGET}" \
+            -e SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            -e LC_ALL=C -e LANG=C -e TZ=UTC \
+            -e CARGO_BUILD_JOBS=1 \
+            rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 \
+            sh -euc '
+              apk add --no-cache bash git build-base musl-dev perl pkgconf openssl-dev tar rsync python3
+              rustup target add "${SUPER_TARGET}"
+              git config --global --add safe.directory /src
+              chmod +x scripts/package_release.sh scripts/verify_release_assets.sh
+              ./scripts/package_release.sh
+              ./scripts/verify_release_assets.sh
+            '
+          sudo chown -R "$(id -u):$(id -g)" dist target 2>/dev/null || true
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: super-${{ env.SUPER_VERSION }}-${{ matrix.target }}
+          path: |
+            dist/super-${{ env.SUPER_VERSION }}-${{ matrix.target }}.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-${{ matrix.target }}.sha256
+          if-no-files-found: error
+
+  package-freebsd:
+    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    env:
+      SUPER_TARGET: x86_64-unknown-freebsd
+      FREEBSD_RELEASE: 14.4-RELEASE
+      FREEBSD_BASE_SHA256: 769f60a6eea2938ad6b7943cfbcc17dfaf7d1f7ba59a32b869a00349302df853
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cross toolchain
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            sudo apt-get -o Acquire::Retries=3 update -qq \
+              && sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+                clang lld llvm pkg-config xz-utils curl \
+              && break
+            [ "$attempt" = 6 ] && exit 1
+            sleep $((attempt * 20))
+          done
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-freebsd
+      - name: FreeBSD sysroot
+        run: |
+          base="$RUNNER_TEMP/base.txz"
+          curl --proto '=https' -fsSL --retry 5 -o "$base" \
+            "https://download.freebsd.org/releases/amd64/$FREEBSD_RELEASE/base.txz" \
+            || curl -fsSL --retry 5 -o "$base" \
+            "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/amd64/$FREEBSD_RELEASE/base.txz"
+          echo "$FREEBSD_BASE_SHA256  $base" | sha256sum -c -
+          sysroot="$RUNNER_TEMP/freebsd-sysroot"
+          mkdir -p "$sysroot"
+          tar -xJf "$base" -C "$sysroot" --warning=no-unknown-keyword \
+            ./lib ./usr/lib ./usr/include ./usr/libdata/pkgconfig
+          rm -f "$base"
+          clang_target="x86_64-unknown-freebsd${FREEBSD_RELEASE%%.*}"
+          flags="--target=$clang_target --sysroot=$sysroot"
+          # Explicit -L paths: host GNU ld ignores bare --sysroot when
+          # -fuse-ld=lld is dropped (see package_release RUSTFLAGS fold).
+          # FreeBSD 14+ folded libexecinfo into libc — provide a linker script
+          # so rustc's still-emitted -lexecinfo resolves.
+          if [[ ! -e "$sysroot/usr/lib/libexecinfo.so" && ! -e "$sysroot/usr/lib/libexecinfo.a" ]]; then
+            printf 'INPUT(libc.so)\n' > "$sysroot/usr/lib/libexecinfo.so"
+          fi
+          {
+            echo "CC_x86_64_unknown_freebsd=clang"
+            echo "CXX_x86_64_unknown_freebsd=clang++"
+            echo "AR_x86_64_unknown_freebsd=llvm-ar"
+            echo "CFLAGS_x86_64_unknown_freebsd=$flags"
+            echo "CXXFLAGS_x86_64_unknown_freebsd=$flags"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=clang"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS=-C link-arg=--target=$clang_target -C link-arg=--sysroot=$sysroot -C link-arg=-L$sysroot/usr/lib -C link-arg=-L$sysroot/lib -C link-arg=-fuse-ld=lld"
+            echo "PKG_CONFIG_ALLOW_CROSS=1"
+            echo "PKG_CONFIG_SYSROOT_DIR_x86_64_unknown_freebsd=$sysroot"
+            echo "PKG_CONFIG_LIBDIR_x86_64_unknown_freebsd=$sysroot/usr/libdata/pkgconfig"
+          } >> "$GITHUB_ENV"
+      - name: Package FreeBSD bundle
+        run: |
+          chmod +x scripts/package_release.sh scripts/verify_release_assets.sh
+          ./scripts/package_release.sh
+          ./scripts/verify_release_assets.sh
+      - name: Verify ELF OS/ABI
+        run: |
+          bin="target/$SUPER_TARGET/release/super"
+          readelf -h "$bin" | grep -E 'OS/ABI: +UNIX - FreeBSD'
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: super-${{ env.SUPER_VERSION }}-${{ env.SUPER_TARGET }}
+          path: |
+            dist/super-${{ env.SUPER_VERSION }}-${{ env.SUPER_TARGET }}.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-${{ env.SUPER_TARGET }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [package-native, package-musl, package-freebsd]
+    # All three ship lanes must succeed — never publish a partial target matrix.
+    if: >-
+      always() && startsWith(github.ref, 'refs/tags/') &&
+      needs.package-native.result == 'success' &&
+      needs.package-musl.result == 'success' &&
+      needs.package-freebsd.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+      - name: Flatten + SHA256SUMS
+        run: |
+          mkdir -p dist
+          find dist-all -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp -f {} dist/ \;
+          cd dist
+          {
+            for f in super-*.tar.gz; do
+              if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi
+            done
+            for f in super-*.zip; do
+              if command -v sha256sum >/dev/null; then sha256sum "$f"; else shasum -a 256 "$f"; fi
+            done
+          } | sort > SHA256SUMS
+          ls -la
+          cat SHA256SUMS
+          # Exact installer matrix for 0.1.0 (must match install.sh SHIPPED_TARGETS).
+          for need in \
+            super-${{ env.SUPER_VERSION }}-x86_64-unknown-linux-gnu.tar.gz \
+            super-${{ env.SUPER_VERSION }}-aarch64-unknown-linux-gnu.tar.gz \
+            super-${{ env.SUPER_VERSION }}-x86_64-unknown-linux-musl.tar.gz \
+            super-${{ env.SUPER_VERSION }}-x86_64-unknown-freebsd.tar.gz \
+            super-${{ env.SUPER_VERSION }}-x86_64-apple-darwin.tar.gz \
+            super-${{ env.SUPER_VERSION }}-aarch64-apple-darwin.tar.gz \
+            super-${{ env.SUPER_VERSION }}-x86_64-pc-windows-gnu.zip
+          do
+            test -f "$need" || { echo "missing required release asset: $need"; exit 1; }
+          done
+          count=$(find . -maxdepth 1 -type f \( -name 'super-*.tar.gz' -o -name 'super-*.zip' \) | wc -l)
+          test "$count" -eq 7 || { echo "expected 7 archives, found $count"; ls -1; exit 1; }
+      # Round 9 Item 6: attest every release archive + SHA256SUMS (not only the manifest).
+      - name: Build provenance attestation (SHA256SUMS)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/SHA256SUMS
+          push-to-registry: false
+      - name: Build provenance attestation (archives)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/super-${{ env.SUPER_VERSION }}-x86_64-unknown-linux-gnu.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-aarch64-unknown-linux-gnu.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-x86_64-unknown-linux-musl.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-x86_64-unknown-freebsd.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-x86_64-apple-darwin.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-aarch64-apple-darwin.tar.gz
+            dist/super-${{ env.SUPER_VERSION }}-x86_64-pc-windows-gnu.zip
+          push-to-registry: false
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/api-style/"/>
+<meta name="description" content="Canonical names and cost-transparent APIs for Super contributors."/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="Super · API Style Guide"/>
+<meta property="og:description" content="Canonical names and cost-transparent APIs for Super contributors."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/api-style/"/>
+<link rel="stylesheet" href="../site.css"/>
+<title>Super · API Style Guide</title>
+</head>
+<body>
+<header class="site-nav">
+  <a class="mark" href="../">Super</a>
+  <nav><a href="../">Home</a><a href="../quickstart/">Quickstart</a><a href="../docs-hub/" aria-current="page">Docs</a><a href="../spec/">Spec</a><a href="../benchmarks/">Benchmarks</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a></nav>
+  <a class="cta" href="../quickstart/">Quickstart</a>
+</header>
+<section class="section">
+<h1>API Style Guide</h1>
+<p>Super uses one short canonical name for one concept. Receiver context avoids stutter: <code>users.len()</code>, <code>app.get(...)</code>, and <code>map.get(key)</code>.</p>
+<ul>
+<li>Use <code>snake_case</code> values/functions and <code>UpperCamelCase</code> types/variants.</li>
+<li>Use verbs for actions and nouns or adjectives for values and predicates.</li>
+<li>Let types constrain meaning: <code>len(text)</code> and <code>len(items)</code>, never type-prefixed duplicates.</li>
+<li>Canonical collection operations are <code>len</code>, <code>get</code>, and <code>contains</code>.</li>
+<li>Scope methods to their owning type. Use macros only for syntax, source capture, item generation, or comptime structure.</li>
+<li>Do not hide allocation, blocking I/O, global mutation, or unrelated linear work behind a cheap-looking accessor.</li>
+<li>Callback APIs statically constrain arity and return types; runtimes never silently discard callback values.</li>
+</ul>
+<p>During 0.x, canonical APIs may change in a breaking release. Complete each rename across compiler, stdlib, examples, tests, book, specification, site, agent text, and editor tooling. Do not retain aliases or shims.</p>
+<p><strong>Full contributor policy:</strong> <a href="https://github.com/theHamdiz/super-lang/blob/main/CONTRIBUTING.md#api-style-guide">CONTRIBUTING.md</a></p>
+</section>
+<footer class="site-footer"><p>Super 0.1.0 · <a href="../">Home</a></p></footer>
+</body>
+</html>

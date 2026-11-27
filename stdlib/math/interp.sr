@@ -1,0 +1,673 @@
+//! std.math.interp — 1-D interpolation on sorted sample arrays
+//!
+//! Import with:
+//!   use std.math.interp
+//!
+//!   xs = [0.0, 1.0, 2.0, 4.0]
+//!   ys = [0.0, 1.0, 4.0, 16.0]
+//!   interp_linear(xs, ys, 3.0)                 // 10.0  (clamped outside [xs[0], xs[n-1]])
+//!   s = spline_natural(xs, ys)                 // C2 cubic spline, natural end conditions
+//!   s.sample(1.5)                              // value
+//!   s.slope(1.5)                               // first derivative
+//!   s.area(0.0, 4.0)                           // exact integral of the spline
+//!   p = spline_pchip(xs, ys)                   // shape-preserving (monotone) cubic Hermite
+//!   h = hermite_eval(xs, ys, [0.0, 2.0, 4.0, 8.0], 1.5)    // cubic Hermite with given slopes
+//!   b = bary_chebyshev(-1.0, 1.0, ys_at_cheb_points)       // barycentric on Chebyshev points
+//!   b.interp(0.3)
+//!   c = bary_new(xs, ys)                       // barycentric on arbitrary distinct nodes
+//!
+//! Splines are stored as nodes plus node slopes (`CubicSpline{xs, ys, ds}`), so evaluation,
+//! differentiation and integration all use the exact piecewise cubic
+//! `y + d s + c2 s^2 + c3 s^3` on each interval (`s = x - xs[i]`). Outside the node range the
+//! end interval's cubic is extended. Public helpers are prefixed `ip_` (modules merge flat);
+//! floats compare with `<`/`>` because `==` on the VM is tolerance-based.
+
+/// Pi.
++IP_PI = 3.141592653589793
+
+// --- helpers ---------------------------------------------------------------------------------
+
+/// Exact float equality (`==` is tolerance-based on the VM).
++ip_same(a: f64, b: f64) : bool => !(a < b) && !(a > b)
+
+/// Absolute value.
++ip_abs(x: f64) : f64 {
+    if x < 0.0 { return -x }
+    x
+}
+
+/// True when `xs` is strictly increasing (and has at least two nodes).
++ip_is_sorted(xs: _) : bool {
+    n = host.sys_arr_len(xs)
+    ensure n >= 2 else { return false }
+    i = 1
+    while i < n {
+        if !(xs[i] > xs[i - 1]) { return false }
+        i += 1
+    }
+    true
+}
+
+/// Index `i` of the interval `[xs[i], xs[i+1]]` containing `x`, clamped to `0..=n-2`.
+/// Binary search in `O(log n)`.
++ip_bracket(xs: _, x: f64) : i64 {
+    n = host.sys_arr_len(xs)
+    ensure n >= 2 else { return 0 }
+    lo = 0
+    hi = n - 1
+    while hi - lo > 1 {
+        mid = (lo + hi) / 2
+        if xs[mid] > x { hi = mid } else { lo = mid }
+    }
+    lo
+}
+
+/// Linear interpolation between `a` and `b` at fraction `t`.
++lerp(a: f64, b: f64, t: f64) : f64 => a + (b - a) * t
+
+// --- piecewise linear --------------------------------------------------------------------
+
+/// Piecewise-linear interpolation of `(xs, ys)` at `x`; clamps to the end values outside the range
+/// (the `numpy.interp` convention).
++interp_linear(xs: _, ys: _, x: f64) : f64 {
+    n = host.sys_arr_len(xs)
+    ensure n >= 1 else { return 0.0 }
+    ensure n >= 2 else { return ys[0] }
+    if x < xs[0] || ip_same(x, xs[0]) { return ys[0] }
+    if x > xs[n - 1] || ip_same(x, xs[n - 1]) { return ys[n - 1] }
+    i = ip_bracket(xs, x)
+    t = (x - xs[i]) / (xs[i + 1] - xs[i])
+    lerp(ys[i], ys[i + 1], t)
+}
+
+/// `interp_linear` at every query in `qs`.
++interp_linear_many(xs: _, ys: _, qs: _) {
+    out = []
+    for qs { out = host.sys_arr_push(out, interp_linear(xs, ys, it)) }
+    out
+}
+
+// --- cubic Hermite -----------------------------------------------------------------------
+
+/// Piecewise cubic through `(xs, ys)` with node slopes `ds`, held as nodes and slopes.
++CubicSpline = {
+    xs: _ = []
+    ys: _ = []
+    ds: _ = []
+
+    /// Number of nodes.
+    count(self) : i64 => host.sys_arr_len(self.xs)
+
+    /// Spline value at `x`.
+    sample(self, x: f64) : f64 => hermite_eval(self.xs, self.ys, self.ds, x)
+
+    /// First derivative at `x`.
+    slope(self, x: f64) : f64 => hermite_deriv(self.xs, self.ys, self.ds, x)
+
+    /// Exact integral from `a` to `b` (either order).
+    area(self, a: f64, b: f64) : f64 => hermite_integral(self.xs, self.ys, self.ds, a, b)
+
+    /// Sample at every query point.
+    sample_many(self, qs: _) {
+        out = []
+        for qs { out = host.sys_arr_push(out, hermite_eval(self.xs, self.ys, self.ds, it)) }
+        out
+    }
+}
+
+/// Quadratic and cubic coefficients `[c2, c3]` of the Hermite cubic on interval `i`.
++ip_coeffs(xs: _, ys: _, ds: _, i: i64) {
+    h = xs[i + 1] - xs[i]
+    delta = (ys[i + 1] - ys[i]) / h
+    c2 = (3.0 * delta - 2.0 * ds[i] - ds[i + 1]) / h
+    c3 = (ds[i] + ds[i + 1] - 2.0 * delta) / (h * h)
+    return [c2, c3]
+}
+
+/// Cubic Hermite interpolant through `(xs, ys)` with slopes `ds`, evaluated at `x`.
++hermite_eval(xs: _, ys: _, ds: _, x: f64) : f64 {
+    n = host.sys_arr_len(xs)
+    ensure n >= 2 else {
+        if n == 1 { return ys[0] }
+        return 0.0
+    }
+    i = ip_bracket(xs, x)
+    c = ip_coeffs(xs, ys, ds, i)
+    s = x - xs[i]
+    ys[i] + s * (ds[i] + s * (c[0] + s * c[1]))
+}
+
+/// First derivative of the cubic Hermite interpolant at `x`.
++hermite_deriv(xs: _, ys: _, ds: _, x: f64) : f64 {
+    n = host.sys_arr_len(xs)
+    ensure n >= 2 else { return 0.0 }
+    i = ip_bracket(xs, x)
+    c = ip_coeffs(xs, ys, ds, i)
+    s = x - xs[i]
+    ds[i] + s * (2.0 * c[0] + 3.0 * c[1] * s)
+}
+
+/// Antiderivative of interval `i`'s cubic from the interval start to offset `s`.
++ip_antideriv(xs: _, ys: _, ds: _, i: i64, s: f64) : f64 {
+    c = ip_coeffs(xs, ys, ds, i)
+    s * (ys[i] + s * (ds[i] / 2.0 + s * (c[0] / 3.0 + s * c[1] / 4.0)))
+}
+
+/// Exact integral of the cubic Hermite interpolant from `a` to `b` (extending the end cubics outside the range).
++hermite_integral(xs: _, ys: _, ds: _, a: f64, b: f64) : f64 {
+    n = host.sys_arr_len(xs)
+    ensure n >= 2 else { return 0.0 }
+    if b < a { return -hermite_integral(xs, ys, ds, b, a) }
+    ia = ip_bracket(xs, a)
+    ib = ip_bracket(xs, b)
+    if ia == ib {
+        return ip_antideriv(xs, ys, ds, ia, b - xs[ia]) - ip_antideriv(xs, ys, ds, ia, a - xs[ia])
+    }
+    total = ip_antideriv(xs, ys, ds, ia, xs[ia + 1] - xs[ia]) - ip_antideriv(xs, ys, ds, ia, a - xs[ia])
+    k = ia + 1
+    while k < ib {
+        total += ip_antideriv(xs, ys, ds, k, xs[k + 1] - xs[k])
+        k += 1
+    }
+    total + ip_antideriv(xs, ys, ds, ib, b - xs[ib])
+}
+
+// --- spline construction ---------------------------------------------------------------
+
+/// Node slopes of the natural cubic spline (zero second derivative at both ends), via the Thomas algorithm.
++spline_slopes(xs: _, ys: _) {
+    n = host.sys_arr_len(xs)
+    ensure n >= 2 else { return host.sys_arr_new(n, 0.0) }
+    if n == 2 {
+        d = (ys[1] - ys[0]) / (xs[1] - xs[0])
+        return [d, d]
+    }
+    // second derivatives m[0..n), m[0] = m[n-1] = 0
+    m = host.sys_arr_new(n, 0.0)
+    cp = host.sys_arr_new(n, 0.0)
+    dp = host.sys_arr_new(n, 0.0)
+    i = 1
+    while i < n - 1 {
+        h0 = xs[i] - xs[i - 1]
+        h1 = xs[i + 1] - xs[i]
+        rhs = 6.0 * ((ys[i + 1] - ys[i]) / h1 - (ys[i] - ys[i - 1]) / h0)
+        diag = 2.0 * (h0 + h1)
+        lower = h0
+        prev_c = cp[i - 1]
+        prev_d = dp[i - 1]
+        denom = diag - lower * prev_c
+        cp = host.sys_arr_set(cp, i, h1 / denom)
+        dp = host.sys_arr_set(dp, i, (rhs - lower * prev_d) / denom)
+        i += 1
+    }
+    i = n - 2
+    while i >= 1 {
+        next_m = m[i + 1]
+        m = host.sys_arr_set(m, i, dp[i] - cp[i] * next_m)
+        i -= 1
+    }
+    ds = host.sys_arr_new(n, 0.0)
+    i = 0
+    while i < n - 1 {
+        h = xs[i + 1] - xs[i]
+        d = (ys[i + 1] - ys[i]) / h - h * (2.0 * m[i] + m[i + 1]) / 6.0
+        ds = host.sys_arr_set(ds, i, d)
+        i += 1
+    }
+    h = xs[n - 1] - xs[n - 2]
+    last = (ys[n - 1] - ys[n - 2]) / h + h * (m[n - 2] + 2.0 * m[n - 1]) / 6.0
+    host.sys_arr_set(ds, n - 1, last)
+}
+
+/// Natural cubic spline through `(xs, ys)`.
++spline_natural(xs: _, ys: _) : CubicSpline => CubicSpline.{xs, ys, ds: spline_slopes(xs, ys)}
+
+/// Sign of `x` as -1, 0 or 1.
++ip_sign(x: f64) : i64 {
+    if x > 0.0 { return 1 }
+    if x < 0.0 { return -1 }
+    0
+}
+
+/// End slope of PCHIP (three-point formula, shape preserving).
++ip_pchip_end(h0: f64, h1: f64, del0: f64, del1: f64) : f64 {
+    d = ((2.0 * h0 + h1) * del0 - h0 * del1) / (h0 + h1)
+    if ip_sign(d) != ip_sign(del0) { return 0.0 }
+    if ip_sign(del0) != ip_sign(del1) && ip_abs(d) > 3.0 * ip_abs(del0) { return 3.0 * del0 }
+    d
+}
+
+/// Node slopes of the monotone piecewise cubic Hermite interpolant (Fritsch–Carlson / PCHIP).
++pchip_slopes(xs: _, ys: _) {
+    n = host.sys_arr_len(xs)
+    ensure n >= 2 else { return host.sys_arr_new(n, 0.0) }
+    h0 = xs[1] - xs[0]
+    del0 = (ys[1] - ys[0]) / h0
+    if n == 2 { return [del0, del0] }
+    ds = host.sys_arr_new(n, 0.0)
+    i = 1
+    while i < n - 1 {
+        ha = xs[i] - xs[i - 1]
+        hb = xs[i + 1] - xs[i]
+        da = (ys[i] - ys[i - 1]) / ha
+        db = (ys[i + 1] - ys[i]) / hb
+        if da * db > 0.0 {
+            w1 = 2.0 * hb + ha
+            w2 = hb + 2.0 * ha
+            ds = host.sys_arr_set(ds, i, (w1 + w2) / (w1 / da + w2 / db))
+        }
+        i += 1
+    }
+    ha = xs[1] - xs[0]
+    hb = xs[2] - xs[1]
+    ds = host.sys_arr_set(ds, 0, ip_pchip_end(ha, hb, (ys[1] - ys[0]) / ha, (ys[2] - ys[1]) / hb))
+    ha = xs[n - 1] - xs[n - 2]
+    hb = xs[n - 2] - xs[n - 3]
+    last = ip_pchip_end(ha, hb, (ys[n - 1] - ys[n - 2]) / ha, (ys[n - 2] - ys[n - 3]) / hb)
+    host.sys_arr_set(ds, n - 1, last)
+}
+
+/// Shape-preserving (monotone where the data are) cubic Hermite spline.
++spline_pchip(xs: _, ys: _) : CubicSpline => CubicSpline.{xs, ys, ds: pchip_slopes(xs, ys)}
+
+/// Cubic spline through `(xs, ys)` with caller-supplied node slopes.
++spline_hermite(xs: _, ys: _, ds: _) : CubicSpline => CubicSpline.{xs, ys, ds}
+
+// --- barycentric --------------------------------------------------------------------------
+
+/// Second-barycentric-form interpolant `p(x) = sum(w_j y_j / (x - x_j)) / sum(w_j / (x - x_j))`.
++Barycentric = {
+    xs: _ = []
+    ys: _ = []
+    ws: _ = []
+
+    /// Number of nodes.
+    count(self) : i64 => host.sys_arr_len(self.xs)
+
+    /// Interpolant value at `x` (exact at the nodes).
+    interp(self, x: f64) : f64 {
+        n = host.sys_arr_len(self.xs)
+        ensure n >= 1 else { return 0.0 }
+        num = 0.0
+        den = 0.0
+        j = 0
+        while j < n {
+            if ip_same(x, self.xs[j]) { return self.ys[j] }
+            t = self.ws[j] / (x - self.xs[j])
+            num += t * self.ys[j]
+            den += t
+            j += 1
+        }
+        num / den
+    }
+
+    /// Interpolate at every query point.
+    interp_many(self, qs: _) {
+        out = []
+        for qs { out = host.sys_arr_push(out, self.interp(it)) }
+        out
+    }
+}
+
+/// Barycentric weights `1 / prod_{k != j}(x_j - x_k)` for arbitrary distinct nodes (`O(n^2)`).
++bary_weights(xs: _) {
+    n = host.sys_arr_len(xs)
+    out = []
+    j = 0
+    while j < n {
+        p = 1.0
+        k = 0
+        while k < n {
+            if k != j { p *= xs[j] - xs[k] }
+            k += 1
+        }
+        out = host.sys_arr_push(out, 1.0 / p)
+        j += 1
+    }
+    out
+}
+
+/// Barycentric interpolant through arbitrary distinct nodes.
++bary_new(xs: _, ys: _) : Barycentric => Barycentric.{xs, ys, ws: bary_weights(xs)}
+
+/// Chebyshev points of the second kind on `[a, b]`: `n + 1` nodes, `x_j = mid + half cos(j pi / n)` (descending).
++cheb_points(a: f64, b: f64, n: i64) {
+    out = []
+    ensure n >= 1 else { return [(a + b) / 2.0] }
+    mid = (a + b) / 2.0
+    half = (b - a) / 2.0
+    j = 0
+    while j <= n {
+        out = host.sys_arr_push(out, mid + half * host.sys_cos(IP_PI * host.sys_to_float(j) / host.sys_to_float(n)))
+        j += 1
+    }
+    out
+}
+
+/// Barycentric weights for Chebyshev points of the second kind: alternating signs, ends halved.
++bary_cheb_weights(n: i64) {
+    out = []
+    j = 0
+    while j <= n {
+        w = 1.0
+        if j % 2 == 1 { w = -1.0 }
+        if j == 0 || j == n { w = w / 2.0 }
+        out = host.sys_arr_push(out, w)
+        j += 1
+    }
+    out
+}
+
+/// Barycentric interpolant of `ys` sampled at `cheb_points(a, b, len(ys) - 1)`; stable and `O(n)` per evaluation.
++bary_chebyshev(a: f64, b: f64, ys: _) : Barycentric {
+    n = host.sys_arr_len(ys) - 1
+    ensure n >= 0 else { return Barycentric.{xs: [], ys: [], ws: []} }
+    Barycentric.{xs: cheb_points(a, b, n), ys, ws: bary_cheb_weights(n)}
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+test "helpers: sorted check, bracket, lerp" {
+    xs = [0.0, 1.0, 2.0, 4.0, 8.0]
+    #assert(ip_is_sorted(xs))
+    #assert(!(ip_is_sorted([1.0, 1.0, 2.0])))
+    #assert(!(ip_is_sorted([2.0, 1.0])))
+    #assert(!(ip_is_sorted([1.0])))
+    assert_eq(ip_bracket(xs, 0.0), 0)
+    assert_eq(ip_bracket(xs, 0.5), 0)
+    assert_eq(ip_bracket(xs, 1.0), 1)
+    assert_eq(ip_bracket(xs, 3.99), 2)
+    assert_eq(ip_bracket(xs, 4.0), 3)
+    assert_eq(ip_bracket(xs, 8.0), 3)
+    assert_eq(ip_bracket(xs, -5.0), 0)
+    assert_eq(ip_bracket(xs, 100.0), 3)
+    assert_eq(ip_bracket([1.0], 3.0), 0)
+    assert_eq(lerp(2.0, 6.0, 0.25), 3.0)
+    assert_eq(lerp(2.0, 6.0, 0.0), 2.0)
+    assert_eq(lerp(2.0, 6.0, 1.0), 6.0)
+    #assert(ip_same(1.0, 1.0))
+    #assert(!(ip_same(1.0, 1.0000000001)))
+    assert_eq(ip_abs(-2.5), 2.5)
+    assert_eq(ip_sign(-3.0), -1)
+    assert_eq(ip_sign(0.0), 0)
+    assert_eq(ip_sign(2.0), 1)
+}
+
+test "interp_linear" {
+    xs = [0.0, 1.0, 2.0, 4.0]
+    ys = [0.0, 1.0, 4.0, 16.0]
+    assert_eq(interp_linear(xs, ys, 0.0), 0.0)
+    assert_eq(interp_linear(xs, ys, 0.5), 0.5)
+    assert_eq(interp_linear(xs, ys, 1.5), 2.5)
+    assert_eq(interp_linear(xs, ys, 3.0), 10.0)
+    assert_eq(interp_linear(xs, ys, 4.0), 16.0)
+    // clamped
+    assert_eq(interp_linear(xs, ys, -3.0), 0.0)
+    assert_eq(interp_linear(xs, ys, 9.0), 16.0)
+    // degenerate sizes
+    assert_eq(interp_linear([2.0], [7.0], 5.0), 7.0)
+    assert_eq(interp_linear([], [], 5.0), 0.0)
+    many = interp_linear_many(xs, ys, [0.5, 1.5, 3.0, 10.0])
+    assert_eq(many[0], 0.5)
+    assert_eq(many[1], 2.5)
+    assert_eq(many[2], 10.0)
+    assert_eq(many[3], 16.0)
+    // exact for a line
+    line_x = [-2.0, 0.0, 3.0, 7.0]
+    line_y = [-5.0, -1.0, 5.0, 13.0]
+    k = 0
+    while k < 20 {
+        x = -2.0 + 9.0 * host.sys_to_float(k) / 19.0
+        #assert(ip_abs(interp_linear(line_x, line_y, x) - (2.0 * x - 1.0)) < 1.0e-12)
+        k += 1
+    }
+}
+
+test "cubic Hermite reproduces cubics" {
+    // p(x) = x^3 - 2x^2 + x + 3, p'(x) = 3x^2 - 4x + 1
+    xs = [0.0, 0.7, 1.5, 2.0, 3.5]
+    ys = []
+    ds = []
+    for xs {
+        ys = host.sys_arr_push(ys, it * it * it - 2.0 * it * it + it + 3.0)
+        ds = host.sys_arr_push(ds, 3.0 * it * it - 4.0 * it + 1.0)
+    }
+    k = 0
+    while k <= 40 {
+        x = 3.5 * host.sys_to_float(k) / 40.0
+        p = x * x * x - 2.0 * x * x + x + 3.0
+        dp = 3.0 * x * x - 4.0 * x + 1.0
+        #assert(ip_abs(hermite_eval(xs, ys, ds, x) - p) < 1.0e-12)
+        #assert(ip_abs(hermite_deriv(xs, ys, ds, x) - dp) < 1.0e-11)
+        k += 1
+    }
+    // integral of p over [0.3, 3.1] = x^4/4 - 2x^3/3 + x^2/2 + 3x
+    big = 3.1 * 3.1 * 3.1 * 3.1 / 4.0 - 2.0 * 3.1 * 3.1 * 3.1 / 3.0 + 3.1 * 3.1 / 2.0 + 9.3
+    small = 0.3 * 0.3 * 0.3 * 0.3 / 4.0 - 2.0 * 0.3 * 0.3 * 0.3 / 3.0 + 0.3 * 0.3 / 2.0 + 0.9
+    #assert(ip_abs(hermite_integral(xs, ys, ds, 0.3, 3.1) - (big - small)) < 1.0e-10)
+    // reversed bounds negate; single-interval integrals; empty range
+    #assert(ip_abs(hermite_integral(xs, ys, ds, 3.1, 0.3) + (big - small)) < 1.0e-10)
+    #assert(ip_abs(hermite_integral(xs, ys, ds, 1.6, 1.9) - hermite_integral(xs, ys, ds, 1.6, 1.9)) < 1.0e-15)
+    #assert(ip_abs(hermite_integral(xs, ys, ds, 1.2, 1.2)) < 1.0e-15)
+    // single node degenerate input
+    assert_eq(hermite_eval([1.0], [4.0], [0.0], 3.0), 4.0)
+    assert_eq(hermite_eval([], [], [], 3.0), 0.0)
+}
+
+test "natural spline" {
+    xs = [0.0, 1.0, 2.0, 3.0, 4.0]
+    ys = [0.0, 1.0, 0.0, 1.0, 0.0]
+    s = spline_natural(xs, ys)
+    assert_eq(s.count(), 5)
+    // interpolates nodes
+    k = 0
+    while k < 5 {
+        #assert(ip_abs(s.sample(xs[k]) - ys[k]) < 1.0e-12)
+        k += 1
+    }
+    // C1: slope continuous across an interior node
+    #assert(ip_abs(s.slope(2.0 - 1.0e-9) - s.slope(2.0 + 1.0e-9)) < 1.0e-6)
+    // known natural-spline slopes for this data: d = [1.4286, -0.1429, 0.2143?] checked by symmetry
+    #assert(ip_abs(s.slope(0.0) + s.slope(4.0)) < 1.0e-12)
+    #assert(ip_abs(s.slope(1.0) + s.slope(3.0)) < 1.0e-12)
+    #assert(ip_abs(s.slope(2.0)) < 1.0e-12)
+    // natural ends: second derivative zero -> check numerically
+    h = 1.0e-4
+    second = (s.slope(h) - s.slope(0.0)) / h
+    #assert(ip_abs(second) < 1.0e-3)
+
+    // reproduces linear data exactly
+    lx = [0.0, 0.5, 2.0, 2.5, 6.0]
+    ly = []
+    for lx { ly = host.sys_arr_push(ly, 3.0 * it - 2.0) }
+    ls = spline_natural(lx, ly)
+    j = 0
+    while j <= 30 {
+        x = 6.0 * host.sys_to_float(j) / 30.0
+        #assert(ip_abs(ls.sample(x) - (3.0 * x - 2.0)) < 1.0e-11)
+        #assert(ip_abs(ls.slope(x) - 3.0) < 1.0e-11)
+        j += 1
+    }
+
+    // sin on [0, pi] with 12 nodes: error well below 1e-3 away from the ends
+    sx = []
+    sy = []
+    i = 0
+    while i < 12 {
+        x = IP_PI * host.sys_to_float(i) / 11.0
+        sx = host.sys_arr_push(sx, x)
+        sy = host.sys_arr_push(sy, host.sys_sin(x))
+        i += 1
+    }
+    ss = spline_natural(sx, sy)
+    t = 0
+    while t <= 50 {
+        x = 0.4 + (IP_PI - 0.8) * host.sys_to_float(t) / 50.0
+        #assert(ip_abs(ss.sample(x) - host.sys_sin(x)) < 1.0e-4)
+        #assert(ip_abs(ss.slope(x) - host.sys_cos(x)) < 1.0e-3)
+        t += 1
+    }
+    // integral of sin on [0, pi] is 2
+    #assert(ip_abs(ss.area(0.0, IP_PI) - 2.0) < 1.0e-3)
+    #assert(ip_abs(ss.area(IP_PI, 0.0) + 2.0) < 1.0e-3)
+    many = ss.sample_many([0.5, 1.0, 1.5])
+    #assert(ip_abs(many[1] - host.sys_sin(1.0)) < 1.0e-4)
+
+    // two nodes: straight line; three nodes work
+    two = spline_natural([0.0, 2.0], [1.0, 5.0])
+    #assert(ip_abs(two.sample(1.0) - 3.0) < 1.0e-12)
+    #assert(ip_abs(two.slope(0.5) - 2.0) < 1.0e-12)
+    three = spline_natural([0.0, 1.0, 2.0], [0.0, 1.0, 0.0])
+    #assert(ip_abs(three.sample(1.0) - 1.0) < 1.0e-12)
+    #assert(ip_abs(three.sample(0.5) - 0.6875) < 1.0e-12)
+}
+
+test "pchip is monotone and shape preserving" {
+    // monotone step-like data: a natural spline overshoots, pchip does not
+    xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    ys = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    p = spline_pchip(xs, ys)
+    k = 0
+    prev = -1.0
+    while k <= 100 {
+        x = 5.0 * host.sys_to_float(k) / 100.0
+        v = p.sample(x)
+        #assert(v > -1.0e-12)
+        #assert(v < 1.0 + 1.0e-12)
+        #assert(v > prev - 1.0e-12)
+        prev = v
+        k += 1
+    }
+    nat = spline_natural(xs, ys)
+    over = 0.0
+    m = 0
+    while m <= 100 {
+        x = 5.0 * host.sys_to_float(m) / 100.0
+        v = nat.sample(x)
+        if v > over { over = v }
+        if -v > over { over = -v }
+        m += 1
+    }
+    #assert(over > 1.0)
+    // flat regions get zero slope
+    #assert(ip_abs(p.slope(0.5)) < 1.0e-12)
+    #assert(ip_abs(p.slope(4.5)) < 1.0e-12)
+    // interpolates nodes
+    j = 0
+    while j < 6 {
+        #assert(ip_abs(p.sample(xs[j]) - ys[j]) < 1.0e-12)
+        j += 1
+    }
+    // matches a straight line
+    lx = [0.0, 1.0, 3.0, 4.0]
+    ly = [1.0, 3.0, 7.0, 9.0]
+    lp = spline_pchip(lx, ly)
+    #assert(ip_abs(lp.sample(2.0) - 5.0) < 1.0e-12)
+    #assert(ip_abs(lp.slope(0.2) - 2.0) < 1.0e-12)
+    // two-node case
+    two = spline_pchip([0.0, 4.0], [0.0, 8.0])
+    #assert(ip_abs(two.sample(1.0) - 2.0) < 1.0e-12)
+    // reference slopes from scipy.interpolate.PchipInterpolator for data below
+    rx = [0.0, 1.0, 2.0, 4.0, 5.0]
+    ry = [0.0, 1.0, 3.0, 3.5, 8.0]
+    ds = pchip_slopes(rx, ry)
+    #assert(ip_abs(ds[0] - 0.5) < 1.0e-12)
+    #assert(ip_abs(ds[1] - 1.3333333333333333) < 1.0e-12)
+    #assert(ip_abs(ds[2] - 0.48648648648648646) < 1.0e-12)
+    #assert(ip_abs(ds[3] - 0.525974025974026) < 1.0e-12)
+    #assert(ip_abs(ds[4] - 5.916666666666667) < 1.0e-12)
+    // custom Hermite constructor
+    hs = spline_hermite([0.0, 1.0], [0.0, 1.0], [0.0, 0.0])
+    #assert(ip_abs(hs.sample(0.5) - 0.5) < 1.0e-12)
+    #assert(ip_abs(hs.sample(0.25) - 0.15625) < 1.0e-12)
+}
+
+test "barycentric Chebyshev interpolation" {
+    n = 16
+    pts = cheb_points(-1.0, 1.0, n)
+    assert_eq(host.sys_arr_len(pts), 17)
+    #assert(ip_abs(pts[0] - 1.0) < 1.0e-15)
+    #assert(ip_abs(pts[16] + 1.0) < 1.0e-15)
+    #assert(ip_abs(pts[8]) < 1.0e-15)
+    ys = []
+    for pts { ys = host.sys_arr_push(ys, host.sys_exp(it)) }
+    b = bary_chebyshev(-1.0, 1.0, ys)
+    assert_eq(b.count(), 17)
+    k = 0
+    while k <= 40 {
+        x = -1.0 + 2.0 * host.sys_to_float(k) / 40.0
+        #assert(ip_abs(b.interp(x) - host.sys_exp(x)) < 1.0e-13)
+        k += 1
+    }
+    // exact at a node
+    assert_eq(b.interp(pts[3]), ys[3])
+    // shifted interval and polynomial exactness: degree-5 polynomial through 6 points
+    a2 = 2.0
+    b2 = 7.0
+    px = cheb_points(a2, b2, 5)
+    py = []
+    for px { py = host.sys_arr_push(py, it * it * it * it * it - 3.0 * it * it + 1.0) }
+    pb = bary_chebyshev(a2, b2, py)
+    q = pb.interp_many([2.5, 4.0, 6.75])
+    #assert(ip_abs(q[0] - (97.65625 - 18.75 + 1.0)) < 1.0e-9)
+    #assert(ip_abs(q[1] - (1024.0 - 48.0 + 1.0)) < 1.0e-8)
+    #assert(ip_abs(q[2] - (6.75 * 6.75 * 6.75 * 6.75 * 6.75 - 3.0 * 6.75 * 6.75 + 1.0)) < 1.0e-6)
+    // Chebyshev weights alternate and halve at the ends
+    w = bary_cheb_weights(4)
+    assert_eq(w[0], 0.5)
+    assert_eq(w[1], -1.0)
+    assert_eq(w[2], 1.0)
+    assert_eq(w[3], -1.0)
+    assert_eq(w[4], 0.5)
+    // Runge function: Chebyshev nodes converge, equispaced nodes (n = 16) blow up near the ends
+    rx = cheb_points(-1.0, 1.0, 24)
+    ry = []
+    for rx { ry = host.sys_arr_push(ry, 1.0 / (1.0 + 25.0 * it * it)) }
+    rb = bary_chebyshev(-1.0, 1.0, ry)
+    cheb_err = ip_abs(rb.interp(0.93) - 1.0 / (1.0 + 25.0 * 0.93 * 0.93))
+    #assert(cheb_err < 1.0e-2)
+    ex = []
+    ey = []
+    j = 0
+    while j <= 16 {
+        x = -1.0 + 2.0 * host.sys_to_float(j) / 16.0
+        ex = host.sys_arr_push(ex, x)
+        ey = host.sys_arr_push(ey, 1.0 / (1.0 + 25.0 * x * x))
+        j += 1
+    }
+    eb = bary_new(ex, ey)
+    equi_err = ip_abs(eb.interp(0.97) - 1.0 / (1.0 + 25.0 * 0.97 * 0.97))
+    #assert(equi_err > 0.1)
+    // degenerate
+    assert_eq(bary_chebyshev(0.0, 1.0, []).interp(0.5), 0.0)
+    assert_eq(cheb_points(0.0, 2.0, 0)[0], 1.0)
+}
+
+test "barycentric on arbitrary nodes" {
+    xs = [0.0, 1.0, 3.0, 4.5, 7.0]
+    ys = []
+    for xs { ys = host.sys_arr_push(ys, 2.0 * it * it * it * it - it + 5.0) }
+    b = bary_new(xs, ys)
+    ws = bary_weights(xs)
+    assert_eq(host.sys_arr_len(ws), 5)
+    // sum of w_j x_j^k vanishes for k < n-1 (divided-difference identity)
+    s0 = 0.0
+    s1 = 0.0
+    j = 0
+    while j < 5 {
+        s0 += ws[j]
+        s1 += ws[j] * xs[j]
+        j += 1
+    }
+    #assert(ip_abs(s0) < 1.0e-12)
+    #assert(ip_abs(s1) < 1.0e-12)
+    // degree-4 polynomial through 5 nodes is reproduced exactly
+    k = 0
+    while k <= 20 {
+        x = 7.0 * host.sys_to_float(k) / 20.0 + 0.013
+        #assert(ip_abs(b.interp(x) - (2.0 * x * x * x * x - x + 5.0)) < 1.0e-9)
+        k += 1
+    }
+    assert_eq(b.interp(4.5), ys[3])
+    assert_eq(b.count(), 5)
+}

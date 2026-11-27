@@ -1,0 +1,768 @@
+//! std.tui — terminal UI in the shape of ratatui
+//!
+//! Import with:
+//!   use std.tui
+//!
+//!   view = Screen.new(40, 12)
+//!   area = Rect.new(0, 0, view.w, view.h)
+//!   @view.block(area, "Tasks")
+//!   @view.list(Rect.new(1, 1, 38, 8), ["ship", "write"], 0)
+//!   @view.gauge(Rect.new(1, 10, 38, 1), 0.4, "")
+//!   frame = @view.ansi()
+//!
+//! Cells live in four dense integer planes (`arr_new` / `arr_set` from
+//! `std.core.collections`). Clearing a screen replaces those planes in one
+//! allocation. `ansi` asks the host for one pass: a full frame on the first
+//! paint, then only the damaged horizontal runs. Text measurement uses
+//! `std.core.str` (`byte_len`, `substr`, `pad_right`, `chr`). Gauges use
+//! `clamp` and `to_int` from `std.math.core`.
+//!
+//! `Style` and `theme` name ink and paper. `layout_grid`, `tier`, and `reflow`
+//! place cells, stacking when the width is tight. `words`, `align_in`,
+//! `scrollbar`, and `bars` are the extra widgets. `mouse_parse` reads SGR.
+//! `key_parse` understands bytes, so tests do not need a terminal.
+//! `Term.open` turns on raw mode only when stdin is a tty; `sys_term_feed`
+//! injects keys and captures the write.
+
+use std.core.str
+use std.core.collections
+use std.math.core
+
+/// `TUI_TL` is `"┌"`.
++TUI_TL = "\u{250C}"
+/// `TUI_TR` is `"┐"`.
++TUI_TR = "\u{2510}"
+/// `TUI_BL` is `"└"`.
++TUI_BL = "\u{2514}"
+/// `TUI_BR` is `"┘"`.
++TUI_BR = "\u{2518}"
+/// `TUI_H` is `"─"`.
++TUI_H = "\u{2500}"
+/// `TUI_V` is `"│"`.
++TUI_V = "\u{2502}"
+/// `TUI_BARS` is the eight sparkline steps.
++TUI_BARS = "\u{2581}\u{2582}\u{2583}\u{2584}\u{2585}\u{2586}\u{2587}\u{2588}"
+
+/// `Rect` is a terminal rectangle in cells.
++Rect = {
+    /// Left column.
+    x: i64 = 0
+    /// Top row.
+    y: i64 = 0
+    /// Width in cells.
+    w: i64 = 0
+    /// Height in cells.
+    h: i64 = 0
+
+    /// Rectangle at `x`, `y` with size `w` by `h`.
+    new(x: i64, y: i64, w: i64, h: i64) : Rect => Rect.{x, y, w, h}
+}
+
+/// `Screen` is a cell buffer. `prev_*` is the last frame `ansi` published.
++Screen = {
+    /// Width in cells.
+    w: i64 = 1
+    /// Height in cells.
+    h: i64 = 1
+    /// Code points, row-major.
+    ch: _ = []
+    /// Foreground color 0..15.
+    fg: _ = []
+    /// Background color 0..15.
+    bg: _ = []
+    /// 1 bold, 2 reverse.
+    at: _ = []
+    /// Previous code points. Shared with `ch` until the next write.
+    prev_ch: _ = []
+    /// Previous foreground.
+    prev_fg: _ = []
+    /// Previous background.
+    prev_bg: _ = []
+    /// Previous attributes.
+    prev_at: _ = []
+
+    /// Blank screen. Sizes below 1 become 1.
+    new(w: i64, h: i64) : Screen {
+        cols = w
+        rows = h
+        if cols < 1 { cols = 1 }
+        if rows < 1 { rows = 1 }
+        n = cols * rows
+        Screen.{
+            w: cols,
+            h: rows,
+            ch: arr_new(n, 32),
+            fg: arr_new(n, 7),
+            bg: arr_new(n, 0),
+            at: arr_new(n, 0),
+            prev_ch: [],
+            prev_fg: [],
+            prev_bg: [],
+            prev_at: []
+        }
+    }
+
+    /// Fill with spaces.
+    clear(@self, fg: i64, bg: i64) : i64 {
+        n = self.w * self.h
+        self.ch = arr_new(n, 32)
+        self.fg = arr_new(n, fg)
+        self.bg = arr_new(n, bg)
+        self.at = arr_new(n, 0)
+        n
+    }
+
+    /// Write one code point. Out-of-range cells are ignored.
+    put(@self, x: i64, y: i64, cp: i64, fg: i64, bg: i64, attr: i64) : i64 {
+        ensure x >= 0 && y >= 0 && x < self.w && y < self.h else { return 0 }
+        i = y * self.w + x
+        self.ch = arr_set(self.ch, i, cp)
+        self.fg = arr_set(self.fg, i, fg)
+        self.bg = arr_set(self.bg, i, bg)
+        self.at = arr_set(self.at, i, attr)
+        1
+    }
+
+    /// Code point at `x`, `y`, or -1 when out of range.
+    get(self, x: i64, y: i64) : i64 {
+        ensure x >= 0 && y >= 0 && x < self.w && y < self.h else { return -1 }
+        self.ch[y * self.w + x]
+    }
+
+    /// Paint `text` from `x`, `y`, clipped to the screen.
+    print_at(@self, x: i64, y: i64, text: str, fg: i64, bg: i64, attr: i64) : i64 {
+        n = char_count(text)
+        wrote = 0
+        for 0..n {
+            col = x + it
+            if (col >= 0 && col < self.w && y >= 0 && y < self.h) {
+                @self.put(col, y, ord(text[it]), fg, bg, attr)
+                wrote = wrote + 1
+            }
+        }
+        wrote
+    }
+
+    /// Rows joined by a newline.
+    plain(self) : str => host.sys_tui_plain(self.w, self.h, self.ch)
+
+    /// One row of plain text.
+    row(self, y: i64) : str {
+        text = self.plain()
+        ensure y > 0 else { return split_nth(text, "\n", 0) }
+        split_nth(text, "\n", y)
+    }
+
+    /// ANSI frame. The second call with no edits is empty.
+    ansi(@self) : str {
+        frame = host.sys_tui_diff(self.w, self.h, self.ch, self.fg, self.bg, self.at, self.prev_ch, self.prev_fg, self.prev_bg, self.prev_at)
+        self.prev_ch = self.ch
+        self.prev_fg = self.fg
+        self.prev_bg = self.bg
+        self.prev_at = self.at
+        frame
+    }
+
+    /// Box with an optional title on the top edge.
+    block(@self, area: Rect, title: str) : i64 {
+        ensure area.w >= 2 && area.h >= 2 else { return 0 }
+        right = area.x + area.w - 1
+        bottom = area.y + area.h - 1
+        @self.print_at(area.x, area.y, TUI_TL, 7, 0, 0)
+        @self.print_at(right, area.y, TUI_TR, 7, 0, 0)
+        @self.print_at(area.x, bottom, TUI_BL, 7, 0, 0)
+        @self.print_at(right, bottom, TUI_BR, 7, 0, 0)
+        span = area.w - 2
+        for 0..span {
+            @self.print_at(area.x + 1 + it, area.y, TUI_H, 7, 0, 0)
+            @self.print_at(area.x + 1 + it, bottom, TUI_H, 7, 0, 0)
+        }
+        side = area.h - 2
+        for 0..side {
+            @self.print_at(area.x, area.y + 1 + it, TUI_V, 7, 0, 0)
+            @self.print_at(right, area.y + 1 + it, TUI_V, 7, 0, 0)
+        }
+        if title != "" { @self.print_at(area.x + 2, area.y, title, 7, 0, 1) }
+        1
+    }
+
+    /// Wrapped paragraph. Newlines in `text` break lines.
+    paragraph(@self, area: Rect, text: str, fg: i64) : i64 {
+        ensure area.w > 0 && area.h > 0 else { return 0 }
+        col = 0
+        row = 0
+        n = char_count(text)
+        for 0..n {
+            if (row < area.h) {
+                ch = text[it]
+                if ch == "\n" {
+                    col = 0
+                    row = row + 1
+                } else {
+                    if (col >= area.w) {
+                        col = 0
+                        row = row + 1
+                    }
+                    if (row < area.h) {
+                        @self.print_at(area.x + col, area.y + row, ch, fg, 0, 0)
+                        col = col + 1
+                    }
+                }
+            }
+        }
+        1
+    }
+
+    /// List. The selected row is reversed.
+    list(@self, area: Rect, items: _, selected: i64) : i64 {
+        n = len(items)
+        shown = area.h
+        if shown > n { shown = n }
+        for 0..shown {
+            attr = 0
+            bg = 0
+            if it == selected {
+                attr = 2
+                bg = 4
+            }
+            label = items[it]
+            @self.print_at(area.x, area.y + it, pad_right(substr(label, 0, area.w), area.w, " "), 7, bg, attr)
+        }
+        shown
+    }
+
+    /// Horizontal gauge. `ratio` is clamped to 0..1.
+    gauge(@self, area: Rect, ratio: f64, label: str) : i64 {
+        ensure area.w > 0 && area.h > 0 else { return 0 }
+        filled = to_int(clamp(ratio, 0.0, 1.0) * area.w)
+        if (filled > area.w) { filled = area.w }
+        bar = repeat("\u{2588}", filled)
+        rest = repeat("\u{2591}", area.w - filled)
+        @self.print_at(area.x, area.y, "{bar}{rest}", 2, 0, 0)
+        if label != "" { @self.print_at(area.x, area.y, label, 7, 0, 1) }
+        filled
+    }
+
+    /// Tab strip. The selected title is bold.
+    tabs(@self, area: Rect, titles: _, selected: i64) : i64 {
+        x = area.x
+        n = len(titles)
+        for 0..n {
+            title = titles[it]
+            attr = 0
+            if it == selected { attr = 1 }
+            @self.print_at(x, area.y, title, 7, 0, attr)
+            x = x + char_count(title) + 1
+        }
+        n
+    }
+
+    /// One-row sparkline of non-negative samples.
+    sparkline(@self, area: Rect, values: _) : i64 {
+        n = len(values)
+        shown = n
+        if (shown > area.w) { shown = area.w }
+        max_v = 1
+        for 0..shown {
+            v = values[it]
+            if v > max_v { max_v = v }
+        }
+        line = ""
+        for 0..shown {
+            v = values[it]
+            level = (v * 7) / max_v
+            if level < 0 { level = 0 }
+            if level > 7 { level = 7 }
+            line = "{line}{TUI_BARS[level]}"
+        }
+        @self.print_at(area.x, area.y, line, 6, 0, 0)
+        shown
+    }
+
+    /// Table. `cells` is row-major and `cols` is the column count.
+    table(@self, area: Rect, headers: _, cells: _, cols: i64) : i64 {
+        ensure cols > 0 && area.w > 0 else { return 0 }
+        col_w = area.w / cols
+        if col_w < 1 { col_w = 1 }
+        hn = len(headers)
+        for 0..hn {
+            if it < cols {
+                @self.print_at(area.x + it * col_w, area.y, pad_right(substr(headers[it], 0, col_w), col_w, " "), 7, 0, 1)
+            }
+        }
+        cn = len(cells)
+        for 0..cn {
+            row = it / cols
+            col = it - row * cols
+            if row + 1 < area.h && col < cols {
+                @self.print_at(area.x + col * col_w, area.y + 1 + row, pad_right(substr(cells[it], 0, col_w), col_w, " "), 7, 0, 0)
+            }
+        }
+        cn
+    }
+
+    /// Wrapped words. A newline in `text` is a hard break.
+    words(@self, area: Rect, text: str, fg: i64) : i64 {
+        wrapped = wrap_text(text, area.w)
+        @self.paragraph(area, wrapped, fg)
+    }
+
+    /// Paint `text` aligned in `area`. `how` is `start`, `center`, or `end`.
+    align_in(@self, area: Rect, text: str, how: str, fg: i64, bg: i64) : i64 {
+        shown = substr(text, 0, area.w)
+        pad = area.w - char_count(shown)
+        if pad < 0 { pad = 0 }
+        lead = 0
+        if how == "center" { lead = pad / 2 }
+        if how == "end" { lead = pad }
+        @self.print_at(area.x + lead, area.y, shown, fg, bg, 0)
+    }
+
+    /// Vertical scrollbar. `top` is the first visible row, `span` the window, `total` the document.
+    scrollbar(@self, area: Rect, top: i64, span: i64, total: i64) : i64 {
+        ensure area.h > 0 && total > 0 else { return 0 }
+        thumb = area.h * span / total
+        if thumb < 1 { thumb = 1 }
+        if (thumb > area.h) { thumb = area.h }
+        offset = 0
+        room = total - span
+        if room > 0 { offset = (area.h - thumb) * top / room }
+        if offset < 0 { offset = 0 }
+        if (offset > area.h - thumb) { offset = area.h - thumb }
+        rows = area.h
+        for 0..rows {
+            ch = "\u{2591}"
+            if it >= offset && it < offset + thumb { ch = "\u{2588}" }
+            @self.print_at(area.x, area.y + it, ch, 7, 0, 0)
+        }
+        thumb
+    }
+
+    /// Horizontal bars. Each value is a fraction of the tallest sample.
+    bars(@self, area: Rect, labels: _, values: _) : i64 {
+        n = len(values)
+        shown = n
+        if (shown > area.h) { shown = area.h }
+        max_v = 1
+        for 0..shown {
+            v = values[it]
+            if v > max_v { max_v = v }
+        }
+        for 0..shown {
+            label = ""
+            if it < len(labels) { label = labels[it] }
+            name_w = 8
+            if (name_w > area.w) { name_w = area.w }
+            @self.print_at(area.x, area.y + it, pad_right(substr(label, 0, name_w), name_w, " "), 7, 0, 0)
+            room = area.w - name_w - 1
+            if room < 1 { room = 1 }
+            filled = values[it] * room / max_v
+            if filled < 0 { filled = 0 }
+            if filled > room { filled = room }
+            @self.print_at(area.x + name_w + 1, area.y + it, repeat("\u{2588}", filled), 6, 0, 0)
+        }
+        shown
+    }
+}
+
+/// Split `area` along `dir` (`h` or `v`).
+/// `kinds` entries are `len`, `pct`, `min`, or `fill`. `nums` is parallel.
++layout_split(area: Rect, dir: str, kinds: _, nums: _) {
+    n = len(kinds)
+    total = area.w
+    if dir == "v" { total = area.h }
+    sizes = arr_new(n, 0)
+    fixed = 0
+    fills = 0
+    for 0..n {
+        kind = kinds[it]
+        num = nums[it]
+        size = 0
+        if kind == "len" { size = num }
+        if kind == "pct" { size = total * num / 100 }
+        if kind == "min" { size = num }
+        if kind == "fill" { fills = fills + 1 }
+        if size < 0 { size = 0 }
+        sizes = arr_set(sizes, it, size)
+        fixed = fixed + size
+    }
+    if fixed > total {
+        over = fixed - total
+        for 0..n {
+            if over > 0 {
+                cur = sizes[n - 1 - it]
+                cut = cur
+                if cut > over { cut = over }
+                sizes = arr_set(sizes, n - 1 - it, cur - cut)
+                over = over - cut
+            }
+        }
+        fixed = total
+    }
+    left = total - fixed
+    if fills > 0 {
+        share = left / fills
+        extra = left - share * fills
+        for 0..n {
+            if kinds[it] == "fill" {
+                add = share
+                if extra > 0 {
+                    add = add + 1
+                    extra = extra - 1
+                }
+                sizes = arr_set(sizes, it, sizes[it] + add)
+            }
+        }
+    }
+    out = []
+    cursor = 0
+    if dir == "v" { cursor = area.y } else { cursor = area.x }
+    for 0..n {
+        size = sizes[it]
+        if dir == "v" {
+            out = arr_push(out, Rect.new(area.x, cursor, area.w, size))
+        } else {
+            out = arr_push(out, Rect.new(cursor, area.y, size, area.h))
+        }
+        cursor = cursor + size
+    }
+    out
+}
+
+/// `Style` is the color and weight of a cell run.
++Style = {
+    /// Foreground 0..15.
+    fg: i64 = 7
+    /// Background 0..15.
+    bg: i64 = 0
+    /// 1 bold, 2 reverse.
+    attr: i64 = 0
+
+    /// Style with the given colors and attribute.
+    new(fg: i64, bg: i64, attr: i64) : Style => Style.{fg, bg, attr}
+}
+
+/// Named palette. `light` flips the default ink and paper. Anything else is the dark theme.
++theme(name: str) : Style {
+    if name == "light" { return Style.new(0, 7, 0) }
+    if name == "accent" { return Style.new(7, 4, 1) }
+    if name == "warn" { return Style.new(1, 0, 1) }
+    if name == "ok" { return Style.new(2, 0, 0) }
+    Style.new(7, 0, 0)
+}
+
+/// Cells of a grid that fills `area`.
++layout_grid(area: Rect, cols: i64, rows: i64) {
+    cx = cols
+    rx = rows
+    if cx < 1 { cx = 1 }
+    if rx < 1 { rx = 1 }
+    cw = area.w / cx
+    rh = area.h / rx
+    if cw < 1 { cw = 1 }
+    if rh < 1 { rh = 1 }
+    out = []
+    for 0..rx {
+        row = it
+        for 0..cx {
+            out = arr_push(out, Rect.new(area.x + it * cw, area.y + row * rh, cw, rh))
+        }
+    }
+    out
+}
+
+/// `compact` below 40 columns, `regular` below 100, otherwise `wide`.
++tier(cols: i64) : str {
+    if cols < 40 { return "compact" }
+    if cols < 100 { return "regular" }
+    "wide"
+}
+
+/// Place `n` cells of at least `min_w`. Narrow areas stack to one column.
++reflow(area: Rect, n: i64, min_w: i64) {
+    cells = n
+    if cells < 1 { cells = 1 }
+    least = min_w
+    if least < 1 { least = 1 }
+    cols = area.w / least
+    if cols < 1 { cols = 1 }
+    if cols > cells { cols = cells }
+    rows = (cells + cols - 1) / cols
+    layout_grid(area, cols, rows)
+}
+
+/// Insert newlines so each line is at most `width` characters. Longer words are split.
++wrap_text(text: str, width: i64) : str {
+    ensure width > 0 else { return text }
+    out = ""
+    line = ""
+    word = ""
+    n = char_count(text)
+    for 0..n {
+        ch = text[it]
+        if ch == "\n" || ch == " " {
+            if word != "" {
+                line = wrap_push(line, word, width)
+                word = ""
+            }
+            if ch == "\n" {
+                if out != "" { out = "{out}\n" }
+                out = "{out}{line}"
+                line = ""
+            }
+        } else {
+            word = "{word}{ch}"
+        }
+    }
+    if word != "" { line = wrap_push(line, word, width) }
+    if line != "" {
+        if out != "" { out = "{out}\n" }
+        out = "{out}{line}"
+    }
+    out
+}
+
+/// Append `word` to `line`, breaking when it would pass `width`.
+wrap_push(line: str, word: str, width: i64) : str {
+    if line == "" {
+        ensure char_count(word) <= width else { return substr(word, 0, width) }
+        return word
+    }
+    joined = "{line} {word}"
+    ensure char_count(joined) <= width else { return "{line}\n{word}" }
+    joined
+}
+
+/// `Pointer` is one SGR mouse event (`\x1b[<btn;x;yM`).
++Pointer = {
+    /// `down`, `up`, `drag`, or `none`.
+    kind: str = "none"
+    /// 0 left, 1 middle, 2 right.
+    button: i64 = 0
+    /// 1-based column.
+    x: i64 = 1
+    /// 1-based row.
+    y: i64 = 1
+
+    /// No event.
+    blank() : Pointer => Pointer.{kind: "none", button: 0, x: 1, y: 1}
+}
+
+/// Decode one SGR mouse event. Other text becomes `Pointer.blank`.
++mouse_parse(text: str) : Pointer {
+    ensure starts_with(text, "\x1b[<") else { return Pointer.blank() }
+    body = strip_prefix(text, "\x1b[<")
+    n = byte_len(body)
+    ensure n > 2 else { return Pointer.blank() }
+    tail = body[n - 1]
+    kind = "down"
+    if tail == "m" { kind = "up" }
+    nums = substr(body, 0, n - 1)
+    btn = to_i64(split_nth(nums, ";", 0)) or 0
+    x = to_i64(split_nth(nums, ";", 1)) or 1
+    y = to_i64(split_nth(nums, ";", 2)) or 1
+    if btn >= 32 { kind = "drag" }
+    button = btn
+    if button >= 32 { button = button - 32 }
+    Pointer.{kind, button, x, y}
+}
+
+/// `Key` is one decoded terminal key.
++Key = {
+    /// `char`, `enter`, `esc`, `up`, `down`, `left`, `right`, `tab`, `backspace`, `ctrl`, or `none`.
+    kind: str = "none"
+    /// The character, or the letter of a ctrl key.
+    ch: str = ""
+
+    /// No key.
+    blank() : Key => Key.{kind: "none", ch: ""}
+}
+
+/// Decode the first key in `text`.
++key_parse(text: str) : Key {
+    n = byte_len(text)
+    ensure n > 0 else { return Key.blank() }
+    if starts_with(text, "\x1b[") {
+        ensure n >= 3 else { return Key.{kind: "esc", ch: ""} }
+        arrow = text[2]
+        if arrow == "A" { return Key.{kind: "up", ch: ""} }
+        if arrow == "B" { return Key.{kind: "down", ch: ""} }
+        if arrow == "C" { return Key.{kind: "right", ch: ""} }
+        if arrow == "D" { return Key.{kind: "left", ch: ""} }
+        return Key.{kind: "esc", ch: ""}
+    }
+    if text[0] == "\x1b" { return Key.{kind: "esc", ch: ""} }
+    if text[0] == "\n" || text[0] == "\r" { return Key.{kind: "enter", ch: ""} }
+    if text[0] == "\t" { return Key.{kind: "tab", ch: ""} }
+    cp = ord(text[0])
+    if cp == 127 || cp == 8 { return Key.{kind: "backspace", ch: ""} }
+    if cp > 0 && cp < 32 { return Key.{kind: "ctrl", ch: chr(cp + 96)} }
+    Key.{kind: "char", ch: text[0]}
+}
+
+/// `Term` is the real terminal. Raw mode stays off when stdin is not a tty.
++Term = {
+    /// Columns reported by the terminal, or 80.
+    cols: i64 = 80
+    /// Rows reported by the terminal, or 24.
+    rows: i64 = 24
+    /// True when raw mode was enabled.
+    raw: bool = false
+
+    /// Enter the alternate screen when stdin is a tty.
+    open() : Term {
+        host.sys_term_reset()
+        raw = host.sys_term_raw(1)
+        if raw { host.sys_term_write("\x1b[?1049h\x1b[?25l") }
+        Term.{cols: host.sys_term_cols(), rows: host.sys_term_rows(), raw}
+    }
+
+    /// Leave raw mode and the alternate screen.
+    close(@self) : bool {
+        if (self.raw) { host.sys_term_write("\x1b[?25h\x1b[?1049l") }
+        self.raw = false
+        host.sys_term_raw(0)
+    }
+
+    /// Write one ANSI frame.
+    write(_self, frame: str) : i64 => host.sys_term_write(frame)
+
+    /// Paint `screen` and remember the frame for the next diff.
+    draw(self, @screen: Screen) : i64 {
+        self.write(@screen.ansi())
+    }
+
+    /// Next decoded key, or `Key.blank` when nothing is buffered.
+    poll(_self) : Key {
+        chunk = host.sys_term_read(16)
+        key_parse(chunk)
+    }
+}
+
+/// Test that cells clip and a row round-trips through the host.
+test "cells clip and a row round-trips" {
+    view = Screen.new(4, 2)
+    assert_eq(@view.put(-1, 0, 65, 7, 0, 0), 0)
+    assert_eq(@view.put(1, 0, 65, 7, 0, 0), 1)
+    assert_eq(view.get(1, 0), 65)
+    assert_eq(view.get(9, 0), -1)
+    @view.print_at(0, 1, "hello", 7, 0, 0)
+    assert_eq(view.row(1), "hell")
+    assert_eq(view.plain(), " A  \nhell")
+}
+
+/// Test that the second ansi frame is empty until a cell changes.
+test "the second ansi frame is empty until a cell changes" {
+    view = Screen.new(2, 1)
+    @view.print_at(0, 0, "AB", 7, 0, 0)
+    first = @view.ansi()
+    #assert(contains(first, "\x1b[H"))
+    #assert(contains(first, "AB"))
+    assert_eq(@view.ansi(), "")
+    @view.put(1, 0, 90, 1, 0, 1)
+    patch = @view.ansi()
+    #assert(contains(patch, "\x1b[1;2H"))
+    #assert(contains(patch, "Z"))
+}
+
+/// Test that layout splits length, percent, and fill.
+test "layout splits length, percent, and fill" {
+    area = Rect.new(0, 0, 10, 4)
+    parts = layout_split(area, "h", ["len", "pct", "fill"], [2, 50, 0])
+    assert_eq(parts[0].w, 2)
+    assert_eq(parts[1].w, 5)
+    assert_eq(parts[2].w, 3)
+    assert_eq(parts[2].x, 7)
+    rows = layout_split(area, "v", ["len", "fill"], [1, 0])
+    assert_eq(rows[0].h, 1)
+    assert_eq(rows[1].h, 3)
+    assert_eq(rows[1].y, 1)
+}
+
+/// Test that a block, list, gauge, tabs, sparkline, and table paint.
+test "widgets paint into the cell buffer" {
+    view = Screen.new(12, 6)
+    @view.block(Rect.new(0, 0, 12, 6), "Hi")
+    assert_eq(chr(view.get(0, 0)), TUI_TL)
+    assert_eq(chr(view.get(2, 0)), "H")
+    @view.list(Rect.new(1, 1, 10, 2), ["alpha", "beta"], 1)
+    assert_eq(substr(view.row(2), 1, 4), "beta")
+    filled = @view.gauge(Rect.new(1, 3, 10, 1), 0.4, "")
+    assert_eq(filled, 4)
+    @view.tabs(Rect.new(1, 4, 10, 1), ["One", "Two"], 0)
+    assert_eq(substr(view.row(4), 1, 3), "One")
+    @view.sparkline(Rect.new(1, 5, 4, 1), [1, 2, 4])
+    assert_eq(char_count(substr(view.row(5), 1, 3)), 3)
+    sheet = Screen.new(8, 3)
+    @sheet.table(Rect.new(0, 0, 8, 3), ["A", "B"], ["1", "2", "3", "4"], 2)
+    assert_eq(substr(sheet.row(0), 0, 1), "A")
+    assert_eq(substr(sheet.row(2), 0, 1), "3")
+}
+
+/// Test that paragraphs wrap and honor newlines.
+test "paragraphs wrap and honor newlines" {
+    view = Screen.new(4, 3)
+    @view.paragraph(Rect.new(0, 0, 4, 3), "abcdEF\nZ", 7)
+    assert_eq(view.row(0), "abcd")
+    assert_eq(view.row(1), "EF  ")
+    assert_eq(substr(view.row(2), 0, 1), "Z")
+}
+
+/// Test that keys decode arrows, enter, escape, and ctrl-c.
+test "keys decode arrows, enter, escape, and ctrl-c" {
+    up = key_parse("\x1b[A")
+    assert_eq(up.kind, "up")
+    enter = key_parse("\r")
+    assert_eq(enter.kind, "enter")
+    esc = key_parse("\x1b")
+    assert_eq(esc.kind, "esc")
+    ctrl = key_parse("\x03")
+    assert_eq(ctrl.kind, "ctrl")
+    assert_eq(ctrl.ch, "c")
+    ch = key_parse("q")
+    assert_eq(ch.kind, "char")
+    assert_eq(ch.ch, "q")
+    assert_eq(key_parse("").kind, "none")
+}
+
+/// Test that a fed key is captured without touching a raw terminal.
+test "a fed key is captured without touching a raw terminal" {
+    host.sys_term_reset()
+    host.sys_term_feed("\x1b[B")
+    term = Term.{cols: host.sys_term_cols(), rows: host.sys_term_rows(), raw: false}
+    key = term.poll()
+    assert_eq(key.kind, "down")
+    term.write("ok")
+    assert_eq(host.sys_term_written(), "ok")
+    host.sys_term_reset()
+}
+
+/// Test that themes, grids, wrapping, scrollbars, and the mouse decode.
+test "themes, grids, wrapping, scrollbars, and the mouse decode" {
+    dark = theme("dark")
+    light = theme("light")
+    assert_eq(dark.fg, 7)
+    assert_eq(light.bg, 7)
+    assert_eq(tier(24), "compact")
+    assert_eq(tier(80), "regular")
+    assert_eq(tier(120), "wide")
+    cells = layout_grid(Rect.new(0, 0, 10, 4), 2, 2)
+    assert_eq(len(cells), 4)
+    assert_eq(cells[3].x, 5)
+    assert_eq(cells[3].y, 2)
+    stacked = reflow(Rect.new(0, 0, 10, 8), 4, 6)
+    assert_eq(stacked[0].w, 10)
+    assert_eq(len(stacked), 4)
+    assert_eq(wrap_text("hello world", 5), "hello\nworld")
+    view = Screen.new(6, 4)
+    @view.align_in(Rect.new(0, 0, 6, 1), "ab", "center", 7, 0)
+    assert_eq(substr(view.row(0), 2, 2), "ab")
+    thumb = @view.scrollbar(Rect.new(5, 0, 1, 4), 0, 2, 4)
+    assert_eq(thumb, 2)
+    click = mouse_parse("\x1b[<0;3;4M")
+    assert_eq(click.kind, "down")
+    assert_eq(click.x, 3)
+    assert_eq(click.y, 4)
+    up = mouse_parse("\x1b[<0;3;4m")
+    assert_eq(up.kind, "up")
+}

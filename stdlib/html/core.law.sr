@@ -1,0 +1,56 @@
+//! Laws for std.html.core — real-body (`escape_text` empty; `html_hex2` / `html_hex4`).
+//! Full `escape_text` loops are runtime-tested (verify hex helpers).
+
+#law("escape_text empty is empty")
+escape_text_empty() {
+    #assert(escape_text("") == "")
+}
+
+#law("html_hex2 encodes single-byte values")
+escape_html_hex2() {
+    assert_eq(html_hex2(0), "00")
+    assert_eq(html_hex2(10), "0A")
+    assert_eq(html_hex2(255), "FF")
+}
+
+#law("html_hex4 encodes 16-bit values")
+escape_html_hex4() {
+    assert_eq(html_hex4(0), "0000")
+    assert_eq(html_hex4(256), "0100")
+}
+
+#law("html_hex6 encodes 24-bit palette values")
+escape_html_hex6() {
+    assert_eq(html_hex6(0), "000000")
+    assert_eq(html_hex6(0xFF0000), "FF0000")
+}
+
+#law("escape_text_entity maps markup")
+escape_text_entity_law() {
+    assert_eq(escape_text_entity("&"), "&amp;")
+    assert_eq(escape_text_entity("<"), "&lt;")
+    assert_eq(escape_text_entity(">"), "&gt;")
+    assert_eq(escape_text_entity("\""), "&quot;")
+    assert_eq(escape_text_entity("'"), "&#39;")
+    assert_eq(escape_text_entity("z"), "z")
+}
+
+#law("escape_text_entity distinguishes amp from lt")
+escape_text_entity_distinct() {
+    #assert(escape_text_entity("&") != escape_text_entity("<"))
+    #assert(escape_text_entity("<") != "&gt;")
+    #assert(escape_text_entity(">") == "&gt;")
+}
+
+#law("escape_text_append on empty acc")
+escape_text_append_law() {
+    assert_eq(escape_text_append("", "&"), "&amp;")
+    assert_eq(escape_text_append("", "<"), "&lt;")
+    assert_eq(escape_text_append("", ">"), "&gt;")
+}
+
+#law("escape_text_entity quot helpers")
+escape_text_entity_helpers() {
+    assert_eq(escape_text_entity_quot(), "&quot;")
+    assert_eq(escape_text_entity_apos(), "&#39;")
+}

@@ -1,0 +1,495 @@
+//! std.sec.otp — HOTP (RFC 4226), TOTP (RFC 6238) and offline WebAuthn challenge checks
+//!
+//! Import with:
+//!   use std.sec.otp
+//!
+//!   code  = otp_totp_sha1("12345678901234567890", 59, 30, 6)       // "287082"
+//!   ok    = otp_verify_totp("12345678901234567890", "287082", 59, 30, 6, 1)
+//!   code2 = otp_totp_sha256("12345678901234567890123456789012", 59, 30, 8)  // "46119246"
+//!   uri   = otp_uri("Acme", "amina@acme.test", "JBSWY3DPEHPK3PXP", 6, 30)
+//!
+//! HOTP is RFC 4226 dynamic truncation over an HMAC. `otp_hotp_sha1` is a pure-Super
+//! HMAC-SHA1 (the RFC 4226 default, compatible with authenticator apps) verified below
+//! against the RFC 4226 Appendix D vectors; `otp_hotp_sha256` routes HMAC-SHA256 through
+//! `host.sys_hmac_sha256` and is verified against RFC 6238 Appendix B. `otp_truncate`
+//! accepts any precomputed MAC, so SHA-512 or a hardware token can feed the same path.
+//!
+//! The WebAuthn helpers are an offline structural check only: they validate the length,
+//! alphabet and equality of base64url challenges and the `type` of client data. They do
+//! not verify attestation or assertion signatures; do that with `std.sec.crypto`.
+//! Public helpers are prefixed `otp_` because modules merge flat.
+
+/// `OTP_HEX` is `"0123456789abcdef"`.
++OTP_HEX = "0123456789abcdef"
+/// `OTP_B64URL` is the base64url alphabet without padding.
++OTP_B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+/// `OTP_MASK32` is `0xFFFF_FFFF`.
++OTP_MASK32 = 0xFFFF_FFFF
+/// `OTP_MIN_CHALLENGE_BYTES` is the WebAuthn minimum challenge entropy (16 bytes).
++OTP_MIN_CHALLENGE_BYTES = 16
+/// `OTP_MAX_CHALLENGE_BYTES` caps the accepted challenge size (1024 bytes).
++OTP_MAX_CHALLENGE_BYTES = 1024
+
+// --- small helpers -------------------------------------------------------------------
+
+/// `10` raised to `n`.
++otp_pow10(n: i64) : i64 {
+    acc = 1
+    for 0..n { acc = acc * 10 }
+    acc
+}
+
+/// Zero-padded decimal string of fixed width.
++otp_pad(v: i64, width: i64) : str {
+    s = "" + v
+    for 0..width {
+        if host.sys_str_len(s) < width { s = "0" + s }
+    }
+    s
+}
+
+/// Two lowercase hex characters for the byte `v`.
++otp_hex2(v: i64) : str => OTP_HEX[(v / 16) % 16] + OTP_HEX[v % 16]
+
+/// Lowercase hex of a byte array.
++otp_hex_of(bytes: _) : str {
+    out = ""
+    for bytes { out = out + otp_hex2(it) }
+    out
+}
+
+/// Value of one hex digit, or -1.
++otp_nibble(c: str) : i64 {
+    cp = host.sys_ord(c)
+    if cp >= 48 && cp <= 57 { return cp - 48 }
+    if cp >= 97 && cp <= 102 { return cp - 87 }
+    if cp >= 65 && cp <= 70 { return cp - 55 }
+    -1
+}
+
+/// Hex text -> byte array (invalid digits count as 0; a trailing odd digit is dropped).
++otp_bytes_of_hex(h: str) {
+    out = []
+    n = host.sys_str_len(h)
+    for 0..(n / 2) {
+        hi = otp_nibble(h[it * 2])
+        lo = otp_nibble(h[it * 2 + 1])
+        if hi < 0 { hi = 0 }
+        if lo < 0 { lo = 0 }
+        out = host.sys_arr_push(out, hi * 16 + lo)
+    }
+    out
+}
+
+/// UTF-8 bytes of `s`.
++otp_bytes_of(s: str)  => host.sys_str_to_bytes(s)
+
+/// 8-byte big-endian encoding of a non-negative counter.
++otp_counter_bytes(counter: i64) {
+    digits = []
+    rest = counter
+    for 0..8 {
+        digits = host.sys_arr_push(digits, rest % 256)
+        rest = rest / 256
+    }
+    out = []
+    for 0..8 { out = host.sys_arr_push(out, digits[7 - it]) }
+    out
+}
+
+/// 8-byte big-endian counter as lowercase hex.
++otp_counter_hex(counter: i64) : str => otp_hex_of(otp_counter_bytes(counter))
+
+/// Constant-shape string equality (inspects every position of equal-length inputs).
++otp_ct_eq(a: str, b: str) : bool {
+    na = host.sys_str_len(a)
+    nb = host.sys_str_len(b)
+    diff = 0
+    if na != nb { diff = 1 }
+    n = na
+    if nb > n { n = nb }
+    for 0..n {
+        if a[it] != b[it] { diff = 1 }
+    }
+    diff == 0
+}
+
+// --- pure SHA-1 / HMAC-SHA1 ------------------------------------------------------------
+
+/// 32-bit left rotation of `x` by `n` bits.
++otp_rotl(x: i64, n: i64) : i64 => ((x << n) | (x >>> (32 - n))) & OTP_MASK32
+
+/// SHA-1 padding: 0x80, zeros, 64-bit big-endian bit length (multiple of 64 bytes).
++otp_sha1_pad(msg: _) {
+    n = host.sys_arr_len(msg)
+    out = []
+    for msg { out = host.sys_arr_push(out, it) }
+    out = host.sys_arr_push(out, 128)
+    total = n + 1
+    for 0..64 {
+        if total % 64 != 56 {
+            out = host.sys_arr_push(out, 0)
+            total += 1
+        }
+    }
+    bits = n * 8
+    for 0..8 {
+        out = host.sys_arr_push(out, (bits >> (8 * (7 - it))) & 255)
+    }
+    out
+}
+
+/// Message schedule W[0..80) for the 64-byte block starting at `at`.
++otp_sha1_schedule(padded: _, at: i64) {
+    w = []
+    for 0..16 {
+        p = at + it * 4
+        w = host.sys_arr_push(w, (padded[p] << 24) | (padded[p + 1] << 16) | (padded[p + 2] << 8) | padded[p + 3])
+    }
+    for 16..80 {
+        v = w[it - 3] ^ w[it - 8] ^ w[it - 14] ^ w[it - 16]
+        w = host.sys_arr_push(w, otp_rotl(v, 1))
+    }
+    w
+}
+
+/// SHA-1 round function for round `t`.
++otp_sha1_f(t: i64, b: i64, c: i64, d: i64) : i64 {
+    if t < 20 { return ((b & c) | ((~b) & d)) & OTP_MASK32 }
+    if t < 40 { return (b ^ c ^ d) & OTP_MASK32 }
+    if t < 60 { return ((b & c) | (b & d) | (c & d)) & OTP_MASK32 }
+    parity = b ^ c ^ d
+    parity & OTP_MASK32
+}
+
+/// SHA-1 round constant for round `t`.
++otp_sha1_k(t: i64) : i64 {
+    if t < 20 { return 1518500249 }
+    if t < 40 { return 1859775393 }
+    if t < 60 { return 2400959708 }
+    3395469782
+}
+
+/// SHA-1 digest (20 bytes) of a byte array.
++otp_sha1(msg: _) {
+    padded = otp_sha1_pad(msg)
+    h0 = 1732584193
+    h1 = 4023233417
+    h2 = 2562383102
+    h3 = 271733878
+    h4 = 3285377520
+    blocks = host.sys_arr_len(padded) / 64
+    for 0..blocks {
+        w = otp_sha1_schedule(padded, it * 64)
+        a = h0
+        b = h1
+        c = h2
+        d = h3
+        e = h4
+        for 0..80 {
+            tmp = (otp_rotl(a, 5) + otp_sha1_f(it, b, c, d) + e + otp_sha1_k(it) + w[it]) & OTP_MASK32
+            e = d
+            d = c
+            c = otp_rotl(b, 30)
+            b = a
+            a = tmp
+        }
+        h0 = (h0 + a) & OTP_MASK32
+        h1 = (h1 + b) & OTP_MASK32
+        h2 = (h2 + c) & OTP_MASK32
+        h3 = (h3 + d) & OTP_MASK32
+        h4 = (h4 + e) & OTP_MASK32
+    }
+    out = []
+    for [h0, h1, h2, h3, h4] {
+        word = it
+        for 0..4 { out = host.sys_arr_push(out, (word >> (8 * (3 - it))) & 255) }
+    }
+    out
+}
+
+/// HMAC-SHA1 (RFC 2104) over byte arrays; returns 20 bytes.
++otp_hmac_sha1(key: _, msg: _) {
+    k = key
+    if host.sys_arr_len(k) > 64 { k = otp_sha1(k) }
+    inner = []
+    outer = []
+    for 0..64 {
+        kb = 0
+        if it < host.sys_arr_len(k) { kb = k[it] }
+        inner = host.sys_arr_push(inner, kb ^ 54)
+        outer = host.sys_arr_push(outer, kb ^ 92)
+    }
+    for msg { inner = host.sys_arr_push(inner, it) }
+    for otp_sha1(inner) { outer = host.sys_arr_push(outer, it) }
+    otp_sha1(outer)
+}
+
+// --- HOTP / TOTP --------------------------------------------------------------------------
+
+/// RFC 4226 dynamic truncation of a MAC (byte array) to `digits` (1..9) decimal digits.
++otp_truncate(mac: _, digits: i64) : i64 {
+    n = host.sys_arr_len(mac)
+    ensure n >= 20 else { return 0 }
+    off = mac[n - 1] & 15
+    bin = ((mac[off] & 127) << 24) | (mac[off + 1] << 16) | (mac[off + 2] << 8) | mac[off + 3]
+    bin % otp_pow10(digits)
+}
+
+/// HOTP over HMAC-SHA1 with a text key (RFC 4226).
++otp_hotp_sha1(key: str, counter: i64, digits: i64) : i64 {
+    otp_truncate(otp_hmac_sha1(otp_bytes_of(key), otp_counter_bytes(counter)), digits)
+}
+
+/// HOTP over HMAC-SHA256 with a text key (RFC 6238 SHA-256 mode).
++otp_hotp_sha256(key: str, counter: i64, digits: i64) : i64 {
+    mac_hex = host.sys_hmac_sha256(key, host.sys_hex_decode(otp_counter_hex(counter)))
+    otp_truncate(otp_bytes_of_hex(mac_hex), digits)
+}
+
+/// Zero-padded HOTP/SHA-1 code string.
++otp_hotp_code(key: str, counter: i64, digits: i64) : str => otp_pad(otp_hotp_sha1(key, counter, digits), digits)
+
+/// Time-step counter for `unix_secs` and a `step`-second window (0 when `step` is not positive).
++otp_counter_at(unix_secs: i64, step: i64) : i64 {
+    ensure step > 0 else { return 0 }
+    unix_secs / step
+}
+
+/// TOTP code (HMAC-SHA1) for `key` at `unix_secs`.
++otp_totp_sha1(key: str, unix_secs: i64, step: i64, digits: i64) : str {
+    otp_pad(otp_hotp_sha1(key, otp_counter_at(unix_secs, step), digits), digits)
+}
+
+/// TOTP code (HMAC-SHA256) for `key` at `unix_secs`.
++otp_totp_sha256(key: str, unix_secs: i64, step: i64, digits: i64) : str {
+    otp_pad(otp_hotp_sha256(key, otp_counter_at(unix_secs, step), digits), digits)
+}
+
+/// Accept `code` for steps within `window` of `unix_secs` (HMAC-SHA1). Uses a constant-shape compare.
++otp_verify_totp(key: str, code: str, unix_secs: i64, step: i64, digits: i64, window: i64) : bool {
+    ensure host.sys_str_len(code) == digits else { return false }
+    center = otp_counter_at(unix_secs, step)
+    ok = false
+    for (0 - window)..(window + 1) {
+        c = center + it
+        if c >= 0 {
+            if otp_ct_eq(code, otp_pad(otp_hotp_sha1(key, c, digits), digits)) { ok = true }
+        }
+    }
+    ok
+}
+
+/// Look-ahead resync for HOTP: the counter that matches `code` within `look_ahead` of `counter`, or -1.
++otp_resync_hotp(key: str, code: str, counter: i64, look_ahead: i64, digits: i64) : i64 {
+    found = -1
+    for 0..(look_ahead + 1) {
+        c = counter + it
+        if found < 0 {
+            if otp_ct_eq(code, otp_hotp_code(key, c, digits)) { found = c }
+        }
+    }
+    found
+}
+
+/// Unreserved characters stay; everything else becomes %XX (for otpauth labels).
++otp_escape(s: str) : str {
+    unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+    out = ""
+    for otp_bytes_of(s) {
+        b = it
+        keep = false
+        for 0..host.sys_str_len(unreserved) {
+            if host.sys_ord(unreserved[it]) == b { keep = true }
+        }
+        if keep { out = out + host.sys_chr(b) } else { out = out + "%" + otp_hex2(b) }
+    }
+    out
+}
+
+/// `otpauth://totp/...` provisioning URI (Google Authenticator key-URI format).
++otp_uri(issuer: str, account: str, secret_b32: str, digits: i64, step: i64) : str {
+    label = otp_escape(issuer) + ":" + otp_escape(account)
+    "otpauth://totp/" + label + "?secret=" + secret_b32 + "&issuer=" + otp_escape(issuer) + "&algorithm=SHA1&digits=" + digits + "&period=" + step
+}
+
+// --- WebAuthn challenge checks (offline, structural) ------------------------------------
+
+/// Index of `c` in the base64url alphabet, or -1.
++otp_b64url_index(c: str) : i64 {
+    pos = -1
+    for 0..64 {
+        if pos < 0 && OTP_B64URL[it] == c { pos = it }
+    }
+    pos
+}
+
+/// True when `s` is non-empty unpadded base64url text of a decodable length.
++otp_is_b64url(s: str) : bool {
+    n = host.sys_str_len(s)
+    ensure n > 0 else { return false }
+    ensure n % 4 != 1 else { return false }
+    ok = true
+    for 0..n {
+        if otp_b64url_index(s[it]) < 0 { ok = false }
+    }
+    ok
+}
+
+/// Decoded byte length of unpadded base64url text of `n` characters.
++otp_b64url_decoded_len(n: i64) : i64 => (n * 6) / 8
+
+/// Validate a WebAuthn challenge: base64url, 16..1024 decoded bytes. Fails with the reason.
++otp_webauthn_check_challenge(challenge: str) : bool! {
+    n = host.sys_str_len(challenge)
+    ensure otp_is_b64url(challenge) else {
+        fail "challenge is not unpadded base64url"
+        return
+    }
+    size = otp_b64url_decoded_len(n)
+    ensure size >= OTP_MIN_CHALLENGE_BYTES else {
+        fail "challenge shorter than 16 bytes"
+        return
+    }
+    ensure size <= OTP_MAX_CHALLENGE_BYTES else {
+        fail "challenge longer than 1024 bytes"
+        return
+    }
+    true
+}
+
+/// True when `got` is a well-formed challenge equal to `expected` (constant-shape compare).
++otp_webauthn_verify(expected: str, got: str) : bool {
+    ensure otp_webauthn_check_challenge(expected) or false else { return false }
+    ensure otp_webauthn_check_challenge(got) or false else { return false }
+    otp_ct_eq(expected, got)
+}
+
+/// Check client-data fields: `type` must be `webauthn.create`/`webauthn.get` and the challenge must match.
++otp_webauthn_client_data(kind: str, challenge: str, expected_kind: str, expected_challenge: str) : bool {
+    ensure kind == expected_kind else { return false }
+    ensure kind == "webauthn.create" || kind == "webauthn.get" else { return false }
+    otp_webauthn_verify(expected_challenge, challenge)
+}
+
+// --- tests ---------------------------------------------------------------------------------
+
+/// Test that SHA-1 and HMAC-SHA1 known vectors.
+test "SHA-1 and HMAC-SHA1 known vectors" {
+    assert_eq(otp_hex_of(otp_sha1(otp_bytes_of("abc"))), "a9993e364706816aba3e25717850c26c9cd0d89d")
+    assert_eq(otp_hex_of(otp_sha1([])), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    long = otp_bytes_of("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+    assert_eq(otp_hex_of(otp_sha1(long)), "84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+    mac = otp_hmac_sha1(otp_bytes_of("Jefe"), otp_bytes_of("what do ya want for nothing?"))
+    assert_eq(otp_hex_of(mac), "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")
+}
+
+/// Test that HOTP matches RFC 4226 Appendix D.
+test "HOTP matches RFC 4226 Appendix D" {
+    key = "12345678901234567890"
+    expected = ["755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583", "399871", "520489"]
+    for 0..10 {
+        assert_eq(otp_hotp_code(key, it, 6), expected[it])
+    }
+    assert_eq(otp_hotp_sha1(key, 0, 6), 755224)
+    assert_eq(otp_hotp_sha1(key, 0, 8), 84755224)
+}
+
+/// Test that truncation follows RFC 4226 section 5.4.
+test "truncation follows RFC 4226 section 5.4" {
+    mac = otp_bytes_of_hex("1f8698690e02ca16618550ef7f19da8e945b555a")
+    assert_eq(otp_truncate(mac, 6), 872921)
+    assert_eq(otp_truncate(mac, 9), 357872921)
+    assert_eq(otp_truncate([1, 2, 3], 6), 0)
+}
+
+/// Test that TOTP SHA-1 matches RFC 6238 Appendix B.
+test "TOTP SHA-1 matches RFC 6238 Appendix B" {
+    key = "12345678901234567890"
+    assert_eq(otp_totp_sha1(key, 59, 30, 8), "94287082")
+    assert_eq(otp_totp_sha1(key, 1111111109, 30, 8), "07081804")
+    assert_eq(otp_totp_sha1(key, 1111111111, 30, 8), "14050471")
+    assert_eq(otp_totp_sha1(key, 1234567890, 30, 8), "89005924")
+    assert_eq(otp_totp_sha1(key, 2000000000, 30, 8), "69279037")
+    assert_eq(otp_totp_sha1(key, 20000000000, 30, 8), "65353130")
+}
+
+/// Test that TOTP SHA-256 matches RFC 6238 Appendix B.
+test "TOTP SHA-256 matches RFC 6238 Appendix B" {
+    key = "12345678901234567890123456789012"
+    assert_eq(otp_totp_sha256(key, 59, 30, 8), "46119246")
+    assert_eq(otp_totp_sha256(key, 1111111109, 30, 8), "68084774")
+    assert_eq(otp_totp_sha256(key, 1111111111, 30, 8), "67062674")
+    assert_eq(otp_totp_sha256(key, 1234567890, 30, 8), "91819424")
+    assert_eq(otp_totp_sha256(key, 2000000000, 30, 8), "90698825")
+    assert_eq(otp_totp_sha256(key, 20000000000, 30, 8), "77737706")
+}
+
+/// Test that counters, padding and window verification.
+test "counters, padding and window verification" {
+    key = "12345678901234567890"
+    assert_eq(otp_counter_at(59, 30), 1)
+    assert_eq(otp_counter_at(60, 30), 2)
+    assert_eq(otp_counter_at(60, 0), 0)
+    assert_eq(otp_counter_hex(1), "0000000000000001")
+    assert_eq(otp_counter_hex(258), "0000000000000102")
+    assert_eq(otp_pad(42, 6), "000042")
+    assert_eq(otp_pow10(3), 1000)
+    code = otp_totp_sha1(key, 59, 30, 6)
+    assert_eq(code, "287082")
+    #assert(otp_verify_totp(key, code, 59, 30, 6, 0))
+    #assert(!(otp_verify_totp(key, code, 89, 30, 6, 0)))
+    #assert(otp_verify_totp(key, code, 89, 30, 6, 1))
+    #assert(!(otp_verify_totp(key, "12345", 59, 30, 6, 1)))
+    #assert(!(otp_verify_totp("other-key", code, 59, 30, 6, 1)))
+    assert_eq(otp_resync_hotp(key, "359152", 0, 5, 6), 2)
+    assert_eq(otp_resync_hotp(key, "359152", 3, 5, 6), -1)
+}
+
+/// Test that hex helpers round trip and compare.
+test "hex helpers round trip and compare" {
+    b = otp_bytes_of_hex("00ff10Ab")
+    assert_eq(host.sys_arr_len(b), 4)
+    assert_eq(b[1], 255)
+    assert_eq(b[3], 171)
+    assert_eq(otp_hex_of(b), "00ff10ab")
+    assert_eq(otp_hex2(7), "07")
+    assert_eq(otp_nibble("g"), -1)
+    #assert(otp_ct_eq("abc", "abc"))
+    #assert(!(otp_ct_eq("abc", "abd")))
+    #assert(!(otp_ct_eq("abc", "ab")))
+    assert_eq(otp_rotl(1, 31), 2147483648)
+}
+
+/// Test that provisioning URIs escape labels.
+test "provisioning URIs escape labels" {
+    assert_eq(otp_escape("a b@c"), "a%20b%40c")
+    uri = otp_uri("Acme Co", "amina@acme.test", "JBSWY3DPEHPK3PXP", 6, 30)
+    assert_eq(uri, "otpauth://totp/Acme%20Co:amina%40acme.test?secret=JBSWY3DPEHPK3PXP&issuer=Acme%20Co&algorithm=SHA1&digits=6&period=30")
+}
+
+/// Test that WebAuthn challenges are validated structurally.
+test "WebAuthn challenges are validated structurally" {
+    good = "dGhpcy1pcy1hLTMyLWJ5dGUtY2hhbGxlbmdlISE"
+    #assert(otp_webauthn_check_challenge(good) or false)
+    #assert(!(otp_webauthn_check_challenge("short") or false))
+    #assert(!(otp_webauthn_check_challenge("has space has space has space") or false))
+    #assert(!(otp_webauthn_check_challenge("AAAAAAAAAAAAAAAAAAAAAAAA=") or false))
+    #assert(!(otp_webauthn_check_challenge("") or false))
+    #assert(!(otp_is_b64url("AAAAA")))
+    #assert(otp_is_b64url("AAAA"))
+    assert_eq(otp_b64url_decoded_len(22), 16)
+    assert_eq(otp_b64url_decoded_len(43), 32)
+    #assert(otp_webauthn_verify(good, good))
+    #assert(!(otp_webauthn_verify(good, "dGhpcy1pcy1hLTMyLWJ5dGUtY2hhbGxlbmdlISF")))
+    #assert(!(otp_webauthn_verify("short", "short")))
+}
+
+/// Test that client data type and challenge are both enforced.
+test "client data type and challenge are both enforced" {
+    c = "dGhpcy1pcy1hLTMyLWJ5dGUtY2hhbGxlbmdlISE"
+    #assert(otp_webauthn_client_data("webauthn.get", c, "webauthn.get", c))
+    #assert(!(otp_webauthn_client_data("webauthn.create", c, "webauthn.get", c)))
+    #assert(!(otp_webauthn_client_data("other", c, "other", c)))
+    #assert(!(otp_webauthn_client_data("webauthn.get", "AAAA", "webauthn.get", c)))
+}

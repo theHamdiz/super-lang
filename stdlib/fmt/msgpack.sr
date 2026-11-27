@@ -1,0 +1,823 @@
+//! std.fmt.msgpack — MessagePack encoder and decoder over byte arrays
+//!
+//! Import with:
+//!   use std.fmt.msgpack
+//!
+//! Bytes are `i64` values in 0..255 stored in an array (the same shape as `std.core.bytes`).
+//! `MpWriter` appends values in their smallest canonical encoding; `MpReader` is a cursor
+//! that reads them back, and `mp_to_json` renders any document as JSON text:
+//!
+//!   w = MpWriter.new()
+//!   @w.map(2)
+//!   @w.str("id")
+//!   @w.int(300)
+//!   @w.str("tags")
+//!   @w.array(2)
+//!   @w.str("a")
+//!   @w.nil()
+//!   bytes = w.to_bytes()
+//!   text = mp_to_json(bytes) or "?"      // {"id":300,"tags":["a",null]}
+//!
+//! Covered: nil, bool, signed/unsigned integers up to the i64 range, str, bin, array and map
+//! (fix, 8/16/32-bit forms). Floats and ext values are recognised so `skip_value` and
+//! `mp_valid` can step over them, but `read_*` and `mp_to_json` reject them.
+
+/// `MP_LB` is `"{"`.
++MP_LB = "{"
+/// `MP_RB` is `"}"`.
++MP_RB = "}"
+/// Value kind: nil.
++MP_NIL = 0
+/// Value kind: boolean.
++MP_BOOL = 1
+/// Value kind: integer.
++MP_INT = 2
+/// Value kind: string.
++MP_STR = 3
+/// Value kind: binary blob.
++MP_BIN = 4
+/// Value kind: array.
++MP_ARRAY = 5
+/// Value kind: map.
++MP_MAP = 6
+/// Value kind: float32 or float64 (not decodable to a value here).
++MP_FLOAT = 7
+/// Value kind: extension type.
++MP_EXT = 8
+/// Deepest array/map nesting `mp_to_json` and `mp_valid` accept.
++MP_MAX_DEPTH = 64
+/// `i64::MAX`.
++MP_I64_MAX = 9223372036854775807
+
+// --- big-endian helpers -------------------------------------------------------------------
+
+/// Unsigned big-endian integer from `k` bytes (k <= 4) of `data` at `pos`.
++mp_be(data: _, pos: i64, k: i64) : i64 {
+    v = 0
+    for 0..k { v = v * 256 + data[pos + it] }
+    v
+}
+
+/// Append the low `k` bytes of `v` to `buf`, most significant first (two's complement).
++mp_push_be(buf: _, v: i64, k: i64) : _ {
+    out = buf
+    for 0..k {
+        shift = 8 * (k - 1 - it)
+        out = host.sys_arr_push(out, (v >>> shift) & 255)
+    }
+    out
+}
+
+/// Append every byte of `src` to `buf`.
++mp_push_all(buf: _, src: _) : _ {
+    out = buf
+    for src { out = host.sys_arr_push(out, it) }
+    out
+}
+
+// --- headers ------------------------------------------------------------------------------
+
+/// Decoded type byte: what follows and how many bytes the header itself takes.
++MpHead = {
+    /// One of the `MP_*` kinds. Defaults to `0`.
+    kind: i64 = 0
+    /// Integer value, bool (0/1), or payload length (str/bin/ext) or element count
+    /// (array) or pair count (map). Defaults to `0`.
+    n: i64 = 0
+    /// Header size in bytes, including the type byte. Defaults to `1`.
+    hdr: i64 = 1
+}
+
+/// Decode the header at `pos` of the first `size` bytes of `data`, or fail.
++mp_header_at(data: _, pos: i64, size: i64) : MpHead! {
+    ensure pos >= 0 else {
+        fail "msgpack: negative offset"
+        return
+    }
+    ensure pos < size else {
+        fail "msgpack: unexpected end of data"
+        return
+    }
+    b = data[pos]
+    ensure b >= 0 else {
+        fail "msgpack: byte out of range"
+        return
+    }
+    ensure b < 256 else {
+        fail "msgpack: byte out of range"
+        return
+    }
+    if b < 128 { return MpHead.{kind: 2, n: b, hdr: 1} }
+    if b >= 224 { return MpHead.{kind: 2, n: b - 256, hdr: 1} }
+    if b < 144 { return MpHead.{kind: 6, n: b - 128, hdr: 1} }
+    if b < 160 { return MpHead.{kind: 5, n: b - 144, hdr: 1} }
+    if b < 192 { return MpHead.{kind: 3, n: b - 160, hdr: 1} }
+    ensure b != 193 else {
+        fail "msgpack: reserved type byte 0xc1"
+        return
+    }
+    if b == 192 { return MpHead.{kind: 0, n: 0, hdr: 1} }
+    if b == 194 { return MpHead.{kind: 1, n: 0, hdr: 1} }
+    if b == 195 { return MpHead.{kind: 1, n: 1, hdr: 1} }
+    // Table: kind, width of the length/value field, mode (0 length, 1 signed, 2 unsigned),
+    // and extra header bytes (the ext type byte).
+    kind = -1
+    width = 0
+    mode = 0
+    extra = 0
+    if b == 196 { kind = 4 width = 1 }
+    if b == 197 { kind = 4 width = 2 }
+    if b == 198 { kind = 4 width = 4 }
+    if b == 199 { kind = 8 width = 1 extra = 1 }
+    if b == 200 { kind = 8 width = 2 extra = 1 }
+    if b == 201 { kind = 8 width = 4 extra = 1 }
+    if b == 202 { kind = 7 width = 4 mode = 3 }
+    if b == 203 { kind = 7 width = 8 mode = 3 }
+    if b == 204 { kind = 2 width = 1 mode = 2 }
+    if b == 205 { kind = 2 width = 2 mode = 2 }
+    if b == 206 { kind = 2 width = 4 mode = 2 }
+    if b == 207 { kind = 2 width = 8 mode = 2 }
+    if b == 208 { kind = 2 width = 1 mode = 1 }
+    if b == 209 { kind = 2 width = 2 mode = 1 }
+    if b == 210 { kind = 2 width = 4 mode = 1 }
+    if b == 211 { kind = 2 width = 8 mode = 1 }
+    if b == 217 { kind = 3 width = 1 }
+    if b == 218 { kind = 3 width = 2 }
+    if b == 219 { kind = 3 width = 4 }
+    if b == 220 { kind = 5 width = 2 }
+    if b == 221 { kind = 5 width = 4 }
+    if b == 222 { kind = 6 width = 2 }
+    if b == 223 { kind = 6 width = 4 }
+    if b >= 212 {
+        if b <= 216 {
+            fixed = 1
+            for 0..(b - 212) { fixed = fixed * 2 }
+            return MpHead.{kind: 8, n: fixed, hdr: 2}
+        }
+    }
+    hdr = 1 + width + extra
+    ensure pos + hdr <= size else {
+        fail "msgpack: truncated header"
+        return
+    }
+    if mode == 3 { return MpHead.{kind: 7, n: 0, hdr} }
+    if mode == 0 {
+        len = mp_be(data, pos + 1, width)
+        return MpHead.{kind, n: len, hdr}
+    }
+    if mode == 2 {
+        if width == 8 {
+            ensure data[pos + 1] < 128 else {
+                fail "msgpack: uint64 exceeds the i64 range"
+                return
+            }
+            hi = mp_be(data, pos + 1, 4)
+            lo = mp_be(data, pos + 5, 4)
+            return MpHead.{kind: 2, n: hi * 4294967296 + lo, hdr}
+        }
+        return MpHead.{kind: 2, n: mp_be(data, pos + 1, width), hdr}
+    }
+    if width == 8 {
+        hi = mp_be(data, pos + 1, 4)
+        lo = mp_be(data, pos + 5, 4)
+        if hi >= 2147483648 { hi = hi - 4294967296 }
+        return MpHead.{kind: 2, n: hi * 4294967296 + lo, hdr}
+    }
+    raw = mp_be(data, pos + 1, width)
+    sign_bit = 128
+    if width == 2 { sign_bit = 32768 }
+    if width == 4 { sign_bit = 2147483648 }
+    if raw >= sign_bit { raw = raw - sign_bit * 2 }
+    MpHead.{kind: 2, n: raw, hdr}
+}
+
+/// Number of bytes the value after the header occupies directly (string, bin and ext payloads).
++mp_payload(h: MpHead) : i64 {
+    if h.kind == 3 { return h.n }
+    if h.kind == 4 { return h.n }
+    if h.kind == 8 { return h.n }
+    0
+}
+
+// --- encoding -----------------------------------------------------------------------------
+
+/// Append a length header for `kind` (3 str, 4 bin, 5 array, 6 map) announcing `n`.
++mp_push_len(buf: _, kind: i64, n: i64) : _ {
+    out = buf
+    if kind == 3 {
+        if n <= 31 { return host.sys_arr_push(out, 160 + n) }
+        if n <= 255 { return host.sys_arr_push(host.sys_arr_push(out, 217), n) }
+        if n <= 65535 { return mp_push_be(host.sys_arr_push(out, 218), n, 2) }
+        return mp_push_be(host.sys_arr_push(out, 219), n, 4)
+    }
+    if kind == 4 {
+        if n <= 255 { return host.sys_arr_push(host.sys_arr_push(out, 196), n) }
+        if n <= 65535 { return mp_push_be(host.sys_arr_push(out, 197), n, 2) }
+        return mp_push_be(host.sys_arr_push(out, 198), n, 4)
+    }
+    if kind == 5 {
+        if n <= 15 { return host.sys_arr_push(out, 144 + n) }
+        if n <= 65535 { return mp_push_be(host.sys_arr_push(out, 220), n, 2) }
+        return mp_push_be(host.sys_arr_push(out, 221), n, 4)
+    }
+    if n <= 15 { return host.sys_arr_push(out, 128 + n) }
+    if n <= 65535 { return mp_push_be(host.sys_arr_push(out, 222), n, 2) }
+    mp_push_be(host.sys_arr_push(out, 223), n, 4)
+}
+
+/// Append `n` in its smallest MessagePack integer encoding.
++mp_push_int(buf: _, n: i64) : _ {
+    out = buf
+    if n >= 0 {
+        if n <= 127 { return host.sys_arr_push(out, n) }
+        if n <= 255 { return host.sys_arr_push(host.sys_arr_push(out, 204), n) }
+        if n <= 65535 { return mp_push_be(host.sys_arr_push(out, 205), n, 2) }
+        if n <= 4294967295 { return mp_push_be(host.sys_arr_push(out, 206), n, 4) }
+        return mp_push_be(host.sys_arr_push(out, 207), n, 8)
+    }
+    if n >= -32 { return host.sys_arr_push(out, n & 255) }
+    if n >= -128 { return host.sys_arr_push(host.sys_arr_push(out, 208), n & 255) }
+    if n >= -32768 { return mp_push_be(host.sys_arr_push(out, 209), n, 2) }
+    if n >= -2147483648 { return mp_push_be(host.sys_arr_push(out, 210), n, 4) }
+    mp_push_be(host.sys_arr_push(out, 211), n, 8)
+}
+
+/// Growable MessagePack output buffer.
++MpWriter = {
+    /// Bytes written so far. Defaults to `[]`.
+    buf: _ = []
+
+    /// Empty writer.
+    new() : MpWriter => MpWriter.{buf: []}
+
+    /// Bytes written so far.
+    size(self) : i64 => host.sys_arr_len(self.buf)
+
+    /// A copy of the bytes written so far.
+    to_bytes(self) : _ => mp_push_all([], self.buf)
+
+    /// Append `nil`.
+    nil(@self) : i64 {
+        self.buf = host.sys_arr_push(self.buf, 192)
+        host.sys_arr_len(self.buf)
+    }
+
+    /// Append `true` or `false`.
+    bool(@self, v: bool) : i64 {
+        code = 194
+        if v { code = 195 }
+        self.buf = host.sys_arr_push(self.buf, code)
+        host.sys_arr_len(self.buf)
+    }
+
+    /// Append the integer `n` (smallest encoding).
+    int(@self, n: i64) : i64 {
+        self.buf = mp_push_int(self.buf, n)
+        host.sys_arr_len(self.buf)
+    }
+
+    /// Append the UTF-8 string `s`.
+    str(@self, s: str) : i64 {
+        raw = host.sys_str_to_bytes(s)
+        self.buf = mp_push_len(self.buf, 3, host.sys_arr_len(raw))
+        self.buf = mp_push_all(self.buf, raw)
+        host.sys_arr_len(self.buf)
+    }
+
+    /// Append the binary blob `data` (bytes 0..255).
+    bin(@self, data: _) : i64 {
+        self.buf = mp_push_len(self.buf, 4, host.sys_arr_len(data))
+        self.buf = mp_push_all(self.buf, data)
+        host.sys_arr_len(self.buf)
+    }
+
+    /// Append an array header for `n` elements; write the elements next.
+    array(@self, n: i64) : i64 {
+        self.buf = mp_push_len(self.buf, 5, n)
+        host.sys_arr_len(self.buf)
+    }
+
+    /// Append a map header for `n` key/value pairs; write key, value, key, value... next.
+    map(@self, n: i64) : i64 {
+        self.buf = mp_push_len(self.buf, 6, n)
+        host.sys_arr_len(self.buf)
+    }
+}
+
+/// MessagePack array of the integers in `items`.
++mp_pack_ints(items: _) : _ {
+    w = MpWriter.new()
+    @w.array(host.sys_arr_len(items))
+    for items { @w.int(it) }
+    w.to_bytes()
+}
+
+/// MessagePack array of the strings in `items`.
++mp_pack_strs(items: _) : _ {
+    w = MpWriter.new()
+    @w.array(host.sys_arr_len(items))
+    for items { @w.str(it) }
+    w.to_bytes()
+}
+
+/// MessagePack map from parallel arrays of string keys and string values.
++mp_pack_str_map(keys: _, vals: _) : _ {
+    w = MpWriter.new()
+    @w.map(host.sys_arr_len(keys))
+    for keys {
+        @w.str(it)
+        @w.str(vals[index])
+    }
+    w.to_bytes()
+}
+
+// --- decoding -----------------------------------------------------------------------------
+
+/// Cursor over a MessagePack byte array.
++MpReader = {
+    /// Bytes being read. Defaults to `[]`.
+    data: _ = []
+    /// Offset of the next value. Defaults to `0`.
+    pos: i64 = 0
+    /// Number of valid bytes in `data`. Defaults to `0`.
+    size: i64 = 0
+
+    /// Reader at the start of `data`.
+    new(data: _) : MpReader => MpReader.{data, pos: 0, size: host.sys_arr_len(data)}
+
+    /// Bytes left after the cursor.
+    remaining(self) : i64 => self.size - self.pos
+
+    /// True when every byte has been consumed.
+    done(self) : bool => self.pos >= self.size
+
+    /// Kind of the next value (an `MP_*` constant) without consuming it, or fail.
+    peek_kind(self) : i64! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        h.kind
+    }
+
+    /// Consume a `nil`, or fail when the next value is something else.
+    read_nil(@self) : bool! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        ensure h.kind == 0 else {
+            fail "msgpack: expected nil"
+            return
+        }
+        self.pos += h.hdr
+        true
+    }
+
+    /// Consume a boolean, or fail.
+    read_bool(@self) : bool! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        ensure h.kind == 1 else {
+            fail "msgpack: expected bool"
+            return
+        }
+        self.pos += h.hdr
+        h.n == 1
+    }
+
+    /// Consume an integer, or fail.
+    read_int(@self) : i64! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        ensure h.kind == 2 else {
+            fail "msgpack: expected int"
+            return
+        }
+        self.pos += h.hdr
+        h.n
+    }
+
+    /// Consume a string, or fail.
+    read_str(@self) : str! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        ensure h.kind == 3 else {
+            fail "msgpack: expected str"
+            return
+        }
+        ensure self.pos + h.hdr + h.n <= self.size else {
+            fail "msgpack: truncated str"
+            return
+        }
+        start = self.pos + h.hdr
+        raw = []
+        for start..(start + h.n) { raw = host.sys_arr_push(raw, self.data[it]) }
+        self.pos = start + h.n
+        host.sys_bytes_to_str(raw)
+    }
+
+    /// Consume a binary blob, or fail.
+    read_bin(@self) : _! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        ensure h.kind == 4 else {
+            fail "msgpack: expected bin"
+            return
+        }
+        ensure self.pos + h.hdr + h.n <= self.size else {
+            fail "msgpack: truncated bin"
+            return
+        }
+        start = self.pos + h.hdr
+        raw = []
+        for start..(start + h.n) { raw = host.sys_arr_push(raw, self.data[it]) }
+        self.pos = start + h.n
+        raw
+    }
+
+    /// Consume an array header and return its element count, or fail.
+    read_array_len(@self) : i64! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        ensure h.kind == 5 else {
+            fail "msgpack: expected array"
+            return
+        }
+        self.pos += h.hdr
+        h.n
+    }
+
+    /// Consume a map header and return its pair count, or fail.
+    read_map_len(@self) : i64! {
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        ensure h.kind == 6 else {
+            fail "msgpack: expected map"
+            return
+        }
+        self.pos += h.hdr
+        h.n
+    }
+
+    /// Skip one complete value (including nested arrays and maps) without decoding it.
+    skip_value(@self) : bool! {
+        pending = 1
+        while pending > 0 {
+            h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+            payload = mp_payload(h)
+            ensure self.pos + h.hdr + payload <= self.size else {
+                fail "msgpack: truncated value"
+                return
+            }
+            self.pos += h.hdr + payload
+            pending -= 1
+            if h.kind == 5 { pending += h.n }
+            if h.kind == 6 { pending += h.n * 2 }
+        }
+        true
+    }
+
+    /// Render the next value as JSON text (maps with integer keys get string keys), or fail.
+    json_value(@self, depth: i64) : str! {
+        ensure depth <= 64 else {
+            fail "msgpack: nesting too deep"
+            return
+        }
+        h = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+        if h.kind == 0 {
+            self.pos += h.hdr
+            return "null"
+        }
+        if h.kind == 1 {
+            self.pos += h.hdr
+            if h.n == 1 { return "true" }
+            return "false"
+        }
+        if h.kind == 2 {
+            self.pos += h.hdr
+            return "{h.n}"
+        }
+        if h.kind == 3 {
+            s = @self.read_str() or err { fail "{err}" }
+            return mp_json_quote(s)
+        }
+        if h.kind == 4 {
+            blob = @self.read_bin() or err { fail "{err}" }
+            out = ""
+            for blob {
+                if index > 0 { out = "{out}," }
+                out = "{out}{it}"
+            }
+            return "[{out}]"
+        }
+        if h.kind == 5 {
+            self.pos += h.hdr
+            out = ""
+            for 0..h.n {
+                item = @self.json_value(depth + 1) or err { fail "{err}" }
+                if it > 0 { out = "{out}," }
+                out = "{out}{item}"
+            }
+            return "[{out}]"
+        }
+        if h.kind == 6 {
+            self.pos += h.hdr
+            out = ""
+            for 0..h.n {
+                pair = it
+                kh = mp_header_at(self.data, self.pos, self.size) or err { fail "{err}" }
+                if kh.kind != 3 {
+                    ensure kh.kind == 2 else {
+                        fail "msgpack: map key is not a string or integer"
+                        return
+                    }
+                }
+                key = ""
+                if kh.kind == 3 {
+                    key = @self.read_str() or err { fail "{err}" }
+                } else {
+                    kv = @self.read_int() or err { fail "{err}" }
+                    key = "{kv}"
+                }
+                val = @self.json_value(depth + 1) or err { fail "{err}" }
+                if pair > 0 { out = "{out}," }
+                out = "{out}{mp_json_quote(key)}:{val}"
+            }
+            return "{MP_LB}{out}{MP_RB}"
+        }
+        fail "msgpack: float and ext values cannot be rendered"
+        return
+    }
+}
+
+/// `s` as a JSON string literal.
++mp_json_quote(s: str) : str {
+    out = "\""
+    hex = "0123456789abcdef"
+    for 0..host.sys_str_len(s) {
+        c = s[it]
+        code = host.sys_ord(c)
+        piece = c
+        if c == "\"" { piece = "\\\"" }
+        if c == "\\" { piece = "\\\\" }
+        if c == "\n" { piece = "\\n" }
+        if c == "\t" { piece = "\\t" }
+        if c == "\r" { piece = "\\r" }
+        if code < 32 {
+            if code != 10 {
+                if code != 9 {
+                    if code != 13 { piece = "\\u00{hex[code / 16]}{hex[code % 16]}" }
+                }
+            }
+        }
+        out = "{out}{piece}"
+    }
+    "{out}\""
+}
+
+/// Decode a whole MessagePack document (exactly one value) to JSON text, or fail.
++mp_to_json(data: _) : str! {
+    r = MpReader.new(data)
+    text = @r.json_value(0) or err { fail "{err}" }
+    ensure r.done() else {
+        fail "msgpack: trailing bytes after value"
+        return
+    }
+    text
+}
+
+/// True when `data` is exactly one well-formed value (floats and ext values included).
++mp_valid(data: _) : bool {
+    r = MpReader.new(data)
+    ok = @r.skip_value() or false
+    if !ok { return false }
+    r.done()
+}
+
+// --- tests --------------------------------------------------------------------------------
+
+/// True when the byte arrays `got` and `want` have the same length and elements.
++mp_same(got: _, want: _) : bool {
+    if host.sys_arr_len(got) != host.sys_arr_len(want) { return false }
+    same = true
+    for 0..host.sys_arr_len(want) {
+        if got[it] != want[it] { same = false }
+    }
+    same
+}
+
+/// Test that nil and bool use their single-byte forms.
+test "msgpack nil and bool" {
+    w = MpWriter.new()
+    @w.nil()
+    @w.bool(true)
+    @w.bool(false)
+    #assert(mp_same(w.to_bytes(), [192, 195, 194]))
+    r = MpReader.new(w.to_bytes())
+    #assert(@r.read_nil() or false)
+    #assert(@r.read_bool() or false)
+    #assert(!(@r.read_bool() or true))
+    #assert(r.done())
+    #assert(!(@r.read_nil() or false))
+}
+
+/// Test every unsigned integer width boundary against the spec bytes.
+test "msgpack unsigned integers" {
+    cases = [0, 1, 127, 128, 255, 256, 65535, 65536, 4294967295, 4294967296, 9223372036854775807]
+    wants = [[0], [1], [127], [204, 128], [204, 255], [205, 1, 0], [205, 255, 255], [206, 0, 1, 0, 0], [206, 255, 255, 255, 255], [207, 0, 0, 0, 1, 0, 0, 0, 0], [207, 127, 255, 255, 255, 255, 255, 255, 255]]
+    for cases {
+        w = MpWriter.new()
+        @w.int(it)
+        #assert(mp_same(w.to_bytes(), wants[index]))
+        r = MpReader.new(w.to_bytes())
+        assert_eq(@r.read_int() or -1, it)
+        #assert(r.done())
+    }
+}
+
+/// Test every negative integer width boundary against the spec bytes.
+test "msgpack negative integers" {
+    min64 = -9223372036854775807 - 1
+    cases = [-1, -32, -33, -128, -129, -32768, -32769, -2147483648, -2147483649, min64]
+    wants = [[255], [224], [208, 223], [208, 128], [209, 255, 127], [209, 128, 0], [210, 255, 255, 127, 255], [210, 128, 0, 0, 0], [211, 255, 255, 255, 255, 127, 255, 255, 255], [211, 128, 0, 0, 0, 0, 0, 0, 0]]
+    for cases {
+        w = MpWriter.new()
+        @w.int(it)
+        #assert(mp_same(w.to_bytes(), wants[index]))
+        r = MpReader.new(w.to_bytes())
+        assert_eq(@r.read_int() or 7, it)
+    }
+}
+
+/// Test that integers written in a wider-than-needed form still decode.
+test "msgpack decodes non-canonical integers" {
+    assert_eq(@MpReader.new([204, 5]).read_int() or -1, 5)
+    assert_eq(@MpReader.new([211, 0, 0, 0, 0, 0, 0, 0, 9]).read_int() or -1, 9)
+    assert_eq(@MpReader.new([209, 255, 255]).read_int() or 0, -1)
+    assert_eq(@MpReader.new([207, 255, 255, 255, 255, 255, 255, 255, 255]).read_int() or 42, 42)
+}
+
+/// Test fixstr, str8, str16 encodings and UTF-8.
+test "msgpack strings" {
+    w = MpWriter.new()
+    @w.str("")
+    @w.str("a")
+    @w.str("é")
+    #assert(mp_same(w.to_bytes(), [160, 161, 97, 162, 195, 169]))
+    r = MpReader.new(w.to_bytes())
+    assert_eq(@r.read_str() or "?", "")
+    assert_eq(@r.read_str() or "?", "a")
+    assert_eq(@r.read_str() or "?", "é")
+    s31 = host.sys_bytes_to_str(host.sys_arr_new(31, 120))
+    s32 = host.sys_bytes_to_str(host.sys_arr_new(32, 120))
+    s256 = host.sys_bytes_to_str(host.sys_arr_new(256, 120))
+    w31 = MpWriter.new()
+    @w31.str(s31)
+    assert_eq(w31.to_bytes()[0], 191)
+    assert_eq(w31.size(), 32)
+    w32 = MpWriter.new()
+    @w32.str(s32)
+    assert_eq(w32.to_bytes()[0], 217)
+    assert_eq(w32.to_bytes()[1], 32)
+    assert_eq(w32.size(), 34)
+    w256 = MpWriter.new()
+    @w256.str(s256)
+    b256 = w256.to_bytes()
+    assert_eq(b256[0], 218)
+    assert_eq(b256[1], 1)
+    assert_eq(b256[2], 0)
+    assert_eq(w256.size(), 259)
+    back = MpReader.new(b256)
+    assert_eq(@back.read_str() or "?", s256)
+}
+
+/// Test bin blobs.
+test "msgpack bin" {
+    w = MpWriter.new()
+    @w.bin([1, 2, 255])
+    #assert(mp_same(w.to_bytes(), [196, 3, 1, 2, 255]))
+    r = MpReader.new(w.to_bytes())
+    blob = @r.read_bin() or []
+    #assert(mp_same(blob, [1, 2, 255]))
+    assert_eq(mp_to_json(w.to_bytes()) or "?", "[1,2,255]")
+    empty = MpWriter.new()
+    @empty.bin([])
+    #assert(mp_same(empty.to_bytes(), [196, 0]))
+}
+
+/// Test array and map headers at the fix/16-bit boundaries.
+test "msgpack containers" {
+    w = MpWriter.new()
+    @w.array(0)
+    @w.array(3)
+    @w.map(0)
+    @w.map(1)
+    #assert(mp_same(w.to_bytes(), [144, 147, 128, 129]))
+    big = MpWriter.new()
+    @big.array(16)
+    #assert(mp_same(big.to_bytes(), [220, 0, 16]))
+    bigm = MpWriter.new()
+    @bigm.map(16)
+    #assert(mp_same(bigm.to_bytes(), [222, 0, 16]))
+    huge = MpWriter.new()
+    @huge.array(65536)
+    #assert(mp_same(huge.to_bytes(), [221, 0, 1, 0, 0]))
+    r = MpReader.new([220, 0, 16])
+    assert_eq(@r.read_array_len() or -1, 16)
+    m = MpReader.new([222, 0, 200])
+    assert_eq(@m.read_map_len() or -1, 200)
+    wrong = MpReader.new([144])
+    assert_eq(@wrong.read_map_len() or -1, -1)
+}
+
+/// Test packing helpers and JSON rendering of nested documents.
+test "msgpack pack helpers and json" {
+    ints = mp_pack_ints([1, -2, 300])
+    #assert(mp_same(ints, [147, 1, 254, 205, 1, 44]))
+    assert_eq(mp_to_json(ints) or "?", "[1,-2,300]")
+    strs = mp_pack_strs(["a", "bc"])
+    assert_eq(mp_to_json(strs) or "?", "[\"a\",\"bc\"]")
+    kv = mp_pack_str_map(["k", "x"], ["v", "y"])
+    #assert(mp_same(kv, [130, 161, 107, 161, 118, 161, 120, 161, 121]))
+    assert_eq(mp_to_json(kv) or "?", "{MP_LB}\"k\":\"v\",\"x\":\"y\"{MP_RB}")
+    w = MpWriter.new()
+    @w.map(3)
+    @w.str("id")
+    @w.int(300)
+    @w.str("tags")
+    @w.array(4)
+    @w.str("a\"b")
+    @w.nil()
+    @w.bool(true)
+    @w.int(-5)
+    @w.int(7)
+    @w.map(1)
+    @w.str("deep")
+    @w.array(0)
+    want = "{MP_LB}\"id\":300,\"tags\":[\"a\\\"b\",null,true,-5],\"7\":{MP_LB}\"deep\":[]{MP_RB}{MP_RB}"
+    assert_eq(mp_to_json(w.to_bytes()) or "?", want)
+}
+
+/// Test a full write -> read cycle with typed reads.
+test "msgpack typed roundtrip" {
+    w = MpWriter.new()
+    @w.map(3)
+    @w.str("name")
+    @w.str("Amina")
+    @w.str("age")
+    @w.int(34)
+    @w.str("langs")
+    @w.array(2)
+    @w.str("en")
+    @w.str("ar")
+    r = MpReader.new(w.to_bytes())
+    assert_eq(@r.read_map_len() or -1, 3)
+    assert_eq(@r.read_str() or "?", "name")
+    assert_eq(@r.read_str() or "?", "Amina")
+    assert_eq(@r.read_str() or "?", "age")
+    assert_eq(@r.read_int() or -1, 34)
+    assert_eq(@r.read_str() or "?", "langs")
+    assert_eq(@r.read_array_len() or -1, 2)
+    assert_eq(@r.read_str() or "?", "en")
+    assert_eq(r.remaining(), 3)
+    assert_eq(r.peek_kind() or -1, 3)
+    assert_eq(@r.read_str() or "?", "ar")
+    #assert(r.done())
+    assert_eq(r.peek_kind() or -1, -1)
+}
+
+/// Test skip_value over nested content, floats and ext values.
+test "msgpack skip and valid" {
+    w = MpWriter.new()
+    @w.array(3)
+    @w.map(1)
+    @w.str("k")
+    @w.array(2)
+    @w.int(1)
+    @w.nil()
+    @w.str("tail")
+    @w.int(99)
+    r = MpReader.new(w.to_bytes())
+    assert_eq(@r.read_array_len() or -1, 3)
+    #assert(@r.skip_value() or false)
+    #assert(@r.skip_value() or false)
+    assert_eq(@r.read_int() or -1, 99)
+    #assert(r.done())
+    #assert(mp_valid(w.to_bytes()))
+    #assert(mp_valid([203, 64, 9, 33, 251, 84, 68, 45, 24]))
+    #assert(mp_valid([212, 1, 5]))
+    #assert(mp_valid([199, 2, 7, 1, 2]))
+    #assert(!(mp_valid([202, 0, 0])))
+    #assert(!(mp_valid([])))
+    #assert(!(mp_valid([192, 192])))
+}
+
+/// Test that malformed input fails instead of reading out of bounds.
+test "msgpack rejects malformed input" {
+    assert_eq(mp_to_json([]) or "err", "err")
+    assert_eq(mp_to_json([193]) or "err", "err")
+    assert_eq(mp_to_json([204]) or "err", "err")
+    assert_eq(mp_to_json([162, 97]) or "err", "err")
+    assert_eq(mp_to_json([146, 1]) or "err", "err")
+    assert_eq(mp_to_json([129, 192, 1]) or "err", "err")
+    assert_eq(mp_to_json([192, 192]) or "err", "err")
+    assert_eq(mp_to_json([203, 0, 0, 0, 0, 0, 0, 0, 0]) or "err", "err")
+    assert_eq(mp_to_json([207, 255, 255, 255, 255, 255, 255, 255, 255]) or "err", "err")
+    assert_eq(mp_to_json([145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 145, 192]) or "err", "err")
+    shallow = [145, 145, 145, 192]
+    assert_eq(mp_to_json(shallow) or "err", "[[[null]]]")
+    r = MpReader.new([196, 5, 1])
+    assert_eq(@r.read_bin() or [9], [9])
+    s = MpReader.new([164, 1])
+    assert_eq(@s.read_str() or "bad", "bad")
+    assert_eq(s.pos, 0)
+}

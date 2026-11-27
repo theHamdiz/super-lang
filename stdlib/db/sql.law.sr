@@ -1,0 +1,13 @@
+//! Laws for std.db.sql — real-body (`sql_bool` / `sql_digit`).
+//! `sql_len` / quote loops need host strlen (docs/LAWS_STATUS.md).
+//! AI agents must not edit this file; put discharges in `sql.proof.sr`.
+
+#law("sql_bool formats true")
+sql_bool_true() {
+    #assert(sql_bool(true) == "TRUE")
+}
+
+#law("sql_digit maps five")
+sql_digit_five() {
+    #assert(sql_digit("5") == 5)
+}

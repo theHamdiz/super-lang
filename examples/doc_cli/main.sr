@@ -1,0 +1,12 @@
+//! Minimal CLI-style argv parsing.
+//! Run: super run examples/doc_cli/main.sr -- hello
+
++main() {
+    args = host.sys_argv()
+    if host.sys_arr_len(args) < 2 {
+        print("usage: super run examples/doc_cli/main.sr -- <name>")
+        return
+    }
+    name = args[1]
+    print("hello, {name}")
+}

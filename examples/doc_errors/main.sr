@@ -1,0 +1,13 @@
+//! Value errors (`!`) with `ensure` and `or` default.
+//! Run: super run examples/doc_errors/main.sr
+
++port(path: str) : i64! {
+    ensure path != "" else { fail "empty path" }
+    return 8080
+}
+
++main() {
+    good = port("cfg")
+    fallback = port("") or 3000
+    print("good={good} fallback={fallback}")
+}

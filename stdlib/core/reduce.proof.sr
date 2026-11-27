@@ -1,0 +1,11 @@
+//! AI-authored discharges for `std.core.reduce` laws.
+
+#proof(i64_add_associative)
+prove_i64_add_associative(a: i64, b: i64, c: i64) {
+    #assert((a + b) + c == a + (b + c))
+}
+
+#proof(i64_add_commutative)
+prove_i64_add_commutative(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}

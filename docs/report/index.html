@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/report/"/>
+<link rel="icon" href="../assets/favicon.ico" sizes="any"/>
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png"/>
+<link rel="icon" type="image/png" href="../assets/icons/super.png"/>
+<link rel="apple-touch-icon" href="../assets/icons/super.png"/>
+<meta name="description" content="Stage-1 equal-algorithm suite — SuperAot leads the composite board."/>
+<meta name="theme-color" content="#ff7a1f"/>
+<meta property="og:type" content="website"/>
+<meta property="og:site_name" content="Super"/>
+<meta property="og:locale" content="en_US"/>
+<meta property="og:title" content="Super · Benchmarks"/>
+<meta property="og:description" content="Stage-1 equal-algorithm suite — SuperAot leads the composite board."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/report/"/>
+<meta property="og:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<meta property="og:image:width" content="1200"/>
+<meta property="og:image:height" content="630"/>
+<meta property="og:image:alt" content="Super language"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="Super · Benchmarks"/>
+<meta name="twitter:description" content="Stage-1 equal-algorithm suite — SuperAot leads the composite board."/>
+<meta name="twitter:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Super", "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux, macOS, FreeBSD, Windows", "softwareVersion": "0.1.0", "license": "https://opensource.org/licenses/MIT", "url": "https://thehamdiz.github.io/super-lang/", "description": "Stage-1 equal-algorithm suite — SuperAot leads the composite board.", "downloadUrl": "https://thehamdiz.github.io/super-lang/install/", "author": {"@type": "Person", "name": "Ahmad Hamdi"}}</script>
+<title>Super · Benchmarks</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="../site.css"/>
+<script src="../super-highlight.js" defer></script>
+
+</head>
+<body>
+
+<header class="site-nav">
+  <a class="mark" href="./">Super</a>
+  <nav><a href="../">Home</a><a href="../benchmarks/">Benchmarks</a><a href="../winners/">Winners</a><a href="../charts/">Charts</a><a href="../spec/">Spec</a><a href="../book/">Book</a><a href="../examples/">Examples</a><a href="../install/">Install</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a><a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a></nav>
+  <a class="cta" href="../downloads/SUPER_BOOK.pdf" download>Download book</a>
+</header>
+
+<section class="hero-board" aria-label="Overall and category winners">
+  <div class="tile tile-winner">
+    <h1>
+      <span class="rise-wrap"><span class="rise">SuperAot</span></span>
+    </h1>
+    <p class="win-score">89.2</p>
+    <p class="hero-support">Overall composite leader, measured on a single machine. Select a category winner to re-rank the chart by that axis.</p>
+    <div class="hero-actions">
+      <a class="cta" href="#live-chart">Open the chart</a>
+      <a class="cta-ghost" href="#timings">Wall time</a>
+    </div>
+  </div>
+  <div class="tile tile-cats">
+    <h2>Category winners</h2>
+    <div class="cat-grid" data-ui><button type="button" class="cat-tile" data-axis="speed" data-lang="zig" data-reveal aria-label="Speed winner: Zig"><span class="cat-mark" aria-hidden="true">Speed</span><strong>Zig</strong></button><button type="button" class="cat-tile" data-axis="memory" data-lang="super_aot" data-reveal aria-label="Memory winner: SuperAot"><span class="cat-mark" aria-hidden="true">Memory</span><strong>SuperAot</strong></button><button type="button" class="cat-tile" data-axis="reliability" data-lang="all" data-reveal aria-label="Reliability winner: All"><span class="cat-mark" aria-hidden="true">Reliability</span><strong>All</strong></button><button type="button" class="cat-tile" data-axis="cycle" data-lang="super_jit" data-reveal aria-label="Cycle winner: SuperJit"><span class="cat-mark" aria-hidden="true">Cycle</span><strong>SuperJit</strong></button><button type="button" class="cat-tile" data-axis="loc" data-lang="super_aot" data-reveal aria-label="LoC winner: SuperAot"><span class="cat-mark" aria-hidden="true">LoC</span><strong>SuperAot</strong></button></div>
+  </div>
+  <div class="tile tile-axis">
+    <p class="axis-live" id="axis-live">SuperAot leads the composite</p>
+    <div class="axis-meter" data-ui aria-hidden="true"><i id="axis-meter-fill"></i></div>
+    <p class="live-hint" style="margin-top:1rem">Weights are listed below. Speed 40 · Memory 25 · Reliability 15 · Cycle 10 · LoC 10.</p>
+  </div>
+</section>
+
+<noscript>
+<section class="section" aria-label="Static benchmark score table">
+  <h2>Composite scores</h2>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Language</th><th>Composite</th><th>Speed</th><th>Memory</th><th>Reliability</th><th>Cycle</th><th>LoC</th></tr></thead>
+    <tbody><tr><td>SuperAot</td><td class="num">89.23</td><td class="num">97.87</td><td class="num">100.00</td><td class="num">100.00</td><td class="num">0.78</td><td class="num">100.00</td></tr><tr><td>Zig</td><td class="num">79.97</td><td class="num">100.00</td><td class="num">73.10</td><td class="num">100.00</td><td class="num">0.05</td><td class="num">66.87</td></tr><tr><td>Rust</td><td class="num">67.24</td><td class="num">81.07</td><td class="num">52.75</td><td class="num">100.00</td><td class="num">0.33</td><td class="num">65.87</td></tr><tr><td>SuperJit</td><td class="num">65.65</td><td class="num">56.36</td><td class="num">32.45</td><td class="num">100.00</td><td class="num">100.00</td><td class="num">100.00</td></tr><tr><td>C</td><td class="num">49.73</td><td class="num">60.63</td><td class="num">37.43</td><td class="num">100.00</td><td class="num">3.75</td><td class="num">7.39</td></tr><tr><td>Lua</td><td class="num">43.46</td><td class="num">20.67</td><td class="num">33.69</td><td class="num">100.00</td><td class="num">37.83</td><td class="num">79.87</td></tr><tr><td>Bun</td><td class="num">33.39</td><td class="num">12.52</td><td class="num">4.85</td><td class="num">100.00</td><td class="num">21.75</td><td class="num">99.91</td></tr><tr><td>Python</td><td class="num">28.36</td><td class="num">2.14</td><td class="num">10.94</td><td class="num">100.00</td><td class="num">3.72</td><td class="num">93.97</td></tr><tr><td>Julia</td><td class="num">28.12</td><td class="num">14.10</td><td class="num">0.52</td><td class="num">100.00</td><td class="num">1.38</td><td class="num">72.07</td></tr><tr><td>Kotlin</td><td class="num">26.93</td><td class="num">5.48</td><td class="num">2.95</td><td class="num">100.00</td><td class="num">0.19</td><td class="num">89.82</td></tr></tbody>
+  </table></div>
+</section>
+</noscript>
+
+<section class="section band-ink" id="live-chart">
+  <h2>Composite chart</h2>
+  <p class="note chart-note">Composite scores from the Stage-1 suite. Use the axis buttons to re-rank the chart, and select a bar to see that language's score breakdown.</p>
+  <div class="chart-toolbar" role="toolbar" aria-label="Chart axis"><button type="button" class="is-active" data-axis="score">Composite</button><button type="button" data-axis="speed">Speed</button><button type="button" data-axis="memory">Memory</button><button type="button" data-axis="reliability">Reliability</button><button type="button" data-axis="cycle">Cycle</button><button type="button" data-axis="loc">LoC</button></div>
+  <div class="chart-panel" data-reveal>
+    <div id="rank-chart"></div>
+  </div>
+  <noscript><h3>Composite scores</h3><div class="table-wrap"><table class="data"><thead><tr><th>Language</th><th>Score</th></tr></thead><tbody><tr><th scope="row">SuperAot</th><td>89.23</td></tr><tr><th scope="row">Zig</th><td>79.97</td></tr><tr><th scope="row">Rust</th><td>67.24</td></tr><tr><th scope="row">SuperJit</th><td>65.65</td></tr><tr><th scope="row">C</th><td>49.73</td></tr><tr><th scope="row">Lua</th><td>43.46</td></tr><tr><th scope="row">Bun</th><td>33.39</td></tr><tr><th scope="row">Python</th><td>28.36</td></tr><tr><th scope="row">Julia</th><td>28.12</td></tr><tr><th scope="row">Kotlin</th><td>26.93</td></tr></tbody></table></div></noscript>
+</section>
+
+<section class="section" id="score">
+  <div class="stats-wrap">
+    <div>
+      <h2>The composite</h2>
+      <p class="total" id="live-total">89.2</p>
+      <p class="total-cap" id="live-cap">Weighted sum for <strong id="live-lang">SuperAot</strong>. Each axis is ratio-to-best, then multiplied by its weight.</p>
+      <p class="live-hint">Select a language to see its score breakdown and radar.</p>
+      <div class="picks" role="list"><button type="button" class="pick" data-lang="super_aot">SuperAot</button><button type="button" class="pick" data-lang="zig">Zig</button><button type="button" class="pick" data-lang="rust">Rust</button><button type="button" class="pick" data-lang="super_jit">SuperJit</button><button type="button" class="pick" data-lang="c">C</button><button type="button" class="pick" data-lang="lua">Lua</button><button type="button" class="pick" data-lang="bun">Bun</button><button type="button" class="pick" data-lang="python">Python</button><button type="button" class="pick" data-lang="julia">Julia</button><button type="button" class="pick" data-lang="kotlin">Kotlin</button></div>
+      <div class="radar-wrap" id="radar-chart" data-reveal></div>
+    </div>
+    <aside class="receipt" id="receipt" data-ui aria-live="polite">
+      <h3>Score receipt</h3>
+      <div id="receipt-body"></div>
+      <div class="receipt-total"><span>Composite</span><span id="receipt-sum">n/a</span></div>
+    </aside>
+  </div>
+</section>
+
+<section class="section" id="methodology">
+  <h2>Timing protocol</h2>
+  <p class="note" style="max-width:60ch">Protocol <code>2.0.0</code>: 2 warm-up(s) discarded, 10 timed runs interleaved round-robin, primary wall = <strong>median</strong> with stdev/min/max and CI. Overlapping CIs are within noise — never a hard order.</p>
+  <p class="note" style="max-width:60ch;opacity:0.78">Every raw run, including warm-ups, is published alongside the aggregates so results can be re-checked and re-aggregated. All timings come from one machine; see the toolchain section below and REPRODUCE.md to rerun the suite on your own hardware.</p>
+</section>
+
+<section class="section band-field" id="timings">
+  <h2>Wall time</h2>
+  <p class="note" style="color:var(--field-ink);max-width:52ch;opacity:0.72">Primary wall (median) in seconds with stdev where available. Best per algorithm is marked. Overlapping CIs are within noise.</p>
+  <div class="matrix-filter" id="matrix-filter"></div>
+  <div class="timings-layout">
+    <article class='algo' id='algo-01_nbody' data-reveal><div class='algo-head'><h3>01_nbody</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">SuperAot</span></div><p class='note'>gate=ok · ref=13388893 · within-noise pairs: super_aot↔zig, zig↔super_aot/c/rust, c↔zig/rust, rust↔zig/c</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:1.7%'></div></div><em>0.0074s ±0.0005</em></div><div class='abar is-algo-winner'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:1.5%'></div></div><em>0.0066s ±0.0004</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:2.1%'></div></div><em>0.0092s ±0.0007</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:4.6%'></div></div><em>0.0202s ±0.0019</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:13.7%'></div></div><em>0.0597s ±0.0050</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:2.2%'></div></div><em>0.0095s ±0.0010</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.4350s ±0.0810</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:4.6%'></div></div><em>0.0202s ±0.0012</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:1.9%'></div></div><em>0.0082s ±0.0008</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:1.6%'></div></div><em>0.0068s ±0.0005</em></div></div></article><article class='algo' id='algo-02_mandelbrot_parallel' data-reveal><div class='algo-head'><h3>02_mandelbrot_parallel</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Rust</span></div><p class='note'>gate=ok · ref=33883642 · within-noise pairs: rust↔zig, zig↔rust, lua↔bun, bun↔lua</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:4.3%'></div></div><em>0.0214s ±0.0026</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:3.3%'></div></div><em>0.0167s ±0.0025</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:14.7%'></div></div><em>0.0731s ±0.0026</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:16.8%'></div></div><em>0.0839s ±0.0027</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:18.3%'></div></div><em>0.0915s ±0.0128</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:16.1%'></div></div><em>0.0802s ±0.0048</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.4991s ±0.0479</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:5.2%'></div></div><em>0.0261s ±0.0023</em></div><div class='abar is-algo-winner'><span>Rust</span><div class='atrack'><div class='afill' style='width:2.1%'></div></div><em>0.0104s ±0.0013</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:2.3%'></div></div><em>0.0115s ±0.0012</em></div></div></article><article class='algo' id='algo-03_astar_pathfinding' data-reveal><div class='algo-head'><h3>03_astar_pathfinding</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">SuperAot</span></div><p class='note'>gate=ok · ref=1622 · within-noise pairs: super_aot↔zig, zig↔super_aot/c/rust, c↔zig/rust, rust↔zig/c/super_jit</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:3.4%'></div></div><em>0.0016s ±0.0005</em></div><div class='abar is-algo-winner'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:2.3%'></div></div><em>0.0011s ±0.0003</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:5.9%'></div></div><em>0.0028s ±0.0022</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:21.1%'></div></div><em>0.0101s ±0.0063</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.0479s ±0.0148</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:12.0%'></div></div><em>0.0057s ±0.0017</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:72.7%'></div></div><em>0.0348s ±0.0027</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:48.8%'></div></div><em>0.0234s ±0.0018</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:3.9%'></div></div><em>0.0019s ±0.0011</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:3.0%'></div></div><em>0.0014s ±0.0004</em></div></div></article><article class='algo' id='algo-04_json_serde' data-reveal><div class='algo-head'><h3>04_json_serde</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">SuperAot</span></div><p class='note'>gate=ok · ref=10980458832 · within-noise pairs: zig↔c/rust, c↔zig/rust, rust↔zig/c, lua↔super_jit</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:2.4%'></div></div><em>0.0010s ±0.0002</em></div><div class='abar is-algo-winner'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:1.2%'></div></div><em>0.0005s ±0.0001</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:5.3%'></div></div><em>0.0022s ±0.0004</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:27.7%'></div></div><em>0.0115s ±0.0019</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.0416s ±0.0020</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:5.0%'></div></div><em>0.0021s ±0.0002</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:61.6%'></div></div><em>0.0257s ±0.0009</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:41.3%'></div></div><em>0.0172s ±0.0010</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:3.0%'></div></div><em>0.0012s ±0.0003</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:2.1%'></div></div><em>0.0009s ±0.0003</em></div></div></article><article class='algo' id='algo-05_parallel_mapreduce' data-reveal><div class='algo-head'><h3>05_parallel_mapreduce</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">SuperAot</span></div><p class='note'>gate=ok · ref=1422520636761 · within-noise pairs: python↔kotlin, kotlin↔python</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:2.9%'></div></div><em>0.0062s ±0.0010</em></div><div class='abar is-algo-winner'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:0.9%'></div></div><em>0.0019s ±0.0003</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:1.9%'></div></div><em>0.0040s ±0.0005</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:67.7%'></div></div><em>0.1430s ±0.0099</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.2113s ±0.0346</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:12.7%'></div></div><em>0.0268s ±0.0043</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:93.3%'></div></div><em>0.1972s ±0.0186</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:14.4%'></div></div><em>0.0305s ±0.0015</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:3.6%'></div></div><em>0.0076s ±0.0005</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:4.9%'></div></div><em>0.0103s ±0.0009</em></div></div></article><article class='algo' id='algo-06_mergesort_radix' data-reveal><div class='algo-head'><h3>06_mergesort_radix</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=3556374819638513243 · within-noise pairs: super_aot↔rust, rust↔super_aot/c, c↔rust</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:3.1%'></div></div><em>0.0057s ±0.0005</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:2.7%'></div></div><em>0.0050s ±0.0003</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:3.7%'></div></div><em>0.0069s ±0.0005</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:75.4%'></div></div><em>0.1398s ±0.0056</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:30.6%'></div></div><em>0.0568s ±0.0020</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:6.2%'></div></div><em>0.0114s ±0.0005</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.1854s ±0.0279</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:10.6%'></div></div><em>0.0196s ±0.0014</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:2.9%'></div></div><em>0.0054s ±0.0005</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:2.1%'></div></div><em>0.0039s ±0.0002</em></div></div></article><article class='algo' id='algo-07_crc32_lz4_compress' data-reveal><div class='algo-head'><h3>07_crc32_lz4_compress</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">SuperAot</span></div><p class='note'>gate=ok · ref=5987620402 · within-noise pairs: super_aot↔zig/c, zig↔super_aot/c, c↔super_aot/zig/rust, rust↔c</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:1.9%'></div></div><em>0.0010s ±0.0002</em></div><div class='abar is-algo-winner'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:1.6%'></div></div><em>0.0008s ±0.0002</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:5.4%'></div></div><em>0.0027s ±0.0004</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:18.7%'></div></div><em>0.0095s ±0.0006</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.0507s ±0.0011</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:5.0%'></div></div><em>0.0025s ±0.0003</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:34.5%'></div></div><em>0.0175s ±0.0024</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:42.2%'></div></div><em>0.0214s ±0.0017</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:2.5%'></div></div><em>0.0013s ±0.0003</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:1.8%'></div></div><em>0.0009s ±0.0002</em></div></div></article><article class='algo' id='algo-08_ecs_simulation' data-reveal><div class='algo-head'><h3>08_ecs_simulation</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=11972521 · within-noise pairs: zig↔super_aot/rust/c, super_aot↔zig/rust/c, rust↔zig/super_aot/c, c↔zig/super_aot/rust</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:3.0%'></div></div><em>0.0042s ±0.0003</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:2.9%'></div></div><em>0.0039s ±0.0004</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:4.6%'></div></div><em>0.0063s ±0.0005</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:10.9%'></div></div><em>0.0149s ±0.0011</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:47.6%'></div></div><em>0.0652s ±0.0042</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:8.4%'></div></div><em>0.0115s ±0.0026</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.1370s ±0.0217</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:18.3%'></div></div><em>0.0251s ±0.0017</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:3.0%'></div></div><em>0.0041s ±0.0003</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:2.7%'></div></div><em>0.0037s ±0.0003</em></div></div></article><article class='algo' id='algo-09_matmul_tiled' data-reveal><div class='algo-head'><h3>09_matmul_tiled</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">SuperAot</span></div><p class='note'>gate=ok · ref=16065614 · within-noise pairs: c↔zig/rust, zig↔c/rust, rust↔c/zig, julia↔lua/bun</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:0.2%'></div></div><em>0.0033s ±0.0005</em></div><div class='abar is-algo-winner'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:0.1%'></div></div><em>0.0024s ±0.0005</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:0.3%'></div></div><em>0.0045s ±0.0005</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:1.6%'></div></div><em>0.0278s ±0.0019</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:4.0%'></div></div><em>0.0669s ±0.0029</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:1.6%'></div></div><em>0.0267s ±0.0020</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>1.6908s ±0.2732</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:1.6%'></div></div><em>0.0265s ±0.0011</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:0.2%'></div></div><em>0.0038s ±0.0004</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:0.2%'></div></div><em>0.0037s ±0.0005</em></div></div></article><article class='algo' id='algo-10_sha256_merkle_tree' data-reveal><div class='algo-head'><h3>10_sha256_merkle_tree</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=4258982549689610983 · within-noise pairs: zig↔c, c↔zig/rust/super_aot, rust↔c/super_aot, super_aot↔c/rust</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:0.7%'></div></div><em>0.0020s ±0.0002</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:0.8%'></div></div><em>0.0022s ±0.0002</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:1.3%'></div></div><em>0.0038s ±0.0007</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:4.9%'></div></div><em>0.0140s ±0.0015</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:23.9%'></div></div><em>0.0690s ±0.0045</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.2885s ±0.0285</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:8.6%'></div></div><em>0.0248s ±0.0029</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:10.4%'></div></div><em>0.0299s ±0.0013</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:0.7%'></div></div><em>0.0021s ±0.0003</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:0.6%'></div></div><em>0.0018s ±0.0002</em></div></div></article><article class='algo' id='algo-11_symbolic_autodiff_ode' data-reveal><div class='algo-head'><h3>11_symbolic_autodiff_ode</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=10687428704 · within-noise pairs: zig↔julia/c/rust/super_aot, julia↔zig/c/rust/super_aot, c↔zig/julia/rust/super_aot, rust↔zig/julia/c/super_aot</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:3.7%'></div></div><em>0.0574s ±0.0075</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:4.0%'></div></div><em>0.0609s ±0.0066</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:4.3%'></div></div><em>0.0656s ±0.0030</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:7.5%'></div></div><em>0.1153s ±0.0093</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:10.9%'></div></div><em>0.1674s ±0.0252</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:8.3%'></div></div><em>0.1275s ±0.0109</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>1.5384s ±0.2369</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:3.5%'></div></div><em>0.0539s ±0.0128</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:3.9%'></div></div><em>0.0600s ±0.0068</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:3.4%'></div></div><em>0.0529s ±0.0064</em></div></div></article><article class='algo' id='algo-12_sparse_fem_fft' data-reveal><div class='algo-head'><h3>12_sparse_fem_fft</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=17090844 · within-noise pairs: zig↔rust/super_aot, rust↔zig/super_aot, super_aot↔zig/rust, super_jit↔c</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:2.4%'></div></div><em>0.0096s ±0.0008</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:1.7%'></div></div><em>0.0068s ±0.0011</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:2.3%'></div></div><em>0.0091s ±0.0013</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:9.1%'></div></div><em>0.0357s ±0.0027</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:22.3%'></div></div><em>0.0877s ±0.0070</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:4.8%'></div></div><em>0.0188s ±0.0029</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.3934s ±0.0833</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:10.0%'></div></div><em>0.0392s ±0.0039</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:1.6%'></div></div><em>0.0061s ±0.0011</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:1.5%'></div></div><em>0.0060s ±0.0012</em></div></div></article><article class='algo' id='algo-13_polars_data_pipeline' data-reveal><div class='algo-head'><h3>13_polars_data_pipeline</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=14856833716 · within-noise pairs: zig↔super_aot/rust, super_aot↔zig/rust, rust↔zig/super_aot</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>1.8483s ±0.2002</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:0.1%'></div></div><em>0.0022s ±0.0007</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:0.2%'></div></div><em>0.0037s ±0.0009</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:1.0%'></div></div><em>0.0176s ±0.0023</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:2.8%'></div></div><em>0.0521s ±0.0018</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:0.5%'></div></div><em>0.0087s ±0.0006</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:8.1%'></div></div><em>0.1499s ±0.0081</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:1.1%'></div></div><em>0.0199s ±0.0011</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:0.1%'></div></div><em>0.0027s ±0.0006</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:0.1%'></div></div><em>0.0019s ±0.0004</em></div></div></article><article class='algo' id='algo-14_http_router_throughput' data-reveal><div class='algo-head'><h3>14_http_router_throughput</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=1226939264 · within-noise pairs: zig↔super_aot/super_jit, super_aot↔zig/super_jit, super_jit↔zig/super_aot, julia↔bun</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:11.1%'></div></div><em>0.0516s ±0.0046</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:3.7%'></div></div><em>0.0171s ±0.0021</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:4.1%'></div></div><em>0.0189s ±0.0020</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:31.2%'></div></div><em>0.1447s ±0.0077</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:54.5%'></div></div><em>0.2524s ±0.0136</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:90.3%'></div></div><em>0.4182s ±0.0532</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.4631s ±0.0954</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:29.3%'></div></div><em>0.1357s ±0.0255</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:12.8%'></div></div><em>0.0594s ±0.0050</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:3.6%'></div></div><em>0.0165s ±0.0024</em></div></div></article><article class='algo' id='algo-15_physics2d_broadphase_solver' data-reveal><div class='algo-head'><h3>15_physics2d_broadphase_solver</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Julia</span></div><p class='note'>gate=ok · ref=811288617 · within-noise pairs: julia↔zig/rust, zig↔julia, rust↔julia/c, c↔rust</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:3.9%'></div></div><em>0.0754s ±0.0057</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:5.1%'></div></div><em>0.1004s ±0.0096</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:5.0%'></div></div><em>0.0983s ±0.0110</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:9.2%'></div></div><em>0.1787s ±0.0069</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:9.0%'></div></div><em>0.1765s ±0.0049</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:14.2%'></div></div><em>0.2780s ±0.0317</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>1.9519s ±0.2362</em></div><div class='abar is-algo-winner'><span>Julia</span><div class='atrack'><div class='afill' style='width:3.0%'></div></div><em>0.0585s ±0.0072</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:3.6%'></div></div><em>0.0704s ±0.0050</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:3.2%'></div></div><em>0.0627s ±0.0039</em></div></div></article><article class='algo' id='algo-16_crypto_pq_argon2_suite' data-reveal><div class='algo-head'><h3>16_crypto_pq_argon2_suite</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Rust</span></div><p class='note'>gate=ok · ref=294956381 · within-noise pairs: rust↔zig, zig↔rust/super_aot, super_aot↔zig/c, c↔super_aot</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:0.8%'></div></div><em>0.0025s ±0.0003</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:0.7%'></div></div><em>0.0022s ±0.0004</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:1.2%'></div></div><em>0.0039s ±0.0003</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:7.9%'></div></div><em>0.0248s ±0.0018</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:25.9%'></div></div><em>0.0819s ±0.0046</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:6.7%'></div></div><em>0.0211s ±0.0009</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.3160s ±0.0476</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:12.7%'></div></div><em>0.0402s ±0.0045</em></div><div class='abar is-algo-winner'><span>Rust</span><div class='atrack'><div class='afill' style='width:0.5%'></div></div><em>0.0016s ±0.0003</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:0.6%'></div></div><em>0.0019s ±0.0003</em></div></div></article><article class='algo' id='algo-17_ai_tensor_hnsw_search' data-reveal><div class='algo-head'><h3>17_ai_tensor_hnsw_search</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">C</span></div><p class='note'>gate=ok · ref=315371945 · within-noise pairs: c↔super_aot, super_aot↔c/zig, zig↔super_aot/rust, rust↔zig</p><div class='achart' data-ui><div class='abar is-algo-winner'><span>C</span><div class='atrack'><div class='afill' style='width:0.5%'></div></div><em>0.0029s ±0.0003</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:0.6%'></div></div><em>0.0032s ±0.0006</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:0.9%'></div></div><em>0.0047s ±0.0004</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:10.0%'></div></div><em>0.0528s ±0.0015</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:14.3%'></div></div><em>0.0757s ±0.0041</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:2.4%'></div></div><em>0.0128s ±0.0020</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.5279s ±0.0958</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:7.1%'></div></div><em>0.0376s ±0.0034</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:0.8%'></div></div><em>0.0040s ±0.0006</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:0.7%'></div></div><em>0.0038s ±0.0005</em></div></div></article><article class='algo' id='algo-18_stdlib_core_algorithms' data-reveal><div class='algo-head'><h3>18_stdlib_core_algorithms</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">SuperAot</span></div><p class='note'>gate=ok · ref=364290084 · within-noise pairs: super_aot↔zig, zig↔super_aot/c, c↔zig, super_jit↔rust</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:3.7%'></div></div><em>0.0037s ±0.0002</em></div><div class='abar is-algo-winner'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:2.7%'></div></div><em>0.0027s ±0.0007</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:4.5%'></div></div><em>0.0045s ±0.0005</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:27.2%'></div></div><em>0.0272s ±0.0037</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:74.6%'></div></div><em>0.0746s ±0.0094</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:14.6%'></div></div><em>0.0146s ±0.0012</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.1000s ±0.0165</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:36.2%'></div></div><em>0.0362s ±0.0026</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:4.6%'></div></div><em>0.0046s ±0.0003</em></div><div class='abar'><span>Zig</span><div class='atrack'><div class='afill' style='width:3.4%'></div></div><em>0.0034s ±0.0004</em></div></div></article><article class='algo' id='algo-19_distributed_raft_wal_kv' data-reveal><div class='algo-head'><h3>19_distributed_raft_wal_kv</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=877422946 · within-noise pairs: zig↔c/rust, c↔zig/rust, rust↔zig/c</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:1.1%'></div></div><em>0.0027s ±0.0003</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:1.9%'></div></div><em>0.0046s ±0.0003</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:2.7%'></div></div><em>0.0064s ±0.0006</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:8.5%'></div></div><em>0.0202s ±0.0015</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:28.6%'></div></div><em>0.0678s ±0.0016</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:3.1%'></div></div><em>0.0074s ±0.0005</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.2369s ±0.0416</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:11.2%'></div></div><em>0.0265s ±0.0031</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:1.3%'></div></div><em>0.0030s ±0.0003</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:1.1%'></div></div><em>0.0025s ±0.0004</em></div></div></article><article class='algo' id='algo-20_end_to_end_lakehouse_service' data-reveal><div class='algo-head'><h3>20_end_to_end_lakehouse_service</h3><span class="winner-chip" title="Fastest primary wall for this algorithm">Zig</span></div><p class='note'>gate=ok · ref=578180866 · within-noise pairs: zig↔c, c↔zig, lua↔super_aot/super_jit, super_aot↔lua/super_jit</p><div class='achart' data-ui><div class='abar'><span>C</span><div class='atrack'><div class='afill' style='width:3.1%'></div></div><em>0.0044s ±0.0005</em></div><div class='abar'><span>SuperAot</span><div class='atrack'><div class='afill' style='width:10.4%'></div></div><em>0.0150s ±0.0020</em></div><div class='abar'><span>SuperJit</span><div class='atrack'><div class='afill' style='width:11.9%'></div></div><em>0.0171s ±0.0020</em></div><div class='abar'><span>Bun</span><div class='atrack'><div class='afill' style='width:35.3%'></div></div><em>0.0509s ±0.0052</em></div><div class='abar'><span>Kotlin</span><div class='atrack'><div class='afill' style='width:73.4%'></div></div><em>0.1058s ±0.0047</em></div><div class='abar'><span>Lua</span><div class='atrack'><div class='afill' style='width:10.3%'></div></div><em>0.0148s ±0.0012</em></div><div class='abar'><span>Python</span><div class='atrack'><div class='afill' style='width:100.0%'></div></div><em>0.1440s ±0.0230</em></div><div class='abar'><span>Julia</span><div class='atrack'><div class='afill' style='width:37.1%'></div></div><em>0.0534s ±0.0040</em></div><div class='abar'><span>Rust</span><div class='atrack'><div class='afill' style='width:4.9%'></div></div><em>0.0071s ±0.0012</em></div><div class='abar is-algo-winner'><span>Zig</span><div class='atrack'><div class='afill' style='width:2.6%'></div></div><em>0.0038s ±0.0006</em></div></div></article>
+    <div class="table-wrap" data-reveal>
+      <table class="data" id="timings-table">
+        <thead>
+          <tr><th scope="col" data-col="algo">Algorithm</th><th class="num" data-col="c">C</th><th class="num" data-col="super_aot">SuperAot</th><th class="num" data-col="super_jit">SuperJit</th><th class="num" data-col="bun">Bun</th><th class="num" data-col="kotlin">Kotlin</th><th class="num" data-col="lua">Lua</th><th class="num" data-col="python">Python</th><th class="num" data-col="julia">Julia</th><th class="num" data-col="rust">Rust</th><th class="num" data-col="zig">Zig</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row" data-col="algo">01_nbody</th><td class="num" data-col="c">0.0074s</td><td class="num is-best-cell" data-col="super_aot">0.0066s</td><td class="num" data-col="super_jit">0.0092s</td><td class="num" data-col="bun">0.0202s</td><td class="num" data-col="kotlin">0.0597s</td><td class="num" data-col="lua">0.0095s</td><td class="num" data-col="python">0.4350s</td><td class="num" data-col="julia">0.0202s</td><td class="num" data-col="rust">0.0082s</td><td class="num" data-col="zig">0.0068s</td></tr><tr><th scope="row" data-col="algo">02_mandelbrot_parallel</th><td class="num" data-col="c">0.0214s</td><td class="num" data-col="super_aot">0.0167s</td><td class="num" data-col="super_jit">0.0731s</td><td class="num" data-col="bun">0.0839s</td><td class="num" data-col="kotlin">0.0915s</td><td class="num" data-col="lua">0.0802s</td><td class="num" data-col="python">0.4991s</td><td class="num" data-col="julia">0.0261s</td><td class="num is-best-cell" data-col="rust">0.0104s</td><td class="num" data-col="zig">0.0115s</td></tr><tr><th scope="row" data-col="algo">03_astar_pathfinding</th><td class="num" data-col="c">0.0016s</td><td class="num is-best-cell" data-col="super_aot">0.0011s</td><td class="num" data-col="super_jit">0.0028s</td><td class="num" data-col="bun">0.0101s</td><td class="num" data-col="kotlin">0.0479s</td><td class="num" data-col="lua">0.0057s</td><td class="num" data-col="python">0.0348s</td><td class="num" data-col="julia">0.0234s</td><td class="num" data-col="rust">0.0019s</td><td class="num" data-col="zig">0.0014s</td></tr><tr><th scope="row" data-col="algo">04_json_serde</th><td class="num" data-col="c">0.0010s</td><td class="num is-best-cell" data-col="super_aot">0.0005s</td><td class="num" data-col="super_jit">0.0022s</td><td class="num" data-col="bun">0.0115s</td><td class="num" data-col="kotlin">0.0416s</td><td class="num" data-col="lua">0.0021s</td><td class="num" data-col="python">0.0257s</td><td class="num" data-col="julia">0.0172s</td><td class="num" data-col="rust">0.0012s</td><td class="num" data-col="zig">0.0009s</td></tr><tr><th scope="row" data-col="algo">05_parallel_mapreduce</th><td class="num" data-col="c">0.0062s</td><td class="num is-best-cell" data-col="super_aot">0.0019s</td><td class="num" data-col="super_jit">0.0040s</td><td class="num" data-col="bun">0.1430s</td><td class="num" data-col="kotlin">0.2113s</td><td class="num" data-col="lua">0.0268s</td><td class="num" data-col="python">0.1972s</td><td class="num" data-col="julia">0.0305s</td><td class="num" data-col="rust">0.0076s</td><td class="num" data-col="zig">0.0103s</td></tr><tr><th scope="row" data-col="algo">06_mergesort_radix</th><td class="num" data-col="c">0.0057s</td><td class="num" data-col="super_aot">0.0050s</td><td class="num" data-col="super_jit">0.0069s</td><td class="num" data-col="bun">0.1398s</td><td class="num" data-col="kotlin">0.0568s</td><td class="num" data-col="lua">0.0114s</td><td class="num" data-col="python">0.1854s</td><td class="num" data-col="julia">0.0196s</td><td class="num" data-col="rust">0.0054s</td><td class="num is-best-cell" data-col="zig">0.0039s</td></tr><tr><th scope="row" data-col="algo">07_crc32_lz4_compress</th><td class="num" data-col="c">0.0010s</td><td class="num is-best-cell" data-col="super_aot">0.0008s</td><td class="num" data-col="super_jit">0.0027s</td><td class="num" data-col="bun">0.0095s</td><td class="num" data-col="kotlin">0.0507s</td><td class="num" data-col="lua">0.0025s</td><td class="num" data-col="python">0.0175s</td><td class="num" data-col="julia">0.0214s</td><td class="num" data-col="rust">0.0013s</td><td class="num" data-col="zig">0.0009s</td></tr><tr><th scope="row" data-col="algo">08_ecs_simulation</th><td class="num" data-col="c">0.0042s</td><td class="num" data-col="super_aot">0.0039s</td><td class="num" data-col="super_jit">0.0063s</td><td class="num" data-col="bun">0.0149s</td><td class="num" data-col="kotlin">0.0652s</td><td class="num" data-col="lua">0.0115s</td><td class="num" data-col="python">0.1370s</td><td class="num" data-col="julia">0.0251s</td><td class="num" data-col="rust">0.0041s</td><td class="num is-best-cell" data-col="zig">0.0037s</td></tr><tr><th scope="row" data-col="algo">09_matmul_tiled</th><td class="num" data-col="c">0.0033s</td><td class="num is-best-cell" data-col="super_aot">0.0024s</td><td class="num" data-col="super_jit">0.0045s</td><td class="num" data-col="bun">0.0278s</td><td class="num" data-col="kotlin">0.0669s</td><td class="num" data-col="lua">0.0267s</td><td class="num" data-col="python">1.6908s</td><td class="num" data-col="julia">0.0265s</td><td class="num" data-col="rust">0.0038s</td><td class="num" data-col="zig">0.0037s</td></tr><tr><th scope="row" data-col="algo">10_sha256_merkle_tree</th><td class="num" data-col="c">0.0020s</td><td class="num" data-col="super_aot">0.0022s</td><td class="num" data-col="super_jit">0.0038s</td><td class="num" data-col="bun">0.0140s</td><td class="num" data-col="kotlin">0.0690s</td><td class="num" data-col="lua">0.2885s</td><td class="num" data-col="python">0.0248s</td><td class="num" data-col="julia">0.0299s</td><td class="num" data-col="rust">0.0021s</td><td class="num is-best-cell" data-col="zig">0.0018s</td></tr><tr><th scope="row" data-col="algo">11_symbolic_autodiff_ode</th><td class="num" data-col="c">0.0574s</td><td class="num" data-col="super_aot">0.0609s</td><td class="num" data-col="super_jit">0.0656s</td><td class="num" data-col="bun">0.1153s</td><td class="num" data-col="kotlin">0.1674s</td><td class="num" data-col="lua">0.1275s</td><td class="num" data-col="python">1.5384s</td><td class="num" data-col="julia">0.0539s</td><td class="num" data-col="rust">0.0600s</td><td class="num is-best-cell" data-col="zig">0.0529s</td></tr><tr><th scope="row" data-col="algo">12_sparse_fem_fft</th><td class="num" data-col="c">0.0096s</td><td class="num" data-col="super_aot">0.0068s</td><td class="num" data-col="super_jit">0.0091s</td><td class="num" data-col="bun">0.0357s</td><td class="num" data-col="kotlin">0.0877s</td><td class="num" data-col="lua">0.0188s</td><td class="num" data-col="python">0.3934s</td><td class="num" data-col="julia">0.0392s</td><td class="num" data-col="rust">0.0061s</td><td class="num is-best-cell" data-col="zig">0.0060s</td></tr><tr><th scope="row" data-col="algo">13_polars_data_pipeline</th><td class="num" data-col="c">1.8483s</td><td class="num" data-col="super_aot">0.0022s</td><td class="num" data-col="super_jit">0.0037s</td><td class="num" data-col="bun">0.0176s</td><td class="num" data-col="kotlin">0.0521s</td><td class="num" data-col="lua">0.0087s</td><td class="num" data-col="python">0.1499s</td><td class="num" data-col="julia">0.0199s</td><td class="num" data-col="rust">0.0027s</td><td class="num is-best-cell" data-col="zig">0.0019s</td></tr><tr><th scope="row" data-col="algo">14_http_router_throughput</th><td class="num" data-col="c">0.0516s</td><td class="num" data-col="super_aot">0.0171s</td><td class="num" data-col="super_jit">0.0189s</td><td class="num" data-col="bun">0.1447s</td><td class="num" data-col="kotlin">0.2524s</td><td class="num" data-col="lua">0.4182s</td><td class="num" data-col="python">0.4631s</td><td class="num" data-col="julia">0.1357s</td><td class="num" data-col="rust">0.0594s</td><td class="num is-best-cell" data-col="zig">0.0165s</td></tr><tr><th scope="row" data-col="algo">15_physics2d_broadphase_solver</th><td class="num" data-col="c">0.0754s</td><td class="num" data-col="super_aot">0.1004s</td><td class="num" data-col="super_jit">0.0983s</td><td class="num" data-col="bun">0.1787s</td><td class="num" data-col="kotlin">0.1765s</td><td class="num" data-col="lua">0.2780s</td><td class="num" data-col="python">1.9519s</td><td class="num is-best-cell" data-col="julia">0.0585s</td><td class="num" data-col="rust">0.0704s</td><td class="num" data-col="zig">0.0627s</td></tr><tr><th scope="row" data-col="algo">16_crypto_pq_argon2_suite</th><td class="num" data-col="c">0.0025s</td><td class="num" data-col="super_aot">0.0022s</td><td class="num" data-col="super_jit">0.0039s</td><td class="num" data-col="bun">0.0248s</td><td class="num" data-col="kotlin">0.0819s</td><td class="num" data-col="lua">0.0211s</td><td class="num" data-col="python">0.3160s</td><td class="num" data-col="julia">0.0402s</td><td class="num is-best-cell" data-col="rust">0.0016s</td><td class="num" data-col="zig">0.0019s</td></tr><tr><th scope="row" data-col="algo">17_ai_tensor_hnsw_search</th><td class="num is-best-cell" data-col="c">0.0029s</td><td class="num" data-col="super_aot">0.0032s</td><td class="num" data-col="super_jit">0.0047s</td><td class="num" data-col="bun">0.0528s</td><td class="num" data-col="kotlin">0.0757s</td><td class="num" data-col="lua">0.0128s</td><td class="num" data-col="python">0.5279s</td><td class="num" data-col="julia">0.0376s</td><td class="num" data-col="rust">0.0040s</td><td class="num" data-col="zig">0.0038s</td></tr><tr><th scope="row" data-col="algo">18_stdlib_core_algorithms</th><td class="num" data-col="c">0.0037s</td><td class="num is-best-cell" data-col="super_aot">0.0027s</td><td class="num" data-col="super_jit">0.0045s</td><td class="num" data-col="bun">0.0272s</td><td class="num" data-col="kotlin">0.0746s</td><td class="num" data-col="lua">0.0146s</td><td class="num" data-col="python">0.1000s</td><td class="num" data-col="julia">0.0362s</td><td class="num" data-col="rust">0.0046s</td><td class="num" data-col="zig">0.0034s</td></tr><tr><th scope="row" data-col="algo">19_distributed_raft_wal_kv</th><td class="num" data-col="c">0.0027s</td><td class="num" data-col="super_aot">0.0046s</td><td class="num" data-col="super_jit">0.0064s</td><td class="num" data-col="bun">0.0202s</td><td class="num" data-col="kotlin">0.0678s</td><td class="num" data-col="lua">0.0074s</td><td class="num" data-col="python">0.2369s</td><td class="num" data-col="julia">0.0265s</td><td class="num" data-col="rust">0.0030s</td><td class="num is-best-cell" data-col="zig">0.0025s</td></tr><tr><th scope="row" data-col="algo">20_end_to_end_lakehouse_service</th><td class="num" data-col="c">0.0044s</td><td class="num" data-col="super_aot">0.0150s</td><td class="num" data-col="super_jit">0.0171s</td><td class="num" data-col="bun">0.0509s</td><td class="num" data-col="kotlin">0.1058s</td><td class="num" data-col="lua">0.0148s</td><td class="num" data-col="python">0.1440s</td><td class="num" data-col="julia">0.0534s</td><td class="num" data-col="rust">0.0071s</td><td class="num is-best-cell" data-col="zig">0.0038s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="timing-cards" id="timing-cards"><article class="timing-card" data-reveal><div class="algo-head"><h4>01_nbody</h4><span class="winner-chip">SuperAot</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0074s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="is-best">0.0066s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0092s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0202s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0597s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0095s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.4350s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0202s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0082s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0068s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>02_mandelbrot_parallel</h4><span class="winner-chip">Rust</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0214s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0167s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0731s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0839s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0915s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0802s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.4991s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0261s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="is-best">0.0104s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0115s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>03_astar_pathfinding</h4><span class="winner-chip">SuperAot</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0016s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="is-best">0.0011s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0028s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0101s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0479s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0057s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.0348s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0234s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0019s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0014s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>04_json_serde</h4><span class="winner-chip">SuperAot</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0010s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="is-best">0.0005s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0022s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0115s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0416s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0021s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.0257s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0172s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0012s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0009s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>05_parallel_mapreduce</h4><span class="winner-chip">SuperAot</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0062s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="is-best">0.0019s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0040s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.1430s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.2113s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0268s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.1972s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0305s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0076s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0103s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>06_mergesort_radix</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0057s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0050s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0069s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.1398s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0568s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0114s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.1854s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0196s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0054s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0039s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>07_crc32_lz4_compress</h4><span class="winner-chip">SuperAot</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0010s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="is-best">0.0008s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0027s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0095s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0507s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0025s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.0175s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0214s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0013s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0009s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>08_ecs_simulation</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0042s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0039s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0063s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0149s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0652s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0115s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.1370s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0251s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0041s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0037s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>09_matmul_tiled</h4><span class="winner-chip">SuperAot</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0033s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="is-best">0.0024s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0045s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0278s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0669s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0267s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">1.6908s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0265s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0038s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0037s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>10_sha256_merkle_tree</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0020s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0022s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0038s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0140s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0690s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.2885s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.0248s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0299s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0021s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0018s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>11_symbolic_autodiff_ode</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0574s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0609s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0656s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.1153s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.1674s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.1275s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">1.5384s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0539s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0600s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0529s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>12_sparse_fem_fft</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0096s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0068s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0091s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0357s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0877s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0188s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.3934s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0392s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0061s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0060s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>13_polars_data_pipeline</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">1.8483s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0022s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0037s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0176s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0521s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0087s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.1499s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0199s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0027s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0019s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>14_http_router_throughput</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0516s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0171s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0189s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.1447s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.2524s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.4182s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.4631s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.1357s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0594s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0165s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>15_physics2d_broadphase_solver</h4><span class="winner-chip">Julia</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0754s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.1004s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0983s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.1787s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.1765s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.2780s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">1.9519s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="is-best">0.0585s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0704s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0627s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>16_crypto_pq_argon2_suite</h4><span class="winner-chip">Rust</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0025s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0022s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0039s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0248s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0819s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0211s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.3160s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0402s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="is-best">0.0016s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0019s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>17_ai_tensor_hnsw_search</h4><span class="winner-chip">C</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="is-best">0.0029s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0032s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0047s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0528s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0757s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0128s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.5279s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0376s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0040s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0038s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>18_stdlib_core_algorithms</h4><span class="winner-chip">SuperAot</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0037s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="is-best">0.0027s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0045s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0272s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0746s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0146s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.1000s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0362s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0046s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="">0.0034s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>19_distributed_raft_wal_kv</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0027s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0046s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0064s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0202s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.0678s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0074s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.2369s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0265s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0030s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0025s</dd></div></dl></article><article class="timing-card" data-reveal><div class="algo-head"><h4>20_end_to_end_lakehouse_service</h4><span class="winner-chip">Zig</span></div><dl><div data-lang-row="c"><dt>C</dt><dd class="">0.0044s</dd></div><div data-lang-row="super_aot"><dt>SuperAot</dt><dd class="">0.0150s</dd></div><div data-lang-row="super_jit"><dt>SuperJit</dt><dd class="">0.0171s</dd></div><div data-lang-row="bun"><dt>Bun</dt><dd class="">0.0509s</dd></div><div data-lang-row="kotlin"><dt>Kotlin</dt><dd class="">0.1058s</dd></div><div data-lang-row="lua"><dt>Lua</dt><dd class="">0.0148s</dd></div><div data-lang-row="python"><dt>Python</dt><dd class="">0.1440s</dd></div><div data-lang-row="julia"><dt>Julia</dt><dd class="">0.0534s</dd></div><div data-lang-row="rust"><dt>Rust</dt><dd class="">0.0071s</dd></div><div data-lang-row="zig"><dt>Zig</dt><dd class="is-best">0.0038s</dd></div></dl></article></div>
+  </div>
+</section>
+
+<section class="section band-ink" id="race">
+  <h2>Score race</h2>
+  <div class="ui-stage" data-reveal>
+    <canvas id="score-race" width="960" height="288" data-ui aria-label="Animated composite score race"></canvas>
+    <p class="ui-caption">Animated view of the composite scores; the leading bar is highlighted.</p>
+  </div>
+</section>
+
+<section class="section" id="weights">
+  <h2>How the score is built</h2>
+  <p class="note" style="max-width:48ch">Scoring weights for the composite. Speed still carries the most; the other axes keep a fast incomplete port from winning.</p>
+  <div class="weight-bar" data-reveal><div class="wseg" style="flex-grow:40" tabindex="0"><strong>40%</strong><span>Speed</span></div><div class="wseg" style="flex-grow:25" tabindex="0"><strong>25%</strong><span>Memory</span></div><div class="wseg" style="flex-grow:15" tabindex="0"><strong>15%</strong><span>Reliability</span></div><div class="wseg" style="flex-grow:12" tabindex="0"><strong>10%</strong><span>Cycle</span></div><div class="wseg" style="flex-grow:12" tabindex="0"><strong>10%</strong><span>LoC</span></div></div>
+</section>
+
+<section class="lang-list band-surface" id="languages">
+  <button type="button" class="lang-line" data-lang="super_aot" data-reveal><span class="lang-name">SuperAot</span><span class="lang-score">89.2</span></button><button type="button" class="lang-line" data-lang="zig" data-reveal><span class="lang-name">Zig</span><span class="lang-score">80.0</span></button><button type="button" class="lang-line" data-lang="rust" data-reveal><span class="lang-name">Rust</span><span class="lang-score">67.2</span></button><button type="button" class="lang-line" data-lang="super_jit" data-reveal><span class="lang-name">SuperJit</span><span class="lang-score">65.7</span></button><button type="button" class="lang-line" data-lang="c" data-reveal><span class="lang-name">C</span><span class="lang-score">49.7</span></button><button type="button" class="lang-line" data-lang="lua" data-reveal><span class="lang-name">Lua</span><span class="lang-score">43.5</span></button><button type="button" class="lang-line" data-lang="bun" data-reveal><span class="lang-name">Bun</span><span class="lang-score">33.4</span></button><button type="button" class="lang-line" data-lang="python" data-reveal><span class="lang-name">Python</span><span class="lang-score">28.4</span></button><button type="button" class="lang-line" data-lang="julia" data-reveal><span class="lang-name">Julia</span><span class="lang-score">28.1</span></button><button type="button" class="lang-line" data-lang="kotlin" data-reveal><span class="lang-name">Kotlin</span><span class="lang-score">26.9</span></button>
+</section>
+
+<section class="section" id="method">
+  <div class="faq-grid">
+    <div>
+      <h2>Why these weights</h2>
+      <div id="faq-list"><button type="button" class="faq-q is-active" data-faq="0" data-reveal>What is the timing protocol?</button><button type="button" class="faq-q" data-faq="1" data-reveal>What is Cycle?</button><button type="button" class="faq-q" data-faq="2" data-reveal>What is Reliability?</button><button type="button" class="faq-q" data-faq="3" data-reveal>How does ratio-to-best work?</button><button type="button" class="faq-q" data-faq="4" data-reveal>How do failures affect Speed?</button><button type="button" class="faq-q" data-faq="5" data-reveal>What does LoC measure?</button></div>
+    </div>
+    <p class="faq-answer" id="faq-answer" data-reveal>Versioned protocol (see Protocol version in the suite report): discard 1–2 warm-up runs per language, then N timed runs (default 10) interleaved round-robin across languages. Primary wall is the median (or trimmed mean). Every figure ships with stdev and a CI; overlapping CIs are within noise — not a hard ranking.</p>
+  </div>
+</section>
+
+<section class="faq-bands" id="faq-full" aria-label="Methodology detail">
+  <div class="faq-band" style="background:var(--ink);color:var(--accent-ink);min-height:30svh;align-items:end">
+    <h3 style="color:var(--accent-ink);font-size:clamp(2rem,7vw,4.5rem);max-width:10ch">Why these weights</h3>
+    <p style="color:#ffb07a">Each axis guards against a different failure mode.</p>
+  </div>
+  <div class="faq-band" data-reveal><h3>What is the timing protocol?</h3><p>Versioned protocol (see Protocol version in the suite report): discard 1–2 warm-up runs per language, then N timed runs (default 10) interleaved round-robin across languages. Primary wall is the median (or trimmed mean). Every figure ships with stdev and a CI; overlapping CIs are within noise — not a hard ranking.</p></div><div class="faq-band" data-reveal><h3>What is Cycle?</h3><p>Compile wall (zero for interpreters and SuperJit) plus the first checksummed verify run. It approximates an agent edit→test loop.</p></div><div class="faq-band" data-reveal><h3>What is Reliability?</h3><p>Share of gated algorithms that finish with a matching CHECKSUM. Incomplete ports cannot hide behind a selective geo-mean.</p></div><div class="faq-band" data-reveal><h3>How does ratio-to-best work?</h3><p>For lower-is-better metrics, score = 100 × best / value. For Reliability, score = 100 × rate / best rate. Floor is 0.01.</p></div><div class="faq-band" data-reveal><h3>How do failures affect Speed?</h3><p>A checksum or compile failure injects 2× the slowest successful primary wall on that algorithm (or the suite timeout) into the geo-mean.</p></div><div class="faq-band" data-reveal><h3>What does LoC measure?</h3><p>Non-blank, non-comment source lines for the primary file of each language. SuperAot and SuperJit share algo.sr.</p></div>
+</section>
+
+<section class="showcase" id="showcase">
+  <h2>Forty percent</h2>
+  <p>Speed still leads the composite. The other axes keep a fast incomplete port from winning.</p>
+  <p class="blown" data-reveal>40%</p>
+</section>
+
+<section class="cta-band" id="book-cta">
+  <div class="cta-main">
+    <h2>Read the book</h2>
+    <p style="color:#ffb07a;max-width:34ch">Specification, algorithms, ECS and APIs. Read it online or download the PDF.</p>
+    <div class="hero-actions" style="margin-top:1.5rem">
+      <a class="cta" href="../book/" style="background:var(--accent-ink);color:var(--ink)">Open book</a>
+    </div>
+  </div>
+  <aside class="cta-side book-panel">
+    <h3>Super Book</h3>
+    <p>Page-turn reader with the full text. PDF available for offline reading.</p>
+    <a class="cta" href="../book/">Open viewer</a>
+    <p style="margin-top:1rem"><a href="../downloads/SUPER_BOOK.pdf" download>Download SUPER_BOOK.pdf</a></p>
+  </aside>
+</section>
+
+<section class="section band-field" id="toolchain">
+  <h2>Toolchain and LoC</h2>
+  <p class="note" style="color:var(--field-ink);max-width:52ch;opacity:0.78">Tool versions used for this suite and the primary source size per language. Both describe the single machine behind the scoreboard.</p>
+  <div class="toolchain-grid">
+    <div class="toolchain-panel" data-reveal>
+      <h3>Toolchain versions</h3>
+      <div class="table-wrap">
+        <table class="data data-stack">
+          <thead><tr><th>Tool</th><th>Avail</th><th>Version</th></tr></thead>
+          <tbody><tr><td>Cc</td><td>yes</td><td>cc (GCC) 16.2.1 20261122</td></tr><tr><td>Super</td><td>yes</td><td>super 0.1.0</td></tr><tr><td>Bun</td><td>yes</td><td>1.4.4</td></tr><tr><td>Kotlin</td><td>yes</td><td>info: kotlinc-jvm 2.4.21 (JRE 27.0.1.1) / openjdk version &quot;27.0.1.1&quot; 2026-11-17</td></tr><tr><td>Java</td><td>yes</td><td>openjdk version &quot;27.0.1.1&quot; 2026-11-17</td></tr><tr><td>Luajit</td><td>yes</td><td>LuaJIT 2.1.1795119671 -- Copyright (C) 2005-2026 Mike Pall. https://luajit.org/</td></tr><tr><td>Python3</td><td>yes</td><td>Python 3.14.10</td></tr><tr><td>Julia</td><td>yes</td><td>julia version 1.13.4</td></tr><tr><td>Rustc</td><td>yes</td><td>rustc 1.99.1 (58cf8f9c3 2026-10-13)</td></tr><tr><td>Zig</td><td>yes</td><td>0.17.1</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="toolchain-panel" data-reveal>
+      <h3>Code lines</h3>
+      <div class="table-wrap">
+        <table class="data data-stack">
+          <thead><tr><th>Language</th><th class="num">Lines</th></tr></thead>
+          <tbody><tr><td>C</td><td class='num'>29758</td></tr><tr><td>Super</td><td class='num'>2198</td></tr><tr><td>Bun</td><td class='num'>2200</td></tr><tr><td>Kotlin</td><td class='num'>2447</td></tr><tr><td>Lua</td><td class='num'>2752</td></tr><tr><td>Python</td><td class='num'>2339</td></tr><tr><td>Julia</td><td class='num'>3050</td></tr><tr><td>Rust</td><td class='num'>3337</td></tr><tr><td>Zig</td><td class='num'>3287</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="site-footer">
+  <div class="footer-links">
+    <a href="../benchmarks/">Benchmarks</a>
+    <a href="../winners/">Winners</a>
+    <a href="../charts/">Charts</a>
+    <a href="../book/">Book</a>
+    <a href="../install/">Install</a>
+    <a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a>
+    <a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a>
+    <a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a>
+  </div>
+  <div class="footer-mark" aria-hidden="true">
+    <span>S</span><span>u</span><span>p</span><span>e</span><span>r</span>
+  </div>
+  <div class="footer-legal">
+    <span>Super language</span>
+  </div>
+</footer>
+
+<script type="application/json" id="report-data">{"winner":"super_aot","display":{"super_aot":"SuperAot","zig":"Zig","rust":"Rust","super_jit":"SuperJit","c":"C","lua":"Lua","bun":"Bun","python":"Python","julia":"Julia","kotlin":"Kotlin","all":"All"},"weights":{"speed":0.4,"memory":0.25,"reliability":0.15,"cycle":0.1,"loc":0.1},"category":{"speed":"zig","memory":"super_aot","reliability":"all","cycle":"super_jit","loc":"super_aot"},"composite":{"super_aot":{"score":89.23,"speed":97.87,"memory":100.0,"reliability":100.0,"cycle":0.78,"loc":100.0,"contrib":{"speed":39.15,"memory":25.0,"reliability":15.0,"cycle":0.08,"loc":10.0}},"zig":{"score":79.97,"speed":100.0,"memory":73.1,"reliability":100.0,"cycle":0.05,"loc":66.87,"contrib":{"speed":40.0,"memory":18.27,"reliability":15.0,"cycle":0.01,"loc":6.69}},"rust":{"score":67.24,"speed":81.07,"memory":52.75,"reliability":100.0,"cycle":0.33,"loc":65.87,"contrib":{"speed":32.43,"memory":13.19,"reliability":15.0,"cycle":0.03,"loc":6.59}},"super_jit":{"score":65.65,"speed":56.36,"memory":32.45,"reliability":100.0,"cycle":100.0,"loc":100.0,"contrib":{"speed":22.54,"memory":8.11,"reliability":15.0,"cycle":10.0,"loc":10.0}},"c":{"score":49.73,"speed":60.63,"memory":37.43,"reliability":100.0,"cycle":3.75,"loc":7.39,"contrib":{"speed":24.25,"memory":9.36,"reliability":15.0,"cycle":0.38,"loc":0.74}},"lua":{"score":43.46,"speed":20.67,"memory":33.69,"reliability":100.0,"cycle":37.83,"loc":79.87,"contrib":{"speed":8.27,"memory":8.42,"reliability":15.0,"cycle":3.78,"loc":7.99}},"bun":{"score":33.39,"speed":12.52,"memory":4.85,"reliability":100.0,"cycle":21.75,"loc":99.91,"contrib":{"speed":5.01,"memory":1.21,"reliability":15.0,"cycle":2.18,"loc":9.99}},"python":{"score":28.36,"speed":2.14,"memory":10.94,"reliability":100.0,"cycle":3.72,"loc":93.97,"contrib":{"speed":0.86,"memory":2.73,"reliability":15.0,"cycle":0.37,"loc":9.4}},"julia":{"score":28.12,"speed":14.1,"memory":0.52,"reliability":100.0,"cycle":1.38,"loc":72.07,"contrib":{"speed":5.64,"memory":0.13,"reliability":15.0,"cycle":0.14,"loc":7.21}},"kotlin":{"score":26.93,"speed":5.48,"memory":2.95,"reliability":100.0,"cycle":0.19,"loc":89.82,"contrib":{"speed":2.19,"memory":0.74,"reliability":15.0,"cycle":0.02,"loc":8.98}}},"faq":["Versioned protocol (see Protocol version in the suite report): discard 1\u20132 warm-up runs per language, then N timed runs (default 10) interleaved round-robin across languages. Primary wall is the median (or trimmed mean). Every figure ships with stdev and a CI; overlapping CIs are within noise \u2014 not a hard ranking.","Compile wall (zero for interpreters and SuperJit) plus the first checksummed verify run. It approximates an agent edit\u2192test loop.","Share of gated algorithms that finish with a matching CHECKSUM. Incomplete ports cannot hide behind a selective geo-mean.","For lower-is-better metrics, score = 100 \u00d7 best / value. For Reliability, score = 100 \u00d7 rate / best rate. Floor is 0.01.","A checksum or compile failure injects 2\u00d7 the slowest successful primary wall on that algorithm (or the suite timeout) into the geo-mean.","Non-blank, non-comment source lines for the primary file of each language. SuperAot and SuperJit share algo.sr."]}</script>
+<script>
+(function () {
+  const data = JSON.parse(document.getElementById("report-data").textContent);
+  const order = ["speed", "memory", "reliability", "cycle", "loc"];
+  const labels = {
+    speed: "Speed × 0.40",
+    memory: "Memory × 0.25",
+    reliability: "Reliability × 0.15",
+    cycle: "Cycle × 0.10",
+    loc: "LoC × 0.10"
+  };
+  const axisNames = {
+    speed: "Speed", memory: "Memory", reliability: "Reliability",
+    cycle: "Cycle", loc: "LoC"
+  };
+  let activeLang = data.winner;
+  let activeAxis = "score";
+
+  const body = document.getElementById("receipt-body");
+  const sum = document.getElementById("receipt-sum");
+  const totalEl = document.getElementById("live-total");
+  const langEl = document.getElementById("live-lang");
+  const axisLive = document.getElementById("axis-live");
+  const axisMeter = document.getElementById("axis-meter-fill");
+  const chartHost = document.getElementById("rank-chart");
+
+  function ranked() {
+    return Object.keys(data.composite || {}).sort(
+      (a, b) => data.composite[b].score - data.composite[a].score
+    );
+  }
+
+  function paintReceipt(lang) {
+    const c = data.composite[lang];
+    if (!c || !body) return;
+    body.innerHTML = order.map((k) => {
+      const axis = c[k];
+      const contrib = (c.contrib && c.contrib[k]) != null
+        ? c.contrib[k]
+        : (axis * (data.weights[k] || 0));
+      return `<div class="receipt-row"><span>${labels[k]} (${axis.toFixed(1)})</span><span>${Number(contrib).toFixed(2)}</span></div>`;
+    }).join("");
+    if (sum) sum.textContent = Number(c.score).toFixed(2);
+    if (totalEl) totalEl.textContent = Number(c.score).toFixed(1);
+    const dn = (data.display && data.display[lang]) || lang;
+    if (langEl) langEl.textContent = dn;
+  }
+
+  function paintAxisTile(axis) {
+    if (!axisLive) return;
+    if (axis === "score") {
+      const w = data.display[data.winner] || data.winner;
+      const sc = data.composite[data.winner];
+      axisLive.textContent = w + " leads at " + (sc ? sc.score.toFixed(1) : "—");
+      if (axisMeter) axisMeter.style.width = (sc ? Math.min(100, sc.score) : 0) + "%";
+      return;
+    }
+    const winnerKey = (data.category && data.category[axis]) || null;
+    const dn = winnerKey ? ((data.display && data.display[winnerKey]) || winnerKey) : "—";
+    const c = winnerKey && data.composite[winnerKey];
+    const val = c ? c[axis] : 0;
+    axisLive.textContent = axisNames[axis] + " · " + dn + " · " + Number(val).toFixed(1);
+    if (axisMeter) axisMeter.style.width = Math.min(100, Number(val) || 0) + "%";
+  }
+
+  function drawChart() {
+    if (!chartHost) return;
+    const langs = ranked();
+    const h = Math.max(280, langs.length * 36 + 24);
+    const w = 720;
+    const labelW = 110;
+    const valW = 48;
+    const trackX = labelW;
+    const trackW = w - labelW - valW - 16;
+    let maxV = 1;
+    langs.forEach((id) => {
+      const c = data.composite[id];
+      const v = activeAxis === "score" ? c.score : (c[activeAxis] || 0);
+      if (v > maxV) maxV = v;
+    });
+    const rows = langs.map((id, i) => {
+      const c = data.composite[id];
+      const v = activeAxis === "score" ? c.score : (c[activeAxis] || 0);
+      const y = 18 + i * 36;
+      const bw = trackW * (v / maxV);
+      const dn = (data.display && data.display[id]) || id;
+      const cls = [
+        "bar-fg",
+        id === activeLang ? "is-winner" : "",
+        activeAxis !== "score" && data.category && data.category[activeAxis] === id ? "is-winner" : "",
+      ].filter(Boolean).join(" ");
+      return `
+        <g class="rank-row-svg" data-lang="${id}">
+          <text x="0" y="${y + 12}">${dn}</text>
+          <rect class="bar-bg" x="${trackX}" y="${y}" width="${trackW}" height="18"></rect>
+          <rect class="${cls}" x="${trackX}" y="${y}" width="0" height="18" data-w="${bw.toFixed(1)}"></rect>
+          <text x="${trackX + trackW + 8}" y="${y + 13}">${v.toFixed(1)}</text>
+          <rect class="bar-hit" x="0" y="${y - 6}" width="${w}" height="30" data-lang="${id}" tabindex="0" role="button" aria-label="${dn}"></rect>
+        </g>`;
+    }).join("");
+    chartHost.innerHTML = `<svg class="rank-svg" viewBox="0 0 ${w} ${h}" role="img" aria-label="Composite ranking chart" data-ui>${rows}</svg>`;
+    requestAnimationFrame(() => {
+      chartHost.querySelectorAll(".bar-fg").forEach((el) => {
+        el.setAttribute("width", el.getAttribute("data-w") || "0");
+      });
+    });
+    chartHost.querySelectorAll(".bar-hit").forEach((el) => {
+      const go = () => selectLang(el.getAttribute("data-lang"));
+      el.addEventListener("click", go);
+      el.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); go(); }
+      });
+    });
+  }
+
+  function drawRadar(lang) {
+    const host = document.getElementById("radar-chart");
+    if (!host) return;
+    const c = data.composite[lang];
+    if (!c) return;
+    const cx = 140, cy = 140, R = 100;
+    const pts = order.map((k, i) => {
+      const ang = (-Math.PI / 2) + (i / order.length) * Math.PI * 2;
+      const r = R * Math.min(1, (c[k] || 0) / 100);
+      return [cx + Math.cos(ang) * r, cy + Math.sin(ang) * r];
+    });
+    const axes = order.map((k, i) => {
+      const ang = (-Math.PI / 2) + (i / order.length) * Math.PI * 2;
+      const x2 = cx + Math.cos(ang) * R;
+      const y2 = cy + Math.sin(ang) * R;
+      const lx = cx + Math.cos(ang) * (R + 18);
+      const ly = cy + Math.sin(ang) * (R + 18);
+      return `<line class="axis" x1="${cx}" y1="${cy}" x2="${x2}" y2="${y2}"></line>
+        <text x="${lx}" y="${ly}" text-anchor="middle" dominant-baseline="middle">${axisNames[k]}</text>`;
+    }).join("");
+    const poly = pts.map((p) => p.join(",")).join(" ");
+    host.innerHTML = `<svg class="radar-svg" viewBox="0 0 280 280" data-ui aria-label="Axis radar for selected language">
+      <circle class="axis" cx="${cx}" cy="${cy}" r="${R}"></circle>
+      <circle class="axis" cx="${cx}" cy="${cy}" r="${R * 0.66}"></circle>
+      <circle class="axis" cx="${cx}" cy="${cy}" r="${R * 0.33}"></circle>
+      ${axes}
+      <polygon class="poly" points="${poly}"></polygon>
+    </svg>`;
+  }
+
+  function selectLang(lang) {
+    if (!data.composite[lang]) return;
+    activeLang = lang;
+    paintReceipt(lang);
+    drawRadar(lang);
+    drawChart();
+    document.querySelectorAll(".lang-line, .pick").forEach((el) => {
+      el.classList.toggle("is-active", el.dataset.lang === lang);
+    });
+  }
+
+  function selectAxis(axis) {
+    activeAxis = axis;
+    paintAxisTile(axis);
+    drawChart();
+    document.querySelectorAll(".cat-tile").forEach((el) => {
+      el.classList.toggle("is-active", el.dataset.axis === axis);
+    });
+    document.querySelectorAll(".chart-toolbar button").forEach((el) => {
+      el.classList.toggle("is-active", el.dataset.axis === axis);
+    });
+    // jump language to category winner when filtering an axis
+    if (axis !== "score" && data.category && data.category[axis]) {
+      selectLang(data.category[axis]);
+    }
+  }
+
+  document.querySelectorAll(".lang-line, .pick").forEach((el) => {
+    el.addEventListener("click", () => selectLang(el.dataset.lang));
+  });
+  document.querySelectorAll(".cat-tile").forEach((el) => {
+    el.addEventListener("click", () => selectAxis(el.dataset.axis));
+  });
+  document.querySelectorAll(".chart-toolbar button").forEach((el) => {
+    el.addEventListener("click", () => selectAxis(el.dataset.axis));
+  });
+
+  // FAQ
+  const faqAnswer = document.getElementById("faq-answer");
+  document.querySelectorAll("[data-faq]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("[data-faq]").forEach((b) => b.classList.remove("is-active"));
+      btn.classList.add("is-active");
+      const i = Number(btn.dataset.faq);
+      if (faqAnswer && data.faq[i]) faqAnswer.textContent = data.faq[i];
+    });
+  });
+
+  // Matrix language filter (card + table column priority)
+  const filterHost = document.getElementById("matrix-filter");
+  if (filterHost) {
+    const langs = ranked();
+    filterHost.innerHTML = `<button type="button" class="is-active" data-show="all">All</button>` +
+      langs.map((id) => `<button type="button" data-show="${id}">${(data.display && data.display[id]) || id}</button>`).join("");
+    filterHost.querySelectorAll("button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        filterHost.querySelectorAll("button").forEach((b) => b.classList.remove("is-active"));
+        btn.classList.add("is-active");
+        const show = btn.dataset.show;
+        document.querySelectorAll(".timing-card [data-lang-row]").forEach((row) => {
+          row.hidden = show !== "all" && row.dataset.langRow !== show;
+        });
+        document.querySelectorAll("#timings-table [data-col]").forEach((cell) => {
+          if (show === "all") { cell.hidden = false; return; }
+          const col = cell.dataset.col;
+          cell.hidden = col !== "algo" && col !== show;
+        });
+      });
+    });
+  }
+
+  // Canvas race — moving picture of live scores
+  const canvas = document.getElementById("score-race");
+  if (canvas && canvas.getContext) {
+    const ctx = canvas.getContext("2d");
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const cssW = canvas.clientWidth || 640;
+    const cssH = 288;
+    canvas.width = cssW * dpr;
+    canvas.height = cssH * dpr;
+    ctx.scale(dpr, dpr);
+    const langs = ranked();
+    const max = Math.max(...langs.map((id) => data.composite[id].score), 1);
+    let t0 = null;
+    function frame(ts) {
+      if (t0 == null) t0 = ts;
+      const u = Math.min(1, (ts - t0) / 1600);
+      const ease = 1 - Math.pow(1 - u, 3);
+      ctx.clearRect(0, 0, cssW, cssH);
+      ctx.fillStyle = "#050f16";
+      ctx.fillRect(0, 0, cssW, cssH);
+      langs.forEach((id, i) => {
+        const y = 24 + i * 32;
+        const sc = data.composite[id].score;
+        const w = (cssW - 140) * (sc / max) * ease;
+        ctx.fillStyle = id === activeLang ? "#ffffff" : "#ff7a1f";
+        ctx.fillRect(120, y, w, 16);
+        ctx.fillStyle = "#ffb07a";
+        ctx.font = "500 14px Bricolage Grotesque, sans-serif";
+        ctx.fillText((data.display && data.display[id]) || id, 8, y + 13);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(sc.toFixed(1), 126 + w, y + 13);
+      });
+      if (u < 1) requestAnimationFrame(frame);
+      else {
+        // gentle pulse on winner bar
+        let p = 0;
+        function pulse() {
+          p += 0.02;
+          const pulseW = 4 + Math.sin(p) * 3;
+          const id = langs[0];
+          const sc = data.composite[id].score;
+          const y = 24;
+          const w = (cssW - 140) * (sc / max);
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(120 + w, y, pulseW, 16);
+          requestAnimationFrame(pulse);
+        }
+        if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+          requestAnimationFrame(pulse);
+        }
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+
+  selectLang(activeLang);
+  selectAxis("score");
+  const axisParam = new URLSearchParams(window.location.search).get("axis");
+  if (axisParam && ["speed", "memory", "reliability", "cycle", "loc"].includes(axisParam)) {
+    selectAxis(axisParam);
+  }
+
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((e) => { if (e.isIntersecting) e.target.classList.add("in"); });
+  }, { threshold: 0.12 });
+  document.querySelectorAll("[data-reveal]").forEach((el) => io.observe(el));
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+//! Laws for std.sys.path — real-body (`path_is_abs`).
+//! `path_len` uses `host.sys_str_len` — verify cannot discharge it (sidecar limit).
+//! AI agents must not edit this file; put discharges in `path.proof.sr`.
+
+#law("path_is_abs on absolute paths")
+path_is_abs_root() {
+    #assert(path_is_abs("/"))
+    #assert(path_is_abs("/tmp/x"))
+}
+
+#law("path_is_abs rejects relative and empty")
+path_is_abs_rel() {
+    #assert(!path_is_abs("rel"))
+    #assert(!path_is_abs(""))
+}

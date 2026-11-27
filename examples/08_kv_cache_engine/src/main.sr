@@ -1,0 +1,94 @@
+// Sharded in-memory KV — partition fibers + chan[Command] + TTL after
+//
+// Run: super test examples/08_kv_cache_engine/
+
+use std.db.redis
+use std.core.collections
+
+#SHARD_BITS = 2
+#SHARD_MASK = #{
+    // 2^bits - 1, folded at compile time
+    mask = 1
+    for 0..#SHARD_BITS { mask = mask * 2 }
+    mask - 1
+}
+#FNV_OFFSET = 2166136261
+#FNV_SEEDS = #for i in 0..4 { FNV_OFFSET + i }
+
++Command = {
+    op: i64 = 0
+    key: i64 = 0
+    value: i64 = 0
+}
+
++shard_id(key: i64, n: i64) : i64 {
+    key - (key / n) * n
+}
+
++shard_mask(key: i64) : i64 {
+    // key & mask without bitwise &: key - (key / (mask+1)) * (mask+1)
+    m = #SHARD_MASK + 1
+    key - (key / m) * m
+}
+
++run_shard(cmds: i64) : i64 {
+    inbox = chan[Command](64)
+    stored = shared 0
+    scope {
+        part = spawn {
+            n = 0
+            for _c in inbox {
+                @stored += 1
+                n += 1
+            }
+            n
+        }
+        for 0..cmds {
+            inbox.send(Command{op: 1, key: it, value: it * 2})
+        }
+        // TTL sweep arm
+        select {
+            after 2.ms => 0
+        }
+        inbox.close()
+        got = await part
+        got + stored.load()
+    }
+}
+
+#inline
++get_hit(store: i64, key: i64) : i64 {
+    if key < store {
+        key * 2
+    } else {
+        0 - 1
+    }
+}
+
+test "shard routing" {
+    assert_eq(shard_id(7, 4), 3)
+    assert_eq(shard_id(8, 4), 0)
+}
+
+test "partition fiber applies commands" {
+    assert_eq(run_shard(10), 20)
+}
+
+test "get hit miss" {
+    assert_eq(get_hit(100, 5), 10)
+    assert_eq(get_hit(3, 5), 0 - 1)
+}
+
+test "comptime shard mask and FNV seeds" {
+    assert_eq(#SHARD_MASK, 3)
+    assert_eq(shard_mask(7), 3)
+    assert_eq(#FNV_SEEDS[0], 2166136261)
+}
+
+test "stdlib: redis store mirrors kv get/set" {
+    r = RedisConn.new()
+    r = r.set("k1", "v1")
+    assert_eq(r.get("k1") or "", "v1")
+    assert_eq(r.get("missing") or "none", "none")
+    assert_eq(r.key_count(), 1)
+}

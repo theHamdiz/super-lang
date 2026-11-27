@@ -1,0 +1,389 @@
+//! std.diag.test — assertion helpers, soft checks with a report, and text diffing
+//!
+//! Import with:
+//!   use std.diag.test
+//!
+//! Then, inside `test "..." { }` blocks:
+//!   assert_true(x > 0)            assert_close(a, b, 0.001)
+//!   assert_ne(a, b)               assert_gt(a, b)        assert_in_range(v, 1, 6)
+//!   assert_contains("hello", "ell")                      assert_len([1, 2], 2)
+//!
+//! Every helper is a thin layer over the built-in `assert_eq`, so a failure aborts
+//! the test block and reports a left / right pair that names the violated relation
+//! (for example `left: 5, right: "greater than 9"`). For tests that should keep
+//! going and summarise, use the soft `check` API:
+//!
+//!   rep = Report.new()
+//!   rep = rep.check("adds", add(1, 2) == 3)
+//!   rep = rep.check_close("pi", pi, 3.14159, 0.0001)
+//!   assert_true(rep.ok())              // or print(rep.text())
+//!
+//! Pure Super; `byte_len` / `len` are the only intrinsics.
+
+use std.core.collections
+use std.core.str
+
+/// `TS_NL` is `"\n"`.
++TS_NL = "\n"
+
+// --- predicates ---------------------------------------------------------------------
+
+/// True when `a` and `b` are within `eps`.
++is_close(a: f64, b: f64, eps: f64) : bool {
+    d = a - b
+    if d < 0.0 { d = 0.0 - d }
+    d <= eps
+}
+
+/// Index of the first character where `a` and `b` differ, or -1 when equal.
++first_diff(a: str, b: str) : i64 {
+    na = byte_len(a)
+    nb = byte_len(b)
+    n = na
+    if nb > n { n = nb }
+    pos = -1
+    for 0..n {
+        if pos < 0 && a[it] != b[it] { pos = it }
+    }
+    pos
+}
+
+/// True when `needle` occurs in `hay`.
++ts_contains(hay: str, needle: str) : bool {
+    nh = byte_len(hay)
+    nn = byte_len(needle)
+    ensure nn > 0 else { return true }
+    found = false
+    for 0..(nh - nn + 1) {
+        if !found && hay[it..(it + nn)] == needle { found = true }
+    }
+    found
+}
+
+/// True when `s` begins with `prefix`.
++ts_starts_with(s: str, prefix: str) : bool {
+    n = byte_len(prefix)
+    ensure n <= byte_len(s) else { return false }
+    s[0..n] == prefix
+}
+
+/// True when `s` ends with `suffix`.
++ts_ends_with(s: str, suffix: str) : bool {
+    n = byte_len(s)
+    m = byte_len(suffix)
+    ensure m <= n else { return false }
+    s[(n - m)..n] == suffix
+}
+
+// --- hard assertions ----------------------------------------------------------------
+
+/// Fail the test when `c` is false.
++assert_true(c: bool) : bool {
+    #assert(c)
+    true
+}
+
+/// Fail the test when `c` is true.
++assert_false(c: bool) : bool {
+    #assert(!(c))
+    true
+}
+
+/// Fail the test when `a` equals `b`.
++assert_ne(a: _, b: _) : bool {
+    if a == b { assert_eq(a, "anything but " + b) }
+    #assert(!(a == b))
+    true
+}
+
+/// Fail the test unless `a` > `b`.
++assert_gt(a: f64, b: f64) : bool {
+    if !(a > b) { assert_eq(a, "greater than " + b) }
+    #assert(a > b)
+    true
+}
+
+/// Fail the test unless `a` >= `b`.
++assert_ge(a: f64, b: f64) : bool {
+    if !(a >= b) { assert_eq(a, "at least " + b) }
+    #assert(a >= b)
+    true
+}
+
+/// Fail the test unless `a` < `b`.
++assert_lt(a: f64, b: f64) : bool {
+    if !(a < b) { assert_eq(a, "less than " + b) }
+    #assert(a < b)
+    true
+}
+
+/// Fail the test unless `a` <= `b`.
++assert_le(a: f64, b: f64) : bool {
+    if !(a <= b) { assert_eq(a, "at most " + b) }
+    #assert(a <= b)
+    true
+}
+
+/// lo <= v < hi
++assert_in_range(v: f64, lo: f64, hi: f64) : bool {
+    if !(v >= lo && v < hi) { assert_eq(v, "in [" + lo + ", " + hi + ")") }
+    #assert(v >= lo && v < hi)
+    true
+}
+
+/// Fail the test when `a` and `b` differ by more than the tolerance.
++assert_close(a: f64, b: f64, eps: f64) : bool {
+    if !is_close(a, b, eps) { assert_eq(a, "within " + eps + " of " + b) }
+    #assert(is_close(a, b, eps))
+    true
+}
+
+/// Fail the test when `needle` does not occur in `hay`.
++assert_contains(hay: str, needle: str) : bool {
+    if !ts_contains(hay, needle) { assert_eq(hay, "containing " + needle) }
+    #assert(ts_contains(hay, needle))
+    true
+}
+
+/// Fail the test when `needle` occurs in `hay`.
++assert_not_contains(hay: str, needle: str) : bool {
+    if ts_contains(hay, needle) { assert_eq(hay, "not containing " + needle) }
+    #assert(!(ts_contains(hay, needle)))
+    true
+}
+
+/// Fail the test when `s` does not start with `prefix`.
++assert_starts_with(s: str, prefix: str) : bool {
+    if !ts_starts_with(s, prefix) { assert_eq(s, "starting with " + prefix) }
+    #assert(ts_starts_with(s, prefix))
+    true
+}
+
+/// Fail the test when `s` does not end with `suffix`.
++assert_ends_with(s: str, suffix: str) : bool {
+    if !ts_ends_with(s, suffix) { assert_eq(s, "ending with " + suffix) }
+    #assert(ts_ends_with(s, suffix))
+    true
+}
+
+/// Fail the test when the length of `items` is not `n`.
++assert_len(items: _, n: i64) : bool {
+    assert_eq(len(items), n)
+    true
+}
+
+/// Fail the test when `items` is not empty.
++assert_empty(items: _) : bool {
+    assert_eq(len(items), 0)
+    true
+}
+
+/// Element-wise array equality (ints, floats, strings, bools).
++arrays_equal(a: _, b: _) : bool {
+    n = len(a)
+    ensure n == len(b) else { return false }
+    same = true
+    for 0..n {
+        if a[it] != b[it] { same = false }
+    }
+    same
+}
+
+/// Fail the test when the arrays `a` and `b` differ.
++assert_array_eq(a: _, b: _) : bool {
+    if len(a) != len(b) {
+        return assert_eq(len(a), len(b))
+    }
+    n = len(a)
+    for 0..n {
+        if a[it] != b[it] { assert_eq(a[it], b[it]) }
+    }
+    #assert(arrays_equal(a, b))
+    true
+}
+
+/// Multi-line text equality that reports the first differing character offset.
++assert_text_eq(actual: str, expected: str) : bool {
+    at = first_diff(actual, expected)
+    if at >= 0 { assert_eq(actual, expected) }
+    assert_eq(at, -1)
+    true
+}
+
+// --- soft checks --------------------------------------------------------------------
+
+/// `Report` tallies soft assertion passes and failures.
++Report = {
+    /// Passed on `Report` (`i64`). Defaults to `0`.
+    passed: i64 = 0
+    /// Failed on `Report` (`i64`). Defaults to `0`.
+    failed: i64 = 0
+    /// Failures on `Report`. Defaults to `[]`.
+    failures: _ = []
+
+    /// Create a fresh `Report`.
+    new() : Report => Report.{passed: 0, failed: 0, failures: []}
+
+    /// Record one named condition; returns the updated report.
+    check(self, name: str, cond: bool) : Report {
+        out = Report.{passed: self.passed, failed: self.failed, failures: self.failures}
+        if cond {
+            out.passed = self.passed + 1
+        } else {
+            out.failed = self.failed + 1
+            out.failures = arr_push(self.failures, name)
+        }
+        out
+    }
+
+    /// Record whether `name` equals `a`, without aborting the test.
+    check_eq(self, name: str, a: _, b: _) : Report {
+        if a == b { return self.check(name, true) }
+        self.check(name + ": got " + a + ", want " + b, false)
+    }
+
+    /// Record whether `name` and `a` are close, without aborting the test.
+    check_close(self, name: str, a: f64, b: f64, eps: f64) : Report {
+        if is_close(a, b, eps) { return self.check(name, true) }
+        self.check(name + ": got " + a + ", want " + b + " +/- " + eps, false)
+    }
+
+    /// True when every soft check passed.
+    ok(self) : bool => self.failed == 0
+    /// How many soft checks ran.
+    total(self) : i64 => self.passed + self.failed
+
+    /// "N passed, M failed" plus one `  FAIL name` line per failure.
+    text(self) : str {
+        out = "" + self.passed + " passed, " + self.failed + " failed"
+        fs = self.failures
+        for fs { out = out + TS_NL + "  FAIL " + it }
+        out
+    }
+
+    /// Merge `other` into `self`.
+    merge(self, other: Report) : Report {
+        out = Report.{passed: self.passed + other.passed, failed: self.failed + other.failed, failures: self.failures}
+        fs = other.failures
+        for fs { out.failures = arr_push(out.failures, it) }
+        out
+    }
+}
+
+// --- tests ---------------------------------------------------------------------------
+
+/// Test that is_close and first_diff.
+test "is_close and first_diff" {
+    #assert(is_close(1.0, 1.0005, 0.001))
+    #assert(!(is_close(1.0, 1.01, 0.001)))
+    #assert(is_close(0.0 - 1.0, 0.0 - 1.0005, 0.001))
+    assert_eq(first_diff("abc", "abc"), -1)
+    assert_eq(first_diff("abc", "abd"), 2)
+    assert_eq(first_diff("abc", "abcd"), 3)
+    assert_eq(first_diff("", "x"), 0)
+    assert_eq(first_diff("", ""), -1)
+}
+
+/// Test that string predicates.
+test "string predicates" {
+    #assert(ts_contains("hello world", "o w"))
+    #assert(!(ts_contains("hello", "xyz")))
+    #assert(ts_contains("hello", ""))
+    #assert(!(ts_contains("", "a")))
+    #assert(!(ts_contains("ab", "abc")))
+    #assert(ts_starts_with("hello", "he"))
+    #assert(!(ts_starts_with("hello", "lo")))
+    #assert(!(ts_starts_with("he", "hello")))
+    #assert(ts_ends_with("hello", "llo"))
+    #assert(!(ts_ends_with("hello", "he")))
+    #assert(!(ts_ends_with("lo", "hello")))
+}
+
+/// Test that boolean and relational assertions pass when they hold.
+test "boolean and relational assertions pass when they hold" {
+    assert_true(1 < 2)
+    assert_false(2 < 1)
+    assert_ne(1, 2)
+    assert_ne("a", "b")
+    assert_gt(3, 2)
+    assert_ge(3, 3)
+    assert_lt(2, 3)
+    assert_le(3, 3)
+    assert_in_range(5, 1, 6)
+    assert_in_range(1, 1, 6)
+    assert_in_range(0.5, 0.0, 1.0)
+}
+
+/// Test that float and text assertions pass when they hold.
+test "float and text assertions pass when they hold" {
+    assert_close(0.1 + 0.2, 0.3, 0.0001)
+    assert_close(100.0, 100.4, 0.5)
+    assert_contains("hello world", "lo wo")
+    assert_not_contains("hello", "z")
+    assert_starts_with("super-lang", "super")
+    assert_ends_with("main.sr", ".sr")
+    assert_text_eq("a" + TS_NL + "b", "a" + TS_NL + "b")
+}
+
+/// Test that collection assertions pass when they hold.
+test "collection assertions pass when they hold" {
+    assert_len([1, 2, 3], 3)
+    assert_len([], 0)
+    assert_empty([])
+    assert_array_eq([1, 2, 3], [1, 2, 3])
+    assert_array_eq([], [])
+    assert_array_eq(["a", "b"], ["a", "b"])
+    #assert(arrays_equal([1, 2], [1, 2]))
+    #assert(!(arrays_equal([1, 2], [1, 3])))
+    #assert(!(arrays_equal([1, 2], [1, 2, 3])))
+}
+
+/// Test that soft checks accumulate into a report.
+test "soft checks accumulate into a report" {
+    r = Report.new()
+    r = r.check("first", true)
+    r = r.check("second", false)
+    r = r.check("third", true)
+    assert_eq(r.passed, 2)
+    assert_eq(r.failed, 1)
+    assert_eq(r.total(), 3)
+    #assert(!(r.ok()))
+    assert_eq(len(r.failures), 1)
+    assert_eq(r.failures[0], "second")
+    assert_eq(r.text(), "2 passed, 1 failed" + TS_NL + "  FAIL second")
+}
+
+/// Test that check_eq and check_close name the mismatch.
+test "check_eq and check_close name the mismatch" {
+    r = Report.new()
+    r = r.check_eq("sum", 1 + 1, 2)
+    r = r.check_eq("bad", 3, 4)
+    r = r.check_close("pi", 3.14, 3.14159, 0.01)
+    r = r.check_close("tau", 6.0, 6.28, 0.01)
+    assert_eq(r.passed, 2)
+    assert_eq(r.failed, 2)
+    assert_contains(r.failures[0], "bad: got 3, want 4")
+    assert_contains(r.failures[1], "tau: got 6")
+}
+
+/// Test that an all-green report.
+test "an all-green report" {
+    r = Report.new()
+    r = r.check("a", true)
+    r = r.check("b", true)
+    #assert(r.ok())
+    assert_eq(r.text(), "2 passed, 0 failed")
+    #assert(Report.new().ok())
+}
+
+/// Test that reports merge.
+test "reports merge" {
+    a = Report.new().check("x", true)
+    b = Report.new().check("y", false).check("z", false)
+    m = a.merge(b)
+    assert_eq(m.passed, 1)
+    assert_eq(m.failed, 2)
+    assert_eq(len(m.failures), 2)
+    assert_eq(m.failures[1], "z")
+    assert_eq(a.failed, 0)
+}

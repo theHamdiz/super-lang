@@ -1,0 +1,164 @@
+// 16_resp_lru_cache — fixed-capacity O(1) LRU/TTL core plus RESP commands.
+
+use std.core.str
+use std.diag.log
+
++CAPACITY = 32
++WORKLOAD = 5000
+
++OP_GET = 1
++OP_SET = 2
++OP_DEL = 3
++OP_EXPIRE = 4
+
++RespCommand = {
+    op: i64 = 0
+    key: i64 = 0
+    value: i64 = 0
+    ttl: i64 = 0
+}
+
++parse_command(line: str) : RespCommand {
+    op = split_nth(line, " ", 0)
+    key = to_i64(split_nth(line, " ", 1)) or 0
+    if op == "GET" {
+        return RespCommand{op: OP_GET, key}
+    }
+    if op == "SET" {
+        value = to_i64(split_nth(line, " ", 2)) or 0
+        return RespCommand{op: OP_SET, key, value}
+    }
+    if op == "DEL" {
+        return RespCommand{op: OP_DEL, key}
+    }
+    if op == "EXPIRE" {
+        ttl = to_i64(split_nth(line, " ", 2)) or 0
+        return RespCommand{op: OP_EXPIRE, key, ttl}
+    }
+    RespCommand{}
+}
+
++find_slot(keys, key: i64) : i64 {
+    for i in 0..CAPACITY {
+        return i if keys[i] == key
+    }
+    0 - 1
+}
+
++choose_slot(keys, stamps) : i64 {
+    for i in 0..CAPACITY {
+        return i if keys[i] == 0
+    }
+    oldest = 0
+    for i in 1..CAPACITY {
+        if stamps[i] < stamps[oldest] {
+            oldest = i
+        }
+    }
+    oldest
+}
+
++cache_set(@keys, @values, @expires, @stamps, key: i64, value: i64, now: i64) {
+    slot = find_slot(keys, key)
+    if slot < 0 {
+        slot = choose_slot(keys, stamps)
+    }
+    keys[slot] = key
+    values[slot] = value
+    expires[slot] = 0
+    stamps[slot] = now
+}
+
++cache_get(@keys, values, expires, @stamps, key: i64, now: i64) : i64 {
+    slot = find_slot(keys, key)
+    if slot < 0 {
+        return 0 - 1
+    }
+    if expires[slot] != 0 && expires[slot] <= now {
+        keys[slot] = 0
+        return 0 - 1
+    }
+    stamps[slot] = now
+    values[slot]
+}
+
++cache_del(@keys, key: i64) : i64 {
+    slot = find_slot(keys, key)
+    if slot < 0 {
+        return 0
+    }
+    keys[slot] = 0
+    1
+}
+
++cache_expire(keys, @expires, key: i64, ttl: i64, now: i64) : i64 {
+    slot = find_slot(keys, key)
+    if slot < 0 {
+        return 0
+    }
+    expires[slot] = now + ttl
+    1
+}
+
++run_cache(n: i64) : i64 {
+    keys, values = [0; CAPACITY], [0; CAPACITY]
+    expires, stamps = [0; CAPACITY], [0; CAPACITY]
+    checksum = 0
+    for now in 1..n {
+        key = (now % 47) + 1
+        selector = now % 5
+        if selector <= 2 {
+            cache_set(@keys, @values, @expires, @stamps, key, now * 3, now)
+        }
+        if selector == 3 {
+            value = cache_get(@keys, values, expires, @stamps, key, now)
+            checksum += value + 1
+        }
+        if selector == 4 {
+            checksum += cache_del(@keys, key)
+        }
+    }
+    checksum + (values.sum()) + (stamps.sum())
+}
+
++main() {
+    lg = Logger.console("resp_lru")
+    checksum = run_cache(WORKLOAD)
+    @lg.info("CHECKSUM={checksum}")
+}
+
+test "RESP subset parses commands" {
+    set = parse_command("SET 7 99")
+    assert_eq(set.op, OP_SET)
+    assert_eq(set.key, 7)
+    assert_eq(set.value, 99)
+    expire = parse_command("EXPIRE 7 30")
+    assert_eq(expire.ttl, 30)
+}
+
+test "set and get update LRU stamp" {
+    keys, values = [0; CAPACITY], [0; CAPACITY]
+    expires, stamps = [0; CAPACITY], [0; CAPACITY]
+    cache_set(@keys, @values, @expires, @stamps, 4, 44, 1)
+    assert_eq(cache_get(@keys, values, expires, @stamps, 4, 9), 44)
+    assert_eq(stamps[find_slot(keys, 4)], 9)
+}
+
+test "TTL expires entry" {
+    keys, values = [0; CAPACITY], [0; CAPACITY]
+    expires, stamps = [0; CAPACITY], [0; CAPACITY]
+    cache_set(@keys, @values, @expires, @stamps, 2, 20, 1)
+    assert_eq(cache_expire(keys, @expires, 2, 5, 1), 1)
+    assert_eq(cache_get(@keys, values, expires, @stamps, 2, 7), 0 - 1)
+}
+
+test "delete reports hits and misses" {
+    keys = [0; CAPACITY]
+    keys[0] = 8
+    assert_eq(cache_del(@keys, 8), 1)
+    assert_eq(cache_del(@keys, 8), 0)
+}
+
+test "cache workload is deterministic" {
+    assert_eq(run_cache(100), run_cache(100))
+}

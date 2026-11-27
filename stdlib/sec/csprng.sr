@@ -1,0 +1,61 @@
+//! std.sec.csprng -- OS-backed cryptographically secure random bytes
+//!
+//! Import: use std.sec.csprng
+//!
+//! Failure to obtain OS entropy is a hard error (never a silent fallback).
+//! For simulation and games use `std.math.rand` -- it is not for tokens,
+//! nonces, session ids, or cryptographic keys.
+
+/// Fill `n` cryptographically secure random bytes (OS CSPRNG).
++fill(n: i64) : _! {
+    ensure n >= 0 else {
+        fail "csprng: negative length"
+        return
+    }
+    raw = host.sys_rand_bytes(n)
+    ensure !is_err_val(raw) else {
+        fail "csprng: OS entropy unavailable"
+        return
+    }
+    raw
+}
+
+/// Hex encoding of `n` secure random bytes.
++fill_hex(n: i64) : str! {
+    b = fill(n) or err {
+        fail err
+        return
+    }
+    host.sys_hex_encode(b)
+}
+
++is_err_val(v: _) : bool {
+    s = "{v}"
+    host.sys_str_find(s, "csprng:") >= 0 || host.sys_str_find(s, "entropy") >= 0
+}
+
+test "csprng fill returns requested length" {
+    b = fill(16) or []
+    h = host.sys_hex_encode(b)
+    assert_eq(host.sys_str_len(h), 32)
+}
+
+test "csprng fill_hex length" {
+    h = fill_hex(8) or ""
+    assert_eq(host.sys_str_len(h), 16)
+}
+
+test "csprng two draws differ with overwhelming probability" {
+    a = fill_hex(16) or "a"
+    b = fill_hex(16) or "b"
+    #assert(!(a == b))
+}
+
+test "csprng rejects negative length" {
+    bad = false
+    _ = fill(0 - 1) or err {
+        bad = true
+        ""
+    }
+    #assert(bad)
+}

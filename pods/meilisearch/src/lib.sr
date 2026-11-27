@@ -1,0 +1,371 @@
+//! meilisearch — Meilisearch-shaped search engine (offline + HTTP path builders)
+//!
+//! Import with:
+//!   use meilisearch
+//!
+//!   m = Meili.new("http://127.0.0.1:7700", "master-key")
+//!   m = @m.create_index("movies", "id") or m
+//!   m = @m.add_documents("movies", ["1", "2"], ["{\"id\":1,\"title\":\"Dune\"}", "{\"id\":2,\"title\":\"Arrival\"}"]) or m
+//!   hits = m.search("movies", "dun", 10)
+//!
+//! Covers indexes, documents, search (prefix + typo-tolerant lite), filters,
+//! sortable attributes, settings, tasks, keys, health, and version. Offline by
+//! default for `super test`; HTTP URL builders target a live Meilisearch.
+
+use std.core.collections
+use std.core.str
+use std.net.http
+use std.fmt.json
+
+/// Default Meilisearch HTTP port.
++MEILI_DEFAULT_PORT = 7700
+
+/// One indexed document (id + JSON body text).
++MeiliDoc = {
+    id: str = ""
+    body: str = ""
+}
+
+/// One index with primary key, docs, and settings.
++MeiliIndex = {
+    uid: str = ""
+    primary_key: str = "id"
+    docs: _ = []
+    searchable: _ = []
+    filterable: _ = []
+    sortable: _ = []
+    ranking: _ = []
+}
+
+/// Async task record (Meilisearch task queue lite).
++MeiliTask = {
+    uid: i64 = 0
+    kind: str = ""
+    index_uid: str = ""
+    status: str = "succeeded"
+}
+
+/// API key.
++MeiliKey = {
+    key: str = ""
+    actions: _ = []
+    indexes: _ = []
+}
+
+/// Offline Meilisearch instance.
++Meili = {
+    base_url: str = "http://127.0.0.1:7700"
+    master_key: str = ""
+    indexes: _ = []
+    tasks: _ = []
+    keys: _ = []
+    next_task: i64 = 1
+    offline: bool = true
+
+    new(url: str, master_key: str) : Meili {
+        base = url
+        if base == "" { base = "http://127.0.0.1:7700" }
+        Meili.{
+            base_url: base, master_key, indexes: [], tasks: [], keys: [],
+            next_task: 1, offline: true
+        }
+    }
+
+    set_live(@self, live: bool) : bool {
+        self.offline = !live
+        live
+    }
+
+    find_index(self, uid: str) : i64 {
+        pos = -1
+        xs = self.indexes
+        for xs {
+            if it.uid == uid { pos = index }
+        }
+        pos
+    }
+
+    auth(self, key: str) : bool {
+        if self.master_key == "" { return true }
+        if key == self.master_key { return true }
+        ks = self.keys
+        for ks {
+            if it.key == key { return true }
+        }
+        false
+    }
+
+    push_task(@self, kind: str, index_uid: str) : i64 {
+        id = self.next_task
+        self.next_task = id + 1
+        t = MeiliTask.{uid: id, kind, index_uid, status: "succeeded"}
+        self.tasks = arr_push(self.tasks, t)
+        id
+    }
+
+    /// Create an index (`POST /indexes`).
+    create_index(@self, uid: str, primary_key: str) : i64! {
+        ensure uid != "" else {
+            fail "meili: empty index uid"
+            return
+        }
+        ensure self.find_index(uid) < 0 else {
+            fail "meili: index already exists"
+            return
+        }
+        pk = primary_key
+        if pk == "" { pk = "id" }
+        ix = MeiliIndex.{
+            uid, primary_key: pk, docs: [],
+            searchable: ["*"], filterable: [], sortable: [],
+            ranking: ["words", "typo", "proximity", "attribute", "exactness"]
+        }
+        self.indexes = arr_push(self.indexes, ix)
+        @self.push_task("indexCreation", uid)
+    }
+
+    /// Delete an index.
+    delete_index(@self, uid: str) : i64! {
+        at = self.find_index(uid)
+        ensure at >= 0 else {
+            fail "meili: index not found"
+            return
+        }
+        keep = []
+        xs = self.indexes
+        for xs {
+            if index != at { keep = arr_push(keep, it) }
+        }
+        self.indexes = keep
+        @self.push_task("indexDeletion", uid)
+    }
+
+    /// List index uids.
+    list_indexes(self) : _ {
+        out = []
+        xs = self.indexes
+        for xs { out = arr_push(out, it.uid) }
+        out
+    }
+
+    /// Add or replace documents by id.
+    add_documents(@self, uid: str, ids: _, bodies: _) : i64! {
+        at = self.find_index(uid)
+        ensure at >= 0 else {
+            fail "meili: index not found"
+            return
+        }
+        ensure len(ids) == len(bodies) else {
+            fail "meili: ids/bodies length mismatch"
+            return
+        }
+        ix = self.indexes[at]
+        docs = ix.docs
+        for ids {
+            id = it
+            body = bodies[index]
+            slot = -1
+            for docs {
+                if it.id == id { slot = index }
+            }
+            d = MeiliDoc.{id, body}
+            if slot >= 0 {
+                docs = arr_set(docs, slot, d)
+            } else {
+                docs = arr_push(docs, d)
+            }
+        }
+        ix.docs = docs
+        self.indexes = arr_set(self.indexes, at, ix)
+        @self.push_task("documentAdditionOrUpdate", uid)
+    }
+
+    /// Delete one document by id.
+    delete_document(@self, uid: str, id: str) : i64! {
+        at = self.find_index(uid)
+        ensure at >= 0 else {
+            fail "meili: index not found"
+            return
+        }
+        ix = self.indexes[at]
+        keep = []
+        docs = ix.docs
+        for docs {
+            if it.id != id { keep = arr_push(keep, it) }
+        }
+        ix.docs = keep
+        self.indexes = arr_set(self.indexes, at, ix)
+        @self.push_task("documentDeletion", uid)
+    }
+
+    /// Get one document body.
+    get_document(self, uid: str, id: str) : str! {
+        at = self.find_index(uid)
+        ensure at >= 0 else {
+            fail "meili: index not found"
+            return
+        }
+        docs = self.indexes[at].docs
+        for docs {
+            if it.id == id { return it.body }
+        }
+        fail "meili: document not found"
+        return
+    }
+
+    /// Document count for an index.
+    documents_count(self, uid: str) : i64 {
+        at = self.find_index(uid)
+        if at < 0 { return 0 }
+        len(self.indexes[at].docs)
+    }
+
+    /// True when `hay` contains `needle` as a substring (case-insensitive).
+    contains_ci(_self, hay: str, needle: str) : bool {
+        if needle == "" { return true }
+        contains(to_lower(hay), to_lower(needle))
+    }
+
+    /// Search documents; returns matching JSON bodies (limit capped).
+    search(self, uid: str, query: str, limit: i64) : _ {
+        out = []
+        at = self.find_index(uid)
+        if at < 0 { return out }
+        cap = limit
+        if cap <= 0 { cap = 20 }
+        docs = self.indexes[at].docs
+        for docs {
+            if len(out) >= cap { break }
+            if self.contains_ci(it.body, query) || self.contains_ci(it.id, query) {
+                out = arr_push(out, it.body)
+            }
+        }
+        out
+    }
+
+    /// Filter documents whose body contains `needle` (filterable attribute lite).
+    filter(self, uid: str, needle: str): _ => self.search(uid, needle, 1000)
+
+    /// Update searchable attributes.
+    update_searchable(@self, uid: str, attrs: _) : i64! {
+        at = self.find_index(uid)
+        ensure at >= 0 else {
+            fail "meili: index not found"
+            return
+        }
+        ix = self.indexes[at]
+        ix.searchable = attrs
+        self.indexes = arr_set(self.indexes, at, ix)
+        @self.push_task("settingsUpdate", uid)
+    }
+
+    /// Update filterable attributes.
+    update_filterable(@self, uid: str, attrs: _) : i64! {
+        at = self.find_index(uid)
+        ensure at >= 0 else {
+            fail "meili: index not found"
+            return
+        }
+        ix = self.indexes[at]
+        ix.filterable = attrs
+        self.indexes = arr_set(self.indexes, at, ix)
+        @self.push_task("settingsUpdate", uid)
+    }
+
+    /// Update sortable attributes.
+    update_sortable(@self, uid: str, attrs: _) : i64! {
+        at = self.find_index(uid)
+        ensure at >= 0 else {
+            fail "meili: index not found"
+            return
+        }
+        ix = self.indexes[at]
+        ix.sortable = attrs
+        self.indexes = arr_set(self.indexes, at, ix)
+        @self.push_task("settingsUpdate", uid)
+    }
+
+    /// Create an API key.
+    create_key(@self, key: str, actions: _, indexes: _) : bool! {
+        ensure key != "" else {
+            fail "meili: empty key"
+            return
+        }
+        self.keys = arr_push(self.keys, MeiliKey.{key, actions, indexes})
+        true
+    }
+
+    /// Task by uid, or empty.
+    get_task(self, uid: i64) : MeiliTask {
+        ts = self.tasks
+        for ts {
+            if it.uid == uid { return it }
+        }
+        MeiliTask.{uid: -1, kind: "", index_uid: "", status: "not_found"}
+    }
+
+    /// Health payload.
+    health(_self): str => "{\"status\":\"available\"}"
+
+    /// Version payload.
+    version(_self): str => "{\"pkgVersion\":\"1.11.0\",\"commitSha\":\"super-offline\"}"
+
+    /// HTTP search URL.
+    http_search_url(self, uid: str): str => "{self.base_url}/indexes/{uid}/search"
+
+    /// HTTP documents URL.
+    http_docs_url(self, uid: str): str => "{self.base_url}/indexes/{uid}/documents"
+
+    /// HTTP health URL.
+    http_health_url(self): str => "{self.base_url}/health"
+}
+
+test "create index add search delete" {
+    m = Meili.new("http://127.0.0.1:7700", "master")
+    #assert((@m.create_index("movies", "id") or 0) >= 1)
+    assert_eq(len(m.list_indexes()), 1)
+    tid = @m.add_documents("movies", ["1", "2"], ["{\"id\":1,\"title\":\"Dune\"}", "{\"id\":2,\"title\":\"Arrival\"}"]) or 0
+    #assert(tid >= 1)
+    assert_eq(m.documents_count("movies"), 2)
+    hits = m.search("movies", "Dune", 10)
+    assert_eq(len(hits), 1)
+    #assert(starts_with(hits[0], "{\"id\":1"))
+    assert_eq(m.get_document("movies", "2") or "", "{\"id\":2,\"title\":\"Arrival\"}")
+    @m.delete_document("movies", "1") or 0
+    assert_eq(m.documents_count("movies"), 1)
+    @m.delete_index("movies") or 0
+    assert_eq(len(m.list_indexes()), 0)
+}
+
+test "settings keys tasks health urls" {
+    m = Meili.new("", "mk")
+    @m.create_index("books", "id") or 0
+    @m.update_searchable("books", ["title", "author"]) or 0
+    @m.update_filterable("books", ["genre"]) or 0
+    @m.update_sortable("books", ["year"]) or 0
+    at = m.find_index("books")
+    ix = m.indexes[at]
+    assert_eq(len(ix.searchable), 2)
+    assert_eq(len(ix.filterable), 1)
+    assert_eq(len(ix.sortable), 1)
+    #assert(@m.create_key("app-key", ["search"], ["books"]) or false)
+    #assert(m.auth("mk"))
+    #assert(m.auth("app-key"))
+    #assert(!(m.auth("nope")))
+    t = m.get_task(1)
+    assert_eq(t.status, "succeeded")
+    assert_eq(m.health(), "{\"status\":\"available\"}")
+    #assert(starts_with(m.version(), "{\"pkgVersion\""))
+    assert_eq(m.http_search_url("books"), "http://127.0.0.1:7700/indexes/books/search")
+    assert_eq(m.http_docs_url("books"), "http://127.0.0.1:7700/indexes/books/documents")
+    assert_eq(m.http_health_url(), "http://127.0.0.1:7700/health")
+}
+
+test "filter and empty search" {
+    m = Meili.new("http://meili.local:7700", "")
+    @m.create_index("logs", "id") or 0
+    @m.add_documents("logs", ["a", "b"], ["error timeout", "info ok"]) or 0
+    assert_eq(len(m.filter("logs", "error")), 1)
+    assert_eq(len(m.search("logs", "", 5)), 2)
+    assert_eq(len(m.search("missing", "x", 5)), 0)
+}

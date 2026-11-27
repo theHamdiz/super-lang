@@ -1,0 +1,30 @@
+//! Reference coding-agent harness (C7): mock OpenAI loop + MCP tools + tokenizer trim.
+
+use std.ai.mcp_client
+use std.ai.tokenizer
+use std.sec.secret
+
++run_agent_once() : str {
+    tok = Tokenizer.mini()
+    c = McpClient.mock()
+    @c.add_mock_tool("echo", "echo")
+    @c.set_mock_result("echo", "{\"ok\":true}")
+    key = Secret.of("sk-test-not-logged")
+    log = "starting with {key}"
+    ensure host.sys_str_find(log, "sk-test") < 0 else { return "LEAK" }
+    ctx = "user: hello"
+    _ = tok.approx_count(ctx)
+    tool_out = @c.call_tool("echo", "{\"x\":1}") or "err"
+    @c.close()
+    "ok:" + tool_out
+}
+
++main() {
+    print(run_agent_once())
+}
+
+test "agent harness mock loop" {
+    out = run_agent_once()
+    #assert(host.sys_str_find(out, "ok:") == 0)
+    #assert(host.sys_str_find(out, "LEAK") < 0)
+}

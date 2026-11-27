@@ -1,0 +1,770 @@
+//! std.math.algebra — numeric traits and compensated (error-free) f64 arithmetic
+//!
+//! Import with:
+//!   use std.math.algebra
+//!
+//!   s = neumaier_sum([1.0, 1.0e100, 1.0, -1.0e100])   // 2.0 (a naive sum gives 0.0)
+//!   e = two_sum(0.1, 0.2)                              // e.s + e.e == 0.1 + 0.2 exactly
+//!   z = fma(0.1, 10.0, -1.0)                           // 5.55e-17, no intermediate rounding
+//!   l = logsumexp([1000.0, 1000.0])                    // 1000 + ln 2, no overflow
+//!
+//! Traits (signatures only; the type writes the bodies on `+Name: Trait = { … }`):
+//!   AlgField, Ring, NormedSpace, InnerProductSpace, Matrix, Factorization,
+//!   Distribution, Differentiable.
+//! Reference implementations live here so the laws can be tested: `ModP` (the prime
+//! field Z/p, an `AlgField` and `Ring`), `Real` (f64 as an `AlgField`), `VecN` (a `NormedSpace`
+//! and `InnerProductSpace`), `Normal` / `Uniform` / `Exponential` (`Distribution`).
+//! `std.math.linalg` implements `Matrix` and `Factorization`; `std.math.ad` implements
+//! `Differentiable`.
+//!
+//! The error-free transformations are exact under IEEE-754 round-to-nearest. They rely
+//! on the compiler not reassociating float math, so a build with `-ffast-math` (the
+//! `release` and `fast` C23 profiles) may fold `kahan_sum` back into a naive sum; use the
+//! VM or a `--no-fast-math` build when exact compensation matters. Public helpers are
+//! prefixed `alg_` unless they carry the textbook name (modules merge flat).
+
+use std.math.special
+
+/// `ALG_EPS` is the f64 machine epsilon, 2^-52.
++ALG_EPS = 0.0000000000000002220446049250313
+/// `ALG_SPLIT` is the Veltkamp splitter 2^27 + 1.
++ALG_SPLIT = 134217729.0
+
+// --- traits ---------------------------------------------------------------------------
+
+/// A commutative ring where every non-zero element has an inverse.
++AlgField = trait {
+    add(self, other)
+    sub(self, other)
+    mul(self, other)
+    div(self, other)
+    neg(self)
+    zero(self)
+    one(self)
+    inv(self)
+    is_zero(self) : bool
+}
+
+/// A ring with identity: closed under `+`, `-`, `*`, with `pow` by repeated squaring.
++Ring = trait {
+    add(self, other)
+    sub(self, other)
+    mul(self, other)
+    neg(self)
+    zero(self)
+    one(self)
+    pow(self, e: i64)
+}
+
+/// A vector space with a norm: `norm(a - b)` is a metric.
++NormedSpace = trait {
+    add(self, other)
+    sub(self, other)
+    scale(self, k: f64)
+    norm(self) : f64
+}
+
+/// A normed space whose norm comes from an inner product: `norm(x)^2 == dot(x, x)`.
++InnerProductSpace = trait {
+    add(self, other)
+    scale(self, k: f64)
+    dot(self, other) : f64
+    norm(self) : f64
+}
+
+/// Read-only access to a rows x cols real matrix, whatever its storage.
++Matrix = trait {
+    nrows(self) : i64
+    ncols(self) : i64
+    at(self, r: i64, c: i64) : f64
+    matvec(self, x: _)
+}
+
+/// A solved decomposition (LU, Cholesky, QR, ...): solve linear systems and report the determinant.
++Factorization = trait {
+    kind(self) : str
+    solve(self, b: _)
+    det(self) : f64
+}
+
+/// A univariate probability distribution.
++Distribution = trait {
+    pdf(self, x: f64) : f64
+    cdf(self, x: f64) : f64
+    quantile(self, p: f64) : f64
+    dist_mean(self) : f64
+    dist_var(self) : f64
+}
+
+/// A scalar function of `dim` real variables with a gradient.
++Differentiable = trait {
+    dim(self) : i64
+    value(self, x: _) : f64
+    grad(self, x: _)
+}
+
+// --- compensated arithmetic -----------------------------------------------------------------
+
+/// Result of an error-free transformation: `s` is the rounded result, `e` the exact rounding error.
++EftPair = {
+    /// Rounded result.
+    s: f64 = 0.0
+    /// Exact error, so `s + e` equals the true result.
+    e: f64 = 0.0
+}
+
+/// Knuth two-sum: `s = fl(a + b)` and `e` with `s + e == a + b` exactly. Any magnitudes.
++two_sum(a: f64, b: f64) : EftPair {
+    s = a + b
+    bb = s - a
+    e = (a - (s - bb)) + (b - bb)
+    EftPair.{s, e}
+}
+
+/// Dekker fast-two-sum; requires `|a| >= |b|` (or `a == 0`).
++fast_two_sum(a: f64, b: f64) : EftPair {
+    s = a + b
+    e = b - (s - a)
+    EftPair.{s, e}
+}
+
+/// Veltkamp split of `a` into a high and low half (`s + e == a`, 26 bits each).
++alg_split(a: f64) : EftPair {
+    c = ALG_SPLIT * a
+    hi = c - (c - a)
+    EftPair.{s: hi, e: a - hi}
+}
+
+/// Dekker two-product: `s = fl(a * b)` and `e` with `s + e == a * b` exactly (barring overflow/underflow).
++two_prod(a: f64, b: f64) : EftPair {
+    p = a * b
+    x = alg_split(a)
+    y = alg_split(b)
+    e = ((x.s * y.s - p) + x.s * y.e + x.e * y.s) + x.e * y.e
+    EftPair.{s: p, e}
+}
+
+/// Fused multiply-add `a * b + c` with a single final rounding in practice (error-free product, then compensated add).
++fma(a: f64, b: f64, c: f64) : f64 {
+    p = two_prod(a, b)
+    t = two_sum(p.s, c)
+    t.s + (t.e + p.e)
+}
+
+/// Number of elements in `xs`.
++alg_len(xs: _) : i64 => host.sys_arr_len(xs)
+
+/// Plain left-to-right sum, the baseline the compensated sums are measured against.
++naive_sum(xs: _) : f64 {
+    acc = 0.0
+    i = 0
+    n = alg_len(xs)
+    while i < n {
+        acc += xs[i]
+        i += 1
+    }
+    acc
+}
+
+/// Kahan compensated summation: error bounded by about 2 eps regardless of length (assuming no huge cancellation).
++kahan_sum(xs: _) : f64 {
+    acc = 0.0
+    comp = 0.0
+    i = 0
+    n = alg_len(xs)
+    while i < n {
+        y = xs[i] - comp
+        t = acc + y
+        comp = (t - acc) - y
+        acc = t
+        i += 1
+    }
+    acc
+}
+
+/// Neumaier's improved Kahan-Babuska sum: also correct when a term exceeds the running sum.
++neumaier_sum(xs: _) : f64 {
+    acc = 0.0
+    comp = 0.0
+    i = 0
+    n = alg_len(xs)
+    while i < n {
+        x = xs[i]
+        t = acc + x
+        if alg_abs(acc) >= alg_abs(x) {
+            comp += (acc - t) + x
+        } else {
+            comp += (x - t) + acc
+        }
+        acc = t
+        i += 1
+    }
+    acc + comp
+}
+
+/// Pairwise (cascade) sum: O(log n) error growth with no extra state, for slices [lo, hi).
++alg_pairwise_range(xs: _, lo: i64, hi: i64) : f64 {
+    n = hi - lo
+    if n <= 8 {
+        acc = 0.0
+        i = lo
+        while i < hi {
+            acc += xs[i]
+            i += 1
+        }
+        return acc
+    }
+    mid = lo + n / 2
+    alg_pairwise_range(xs, lo, mid) + alg_pairwise_range(xs, mid, hi)
+}
+
+/// Pairwise sum of all of `xs`.
++pairwise_sum(xs: _) : f64 => alg_pairwise_range(xs, 0, alg_len(xs))
+
+/// Compensated dot product (Ogita-Rump-Oishi Dot2): as accurate as computing in twice the precision.
++dot2(xs: _, ys: _) : f64 {
+    n = alg_len(xs)
+    ensure n == alg_len(ys) else { return 0.0 }
+    ensure n > 0 else { return 0.0 }
+    p0 = two_prod(xs[0], ys[0])
+    s = p0.s
+    c = p0.e
+    i = 1
+    while i < n {
+        p = two_prod(xs[i], ys[i])
+        t = two_sum(s, p.s)
+        s = t.s
+        c += t.e + p.e
+        i += 1
+    }
+    s + c
+}
+
+/// Exact float equality (`==` on floats is tolerance-based on the VM).
++alg_exact(a: f64, b: f64) : bool => !(a < b) && !(a > b)
+
+/// Absolute value of `x`.
++alg_abs(x: f64) : f64 {
+    if x < 0.0 { return -x }
+    x
+}
+
+/// Largest element of `xs` (negative infinity when empty).
++alg_max(xs: _) : f64 {
+    m = -SP_INF
+    i = 0
+    n = alg_len(xs)
+    while i < n {
+        if xs[i] > m { m = xs[i] }
+        i += 1
+    }
+    m
+}
+
+/// `log(sum(exp(xs)))` computed without overflow or underflow.
++logsumexp(xs: _) : f64 {
+    n = alg_len(xs)
+    ensure n > 0 else { return -SP_INF }
+    m = alg_max(xs)
+    if m < -1.0e308 { return m }
+    if m > 1.0e308 { return m }
+    terms = []
+    i = 0
+    while i < n {
+        terms = host.sys_arr_push(terms, host.sys_exp(xs[i] - m))
+        i += 1
+    }
+    m + host.sys_ln(neumaier_sum(terms))
+}
+
+/// `log(exp(a) + exp(b))` without overflow.
++logaddexp(a: f64, b: f64) : f64 {
+    if a < -1.0e308 { return b }
+    if b < -1.0e308 { return a }
+    m = a
+    if b > m { m = b }
+    m + host.sys_ln(host.sys_exp(a - m) + host.sys_exp(b - m))
+}
+
+/// Numerically stable softmax of `xs` (shift by the maximum, then normalise).
++softmax(xs: _) {
+    n = alg_len(xs)
+    out = []
+    ensure n > 0 else { return out }
+    m = alg_max(xs)
+    es = []
+    i = 0
+    while i < n {
+        es = host.sys_arr_push(es, host.sys_exp(xs[i] - m))
+        i += 1
+    }
+    total = neumaier_sum(es)
+    i = 0
+    while i < n {
+        out = host.sys_arr_push(out, es[i] / total)
+        i += 1
+    }
+    out
+}
+
+// --- ModP: Z/p as an AlgField and Ring --------------------------------------------------------------
+
+/// An element of the prime field Z/pZ (`p` prime below 2^31 so products fit in an i64).
++ModP: AlgField, Ring, Add, Sub, Mul, Div, Neg, Eq, Display = {
+    /// Canonical residue in `0..p`.
+    v: i64 = 0
+    /// The modulus.
+    p: i64 = 2
+
+    /// `v mod p` as a canonical residue.
+    new(v: i64, p: i64) : ModP {
+        r = v % p
+        if r < 0 { r += p }
+        ModP.{v: r, p}
+    }
+
+    add(self, other: ModP) : ModP => ModP.new(self.v + other.v, self.p)
+    sub(self, other: ModP) : ModP => ModP.new(self.v - other.v, self.p)
+    mul(self, other: ModP) : ModP => ModP.new(self.v * other.v, self.p)
+    neg(self) : ModP => ModP.new(-self.v, self.p)
+    zero(self) : ModP => ModP.{v: 0, p: self.p}
+    one(self) : ModP => ModP.{v: 1, p: self.p}
+    is_zero(self) : bool => self.v == 0
+
+    /// `self` raised to the integer power `e >= 0` by repeated squaring.
+    pow(self, e: i64) : ModP {
+        acc = ModP.{v: 1, p: self.p}
+        base = self
+        k = e
+        while k > 0 {
+            if k % 2 == 1 { acc = acc.mul(base) }
+            base = base.mul(base)
+            k = k / 2
+        }
+        acc
+    }
+
+    /// Multiplicative inverse by Fermat's little theorem; the inverse of 0 is 0.
+    inv(self) : ModP => self.pow(self.p - 2)
+
+    div(self, other: ModP) : ModP => self.mul(other.inv())
+    eq(self, other: ModP) : bool => self.v == other.v && self.p == other.p
+    display(self) : str => "{self.v} (mod {self.p})"
+}
+
+/// Shorthand for `ModP.new(v, p)`.
++modp(v: i64, p: i64) : ModP => ModP.new(v, p)
+
+// --- Real: f64 as an AlgField -----------------------------------------------------------------------
+
+/// The real numbers (f64) as an `AlgField` and `Ring`, for laws and generic-style code.
++Real: AlgField, Ring, Add, Sub, Mul, Div, Neg, Eq, Display = {
+    /// The value.
+    x: f64 = 0.0
+
+    add(self, other: Real) : Real => Real.{x: self.x + other.x}
+    sub(self, other: Real) : Real => Real.{x: self.x - other.x}
+    mul(self, other: Real) : Real => Real.{x: self.x * other.x}
+    div(self, other: Real) : Real => Real.{x: self.x / other.x}
+    neg(self) : Real => Real.{x: -self.x}
+    zero(_self) : Real => Real.{x: 0.0}
+    one(_self) : Real => Real.{x: 1.0}
+    inv(self) : Real => Real.{x: 1.0 / self.x}
+    is_zero(self) : bool => self.x == 0.0
+
+    /// `self` raised to the integer power `e >= 0`.
+    pow(self, e: i64) : Real {
+        acc = 1.0
+        base = self.x
+        k = e
+        while k > 0 {
+            if k % 2 == 1 { acc = acc * base }
+            base = base * base
+            k = k / 2
+        }
+        Real.{x: acc}
+    }
+
+    eq(self, other: Real) : bool => alg_abs(self.x - other.x) <= 0.000000001 * (1.0 + alg_abs(other.x))
+    display(self) : str => "{self.x}"
+}
+
+/// Shorthand for `Real.{x}`.
++real(x: f64) : Real => Real.{x}
+
+// --- VecN: NormedSpace and InnerProductSpace -------------------------------------------------------
+
+/// A dense vector in R^n with the Euclidean norm.
++VecN: NormedSpace, InnerProductSpace, Add, Sub, Eq = {
+    /// Components.
+    data: _ = []
+
+    add(self, other: VecN) : VecN {
+        out = []
+        i = 0
+        while i < alg_len(self.data) {
+            out = host.sys_arr_push(out, self.data[i] + other.data[i])
+            i += 1
+        }
+        VecN.{data: out}
+    }
+
+    sub(self, other: VecN) : VecN {
+        out = []
+        i = 0
+        while i < alg_len(self.data) {
+            out = host.sys_arr_push(out, self.data[i] - other.data[i])
+            i += 1
+        }
+        VecN.{data: out}
+    }
+
+    scale(self, k: f64) : VecN {
+        out = []
+        i = 0
+        while i < alg_len(self.data) {
+            out = host.sys_arr_push(out, self.data[i] * k)
+            i += 1
+        }
+        VecN.{data: out}
+    }
+
+    /// Compensated Euclidean inner product.
+    dot(self, other: VecN) : f64 => dot2(self.data, other.data)
+
+    /// Euclidean norm, scaled to avoid overflow.
+    norm(self) : f64 {
+        m = 0.0
+        i = 0
+        while i < alg_len(self.data) {
+            a = alg_abs(self.data[i])
+            if a > m { m = a }
+            i += 1
+        }
+        ensure m > 0.0 else { return 0.0 }
+        acc = 0.0
+        i = 0
+        while i < alg_len(self.data) {
+            r = self.data[i] / m
+            acc += r * r
+            i += 1
+        }
+        m * host.sys_sqrt(acc)
+    }
+
+    eq(self, other: VecN) : bool {
+        ensure alg_len(self.data) == alg_len(other.data) else { return false }
+        ok = true
+        i = 0
+        while i < alg_len(self.data) {
+            if alg_abs(self.data[i] - other.data[i]) > 0.000000001 * (1.0 + alg_abs(other.data[i])) { ok = false }
+            i += 1
+        }
+        ok
+    }
+}
+
+/// Shorthand for `VecN.{data}`.
++vecn(data: _) : VecN => VecN.{data}
+
+// --- distributions ------------------------------------------------------------------------------------
+
+/// Normal (Gaussian) distribution with mean `mu` and standard deviation `sigma > 0`.
++Normal: Distribution = {
+    /// Mean.
+    mu: f64 = 0.0
+    /// Standard deviation.
+    sigma: f64 = 1.0
+
+    pdf(self, x: f64) : f64 {
+        z = (x - self.mu) / self.sigma
+        host.sys_exp(-0.5 * z * z) / (self.sigma * 2.5066282746310002)
+    }
+
+    cdf(self, x: f64) : f64 => 0.5 * erfc(-(x - self.mu) / (self.sigma * 1.4142135623730951))
+
+    quantile(self, p: f64) : f64 => self.mu + self.sigma * 1.4142135623730951 * erfinv(2.0 * p - 1.0)
+
+    dist_mean(self) : f64 => self.mu
+    dist_var(self) : f64 => self.sigma * self.sigma
+}
+
+/// Continuous uniform distribution on `[lo, hi]`.
++Uniform: Distribution = {
+    /// Lower bound.
+    lo: f64 = 0.0
+    /// Upper bound.
+    hi: f64 = 1.0
+
+    pdf(self, x: f64) : f64 {
+        if x < self.lo { return 0.0 }
+        if x > self.hi { return 0.0 }
+        1.0 / (self.hi - self.lo)
+    }
+
+    cdf(self, x: f64) : f64 {
+        if x <= self.lo { return 0.0 }
+        if x >= self.hi { return 1.0 }
+        (x - self.lo) / (self.hi - self.lo)
+    }
+
+    quantile(self, p: f64) : f64 => self.lo + p * (self.hi - self.lo)
+    dist_mean(self) : f64 => (self.lo + self.hi) / 2.0
+    dist_var(self) : f64 => (self.hi - self.lo) * (self.hi - self.lo) / 12.0
+}
+
+/// Exponential distribution with rate `rate > 0`.
++Exponential: Distribution = {
+    /// Rate (1 / mean).
+    rate: f64 = 1.0
+
+    pdf(self, x: f64) : f64 {
+        if x < 0.0 { return 0.0 }
+        self.rate * host.sys_exp(-self.rate * x)
+    }
+
+    cdf(self, x: f64) : f64 {
+        if x <= 0.0 { return 0.0 }
+        1.0 - host.sys_exp(-self.rate * x)
+    }
+
+    quantile(self, p: f64) : f64 => -host.sys_ln(1.0 - p) / self.rate
+    dist_mean(self) : f64 => 1.0 / self.rate
+    dist_var(self) : f64 => 1.0 / (self.rate * self.rate)
+}
+
+/// Probability mass of `[a, b]` under a normal distribution.
++alg_normal_interval(n: Normal, a: f64, b: f64) : f64 => n.cdf(b) - n.cdf(a)
+
+// --- tests -------------------------------------------------------------------------------------------
+
+/// Test error-free sum and product.
+test "two_sum and two_prod are exact" {
+    t = two_sum(0.1, 0.2)
+    #assert(alg_exact(t.s, 0.1 + 0.2))
+    // 0.1 + 0.2 = 0.30000000000000004 and the rounding error is -2^-55 * 0.8
+    #assert(alg_abs(t.e + 2.7755575615628914e-17) < 1.0e-32)
+    big = two_sum(1.0e16, 1.0)
+    #assert(alg_exact(big.s, 1.0e16))
+    #assert(alg_exact(big.e, 1.0))
+    f = fast_two_sum(1.0e16, 1.0)
+    #assert(alg_exact(f.s, 1.0e16))
+    #assert(alg_exact(f.e, 1.0))
+    // swapped argument order: two_sum needs no magnitude ordering
+    sw = two_sum(1.0, 1.0e16)
+    #assert(alg_exact(sw.s, 1.0e16))
+    #assert(alg_exact(sw.e, 1.0))
+    p = two_prod(0.1, 0.1)
+    #assert(alg_exact(p.s, 0.1 * 0.1))
+    // exact remainder of fl(0.1)^2, computed with rational arithmetic
+    #assert(alg_abs(p.e + 8.326672684688674e-19) < 1.0e-33)
+    q = two_prod(3.0, 5.0)
+    #assert(alg_exact(q.s, 15.0))
+    #assert(alg_exact(q.e, 0.0))
+    sp = alg_split(1.0 / 3.0)
+    #assert(alg_exact(sp.s + sp.e, 1.0 / 3.0))
+    #assert(alg_abs(sp.e) < 1.0e-8)
+}
+
+/// Test fma against exact residuals.
+test "fma keeps the low bits" {
+    #assert(alg_abs(fma(2.0, 3.0, 4.0) - 10.0) < 1.0e-15)
+    z = fma(0.1, 10.0, -1.0)
+    #assert(alg_abs(z - 5.551115123125783e-17) < 1.0e-30)
+    #assert(alg_abs(0.1 * 10.0 - 1.0) < 1.0e-30)
+    w = fma(1.0 + 2.220446049250313e-16, 1.0 - 2.220446049250313e-16, -1.0)
+    #assert(alg_abs(w + 4.930380657631324e-32) < 1.0e-40)
+    #assert(alg_abs(fma(0.0, 5.0, 7.0) - 7.0) < 1.0e-15)
+    #assert(alg_abs(fma(-2.0, 4.0, 8.0)) < 1.0e-15)
+}
+
+/// Test the four summation algorithms.
+test "compensated sums" {
+    xs = [1.0, 1.0e100, 1.0, -1.0e100]
+    #assert(alg_abs(naive_sum(xs)) < 1.0e-12)
+    #assert(alg_abs(neumaier_sum(xs) - 2.0) < 1.0e-12)
+    #assert(naive_sum([]) < 1.0e-12)
+    #assert(alg_abs(kahan_sum([])) < 1.0e-12)
+    #assert(alg_abs(neumaier_sum([])) < 1.0e-12)
+    ones = []
+    i = 0
+    while i < 10000 {
+        ones = host.sys_arr_push(ones, 0.1)
+        i += 1
+    }
+    k = kahan_sum(ones)
+    n = neumaier_sum(ones)
+    #assert(alg_abs(k - 1000.0) < 1.0e-12)
+    #assert(alg_abs(n - 1000.0) < 1.0e-12)
+    #assert(alg_abs(k - 1000.0) <= alg_abs(naive_sum(ones) - 1000.0))
+    #assert(alg_abs(pairwise_sum(ones) - 1000.0) < 1.0e-10)
+    big = [1.0e16, 1.0, 1.0, 1.0, 1.0]
+    #assert(alg_abs(neumaier_sum(big) - 1.0000000000000004e16) < 1.0)
+    #assert(alg_abs(naive_sum(big) - 1.0e16) < 1.0)
+}
+
+/// Test the compensated dot product.
+test "dot2 beats the naive dot on cancellation" {
+    xs = [1.0e8, 1.0, -1.0e8]
+    ys = [1.0e8, 1.0, 1.0e8]
+    // exact: 1e16 + 1 - 1e16 = 1; the naive left-to-right sum loses the 1
+    #assert(alg_abs(dot2(xs, ys) - 1.0) < 1.0e-12)
+    naive = xs[0] * ys[0] + xs[1] * ys[1] + xs[2] * ys[2]
+    #assert(alg_abs(naive - 1.0) > 0.5)
+    a = [1.0e20, 1.0, -1.0e20]
+    b = [1.0, 1.0, 1.0]
+    #assert(alg_abs(dot2(a, b) - 1.0) < 1.0e-12)
+    #assert(alg_abs(dot2([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]) - 32.0) < 1.0e-12)
+    #assert(alg_abs(dot2([1.0], [1.0, 2.0])) < 1.0e-12)
+    #assert(alg_abs(dot2([], [])) < 1.0e-12)
+}
+
+/// Test logsumexp, logaddexp and softmax.
+test "logsumexp is overflow safe" {
+    v = logsumexp([1000.0, 1000.0])
+    #assert(alg_abs(v - (1000.0 + 0.6931471805599453)) < 1.0e-12)
+    w = logsumexp([-1000.0, -1000.0])
+    #assert(alg_abs(w - (-1000.0 + 0.6931471805599453)) < 1.0e-12)
+    #assert(alg_abs(logsumexp([0.0, 0.0, 0.0]) - 1.0986122886681098) < 1.0e-14)
+    #assert(alg_abs(logsumexp([2.5]) - 2.5) < 1.0e-14)
+    #assert(logsumexp([]) < -1.0e308)
+    #assert(alg_abs(logaddexp(1.0, 2.0) - 2.3132616875182228) < 1.0e-14)
+    #assert(alg_abs(logaddexp(-SP_INF, 3.0) - 3.0) < 1.0e-14)
+    #assert(alg_abs(logaddexp(800.0, 800.0) - 800.6931471805599) < 1.0e-12)
+    sm = softmax([1.0, 2.0, 3.0])
+    #assert(alg_abs(sm[0] - 0.09003057317038046) < 1.0e-14)
+    #assert(alg_abs(sm[2] - 0.6652409557748219) < 1.0e-14)
+    #assert(alg_abs(neumaier_sum(sm) - 1.0) < 1.0e-14)
+    big = softmax([1000.0, 1000.0])
+    #assert(alg_abs(big[0] - 0.5) < 1.0e-14)
+    assert_eq(alg_len(softmax([])), 0)
+}
+
+/// Test ModP satisfies the field axioms exhaustively for a small prime.
+test "ModP is a field" {
+    p = 13
+    zero = modp(0, p)
+    one = modp(1, p)
+    bad = 0
+    a = 0
+    while a < p {
+        x = modp(a, p)
+        if !x.add(zero).eq(x) { bad += 1 }
+        if !x.mul(one).eq(x) { bad += 1 }
+        if !x.add(x.neg()).eq(zero) { bad += 1 }
+        if a != 0 {
+            if !x.mul(x.inv()).eq(one) { bad += 1 }
+            if !one.div(x).eq(x.inv()) { bad += 1 }
+        }
+        b = 0
+        while b < p {
+            y = modp(b, p)
+            if !x.add(y).eq(y.add(x)) { bad += 1 }
+            if !x.mul(y).eq(y.mul(x)) { bad += 1 }
+            if !x.sub(y).eq(x.add(y.neg())) { bad += 1 }
+            c = 0
+            while c < p {
+                z = modp(c, p)
+                if !x.mul(y.add(z)).eq(x.mul(y).add(x.mul(z))) { bad += 1 }
+                if !x.add(y).add(z).eq(x.add(y.add(z))) { bad += 1 }
+                if !x.mul(y).mul(z).eq(x.mul(y.mul(z))) { bad += 1 }
+                c += 1
+            }
+            b += 1
+        }
+        a += 1
+    }
+    assert_eq(bad, 0)
+    assert_eq(modp(-1, 7).v, 6)
+    assert_eq(modp(10, 7).v, 3)
+    assert_eq(modp(3, 7).pow(6).v, 1)
+    assert_eq(modp(2, 1000003).pow(1000002).v, 1)
+    assert_eq(modp(5, 7).inv().v, 3)
+    assert_eq(modp(0, 7).inv().v, 0)
+    #assert(!(modp(3, 7).is_zero()))
+    #assert(modp(7, 7).is_zero())
+    m49 = modp(4, 9)
+    assert_eq("{m49}", "4 (mod 9)")
+    assert_eq(modp(5, 11).zero().p, 11)
+    assert_eq(modp(5, 11).one().v, 1)
+}
+
+/// Test Real as a field.
+test "Real arithmetic" {
+    a = real(3.0)
+    b = real(4.0)
+    assert_eq(a.add(b).x, 7.0)
+    assert_eq(a.sub(b).x, -1.0)
+    assert_eq(a.mul(b).x, 12.0)
+    assert_eq(a.div(b).x, 0.75)
+    assert_eq(a.neg().x, -3.0)
+    #assert(a.inv().mul(a).eq(a.one()))
+    #assert(a.zero().is_zero())
+    assert_eq(real(2.0).pow(10).x, 1024.0)
+    assert_eq(real(2.0).pow(0).x, 1.0)
+    #assert(a.mul(b.add(real(1.0))).eq(a.mul(b).add(a)))
+    assert_eq("{a}", "3")
+}
+
+/// Test VecN as normed and inner-product space.
+test "VecN norm and inner product" {
+    a = vecn([3.0, 4.0])
+    b = vecn([1.0, 2.0])
+    assert_eq(a.norm(), 5.0)
+    assert_eq(a.dot(b), 11.0)
+    assert_eq(a.add(b).data[1], 6.0)
+    assert_eq(a.sub(b).data[0], 2.0)
+    assert_eq(a.scale(2.0).norm(), 10.0)
+    assert_eq(vecn([]).norm(), 0.0)
+    // Cauchy-Schwarz and triangle inequality
+    #assert(alg_abs(a.dot(b)) <= a.norm() * b.norm())
+    #assert(a.add(b).norm() <= a.norm() + b.norm())
+    // parallelogram law
+    lhs = a.add(b).norm() * a.add(b).norm() + a.sub(b).norm() * a.sub(b).norm()
+    rhs = 2.0 * (a.norm() * a.norm() + b.norm() * b.norm())
+    #assert(alg_abs(lhs - rhs) < 1.0e-12)
+    // norm^2 == dot(x, x), and scaling is homogeneous
+    #assert(alg_abs(a.norm() * a.norm() - a.dot(a)) < 1.0e-12)
+    #assert(alg_abs(a.scale(-3.0).norm() - 3.0 * a.norm()) < 1.0e-12)
+    huge = vecn([3.0e200, 4.0e200])
+    #assert(alg_abs(huge.norm() / 5.0e200 - 1.0) < 1.0e-14)
+    #assert(a.eq(vecn([3.0, 4.0])))
+    #assert(!(a.eq(b)))
+    #assert(!(a.eq(vecn([3.0]))))
+}
+
+/// Test the distributions.
+test "Normal Uniform Exponential" {
+    n = Normal.{mu: 0.0, sigma: 1.0}
+    #assert(alg_abs(n.pdf(0.0) - 0.3989422804014327) < 1.0e-14)
+    #assert(alg_abs(n.cdf(0.0) - 0.5) < 1.0e-14)
+    #assert(alg_abs(n.cdf(1.96) - 0.9750021048517795) < 1.0e-13)
+    #assert(alg_abs(n.cdf(-3.0) - 0.0013498980316301) < 1.0e-13)
+    #assert(alg_abs(n.quantile(0.975) - 1.959963984540054) < 1.0e-9)
+    #assert(alg_abs(n.quantile(0.5)) < 1.0e-12)
+    assert_eq(n.dist_mean(), 0.0)
+    assert_eq(n.dist_var(), 1.0)
+    shifted = Normal.{mu: 10.0, sigma: 2.0}
+    #assert(alg_abs(shifted.cdf(10.0) - 0.5) < 1.0e-14)
+    #assert(alg_abs(shifted.cdf(12.0) - n.cdf(1.0)) < 1.0e-14)
+    #assert(alg_abs(shifted.cdf(shifted.quantile(0.3)) - 0.3) < 1.0e-9)
+    assert_eq(shifted.dist_var(), 4.0)
+    #assert(alg_abs(alg_normal_interval(n, -1.0, 1.0) - 0.6826894921370859) < 1.0e-13)
+    u = Uniform.{lo: 2.0, hi: 6.0}
+    assert_eq(u.pdf(3.0), 0.25)
+    assert_eq(u.pdf(7.0), 0.0)
+    assert_eq(u.cdf(4.0), 0.5)
+    assert_eq(u.cdf(1.0), 0.0)
+    assert_eq(u.cdf(9.0), 1.0)
+    assert_eq(u.quantile(0.25), 3.0)
+    assert_eq(u.dist_mean(), 4.0)
+    #assert(alg_abs(u.dist_var() - 16.0 / 12.0) < 1.0e-15)
+    e = Exponential.{rate: 2.0}
+    assert_eq(e.pdf(-1.0), 0.0)
+    #assert(alg_abs(e.pdf(0.0) - 2.0) < 1.0e-15)
+    #assert(alg_abs(e.cdf(1.0) - 0.8646647167633873) < 1.0e-14)
+    #assert(alg_abs(e.quantile(e.cdf(0.7)) - 0.7) < 1.0e-13)
+    assert_eq(e.dist_mean(), 0.5)
+    assert_eq(e.dist_var(), 0.25)
+    assert_eq(e.cdf(-3.0), 0.0)
+}

@@ -1,0 +1,433 @@
+//! neon — Neon serverless Postgres (branches, pooler, projects)
+//!
+//! Import with:
+//!   use neon
+//!
+//!   neon = Neon.new("postgresql://user:pass@ep-cool-name.us-east-2.aws.neon.tech/neondb?sslmode=require") or err { return }
+//!   neon = neon.make_table("events", ["id", "payload"]) or neon
+//!   br = @neon.create_branch("dev", "main") or NeonBranch.{}
+//!
+//! Neon speaks the PostgreSQL wire protocol. This module wraps `neon`
+//! with Neon URL parsing (`*.neon.tech`), connection pooler endpoints, project /
+//! branch lifecycle, compute suspend/resume metadata, and HTTP API path builders.
+
+use std.db.postgres
+use std.db.sql
+use std.core.collections
+use std.core.str
+
++NEON_DEFAULT_DB = "neondb"
++NEON_POOLER_PORT = 5432
++NEON_DIRECT_PORT = 5432
+
+/// Neon connection / project config.
++NeonConfig = {
+    host: str = ""
+    port: i64 = 5432
+    user: str = ""
+    password: str = ""
+    dbname: str = "neondb"
+    sslmode: str = "require"
+    endpoint_id: str = ""
+    region: str = ""
+    pooler: bool = false
+    channel_binding: str = ""
+}
+
+/// Neon branch record.
++NeonBranch = {
+    id: str = ""
+    name: str = ""
+    parent: str = ""
+    current_state: str = "ready"
+    logical_size: i64 = 0
+}
+
+/// Neon project record.
++NeonProject = {
+    id: str = ""
+    name: str = ""
+    region_id: str = ""
+    platform_id: str = "aws"
+}
+
+/// Neon compute endpoint.
++NeonEndpoint = {
+    id: str = ""
+    branch_id: str = ""
+    host: str = ""
+    pooler_host: str = ""
+    suspended: bool = false
+}
+
+/// Neon client over a Postgres pool.
++Neon = {
+    cfg: NeonConfig = NeonConfig.{host: "", port: 5432, user: "", password: "", dbname: "neondb", sslmode: "require", endpoint_id: "", region: "", pooler: false, channel_binding: ""}
+    pool: PgPool = PgPool.empty()
+    project: NeonProject = NeonProject.{id: "", name: "", region_id: "", platform_id: "aws"}
+    branches: _ = []
+    endpoints: _ = []
+    api_key: str = ""
+    api_base: str = "https://console.neon.tech/api/v2"
+    offline: bool = true
+
+    empty(): Neon => Neon.{
+        cfg: NeonConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "require", endpoint_id: "", region: "", pooler: false, channel_binding: ""},
+        pool: PgPool.empty(),
+        project: NeonProject.{id: "", name: "", region_id: "", platform_id: "aws"},
+        branches: [], endpoints: [], api_key: "", api_base: "https://console.neon.tech/api/v2", offline: true
+    }
+
+    new(url: str) : Neon! {
+        cfg = neon_parse_url(url) or NeonConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "require", endpoint_id: "", region: "", pooler: false, channel_binding: ""}
+        ensure cfg.host != "" else {
+            fail "neon: invalid connection url"
+            return
+        }
+        pg_url = neon_to_postgres_url(cfg)
+        pool = PgPool.new(pg_url, 8) or PgPool.empty()
+        ensure pool.cfg.host != "" else {
+            fail "neon: could not open postgres pool"
+            return
+        }
+        eid = cfg.endpoint_id
+        if eid == "" { eid = "ep-local" }
+        region = cfg.region
+        if region == "" { region = "aws-us-east-1" }
+        project = NeonProject.{id: "prj-{eid}", name: "default", region_id: region, platform_id: "aws"}
+        main = NeonBranch.{id: "br-main", name: "main", parent: "", current_state: "ready", logical_size: 0}
+        ep = NeonEndpoint.{
+            id: eid, branch_id: "br-main", host: cfg.host,
+            pooler_host: neon_pooler_host(cfg.host), suspended: false
+        }
+        Neon.{
+            cfg, pool, project, branches: [main], endpoints: [ep],
+            api_key: "", api_base: "https://console.neon.tech/api/v2", offline: true
+        }
+    }
+
+    set_api_key(@self, key: str) : str {
+        self.api_key = key
+        key
+    }
+
+    store(self): SqlDb => self.pool.store()
+
+    with_pool(self, pool: PgPool) : Neon {
+        Neon.{
+            cfg: self.cfg, pool, project: self.project, branches: self.branches,
+            endpoints: self.endpoints, api_key: self.api_key, api_base: self.api_base, offline: self.offline
+        }
+    }
+
+    make_table(self, name: str, cols: _) : Neon! {
+        pool = self.pool.make_table(name, cols) or self.pool
+        ensure SqlDb.has_table(pool.store(), name) else {
+            fail "neon: cannot create table {name}"
+            return
+        }
+        self.with_pool(pool)
+    }
+
+    add_row(self, name: str, row: _) : Neon! {
+        self.with_pool(self.pool.add_row(name, row) or self.pool)
+    }
+
+    find(self, name: str, col: str, val: str): _ => self.pool.find(name, col, val)
+
+    count(self, name: str): i64 => self.pool.count(name)
+
+    upsert(self, name: str, key_col: str, row: _) : Neon! {
+        self.with_pool(self.pool.upsert(name, key_col, row) or self.pool)
+    }
+
+    begin(self): PgTx => self.pool.begin()
+
+    commit(self, t: PgTx): Neon => self.with_pool(self.pool.commit(t))
+
+    rollback(self, t: PgTx): Neon => self.with_pool(self.pool.rollback(t))
+
+    /// Create a branch from `parent` (name).
+    create_branch(@self, name: str, parent: str) : NeonBranch! {
+        ensure name != "" else {
+            fail "neon: branch name required"
+            return
+        }
+        bs = self.branches
+        for bs {
+            if it.name == name {
+                fail "neon: branch already exists"
+                return
+            }
+        }
+        parent_id = "br-main"
+        for bs {
+            if it.name == parent { parent_id = it.id }
+        }
+        // Clone catalog size metadata from parent
+        size = SqlDb.count(self.pool.store(), "pg_catalog_dummy")
+        // Use table count as size proxy
+        size = len(self.pool.store().tables)
+        br = NeonBranch.{id: "br-{name}", name, parent: parent_id, current_state: "ready", logical_size: size}
+        self.branches = arr_push(self.branches, br)
+        // Endpoint for the new branch
+        host = "ep-{name}.{self.cfg.region}.aws.neon.tech"
+        if self.cfg.region == "" { host = "ep-{name}.us-east-2.aws.neon.tech" }
+        ep = NeonEndpoint.{id: "ep-{name}", branch_id: br.id, host, pooler_host: neon_pooler_host(host), suspended: false}
+        self.endpoints = arr_push(self.endpoints, ep)
+        br
+    }
+
+    list_branches(self): _ => self.branches
+
+    get_branch(self, name: str) : NeonBranch! {
+        bs = self.branches
+        for bs {
+            if it.name == name { return it }
+        }
+        fail "neon: branch not found"
+        return
+    }
+
+    delete_branch(@self, name: str) : bool! {
+        ensure name != "main" else {
+            fail "neon: cannot delete main branch"
+            return
+        }
+        keep = []
+        found = false
+        bs = self.branches
+        for bs {
+            if it.name == name { found = true } else { keep = arr_push(keep, it) }
+        }
+        ensure found else {
+            fail "neon: branch not found"
+            return
+        }
+        self.branches = keep
+        // drop endpoints for that branch
+        eps = []
+        old = self.endpoints
+        for old {
+            if it.branch_id != "br-{name}" { eps = arr_push(eps, it) }
+        }
+        self.endpoints = eps
+        true
+    }
+
+    /// Suspend compute endpoint.
+    suspend_endpoint(@self, endpoint_id: str) : bool! {
+        eps = self.endpoints
+        for eps {
+            if it.id == endpoint_id {
+                e = it
+                e.suspended = true
+                self.endpoints = arr_set(self.endpoints, index, e)
+                return true
+            }
+        }
+        fail "neon: endpoint not found"
+        return
+    }
+
+    /// Wake a suspended endpoint.
+    resume_endpoint(@self, endpoint_id: str) : bool! {
+        eps = self.endpoints
+        for eps {
+            if it.id == endpoint_id {
+                e = it
+                e.suspended = false
+                self.endpoints = arr_set(self.endpoints, index, e)
+                return true
+            }
+        }
+        fail "neon: endpoint not found"
+        return
+    }
+
+    /// Prefer pooler host in connection string.
+    use_pooler(@self, on: bool) : bool {
+        c = self.cfg
+        c.pooler = on
+        self.cfg = c
+        on
+    }
+
+    /// Connection string for a branch endpoint (direct or pooler).
+    connection_string(self, branch: str) : str! {
+        bs = self.branches
+        bid = ""
+        for bs {
+            if it.name == branch { bid = it.id }
+        }
+        ensure bid != "" else {
+            fail "neon: branch not found"
+            return
+        }
+        host = self.cfg.host
+        eps = self.endpoints
+        for eps {
+            if it.branch_id == bid {
+                if self.cfg.pooler { host = it.pooler_host } else { host = it.host }
+            }
+        }
+        auth = ""
+        if self.cfg.user != "" {
+            if self.cfg.password != "" {
+                auth = "{self.cfg.user}:{self.cfg.password}@"
+            } else {
+                auth = "{self.cfg.user}@"
+            }
+        }
+        "postgresql://{auth}{host}/{self.cfg.dbname}?sslmode={self.cfg.sslmode}"
+    }
+
+    /// HTTP API: list projects path.
+    api_projects_url(self): str => "{self.api_base}/projects"
+
+    /// HTTP API: branches path.
+    api_branches_url(self): str => "{self.api_base}/projects/{self.project.id}/branches"
+
+    /// HTTP API: endpoints path.
+    api_endpoints_url(self): str => "{self.api_base}/projects/{self.project.id}/endpoints"
+
+    health(self) : str {
+        sus = 0
+        eps = self.endpoints
+        for eps {
+            if it.suspended { sus += 1 }
+        }
+        bn = len(self.branches)
+        "{\"status\":\"ok\",\"branches\":{bn},\"suspended_endpoints\":{sus}}"
+    }
+}
+
++neon_pooler_host(host: str) : str {
+    // ep-xxx -> ep-xxx-pooler
+    if contains(host, "-pooler.") { return host }
+    // insert -pooler before first region marker `.`
+    at = find(host, ".")
+    if at < 0 { return host + "-pooler" }
+    host[0..at] + "-pooler" + host[at..byte_len(host)]
+}
+
++neon_find_from(s: str, needle: str, start: i64) : i64 {
+    found = -1
+    n = byte_len(s)
+    for start..n {
+        if found < 0 && s[it] == needle { found = it }
+    }
+    found
+}
+
++neon_slice(s: str, start: i64, stop: i64) : str {
+    out = ""
+    for start..stop { out = out + s[it] }
+    out
+}
+
+/// Parse Neon / Postgres URLs; detect `*.neon.tech` and `-pooler` hosts.
++neon_parse_url(url: str) : NeonConfig! {
+    // Accept postgres://, postgresql://, neon://
+    u = url
+    if starts_with(u, "neon://") {
+        u = "postgres://" + u[7..byte_len(u)]
+    }
+    cfg = pg_parse_url(u) or PgConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "require", application_name: "", search_path: "public"}
+    ensure cfg.host != "" else {
+        fail "neon: invalid connection url"
+        return
+    }
+    pooler = contains(cfg.host, "-pooler") || contains(cfg.host, "pooler.")
+    endpoint_id = ""
+    region = ""
+    // ep-cool-name.us-east-2.aws.neon.tech
+    if contains(cfg.host, ".neon.tech") {
+        parts_host = cfg.host
+        // endpoint id = label before first dot (strip -pooler suffix)
+        dot = find(parts_host, ".")
+        if dot > 0 {
+            endpoint_id = parts_host[0..dot]
+            if ends_with(endpoint_id, "-pooler") {
+                endpoint_id = endpoint_id[0..(byte_len(endpoint_id) - 7)]
+            }
+        }
+        // region ≈ second label
+        rest = parts_host[(dot + 1)..byte_len(parts_host)]
+        dot2 = find(rest, ".")
+        if dot2 > 0 { region = rest[0..dot2] }
+    }
+    sslmode = cfg.sslmode
+    if sslmode == "prefer" { sslmode = "require" }
+    NeonConfig.{
+        host: cfg.host, port: cfg.port, user: cfg.user, password: cfg.password,
+        dbname: cfg.dbname, sslmode, endpoint_id, region, pooler, channel_binding: ""
+    }
+}
+
++neon_to_postgres_url(cfg: NeonConfig) : str {
+    auth = ""
+    if cfg.user != "" {
+        if cfg.password != "" {
+            auth = "{cfg.user}:{cfg.password}@"
+        } else {
+            auth = "{cfg.user}@"
+        }
+    }
+    "postgres://{auth}{cfg.host}:{cfg.port}/{cfg.dbname}?sslmode={cfg.sslmode}"
+}
+
++neon_redacted(cfg: NeonConfig) : str {
+    auth = ""
+    if cfg.user != "" { auth = "{cfg.user}@" }
+    "postgresql://{auth}{cfg.host}/{cfg.dbname}?sslmode={cfg.sslmode}"
+}
+
+test "parse neon url and pooler host" {
+    cfg = neon_parse_url("postgresql://u:p@ep-cool-name.us-east-2.aws.neon.tech/neondb?sslmode=require") or NeonConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "", endpoint_id: "", region: "", pooler: false, channel_binding: ""}
+    assert_eq(cfg.user, "u")
+    assert_eq(cfg.dbname, "neondb")
+    assert_eq(cfg.endpoint_id, "ep-cool-name")
+    assert_eq(cfg.region, "us-east-2")
+    assert_eq(cfg.sslmode, "require")
+    #assert(!(cfg.pooler))
+    ph = neon_pooler_host(cfg.host)
+    #assert(contains(ph, "-pooler."))
+    pooled = neon_parse_url("postgres://u@ep-cool-name-pooler.us-east-2.aws.neon.tech/neondb") or NeonConfig.{host: "", port: 0, user: "", password: "", dbname: "", sslmode: "", endpoint_id: "", region: "", pooler: false, channel_binding: ""}
+    #assert(pooled.pooler)
+    assert_eq(pooled.endpoint_id, "ep-cool-name")
+    assert_eq(neon_redacted(cfg), "postgresql://u@ep-cool-name.us-east-2.aws.neon.tech/neondb?sslmode=require")
+}
+
+test "branches endpoints sql" {
+    neon = Neon.new("postgresql://u:p@ep-cool.us-east-2.aws.neon.tech/neondb") or Neon.empty()
+    #assert(neon.project.id != "")
+    assert_eq(len(neon.list_branches()), 1)
+    br = @neon.create_branch("dev", "main") or NeonBranch.{id: "", name: "", parent: "", current_state: "", logical_size: 0}
+    assert_eq(br.name, "dev")
+    assert_eq(len(neon.list_branches()), 2)
+    neon = neon.make_table("events", ["id", "payload"]) or neon
+    neon = neon.add_row("events", ["1", "hello"]) or neon
+    assert_eq(neon.count("events"), 1)
+    #assert(@neon.use_pooler(true))
+    cs = neon.connection_string("dev") or ""
+    #assert(contains(cs, "-pooler."))
+    eid = neon.endpoints[0].id
+    #assert(@neon.suspend_endpoint(eid) or false)
+    #assert(@neon.resume_endpoint(eid) or false)
+    #assert(@neon.delete_branch("dev") or false)
+    assert_eq(len(neon.list_branches()), 1)
+    #assert(starts_with(neon.api_projects_url(), "https://console.neon.tech"))
+    #assert(contains(neon.health(), "\"status\":\"ok\""))
+}
+
+test "neon scheme alias and upsert" {
+    neon = Neon.new("neon://user@ep-x.us-west-2.aws.neon.tech/db") or Neon.empty()
+    #assert(neon.cfg.host != "")
+    neon = neon.make_table("t", ["k", "v"]) or neon
+    neon = neon.upsert("t", "k", ["a", "1"]) or neon
+    neon = neon.upsert("t", "k", ["a", "2"]) or neon
+    assert_eq(neon.count("t"), 1)
+    rows = neon.find("t", "k", "a")
+    assert_eq(rows[0][1], "2")
+}

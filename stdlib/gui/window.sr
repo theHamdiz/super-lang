@@ -1,0 +1,119 @@
+//! std.gui.window — native window open/poll host bindings
+//!
+//! Import with:
+//!   use std.gui.window
+//!
+//! `window_open` returns `headless: true` when no display is available.
+//! Linux uses GTK 4 and tries Wayland before X11. Windows uses Win32. macOS
+//! uses Cocoa. `SUPER_GUI=gtk|wayland|x11|win32|cocoa` picks a provider.
+//! A `gui` document becomes real controls; any other script is a drawing area.
+//! `window_show` presents until the window closes, or once when the host is headless.
+//!
+//! Application code must use these APIs — never call `host.sys_gui_*` directly.
+
+use std.sys.time
+
+/// Window open (`width`, `height`, `title`).
++window_open(width: i64, height: i64, title: str)  => host.sys_window_open(width, height, title)
+/// Poll the next native window event.
++window_poll()  => host.sys_window_poll()
+
+/// Begin a GUI frame session for `title` at `w`×`h`.
++gui_open(w: i64, h: i64, title: str) : bool {
+    host.sys_gui_open(w, h, title)
+    true
+}
+
+/// Present one frame of `script` (widget tree or draw commands).
++gui_present(w: i64, h: i64, script: str) : bool {
+    host.sys_gui_present(w, h, script)
+    true
+}
+
+/// Last widget id clicked since the previous poll, or `""`.
++gui_click() : str => host.sys_gui_click()
+
+/// Last key name (`enter`, `esc`, `left`, …), or `""`.
++gui_key() : str => host.sys_gui_key()
+
+/// Current value of the named field widget, or `""`.
++gui_value(id: str) : str => host.sys_gui_value(id)
+
+/// True when the host requested quit.
++gui_quit() : bool => host.sys_gui_quit()
+
+/// Pointer X in window coordinates.
++gui_mouse_x() : i64 => host.sys_gui_mouse_x()
+
+/// Pointer Y in window coordinates.
++gui_mouse_y() : i64 => host.sys_gui_mouse_y()
+
+/// True while the primary mouse button is down.
++gui_mouse_down() : bool => host.sys_gui_mouse_down() != 0
+
+/// Reset host GUI state (tests / headless feeds).
++gui_reset() {
+    host.sys_gui_reset()
+}
+
+/// Feed a synthetic mouse position (tests).
++gui_feed_mouse(x: i64, y: i64, down: i64) {
+    host.sys_gui_feed_mouse(x, y, down)
+}
+
+/// Feed a synthetic key (tests).
++gui_feed_key(key: str) {
+    host.sys_gui_feed_key(key)
+}
+
+/// Sample a pixel (tests / headless).
++gui_pixel(x: i64, y: i64) : i64 => host.sys_gui_pixel(x, y)
+
+/// Last presented script (tests).
++gui_last() : str => host.sys_gui_last()
+
+/// Present `script` until the window closes, or for one frame when headless.
++window_show(title: str, w: i64, h: i64, script: str) : i64 {
+    opened = window_open(w, h, title)
+    gui_open(w, h, title)
+    frames = 0
+    quit = false
+    while quit == false {
+        gui_present(w, h, script)
+        poll = window_poll()
+        key = gui_key()
+        if poll.quit || gui_quit() || key == "esc" || key == "q" || opened.headless {
+            quit = true
+        }
+        if quit == false { sleep_ms(16) }
+        frames = frames + 1
+    }
+    frames
+}
+
+/// Run a frame callback until quit. `paint` returns the script for each frame;
+/// `on_frame` receives `(click, key, typed_title_field)` and returns true to quit.
++window_run(
+    title: str,
+    w: i64,
+    h: i64,
+    paint: Fn[str],
+    on_frame: Fn[str, str, str, bool]
+) : i64 {
+    opened = window_open(w, h, title)
+    gui_open(w, h, title)
+    frames = 0
+    quit = false
+    while quit == false {
+        gui_present(w, h, paint())
+        click = gui_click()
+        key = gui_key()
+        typed = gui_value("title")
+        if on_frame(click, key, typed) { quit = true }
+        poll = window_poll()
+        if poll.quit || gui_quit() || key == "esc" || opened.headless { quit = true }
+        if quit == false { sleep_ms(16) }
+        frames = frames + 1
+    }
+    frames
+}

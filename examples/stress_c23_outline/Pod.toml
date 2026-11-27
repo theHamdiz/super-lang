@@ -1,0 +1,9 @@
+[pod]
+name = "stress_c23_outline"
+version = "0.1.0"
+kind = "bin"
+
+[build]
+backend = "c23"
+mode = "aot"
+outline-stmt-threshold = 100

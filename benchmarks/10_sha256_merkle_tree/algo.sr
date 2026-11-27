@@ -1,0 +1,42 @@
+// 10_sha256_merkle — 1024 leaves; dense msg buffers + std.sec.sha2
+use std.sec.sha2
+use std.core.collections
+
++LEAVES = 1024
+
+#inline
++hash_leaf(i: i64) : _ {
+    msg = [0; 64]
+    for 0..64 { msg[it] = (i * 131 + it * 17) % 256 }
+    sha2_256(msg)
+}
+
+#inline
++hash_pair(a, b) : _ {
+    cat = [0; 64]
+    for 0..32 {
+        cat[it], cat[it + 32] = a[it], b[it]
+    }
+    sha2_256(cat)
+}
+
++main() {
+    level = []
+    for 0..LEAVES { level = arr_push(level, hash_leaf(it)) }
+    n = LEAVES
+    for 0..20 {
+        if n > 1 {
+            next = []
+            m = (n + 1) / 2
+            for 0..m {
+                a = level[it * 2]
+                b = if it * 2 + 1 < n { level[it * 2 + 1] } else { a }
+                next = arr_push(next, hash_pair(a, b))
+            }
+            level, n = next, m
+        }
+    }
+    cs, d = 0, level[0]
+    for 0..32 { cs = cs * 131 + (d[it] % 256) }
+    print("CHECKSUM={cs}")
+}

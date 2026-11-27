@@ -1,0 +1,13 @@
+//! Laws for std.sec.hash — real-body (`hash_u32`, `hash_xor32`).
+//! Cryptographic digests use host kernels (docs/LAWS_STATUS.md limits).
+
+#law("hash_u32 wraps negative inputs")
+hash_u32_wrap() {
+    #assert(hash_u32(-1) == 4294967295)
+    #assert(hash_u32(4294967296) == 0)
+}
+
+#law("hash_xor32 folds with xor")
+hash_xor32_model() {
+    #assert(hash_xor32(3, 5) == (hash_u32(3) ^ hash_u32(5)))
+}

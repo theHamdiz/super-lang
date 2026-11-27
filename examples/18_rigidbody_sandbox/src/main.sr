@@ -1,0 +1,135 @@
+// 18_rigidbody_sandbox — fixed-timestep SoA rigid-body integration and contacts.
+
+use std.game.physics2d
+use std.math.core
+
++BODY_COUNT = 96
++TICKS = 180
++DT = 1.0 / 60.0
++GRAVITY = 24.0
++WORLD_WIDTH = 120.0
++WORLD_HEIGHT = 80.0
+
++integrate(@x, @y, @vx, @vy, radius, dt: f64) {
+    for i in 0..BODY_COUNT {
+        vy[i] += GRAVITY * dt
+        x[i] += vx[i] * dt
+        y[i] += vy[i] * dt
+
+        if x[i] - radius[i] < 0.0 {
+            x[i] = radius[i]
+            vx[i] = 0.0 - vx[i] * 0.8
+        }
+        if x[i] + radius[i] > WORLD_WIDTH {
+            x[i] = WORLD_WIDTH - radius[i]
+            vx[i] = 0.0 - vx[i] * 0.8
+        }
+        if y[i] + radius[i] > WORLD_HEIGHT {
+            y[i] = WORLD_HEIGHT - radius[i]
+            vy[i] = 0.0 - vy[i] * 0.65
+        }
+    }
+}
+
++resolve_pair(@x, @y, @vx, @vy, radius, a: i64, b: i64) : i64 {
+    dx = x[b] - x[a]
+    dy = y[b] - y[a]
+    min_distance = radius[a] + radius[b]
+    distance2 = dx * dx + dy * dy
+    return 0 if distance2 >= min_distance * min_distance
+    return 0 if distance2 < 0.000001
+
+    distance = distance2.sqrt()
+    nx = dx / distance
+    ny = dy / distance
+    overlap = min_distance - distance
+    x[a] -= nx * overlap * 0.5
+    y[a] -= ny * overlap * 0.5
+    x[b] += nx * overlap * 0.5
+    y[b] += ny * overlap * 0.5
+
+    relative = (vx[b] - vx[a]) * nx + (vy[b] - vy[a]) * ny
+    if relative < 0.0 {
+        impulse = (0.0 - relative) * 0.9
+        vx[a] -= impulse * nx
+        vy[a] -= impulse * ny
+        vx[b] += impulse * nx
+        vy[b] += impulse * ny
+    }
+    1
+}
+
++solve_contacts(@x, @y, @vx, @vy, radius) : i64 {
+    contacts = 0
+    for a in 0..BODY_COUNT {
+        for b in (a + 1)..BODY_COUNT {
+            contacts += resolve_pair(@x, @y, @vx, @vy, radius, a, b)
+        }
+    }
+    contacts
+}
+
++step(@x, @y, @vx, @vy, radius) : i64 {
+    integrate(@x, @y, @vx, @vy, radius, DT)
+    contacts = 0
+    #unroll(2)
+    for 0..2 {
+        contacts += solve_contacts(@x, @y, @vx, @vy, radius)
+    }
+    contacts
+}
+
++run_sandbox(ticks: i64) : i64 {
+    x, y = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    vx, vy = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    radius = [0.0; BODY_COUNT]
+    for i in 0..BODY_COUNT {
+        x[i] = 3.0 + (i % 16) * 7.0
+        y[i] = 3.0 + (i / 16) * 6.0
+        vx[i] = (i % 7) * 0.35 - 1.0
+        vy[i] = (i % 5) * 0.15
+        radius[i] = 1.5 + (i % 3) * 0.2
+    }
+    contacts = 0
+    for 0..ticks {
+        contacts += step(@x, @y, @vx, @vy, radius)
+    }
+    checksum = contacts * 101
+    checksum += (0..BODY_COUNT).map((x[it] * 100.0).to_int() + (y[it] * 100.0).to_int() * 3).sum()
+    checksum
+}
+
++main() {
+    checksum = run_sandbox(TICKS)
+    print("CHECKSUM={checksum}")
+}
+
+test "fixed step applies gravity" {
+    x, y = [10.0; BODY_COUNT], [10.0; BODY_COUNT]
+    vx, vy = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    radius = [1.0; BODY_COUNT]
+    integrate(@x, @y, @vx, @vy, radius, DT)
+    #assert(vy[0] > 0.0)
+    #assert(y[0] > 10.0)
+}
+
+test "overlapping circles resolve" {
+    x, y = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    vx, vy = [0.0; BODY_COUNT], [0.0; BODY_COUNT]
+    radius = [1.0; BODY_COUNT]
+    x[0] = 10.0
+    x[1] = 11.0
+    assert_eq(resolve_pair(@x, @y, @vx, @vy, radius, 0, 1), 1)
+    #assert(x[1] - x[0] >= 2.0)
+}
+
+test "separated circles do not collide" {
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(5.0, 0.0, 1.0, 1.0)
+    #assert(!(p2_collide(a, b).hit))
+}
+
+test "sandbox is deterministic" {
+    assert_eq(run_sandbox(10), run_sandbox(10))
+    #assert(run_sandbox(10) > 0)
+}

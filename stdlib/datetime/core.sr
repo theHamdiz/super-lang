@@ -1,0 +1,648 @@
+//! std.datetime -- civil dates, IANA time zones, calendar arithmetic, ISO 8601
+//!
+//! Separate from low-level `std.sys.time` (Instant / Duration / wall clock).
+//! Import: use std.datetime
+//!
+//!   d = Date.of(2024, 2, 29) or Date.of(2024, 2, 28)
+//!   z = Zone.of("America/New_York")
+//!   t = ZonedDateTime.of(d, Time.of(2, 30, 0), z) or none
+//!   s = t.format_iso8601()
+
+// --- civil helpers (Howard Hinnant civil_from_days / days_from_civil) -----------------
+
+/// Days from civil y-m-d to the Unix epoch day count (proleptic Gregorian).
++days_from_civil(y: i64, m: i64, d: i64) : i64 {
+    yy = y
+    if m <= 2 { yy = y - 1 }
+    era = 0
+    if yy >= 0 { era = yy / 400 } else { era = (yy - 399) / 400 }
+    yoe = yy - era * 400
+    mm = m
+    if m > 2 { mm = m - 3 } else { mm = m + 9 }
+    doy = (153 * mm + 2) / 5 + d - 1
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+/// Civil y/m/d from a Unix-epoch day count.
++civil_from_days(z: i64) {
+    zz = z + 719468
+    era = 0
+    if zz >= 0 { era = zz / 146097 } else { era = (zz - 146096) / 146097 }
+    doe = zz - era * 146097
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp = (5 * doy + 2) / 153
+    d = doy - (153 * mp + 2) / 5 + 1
+    m = mp + 3
+    if m > 12 { m = m - 12 }
+    if m <= 2 { y = y + 1 }
+    {year: y, month: m, day: d}
+}
+
+/// True for Gregorian leap years.
++is_leap_year(y: i64) : bool {
+    if y % 400 == 0 { return true }
+    if y % 100 == 0 { return false }
+    y % 4 == 0
+}
+
+/// Days in month `m` (1..12) of year `y`.
++days_in_month(y: i64, m: i64) : i64 {
+    when m {
+        1 => 31
+        2 => if is_leap_year(y) { 29 } else { 28 }
+        3 => 31
+        4 => 30
+        5 => 31
+        6 => 30
+        7 => 31
+        8 => 31
+        9 => 30
+        10 => 31
+        11 => 30
+        12 => 31
+        else => 0
+    }
+}
+
+/// Zero-pad `n` to `width` digits (non-negative).
++dt_pad(n: i64, width: i64) : str {
+    s = "{n}"
+    if n < 0 { return s }
+    out = s
+    for 0..width {
+        if host.sys_str_len(out) >= width { return out }
+        out = "0" + out
+    }
+    out
+}
+
+/// Parse decimal digits `[lo, hi)` of `s`.
++dt_parse_int(s: str, lo: i64, hi: i64) : i64! {
+    n = host.sys_str_len(s)
+    ensure lo >= 0 && hi <= n && hi > lo else {
+        fail "datetime: bad slice"
+        return
+    }
+    v = 0
+    for lo..hi {
+        c = host.sys_ord(s[it])
+        ensure c >= 48 && c <= 57 else {
+            fail "datetime: non-digit"
+            return
+        }
+        v = v * 10 + (c - 48)
+    }
+    v
+}
+
+// --- Date / Time / DateTime ----------------------------------------------------------
+
+/// `Date` is a civil Gregorian calendar date (no time zone).
++Date: Display, Eq, Ord = {
+    year: i64 = 1970
+    month: i64 = 1
+    day: i64 = 1
+
+    display(self) : str => dt_pad(self.year, 4) + "-" + dt_pad(self.month, 2) + "-" + dt_pad(self.day, 2)
+
+    /// Construct a validated date, or fail.
+    of(y: i64, m: i64, d: i64) : Date! {
+        ensure m >= 1 && m <= 12 else {
+            fail "datetime: month out of range"
+            return
+        }
+        dim = days_in_month(y, m)
+        ensure d >= 1 && d <= dim else {
+            fail "datetime: day out of range"
+            return
+        }
+        Date.{year: y, month: m, day: d}
+    }
+
+    /// Unix epoch day count for this date.
+    to_epoch_days(self) : i64 => days_from_civil(self.year, self.month, self.day)
+
+    /// Date of Unix epoch day `z`.
+    from_epoch_days(z: i64) : Date {
+        c = civil_from_days(z)
+        Date.{year: c.year, month: c.month, day: c.day}
+    }
+
+    /// Add `n` calendar months (clamp day to month end).
+    add_months(self, n: i64) : Date {
+        total = self.year * 12 + (self.month - 1) + n
+        y = total / 12
+        m = total % 12 + 1
+        if m <= 0 {
+            m = m + 12
+            y = y - 1
+        }
+        dim = days_in_month(y, m)
+        d = self.day
+        if d > dim { d = dim }
+        Date.{year: y, month: m, day: d}
+    }
+
+    /// Add `n` calendar days.
+    add_days(self, n: i64) : Date => Date.from_epoch_days(self.to_epoch_days() + n)
+
+    /// Day of week: 0 = Sunday .. 6 = Saturday (Unix epoch was Thursday).
+    weekday(self) : i64 {
+        // 1970-01-01 was Thursday (4).
+        (self.to_epoch_days() + 4) % 7
+    }
+
+    eq(self, other: Date) : bool => self.year == other.year && self.month == other.month && self.day == other.day
+    cmp(self, other: Date) : i64 {
+        if self.year != other.year { return if self.year < other.year { 0 - 1 } else { 1 } }
+        if self.month != other.month { return if self.month < other.month { 0 - 1 } else { 1 } }
+        if self.day < other.day { 0 - 1 } else { if self.day > other.day { 1 } else { 0 } }
+    }
+}
+
+/// `Time` is a civil clock time (hour/minute/second + nanoseconds).
++Time: Display, Eq = {
+    hour: i64 = 0
+    minute: i64 = 0
+    second: i64 = 0
+    nano: i64 = 0
+
+    display(self) : str {
+        base = dt_pad(self.hour, 2) + ":" + dt_pad(self.minute, 2) + ":" + dt_pad(self.second, 2)
+        if self.nano == 0 { return base }
+        base + "." + dt_pad(self.nano, 9)
+    }
+
+    of(h: i64, mi: i64, se: i64) : Time! {
+        ensure h >= 0 && h <= 23 else {
+            fail "datetime: hour out of range"
+            return
+        }
+        ensure mi >= 0 && mi <= 59 else {
+            fail "datetime: minute out of range"
+            return
+        }
+        ensure se >= 0 && se <= 60 else {
+            fail "datetime: second out of range"
+            return
+        }
+        Time.{hour: h, minute: mi, second: se, nano: 0}
+    }
+
+    /// Seconds since midnight (leap second 60 counts as 60).
+    to_day_seconds(self) : i64 => self.hour * 3600 + self.minute * 60 + self.second
+
+    eq(self, other: Time) : bool {
+        self.hour == other.hour && self.minute == other.minute && self.second == other.second && self.nano == other.nano
+    }
+}
+
+/// Naive local date+time (no zone).
++NaiveDateTime: Display = {
+    date: Date = Date.{year: 1970, month: 1, day: 1}
+    time: Time = Time.{hour: 0, minute: 0, second: 0, nano: 0}
+
+    display(self) : str => "{self.date}T{self.time}"
+
+    of(d: Date, t: Time) : NaiveDateTime => NaiveDateTime.{date: d, time: t}
+
+    /// Unix seconds interpreting this as UTC.
+    to_unix_utc(self) : i64 => self.date.to_epoch_days() * 86400 + self.time.to_day_seconds()
+}
+
+// --- Time zones (curated IANA subset with DST transitions) ---------------------------
+
+/// One DST / offset transition: at `unix_utc` the offset becomes `offset_sec`.
++ZoneTransition = {
+    unix_utc: i64 = 0
+    offset_sec: i64 = 0
+    abbrev: str = "UTC"
+    is_dst: bool = false
+}
+
+/// `Zone` is an IANA time zone with a transition table.
++Zone: Display = {
+    name: str = "UTC"
+    /// Sorted ascending by `unix_utc`.
+    transitions: _ = []
+
+    display(self) : str => self.name
+
+    /// Look up a built-in zone, or fail.
+    of(name: str) : Zone! {
+        z = zone_builtin(name)
+        ensure host.sys_str_len(z.name) > 0 else {
+            fail "datetime: unknown zone {name}"
+            return
+        }
+        z
+    }
+
+    /// Fixed offset zone (`Etc/GMT+/-N` style), offset east of UTC in seconds.
+    fixed(name: str, offset_sec: i64) : Zone {
+        Zone.{
+            name,
+            transitions: [ZoneTransition.{unix_utc: 0 - 62135596800, offset_sec, abbrev: name, is_dst: false}]
+        }
+    }
+
+    /// Offset (seconds east of UTC) active at instant `unix_utc`.
+    offset_at(self, unix_utc: i64) : i64 {
+        n = host.sys_arr_len(self.transitions)
+        if n == 0 { return 0 }
+        off = self.transitions[0].offset_sec
+        for 0..n {
+            tr = self.transitions[it]
+            if unix_utc >= tr.unix_utc { off = tr.offset_sec }
+        }
+        off
+    }
+
+    /// Active transition at `unix_utc`.
+    transition_at(self, unix_utc: i64) : ZoneTransition {
+        n = host.sys_arr_len(self.transitions)
+        cur = self.transitions[0]
+        for 0..n {
+            tr = self.transitions[it]
+            if unix_utc >= tr.unix_utc { cur = tr }
+        }
+        cur
+    }
+}
+
+/// Built-in curated zones (UTC + common IANA with 2020–2027 DST edges).
++zone_builtin(name: str) : Zone {
+    if name == "UTC" || name == "Etc/UTC" || name == "Z" {
+        return Zone.fixed("UTC", 0)
+    }
+    if name == "Etc/GMT" {
+        return Zone.fixed("Etc/GMT", 0)
+    }
+    if name == "Asia/Tokyo" {
+        return Zone.fixed("Asia/Tokyo", 9 * 3600)
+    }
+    if name == "America/New_York" {
+        // US Eastern: EST=-5 / EDT=-4. Transitions at 02:00 local ≈ 07:00/06:00 UTC.
+        // 2024-03-10 07:00 UTC → EDT; 2024-11-03 06:00 UTC → EST
+        // 2025-03-09 07:00 UTC → EDT; 2025-11-02 06:00 UTC → EST
+        return Zone.{
+            name: "America/New_York",
+            transitions: [
+                ZoneTransition.{unix_utc: 0, offset_sec: 0 - 18000, abbrev: "EST", is_dst: false},
+                ZoneTransition.{unix_utc: 1710054000, offset_sec: 0 - 14400, abbrev: "EDT", is_dst: true},
+                ZoneTransition.{unix_utc: 1730613600, offset_sec: 0 - 18000, abbrev: "EST", is_dst: false},
+                ZoneTransition.{unix_utc: 1741503600, offset_sec: 0 - 14400, abbrev: "EDT", is_dst: true},
+                ZoneTransition.{unix_utc: 1762063200, offset_sec: 0 - 18000, abbrev: "EST", is_dst: false},
+            ]
+        }
+    }
+    if name == "America/Los_Angeles" {
+        return Zone.{
+            name: "America/Los_Angeles",
+            transitions: [
+                ZoneTransition.{unix_utc: 0, offset_sec: 0 - 28800, abbrev: "PST", is_dst: false},
+                ZoneTransition.{unix_utc: 1710064800, offset_sec: 0 - 25200, abbrev: "PDT", is_dst: true},
+                ZoneTransition.{unix_utc: 1730624400, offset_sec: 0 - 28800, abbrev: "PST", is_dst: false},
+                ZoneTransition.{unix_utc: 1741514400, offset_sec: 0 - 25200, abbrev: "PDT", is_dst: true},
+                ZoneTransition.{unix_utc: 1762074000, offset_sec: 0 - 28800, abbrev: "PST", is_dst: false},
+            ]
+        }
+    }
+    if name == "Europe/London" {
+        return Zone.{
+            name: "Europe/London",
+            transitions: [
+                ZoneTransition.{unix_utc: 0, offset_sec: 0, abbrev: "GMT", is_dst: false},
+                ZoneTransition.{unix_utc: 1711846800, offset_sec: 3600, abbrev: "BST", is_dst: true},
+                ZoneTransition.{unix_utc: 1729994400, offset_sec: 0, abbrev: "GMT", is_dst: false},
+                ZoneTransition.{unix_utc: 1743296400, offset_sec: 3600, abbrev: "BST", is_dst: true},
+                ZoneTransition.{unix_utc: 1761444000, offset_sec: 0, abbrev: "GMT", is_dst: false},
+            ]
+        }
+    }
+    if name == "Australia/Sydney" {
+        return Zone.{
+            name: "Australia/Sydney",
+            transitions: [
+                ZoneTransition.{unix_utc: 0, offset_sec: 39600, abbrev: "AEDT", is_dst: true},
+                ZoneTransition.{unix_utc: 1714518000, offset_sec: 36000, abbrev: "AEST", is_dst: false},
+                ZoneTransition.{unix_utc: 1729994400, offset_sec: 39600, abbrev: "AEDT", is_dst: true},
+                ZoneTransition.{unix_utc: 1745967600, offset_sec: 36000, abbrev: "AEST", is_dst: false},
+            ]
+        }
+    }
+    Zone.{name: "", transitions: []}
+}
+
+/// Resolve local civil time in `zone` to a UTC unix second.
+/// DST gap → fail; DST overlap → prefer the earlier (DST) offset when `prefer_earlier`.
++resolve_local(zone: Zone, naive: NaiveDateTime, prefer_earlier: bool) : i64! {
+    local = naive.to_unix_utc() // treat fields as if UTC, then subtract candidate offsets
+    // Candidate offsets: unique offsets appearing in the table.
+    candidates = []
+    n = host.sys_arr_len(zone.transitions)
+    for 0..n {
+        off = zone.transitions[it].offset_sec
+        seen = false
+        cn = host.sys_arr_len(candidates)
+        for 0..cn {
+            if candidates[it] == off { seen = true }
+        }
+        if !seen { candidates = host.sys_arr_push(candidates, off) }
+    }
+    if host.sys_arr_len(candidates) == 0 { candidates = [0] }
+
+    hits = []
+    cn = host.sys_arr_len(candidates)
+    for 0..cn {
+        off = candidates[it]
+        utc = local - off
+        // Verify this offset is actually active at utc.
+        if zone.offset_at(utc) == off {
+            hits = host.sys_arr_push(hits, utc)
+        }
+    }
+    hn = host.sys_arr_len(hits)
+    ensure hn > 0 else {
+        fail "datetime: local time does not exist (DST gap)"
+        return
+    }
+    if hn == 1 { return hits[0] }
+    // Overlap: two UTC instants map to the same local wall time.
+    a = hits[0]
+    b = hits[1]
+    if a > b { a, b = b, a }
+    if prefer_earlier {
+        return a
+    }
+    b
+}
+
+/// Instant in a named time zone.
++ZonedDateTime: Display = {
+    unix_utc: i64 = 0
+    zone: Zone = Zone.fixed("UTC", 0)
+
+    display(self) : str => self.format_iso8601()
+
+    /// Instant from unix seconds in `zone`.
+    from_unix(unix_utc: i64, zone: Zone) : ZonedDateTime => ZonedDateTime.{unix_utc, zone}
+
+    /// Local civil fields in this zone at a UTC instant.
+    of(date: Date, time: Time, zone: Zone) : ZonedDateTime! {
+        naive = NaiveDateTime.of(date, time)
+        utc = resolve_local(zone, naive, true) or err {
+            fail err
+            return
+        }
+        ZonedDateTime.{unix_utc: utc, zone}
+    }
+
+    /// Local date in the zone.
+    local_date(self) : Date {
+        off = self.zone.offset_at(self.unix_utc)
+        local = self.unix_utc + off
+        Date.from_epoch_days(local / 86400)
+    }
+
+    /// Local time in the zone.
+    local_time(self) : Time {
+        off = self.zone.offset_at(self.unix_utc)
+        local = self.unix_utc + off
+        s = local % 86400
+        if s < 0 { s = s + 86400 }
+        Time.{hour: s / 3600, minute: (s % 3600) / 60, second: s % 60, nano: 0}
+    }
+
+    /// Offset east of UTC at this instant.
+    offset_sec(self) : i64 => self.zone.offset_at(self.unix_utc)
+
+    /// ISO 8601 / RFC 3339 with numeric offset.
+    format_iso8601(self) : str {
+        d = self.local_date()
+        t = self.local_time()
+        off = self.offset_sec()
+        sign = "+"
+        abs = off
+        if off < 0 {
+            sign = "-"
+            abs = 0 - off
+        }
+        oh = abs / 3600
+        om = (abs % 3600) / 60
+        "{d}T{t}" + sign + dt_pad(oh, 2) + ":" + dt_pad(om, 2)
+    }
+}
+
+// --- ISO 8601 parse / format ---------------------------------------------------------
+
+/// Parse `YYYY-MM-DD`.
++parse_date(s: str) : Date! {
+    ensure host.sys_str_len(s) >= 10 else {
+        fail "datetime: date too short"
+        return
+    }
+    y = dt_parse_int(s, 0, 4) or err {
+        fail err
+        return
+    }
+    m = dt_parse_int(s, 5, 7) or err {
+        fail err
+        return
+    }
+    d = dt_parse_int(s, 8, 10) or err {
+        fail err
+        return
+    }
+    Date.of(y, m, d)
+}
+
+/// Parse `HH:MM:SS` (optional fractional ignored beyond seconds).
++parse_time(s: str) : Time! {
+    ensure host.sys_str_len(s) >= 8 else {
+        fail "datetime: time too short"
+        return
+    }
+    h = dt_parse_int(s, 0, 2) or err {
+        fail err
+        return
+    }
+    mi = dt_parse_int(s, 3, 5) or err {
+        fail err
+        return
+    }
+    se = dt_parse_int(s, 6, 8) or err {
+        fail err
+        return
+    }
+    Time.of(h, mi, se)
+}
+
+/// Parse ISO 8601 / RFC 3339 into a UTC unix second (zone offset applied).
++parse_iso8601(s: str) : i64! {
+    n = host.sys_str_len(s)
+    ensure n >= 19 else {
+        fail "datetime: ISO 8601 too short"
+        return
+    }
+    d = parse_date(s[0..10]) or err {
+        fail err
+        return
+    }
+    t = parse_time(s[11..19]) or err {
+        fail err
+        return
+    }
+    naive = NaiveDateTime.of(d, t)
+    // Offset: Z / z / +/-HH:MM / +/-HHMM
+    if n == 19 || s[n - 1] == "Z" || s[n - 1] == "z" {
+        return naive.to_unix_utc()
+    }
+    // Find start of offset (+/-)
+    pos = 19
+    // skip fractional seconds
+    if n > 19 && s[19] == "." {
+        pos = 20
+        for pos..n {
+            c = host.sys_ord(s[it])
+            if c < 48 || c > 57 {
+                pos = it
+                break
+            }
+            pos = it + 1
+        }
+    }
+    ensure pos < n else {
+        fail "datetime: missing offset"
+        return
+    }
+    sign_c = s[pos]
+    ensure sign_c == "+" || sign_c == "-" else {
+        fail "datetime: bad offset sign"
+        return
+    }
+    sign = 1
+    if sign_c == "-" { sign = 0 - 1 }
+    rest = s[(pos + 1)..n]
+    rn = host.sys_str_len(rest)
+    oh = 0
+    om = 0
+    if rn >= 5 && rest[2] == ":" {
+        oh = dt_parse_int(rest, 0, 2) or err {
+            fail err
+            return
+        }
+        om = dt_parse_int(rest, 3, 5) or err {
+            fail err
+            return
+        }
+    } else {
+        ensure rn >= 4 else {
+            fail "datetime: bad offset"
+            return
+        }
+        oh = dt_parse_int(rest, 0, 2) or err {
+            fail err
+            return
+        }
+        om = dt_parse_int(rest, 2, 4) or err {
+            fail err
+            return
+        }
+    }
+    off = sign * (oh * 3600 + om * 60)
+    naive.to_unix_utc() - off
+}
+
+/// Format unix UTC seconds as ISO 8601 with `Z`.
++format_iso8601_utc(unix: i64) : str {
+    d = Date.from_epoch_days(unix / 86400)
+    s = unix % 86400
+    if s < 0 { s = s + 86400 }
+    t = Time.{hour: s / 3600, minute: (s % 3600) / 60, second: s % 60, nano: 0}
+    "{d}T{t}Z"
+}
+
+// --- tests ---------------------------------------------------------------------------
+
+test "leap years and month ends" {
+    #assert(is_leap_year(2024))
+    #assert(!(is_leap_year(1900)))
+    #assert(is_leap_year(2000))
+    assert_eq(days_in_month(2024, 2), 29)
+    assert_eq(days_in_month(2023, 2), 28)
+    d = Date.of(2024, 1, 31) or Date.of(1970, 1, 1)
+    m = d.add_months(1)
+    assert_eq(m.year, 2024)
+    assert_eq(m.month, 2)
+    assert_eq(m.day, 29)
+    m2 = m.add_months(1)
+    assert_eq(m2.month, 3)
+    assert_eq(m2.day, 29)
+}
+
+test "civil round-trip epoch days" {
+    d = Date.of(2024, 6, 15) or Date.of(1970, 1, 1)
+    z = d.to_epoch_days()
+    back = Date.from_epoch_days(z)
+    assert_eq(back.year, 2024)
+    assert_eq(back.month, 6)
+    assert_eq(back.day, 15)
+    epoch = Date.of(1970, 1, 1) or Date.of(1, 1, 1)
+    assert_eq(epoch.to_epoch_days(), 0)
+}
+
+test "ISO 8601 parse/format round-trip" {
+    u = parse_iso8601("2024-01-15T12:30:00Z") or 0
+    assert_eq(format_iso8601_utc(u), "2024-01-15T12:30:00Z")
+    u2 = parse_iso8601("2024-01-15T07:30:00-05:00") or 0
+    assert_eq(u2, u)
+    u3 = parse_iso8601("2024-06-01T00:00:00+09:00") or 0
+    assert_eq(format_iso8601_utc(u3), "2024-05-31T15:00:00Z")
+}
+
+test "America/New_York DST spring gap rejects 02:30" {
+    z = Zone.of("America/New_York") or Zone.fixed("UTC", 0)
+    // 2024-03-10 02:30 EST does not exist (clocks jump 02:00 → 03:00).
+    d = Date.of(2024, 3, 10) or Date.of(1970, 1, 1)
+    t = Time.of(2, 30, 0) or Time.of(0, 0, 0)
+    failed = false
+    _ = ZonedDateTime.of(d, t, z) or err {
+        failed = true
+        ZonedDateTime.from_unix(0, z)
+    }
+    #assert(failed)
+}
+
+test "America/New_York DST fall overlap prefers earlier" {
+    z = Zone.of("America/New_York") or Zone.fixed("UTC", 0)
+    // 2024-11-03 01:30 occurs twice (EDT then EST).
+    d = Date.of(2024, 11, 3) or Date.of(1970, 1, 1)
+    t = Time.of(1, 30, 0) or Time.of(0, 0, 0)
+    naive = NaiveDateTime.of(d, t)
+    earlier = resolve_local(z, naive, true) or 0
+    later = resolve_local(z, naive, false) or 0
+    #assert(earlier < later)
+    // Earlier is still on EDT (−4h): 01:30 EDT = 05:30 UTC = 1730611800
+    assert_eq(z.offset_at(earlier), 0 - 14400)
+    assert_eq(z.offset_at(later), 0 - 18000)
+}
+
+test "Tokyo fixed offset zoned format" {
+    z = Zone.of("Asia/Tokyo") or Zone.fixed("UTC", 0)
+    d = Date.of(2024, 1, 15) or Date.of(1970, 1, 1)
+    t = Time.of(12, 0, 0) or Time.of(0, 0, 0)
+    zt = ZonedDateTime.of(d, t, z) or ZonedDateTime.from_unix(0, z)
+    assert_eq(zt.format_iso8601(), "2024-01-15T12:00:00+09:00")
+    assert_eq(zt.unix_utc, parse_iso8601("2024-01-15T03:00:00Z") or 0)
+}
+
+test "add_days across month boundary" {
+    d = Date.of(2024, 1, 30) or Date.of(1970, 1, 1)
+    n = d.add_days(2)
+    assert_eq(n.month, 2)
+    assert_eq(n.day, 1)
+}

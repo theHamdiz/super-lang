@@ -1,0 +1,321 @@
+//! cockroachdb — CockroachDB dialect over the Postgres offline driver
+//!
+//! Import with:
+//!   use cockroachdb
+//!
+//!   pool = CrdbPool.new("cockroachdb://root@localhost:26257/defaultdb", 8) or err { return }
+//!
+//! CockroachDB speaks the PostgreSQL wire protocol. This module accepts
+//! `cockroach://` / `cockroachdb://` / `postgres://` URLs (default port 26257),
+//! SERIALIZABLE transactions, AS OF SYSTEM TIME reads, SHOW RANGES / ZONE lite,
+//! and UPSERT helpers on top of `cockroachdb`.
+
+use std.db.postgres
+use std.db.sql
+use std.core.collections
+use std.core.str
+
++CRDB_DEFAULT_PORT = 26257
++CRDB_SERIALIZABLE = "SERIALIZABLE"
++CRDB_UNIQUE_VIOLATION = "23505"
++CRDB_UNDEFINED_TABLE = "42P01"
+
+/// CockroachDB connection config (Postgres-shaped + cluster / locality).
++CrdbConfig = {
+    host: str = "localhost"
+    port: i64 = 26257
+    user: str = ""
+    password: str = ""
+    dbname: str = ""
+    cluster: str = ""
+    locality: str = ""
+    sslmode: str = "disable"
+}
+
+/// CockroachDB pool wrapping PgPool with CRDB semantics.
++CrdbPool = {
+    cfg: CrdbConfig = CrdbConfig.{host: "localhost", port: 26257, user: "", password: "", dbname: "", cluster: "", locality: "", sslmode: "disable"}
+    pg: PgPool = PgPool.empty()
+    isolation: str = "SERIALIZABLE"
+    system_time: i64 = 0
+    ranges: _ = []
+    zone_configs: _ = []
+
+    empty(): CrdbPool => CrdbPool.{
+        cfg: CrdbConfig.{host: "", port: 0, user: "", password: "", dbname: "", cluster: "", locality: "", sslmode: "disable"},
+        pg: PgPool.empty(), isolation: CRDB_SERIALIZABLE, system_time: 0, ranges: [], zone_configs: []
+    }
+
+    new(url: str, size: i64) : CrdbPool! {
+        ensure size >= 1 else {
+            fail "crdb: pool size must be at least 1"
+            return
+        }
+        cfg = crdb_parse_url(url) or CrdbConfig.{host: "", port: 0, user: "", password: "", dbname: "", cluster: "", locality: "", sslmode: "disable"}
+        ensure cfg.host != "" else {
+            fail "crdb: invalid connection url"
+            return
+        }
+        // Drive the offline catalog through Postgres pool with a rewritten URL.
+        pg_url = "postgres://{cfg.host}:{cfg.port}/{cfg.dbname}"
+        if cfg.user != "" {
+            if cfg.password != "" {
+                pg_url = "postgres://{cfg.user}:{cfg.password}@{cfg.host}:{cfg.port}/{cfg.dbname}"
+            } else {
+                pg_url = "postgres://{cfg.user}@{cfg.host}:{cfg.port}/{cfg.dbname}"
+            }
+        }
+        pg = PgPool.new(pg_url, size) or PgPool.empty()
+        ensure pg.cfg.host != "" else {
+            fail "crdb: could not open postgres-compatible pool"
+            return
+        }
+        CrdbPool.{cfg, pg, isolation: CRDB_SERIALIZABLE, system_time: 0, ranges: ["[/Min -/Max)"], zone_configs: [".default"]}
+    }
+
+    store(self): SqlDb => self.pg.store()
+
+    with_pg(self, pg: PgPool) : CrdbPool {
+        CrdbPool.{cfg: self.cfg, pg, isolation: self.isolation, system_time: self.system_time, ranges: self.ranges, zone_configs: self.zone_configs}
+    }
+
+    make_table(self, name: str, cols: _) : CrdbPool! {
+        pg = self.pg.make_table(name, cols) or self.pg
+        ensure SqlDb.has_table(pg.store(), name) else {
+            fail "crdb: relation {name} does not exist ({CRDB_UNDEFINED_TABLE})"
+            return
+        }
+        self.with_pg(pg)
+    }
+
+    add_row(self, name: str, row: _) : CrdbPool! {
+        pg = self.pg.add_row(name, row) or self.pg
+        self.with_pg(pg)
+    }
+
+    insert_unique(self, name: str, key_col: str, row: _) : CrdbPool! {
+        pg = self.pg.insert_unique(name, key_col, row) or self.pg
+        self.with_pg(pg)
+    }
+
+    /// UPSERT: replace row if key exists, else insert.
+    upsert(self, name: str, key_col: str, row: _) : CrdbPool! {
+        t = SqlDb.table(self.store(), name)
+        ci = t.col_index(key_col)
+        ensure ci >= 0 else {
+            fail "crdb: column {key_col} does not exist"
+            return
+        }
+        key = row[ci]
+        hits = SqlDb.rows_where(self.store(), name, key_col, key)
+        if sql_count(hits) > 0 {
+            mem = SqlDb.delete_where(self.store(), name, key_col, key) or self.store()
+            pg = self.pg.with_catalog(mem)
+            p = self.with_pg(pg)
+            return p.add_row(name, row)
+        }
+        self.add_row(name, row)
+    }
+
+    find(self, name: str, col: str, val: str): _ => self.pg.find(name, col, val)
+
+    count(self, name: str): i64 => self.pg.count(name)
+
+    update(self, name: str, col: str, val: str, set_col: str, set_val: str) : CrdbPool! {
+        pg = self.pg.update(name, col, val, set_col, set_val) or self.pg
+        self.with_pg(pg)
+    }
+
+    delete(self, name: str, col: str, val: str) : CrdbPool! {
+        pg = self.pg.delete(name, col, val) or self.pg
+        self.with_pg(pg)
+    }
+
+    begin(self) : CrdbTx {
+        CrdbTx.{cfg: self.cfg, tx: self.pg.begin(), isolation: self.isolation, as_of: self.system_time}
+    }
+
+    commit(self, t: CrdbTx): CrdbPool => self.with_pg(self.pg.commit(t.tx))
+
+    rollback(self, t: CrdbTx): CrdbPool => self.with_pg(self.pg.rollback(t.tx))
+
+    /// SET TRANSACTION ISOLATION LEVEL.
+    set_isolation(@self, level: str) : str {
+        self.isolation = level
+        level
+    }
+
+    /// AS OF SYSTEM TIME timestamp (follower read watermark).
+    as_of_system_time(@self, ts: i64) : i64 {
+        self.system_time = ts
+        ts
+    }
+
+    /// SHOW RANGES lite.
+    show_ranges(self): _ => self.ranges
+
+    /// SHOW ZONE CONFIGURATION lite.
+    show_zone_config(self): _ => self.zone_configs
+
+    /// Split range descriptor (admin).
+    split_range(@self, at_key: str) : bool {
+        self.ranges = arr_push(self.ranges, "[/Min - {at_key})", "[{at_key} -/Max)")
+        true
+    }
+
+    /// Cluster settings snapshot string.
+    show_cluster_setting(_self, name: str) : str {
+        if name == "version" { return "v24.1.0-super-offline" }
+        if name == "kv.closed_timestamp.target_duration" { return "3s" }
+        "default"
+    }
+
+    /// EXPLAIN (offline): returns a one-line plan.
+    explain(_self, query: str): str => "distribution: local\nvectorized: true\n·\n• scan / filter\n  query: {query}"
+}
+
++CrdbTx = {
+    cfg: CrdbConfig = CrdbConfig.{host: "localhost", port: 26257, user: "", password: "", dbname: "", cluster: "", locality: "", sslmode: "disable"}
+    tx: PgTx = PgTx.{cfg: PgConfig.{host: "localhost", port: 5432, user: "", password: "", dbname: ""}, tx: SqlTx.{base: SqlDb.{tables: []}, work: SqlDb.{tables: []}, open: true}}
+    isolation: str = "SERIALIZABLE"
+    as_of: i64 = 0
+
+    store(self): SqlDb => self.tx.store()
+    with(self, work: SqlDb): CrdbTx => CrdbTx.{cfg: self.cfg, tx: self.tx.with(work), isolation: self.isolation, as_of: self.as_of}
+}
+
++crdb_find_from(s: str, needle: str, start: i64) : i64 {
+    found = -1
+    n = sql_len(s)
+    for start..n {
+        if found < 0 && s[it] == needle { found = it }
+    }
+    found
+}
+
++crdb_slice(s: str, start: i64, stop: i64) : str {
+    out = ""
+    for start..stop { out = out + s[it] }
+    out
+}
+
++crdb_parse_int(s: str) : i64 {
+    n = -1
+    ensure sql_len(s) > 0 else { return n }
+    acc = 0
+    for 0..sql_len(s) {
+        d = sql_digit(s[it])
+        if d < 0 { return n }
+        acc = acc * 10 + d
+    }
+    acc
+}
+
+/// cockroachdb://user:pass@host:port/db?sslmode=...&cluster=...
++crdb_parse_url(url: str) : CrdbConfig! {
+    // Rewrite cockroach schemes to postgres for shared parsing, then restore port default.
+    u = url
+    scheme_at = crdb_find_from(u, ":", 0)
+    ensure scheme_at > 0 else {
+        fail "crdb: missing scheme"
+        return
+    }
+    scheme = crdb_slice(u, 0, scheme_at)
+    ensure scheme == "cockroach" || scheme == "cockroachdb" || scheme == "postgres" || scheme == "postgresql" else {
+        fail "crdb: unsupported scheme {scheme}"
+        return
+    }
+    rest = crdb_slice(u, scheme_at, sql_len(u))
+    pg_url = "postgres" + rest
+    cfg = pg_parse_url(pg_url) or PgConfig.{host: "", port: 0, user: "", password: "", dbname: ""}
+    ensure cfg.host != "" else {
+        fail "crdb: invalid connection url"
+        return
+    }
+    port = cfg.port
+    // If caller used cockroach scheme without explicit port, pg_parse defaults to 5432 — fix to 26257.
+    if (scheme == "cockroach" || scheme == "cockroachdb") && port == 5432 {
+        // Only rewrite when the original URL had no :port before /
+        host_part_has_port = false
+        // crude: look for :digits/ after @ or //
+        at = crdb_find_from(u, "@", 0)
+        start = scheme_at + 3
+        if at >= 0 { start = at + 1 }
+        slash = crdb_find_from(u, "/", start)
+        if slash > start {
+            hp = crdb_slice(u, start, slash)
+            if crdb_find_from(hp, ":", 0) >= 0 { host_part_has_port = true }
+        }
+        if !host_part_has_port { port = CRDB_DEFAULT_PORT }
+    }
+    cluster = ""
+    locality = ""
+    sslmode = "disable"
+    q_at = crdb_find_from(u, "?", 0)
+    if q_at >= 0 {
+        qs = crdb_slice(u, q_at + 1, sql_len(u))
+        for 0..sql_len(qs) {
+            if qs[it..(it + 8)] == "cluster=" {
+                e = crdb_find_from(qs, "&", it + 8)
+                if e < 0 { e = sql_len(qs) }
+                cluster = crdb_slice(qs, it + 8, e)
+            }
+            if qs[it..(it + 9)] == "locality=" {
+                e = crdb_find_from(qs, "&", it + 9)
+                if e < 0 { e = sql_len(qs) }
+                locality = crdb_slice(qs, it + 9, e)
+            }
+            if qs[it..(it + 8)] == "sslmode=" {
+                e = crdb_find_from(qs, "&", it + 8)
+                if e < 0 { e = sql_len(qs) }
+                sslmode = crdb_slice(qs, it + 8, e)
+            }
+        }
+    }
+    CrdbConfig.{host: cfg.host, port, user: cfg.user, password: cfg.password, dbname: cfg.dbname, cluster, locality, sslmode}
+}
+
++crdb_redacted(cfg: CrdbConfig) : str {
+    auth = ""
+    if cfg.user != "" { auth = "{cfg.user}@" }
+    "cockroachdb://{auth}{cfg.host}:{cfg.port}/{cfg.dbname}"
+}
+
+/// Reuse Postgres $n prepare.
++crdb_prepare(query: str, params: _): str! => pg_prepare(query, params)
+
+test "crdb parse url defaults port" {
+    cfg = crdb_parse_url("cockroachdb://root@localhost/defaultdb") or CrdbConfig.{host: "", port: 0, user: "", password: "", dbname: "", cluster: "", locality: "", sslmode: ""}
+    assert_eq(cfg.host, "localhost")
+    assert_eq(cfg.port, 26257)
+    assert_eq(cfg.user, "root")
+    assert_eq(cfg.dbname, "defaultdb")
+    with_port = crdb_parse_url("cockroach://root@h:26258/db?cluster=my-cluster&sslmode=require") or CrdbConfig.{host: "", port: 0, user: "", password: "", dbname: "", cluster: "", locality: "", sslmode: ""}
+    assert_eq(with_port.port, 26258)
+    assert_eq(with_port.cluster, "my-cluster")
+    assert_eq(with_port.sslmode, "require")
+    assert_eq(crdb_redacted(cfg), "cockroachdb://root@localhost:26257/defaultdb")
+}
+
+test "crdb upsert tx ranges explain" {
+    pool = CrdbPool.new("cockroachdb://root@localhost/defaultdb", 4) or CrdbPool.empty()
+    pool = pool.make_table("kv", ["k", "v"]) or pool
+    pool = pool.add_row("kv", ["a", "1"]) or pool
+    pool = pool.upsert("kv", "k", ["a", "2"]) or pool
+    assert_eq(pool.count("kv"), 1)
+    rows = pool.find("kv", "k", "a")
+    assert_eq(rows[0][1], "2")
+    pool = pool.upsert("kv", "k", ["b", "3"]) or pool
+    assert_eq(pool.count("kv"), 2)
+    assert_eq(@pool.set_isolation("SERIALIZABLE"), "SERIALIZABLE")
+    assert_eq(@pool.as_of_system_time(1700000000), 1700000000)
+    #assert(len(pool.show_ranges()) >= 1)
+    #assert(@pool.split_range("/Table/1"))
+    assert_eq(pool.show_cluster_setting("version"), "v24.1.0-super-offline")
+    plan = pool.explain("SELECT * FROM kv")
+    #assert(starts_with(plan, "distribution:"))
+    tx = pool.begin()
+    assert_eq(tx.isolation, "SERIALIZABLE")
+    q = crdb_prepare("SELECT $1", [sql_int(1)]) or "ERR"
+    assert_eq(q, "SELECT 1")
+}

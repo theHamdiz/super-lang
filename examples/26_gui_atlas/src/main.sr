@@ -1,0 +1,76 @@
+// GUI — a small atlas. Each pin captions itself; the map places the captions.
+//
+// Run: super test examples/26_gui_atlas/
+
+use std.gui
+use std.gui.window
+
++Pin = {
+    name: str
+    x: i64
+    y: i64
+
+    caption(self) : str => "{self.name}  {self.x},{self.y}"
+
+    near(self, other: Pin) : bool {
+        dx = self.x - other.x
+        dy = self.y - other.y
+        if dx < 0 { dx = 0 - dx }
+        if dy < 0 { dy = 0 - dy }
+        dx + dy < 40
+    }
+}
+
++Atlas = {
+    title: str
+
+    sheet(self) : Gui {
+        harbor = Pin{name: "Harbor", x: 12, y: 40}
+        ridge = Pin{name: "Ridge", x: 80, y: 18}
+        bay = Pin{name: "Bay", x: 20, y: 48}
+        app = Gui.new(self.title, 280, 180)
+        @app.theme("contrast")
+        root = @app.column("root")
+        @app.tabs(root, "modes", ["Map", "List"])
+        sheet = @app.panel(root, "sheet")
+        @app.label(sheet, "harbor", harbor.caption())
+        @app.label(sheet, "ridge", ridge.caption())
+        @app.label(sheet, "bay", bay.caption())
+        @app.style("harbor", 24, 236, 16, 1, "start")
+        note = "Harbor and Bay share a coast."
+        if harbor.near(bay) == false { note = "Every pin stands alone." }
+        @app.text(root, "note", note)
+        app
+    }
+
+    picture(self) : str {
+        app = self.sheet()
+        @app.layout()
+        @app.paint()
+    }
+
+    scene(self) : str => self.sheet().describe()
+}
+
++main() {
+    map = Atlas{title: "Atlas"}
+    window_show("Atlas", 280, 180, map.scene())
+}
+
+test "a pin captions itself and knows its neighbors" {
+    harbor = Pin{name: "Harbor", x: 12, y: 40}
+    bay = Pin{name: "Bay", x: 20, y: 48}
+    ridge = Pin{name: "Ridge", x: 80, y: 18}
+    assert_eq(harbor.caption(), "Harbor  12,40")
+    #assert(harbor.near(bay))
+    #assert(!(harbor.near(ridge)))
+}
+
+test "the atlas paints every caption" {
+    map = Atlas{title: "Atlas"}
+    frame = map.picture()
+    #assert(contains(frame, "fill 0 0 280 180"))
+    #assert(contains(frame, "Harbor  12,40"))
+    #assert(contains(frame, "Ridge  80,18"))
+    #assert(contains(frame, "share a coast"))
+}

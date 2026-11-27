@@ -1,0 +1,783 @@
+//! std.io.archive — tar (ustar) and zip (stored) archive building and parsing over byte arrays
+//!
+//! Import with:
+//!   use std.io.archive
+//!
+//!   w = TarWriter.new()
+//!   @w.add_dir("assets/", 1700000000) or false
+//!   @w.add_file("assets/hello.txt", host.sys_str_to_bytes("hi"), 1700000000) or false
+//!   tar = w.finish()                                  // bytes: headers, padded data, 1024 zero bytes
+//!   for ar_tar_list(tar) { print("{it.name} {it.size}") }
+//!
+//!   z = ZipWriter.new()
+//!   @z.add("a.txt", host.sys_str_to_bytes("hello"), 0, 0) or false
+//!   zip = z.finish()                                  // local headers + central directory + EOCD
+//!   entry = ar_zip_list(zip)[0]
+//!   data = ar_zip_data(zip, entry)
+//!
+//! Archives are plain `i64` byte arrays (0..255). The tar side writes and reads POSIX ustar
+//! headers: octal numeric fields, the `ustar` magic, the header checksum, and the 155-byte
+//! `prefix` + 100-byte `name` split for long paths. The zip side uses method 0 (stored) with
+//! CRC-32 computed in pure Super; it emits local file headers, a central directory and the
+//! end-of-central-directory record, and parses stored local entries back. Compression lives in
+//! `std.fmt.compress`. The tests assert the exact ustar and zip field offsets and sizes. Public helpers are prefixed `ar_`
+//! (modules merge flat).
+
+/// `AR_BLOCK` is the tar block size (`512`).
++AR_BLOCK = 512
+/// `AR_ZIP_LOCAL_SIG` is the zip local file header signature `PK\3\4` (`67324752`).
++AR_ZIP_LOCAL_SIG = 67324752
+/// `AR_ZIP_CENTRAL_SIG` is the zip central directory signature `PK\1\2` (`33639248`).
++AR_ZIP_CENTRAL_SIG = 33639248
+/// `AR_ZIP_EOCD_SIG` is the end-of-central-directory signature `PK\5\6` (`101010256`).
++AR_ZIP_EOCD_SIG = 101010256
+/// `AR_CRC_POLY` is the reflected CRC-32 polynomial (`3988292384`).
++AR_CRC_POLY = 3988292384
+
+// --- byte helpers --------------------------------------------------------------------------------
+
+/// `out` with `n` zero bytes appended.
++ar_zeros(out: _, n: i64) {
+    a = out
+    for 0..n { a = host.sys_arr_push(a, 0) }
+    a
+}
+
+/// `out` with all of `data` appended.
++ar_append(out: _, data: _) {
+    a = out
+    for data { a = host.sys_arr_push(a, it) }
+    a
+}
+
+/// `out` with `v` appended as unsigned little-endian 16 bits.
++ar_put_u16(out: _, v: i64) {
+    a = host.sys_arr_push(out, v % 256)
+    host.sys_arr_push(a, (v / 256) % 256)
+}
+
+/// `out` with `v` appended as unsigned little-endian 32 bits.
++ar_put_u32(out: _, v: i64) {
+    a = ar_put_u16(out, v % 65536)
+    ar_put_u16(a, (v / 65536) % 65536)
+}
+
+/// Unsigned little-endian 16-bit value at `at`.
++ar_get_u16(b: _, at: i64) : i64 => b[at] + b[at + 1] * 256
+
+/// Unsigned little-endian 32-bit value at `at`.
++ar_get_u32(b: _, at: i64) : i64 => ar_get_u16(b, at) + ar_get_u16(b, at + 2) * 65536
+
+/// `len` bytes of `data` starting at `at`.
++ar_slice(data: _, at: i64, len: i64) {
+    out = []
+    for at..(at + len) { out = host.sys_arr_push(out, data[it]) }
+    out
+}
+
+/// CRC-32 (IEEE, as used by zip/gzip/PNG) of a byte array.
++ar_crc32(data: _) : i64 {
+    crc = 4294967295
+    for data {
+        crc = (crc ^ it) & 4294967295
+        for 0..8 {
+            if crc % 2 == 1 { crc = (crc >>> 1) ^ AR_CRC_POLY } else { crc = crc >>> 1 }
+        }
+    }
+    (crc ^ 4294967295) & 4294967295
+}
+
+// --- tar: octal fields -----------------------------------------------------------------------
+
+/// Octal digits of `v` (non-negative), most significant first, zero-padded to `digits` characters.
++ar_octal(v: i64, digits: i64) : str {
+    out = ""
+    rest = v
+    for 0..digits {
+        out = host.sys_chr(48 + rest % 8) + out
+        rest = rest / 8
+    }
+    out
+}
+
+/// A `width`-byte numeric field: `width - 1` octal digits then a NUL.
++ar_octal_field(v: i64, width: i64) {
+    out = host.sys_str_to_bytes(ar_octal(v, width - 1))
+    host.sys_arr_push(out, 0)
+}
+
+/// A `width`-byte text field, truncated or NUL-padded.
++ar_text_field(s: str, width: i64) {
+    raw = host.sys_str_to_bytes(s)
+    out = []
+    for 0..width {
+        if it < host.sys_arr_len(raw) { out = host.sys_arr_push(out, raw[it]) } else { out = host.sys_arr_push(out, 0) }
+    }
+    out
+}
+
+/// Value of the octal digits in `[at, at + width)`; stops at NUL or space.
++ar_parse_octal(b: _, at: i64, width: i64) : i64 {
+    v = 0
+    live = true
+    for 0..width {
+        c = b[at + it]
+        if live && c >= 48 && c <= 55 { v = v * 8 + (c - 48) } else { live = false }
+    }
+    v
+}
+
+/// Text in `[at, at + width)` up to the first NUL.
++ar_text_at(b: _, at: i64, width: i64) : str {
+    out = []
+    live = true
+    for 0..width {
+        c = b[at + it]
+        if c == 0 { live = false }
+        if live { out = host.sys_arr_push(out, c) }
+    }
+    host.sys_bytes_to_str(out)
+}
+
+/// Round `n` up to a multiple of 512.
++ar_block_up(n: i64) : i64 {
+    ensure n > 0 else { return 0 }
+    ((n + AR_BLOCK - 1) / AR_BLOCK) * AR_BLOCK
+}
+
+// --- tar: entries --------------------------------------------------------------------------------
+
+/// `TarEntry` is one member of a tar archive.
++TarEntry = {
+    /// Full path (prefix and name joined). Defaults to `""`.
+    name: str = ""
+    /// Permission bits (e.g. 420 = 0644). Defaults to `420`.
+    mode: i64 = 420
+    /// Owner id. Defaults to `0`.
+    uid: i64 = 0
+    /// Group id. Defaults to `0`.
+    gid: i64 = 0
+    /// Data length in bytes. Defaults to `0`.
+    size: i64 = 0
+    /// Modification time (Unix seconds). Defaults to `0`.
+    mtime: i64 = 0
+    /// Type flag: "0" file, "5" directory, "2" symlink. Defaults to `"0"`.
+    typeflag: str = "0"
+    /// Link target for symlinks. Defaults to `""`.
+    linkname: str = ""
+    /// Owner name. Defaults to `""`.
+    uname: str = ""
+    /// Group name. Defaults to `""`.
+    gname: str = ""
+    /// Byte offset of the data inside the parsed archive. Defaults to `0`.
+    data_off: i64 = 0
+
+    /// Regular-file entry.
+    file(name: str, size: i64, mtime: i64) : TarEntry {
+        TarEntry.{name, mode: 420, uid: 0, gid: 0, size, mtime, typeflag: "0", linkname: "", uname: "", gname: "", data_off: 0}
+    }
+
+    /// Directory entry (mode 0755, no data).
+    dir(name: str, mtime: i64) : TarEntry {
+        TarEntry.{name, mode: 493, uid: 0, gid: 0, size: 0, mtime, typeflag: "5", linkname: "", uname: "", gname: "", data_off: 0}
+    }
+
+    /// True for a directory entry.
+    is_dir(self) : bool => self.typeflag == "5"
+
+    /// True for a regular file (`"0"`, or the legacy NUL flag read back as `""`).
+    is_file(self) : bool => self.typeflag == "0" || self.typeflag == ""
+}
+
+/// Split `path` into [prefix, name] for the ustar header, or [] when it cannot fit (100-byte name, 155-byte prefix).
++ar_tar_split(path: str) {
+    n = host.sys_str_len(path)
+    parts = []
+    if n <= 100 {
+        parts = ["", path]
+        return parts
+    }
+    cut = -1
+    for 0..n {
+        if path[it] == "/" && it <= 155 && n - it - 1 <= 100 && n - it - 1 > 0 { cut = it }
+    }
+    if cut < 0 { return parts }
+    parts = [path[0..cut], path[(cut + 1)..n]]
+    parts
+}
+
+/// The 512-byte ustar header for `e`, or fail when the path is too long.
++ar_tar_header(e: TarEntry) : _! {
+    parts = ar_tar_split(e.name)
+    ensure host.sys_arr_len(parts) == 2 else {
+        fail "tar: path too long for ustar: {e.name}"
+        return
+    }
+    h = ar_text_field(parts[1], 100)
+    h = ar_append(h, ar_octal_field(e.mode, 8))
+    h = ar_append(h, ar_octal_field(e.uid, 8))
+    h = ar_append(h, ar_octal_field(e.gid, 8))
+    h = ar_append(h, ar_octal_field(e.size, 12))
+    h = ar_append(h, ar_octal_field(e.mtime, 12))
+    for 0..8 { h = host.sys_arr_push(h, 32) }
+    h = ar_append(h, host.sys_str_to_bytes(e.typeflag))
+    h = ar_append(h, ar_text_field(e.linkname, 100))
+    h = ar_append(h, [117, 115, 116, 97, 114, 0, 48, 48])
+    h = ar_append(h, ar_text_field(e.uname, 32))
+    h = ar_append(h, ar_text_field(e.gname, 32))
+    h = ar_append(h, ar_octal_field(0, 8))
+    h = ar_append(h, ar_octal_field(0, 8))
+    h = ar_append(h, ar_text_field(parts[0], 155))
+    h = ar_zeros(h, 12)
+    sum = 0
+    for h { sum += it }
+    chk = host.sys_str_to_bytes(ar_octal(sum, 6))
+    chk = host.sys_arr_push(chk, 0)
+    chk = host.sys_arr_push(chk, 32)
+    for 0..8 { h = host.sys_arr_set(h, 148 + it, chk[it]) }
+    h
+}
+
+/// Header checksum of the 512-byte block at `at` (chksum field counted as spaces).
++ar_tar_checksum(b: _, at: i64) : i64 {
+    sum = 0
+    for 0..512 {
+        if it >= 148 && it < 156 { sum += 32 } else { sum += b[at + it] }
+    }
+    sum
+}
+
+/// True when the 512-byte block at `at` is all zero (end-of-archive marker).
++ar_is_zero_block(b: _, at: i64) : bool {
+    ensure at >= 0 && at + 512 <= host.sys_arr_len(b) else { return false }
+    zero = true
+    for 0..512 {
+        if b[at + it] != 0 { zero = false }
+    }
+    zero
+}
+
+/// Parse and validate the ustar header at `at` (magic and checksum), or fail.
++ar_tar_parse_header(b: _, at: i64) : TarEntry! {
+    ensure at >= 0 && at + 512 <= host.sys_arr_len(b) else {
+        fail "tar: truncated header"
+        return
+    }
+    ensure ar_text_at(b, at + 257, 5) == "ustar" else {
+        fail "tar: missing ustar magic"
+        return
+    }
+    ensure ar_parse_octal(b, at + 148, 8) == ar_tar_checksum(b, at) else {
+        fail "tar: header checksum mismatch"
+        return
+    }
+    name = ar_text_at(b, at, 100)
+    prefix = ar_text_at(b, at + 345, 155)
+    if prefix != "" { name = prefix + "/" + name }
+    TarEntry.{
+        name,
+        mode: ar_parse_octal(b, at + 100, 8),
+        uid: ar_parse_octal(b, at + 108, 8),
+        gid: ar_parse_octal(b, at + 116, 8),
+        size: ar_parse_octal(b, at + 124, 12),
+        mtime: ar_parse_octal(b, at + 136, 12),
+        typeflag: ar_text_at(b, at + 156, 1),
+        linkname: ar_text_at(b, at + 157, 100),
+        uname: ar_text_at(b, at + 265, 32),
+        gname: ar_text_at(b, at + 297, 32),
+        data_off: at + 512,
+    }
+}
+
+/// Entries of a tar archive in order; stops at the zero block, a bad header or truncated data.
++ar_tar_list(b: _) {
+    out = []
+    n = host.sys_arr_len(b)
+    pos = 0
+    live = true
+    while live && pos + 512 <= n {
+        if ar_is_zero_block(b, pos) {
+            live = false
+        } else {
+            parsed = ar_tar_parse_header(b, pos) or TarEntry.file("", -1, 0)
+            if parsed.size < 0 || pos + 512 + parsed.size > n {
+                live = false
+            } else {
+                out = host.sys_arr_push(out, parsed)
+                pos = pos + 512 + ar_block_up(parsed.size)
+            }
+        }
+    }
+    out
+}
+
+/// The data bytes of a parsed entry.
++ar_tar_data(b: _, e: TarEntry)  => ar_slice(b, e.data_off, e.size)
+
+/// `TarWriter` accumulates a tar archive in memory.
++TarWriter = {
+    /// Archive bytes written so far. Defaults to `[]`.
+    buf: _ = []
+    /// Entries written so far. Defaults to `0`.
+    count: i64 = 0
+
+    /// An empty archive.
+    new() : TarWriter => TarWriter.{buf: [], count: 0}
+
+    /// Append a regular file: header, data and zero padding to a block boundary.
+    add_file(@self, name: str, data: _, mtime: i64) : bool! {
+        n = host.sys_arr_len(data)
+        header = ar_tar_header(TarEntry.file(name, n, mtime)) or err {
+            fail "{err}"
+            return
+        }
+        out = ar_append(self.buf, header)
+        out = ar_append(out, data)
+        out = ar_zeros(out, ar_block_up(n) - n)
+        self.buf = out
+        self.count += 1
+        true
+    }
+
+    /// Append a directory entry (a trailing `/` is added when missing).
+    add_dir(@self, name: str, mtime: i64) : bool! {
+        full = name
+        n = host.sys_str_len(name)
+        if n == 0 || name[n - 1] != "/" { full = name + "/" }
+        header = ar_tar_header(TarEntry.dir(full, mtime)) or err {
+            fail "{err}"
+            return
+        }
+        self.buf = ar_append(self.buf, header)
+        self.count += 1
+        true
+    }
+
+    /// The finished archive: everything written plus two zero blocks.
+    finish(self)  => ar_zeros(self.buf, 1024)
+}
+
+// --- zip -------------------------------------------------------------------------------------------
+
+/// `DOS time` field for a wall-clock time (seconds are stored in 2-second units).
++ar_dos_time(hour: i64, minute: i64, second: i64) : i64 => hour * 2048 + minute * 32 + second / 2
+
+/// `DOS date` field for a calendar date (years from 1980).
++ar_dos_date(year: i64, month: i64, day: i64) : i64 => (year - 1980) * 512 + month * 32 + day
+
+/// `ZipEntry` is one stored member of a zip archive.
++ZipEntry = {
+    /// Member path. Defaults to `""`.
+    name: str = ""
+    /// Compression method (0 = stored). Defaults to `0`.
+    method: i64 = 0
+    /// General-purpose flags. Defaults to `0`.
+    flags: i64 = 0
+    /// CRC-32 of the uncompressed data. Defaults to `0`.
+    crc: i64 = 0
+    /// Compressed size. Defaults to `0`.
+    comp_size: i64 = 0
+    /// Uncompressed size. Defaults to `0`.
+    size: i64 = 0
+    /// DOS modification time. Defaults to `0`.
+    dos_time: i64 = 0
+    /// DOS modification date. Defaults to `0`.
+    dos_date: i64 = 0
+    /// Offset of the local header in the archive. Defaults to `0`.
+    offset: i64 = 0
+    /// Offset of the data bytes in the archive. Defaults to `0`.
+    data_off: i64 = 0
+}
+
+/// Local file header (30 bytes + name) for a stored member.
++ar_zip_local_header(name: str, crc: i64, size: i64, dos_time: i64, dos_date: i64) {
+    raw = host.sys_str_to_bytes(name)
+    h = ar_put_u32([], AR_ZIP_LOCAL_SIG)
+    h = ar_put_u16(h, 20)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, dos_time)
+    h = ar_put_u16(h, dos_date)
+    h = ar_put_u32(h, crc)
+    h = ar_put_u32(h, size)
+    h = ar_put_u32(h, size)
+    h = ar_put_u16(h, host.sys_arr_len(raw))
+    h = ar_put_u16(h, 0)
+    ar_append(h, raw)
+}
+
+/// Central directory record (46 bytes + name) for a stored member at `offset`.
++ar_zip_central_header(name: str, crc: i64, size: i64, dos_time: i64, dos_date: i64, offset: i64) {
+    raw = host.sys_str_to_bytes(name)
+    h = ar_put_u32([], AR_ZIP_CENTRAL_SIG)
+    h = ar_put_u16(h, 20)
+    h = ar_put_u16(h, 20)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, dos_time)
+    h = ar_put_u16(h, dos_date)
+    h = ar_put_u32(h, crc)
+    h = ar_put_u32(h, size)
+    h = ar_put_u32(h, size)
+    h = ar_put_u16(h, host.sys_arr_len(raw))
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u32(h, 0)
+    h = ar_put_u32(h, offset)
+    ar_append(h, raw)
+}
+
+/// End-of-central-directory record (22 bytes).
++ar_zip_eocd(count: i64, cd_size: i64, cd_offset: i64) {
+    h = ar_put_u32([], AR_ZIP_EOCD_SIG)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, 0)
+    h = ar_put_u16(h, count)
+    h = ar_put_u16(h, count)
+    h = ar_put_u32(h, cd_size)
+    h = ar_put_u32(h, cd_offset)
+    ar_put_u16(h, 0)
+}
+
+/// Parse the local file header at `at` (stored or deflated metadata; sizes come from the header), or fail.
++ar_zip_parse_local(b: _, at: i64) : ZipEntry! {
+    n = host.sys_arr_len(b)
+    ensure at >= 0 && at + 30 <= n else {
+        fail "zip: truncated local header"
+        return
+    }
+    ensure ar_get_u32(b, at) == AR_ZIP_LOCAL_SIG else {
+        fail "zip: bad local header signature"
+        return
+    }
+    name_len = ar_get_u16(b, at + 26)
+    extra_len = ar_get_u16(b, at + 28)
+    ensure at + 30 + name_len + extra_len <= n else {
+        fail "zip: truncated name or extra field"
+        return
+    }
+    raw = ar_slice(b, at + 30, name_len)
+    ZipEntry.{
+        name: host.sys_bytes_to_str(raw),
+        method: ar_get_u16(b, at + 8),
+        flags: ar_get_u16(b, at + 6),
+        crc: ar_get_u32(b, at + 14),
+        comp_size: ar_get_u32(b, at + 18),
+        size: ar_get_u32(b, at + 22),
+        dos_time: ar_get_u16(b, at + 10),
+        dos_date: ar_get_u16(b, at + 12),
+        offset: at,
+        data_off: at + 30 + name_len + extra_len,
+    }
+}
+
+/// Stored members of a zip in file order (stops at the first non-local signature or truncated data).
++ar_zip_list(b: _) {
+    out = []
+    n = host.sys_arr_len(b)
+    pos = 0
+    live = true
+    while live && pos + 30 <= n {
+        e = ar_zip_parse_local(b, pos) or ZipEntry.{name: "", method: -1, flags: 0, crc: 0, comp_size: 0, size: 0, dos_time: 0, dos_date: 0, offset: 0, data_off: 0}
+        if e.method < 0 || e.data_off + e.comp_size > n {
+            live = false
+        } else {
+            out = host.sys_arr_push(out, e)
+            pos = e.data_off + e.comp_size
+        }
+    }
+    out
+}
+
+/// Data bytes of a stored member.
++ar_zip_data(b: _, e: ZipEntry)  => ar_slice(b, e.data_off, e.comp_size)
+
+/// True when the stored data of `e` matches its recorded CRC-32 and size.
++ar_zip_verify(b: _, e: ZipEntry) : bool {
+    ensure e.method == 0 && e.comp_size == e.size else { return false }
+    ar_crc32(ar_zip_data(b, e)) == e.crc
+}
+
+/// `ZipWriter` builds a stored-only zip archive in memory.
++ZipWriter = {
+    /// Local headers and data written so far. Defaults to `[]`.
+    buf: _ = []
+    /// Central directory records collected so far. Defaults to `[]`.
+    central: _ = []
+    /// Members added. Defaults to `0`.
+    count: i64 = 0
+
+    /// An empty archive.
+    new() : ZipWriter => ZipWriter.{buf: [], central: [], count: 0}
+
+    /// Append a stored member. Fails on an empty name or one over 65535 bytes.
+    add(@self, name: str, data: _, dos_time: i64, dos_date: i64) : bool! {
+        nlen = host.sys_arr_len(host.sys_str_to_bytes(name))
+        ensure nlen > 0 && nlen < 65536 else {
+            fail "zip: invalid member name length"
+            return
+        }
+        size = host.sys_arr_len(data)
+        crc = ar_crc32(data)
+        offset = host.sys_arr_len(self.buf)
+        out = ar_append(self.buf, ar_zip_local_header(name, crc, size, dos_time, dos_date))
+        self.buf = ar_append(out, data)
+        self.central = ar_append(self.central, ar_zip_central_header(name, crc, size, dos_time, dos_date, offset))
+        self.count += 1
+        true
+    }
+
+    /// The finished archive: members, central directory, end record.
+    finish(self) {
+        body = ar_append(self.buf, self.central)
+        ar_append(body, ar_zip_eocd(self.count, host.sys_arr_len(self.central), host.sys_arr_len(self.buf)))
+    }
+}
+
+// --- tests -----------------------------------------------------------------------------------------
+
+/// Test that CRC-32 matches known vectors.
+test "CRC-32 matches known vectors" {
+    assert_eq(ar_crc32([]), 0)
+    assert_eq(ar_crc32(host.sys_str_to_bytes("123456789")), 3421780262)
+    assert_eq(ar_crc32(host.sys_str_to_bytes("a")), 3904355907)
+    assert_eq(ar_crc32(host.sys_str_to_bytes("The quick brown fox jumps over the lazy dog")), 1095738169)
+    #assert(ar_crc32(host.sys_str_to_bytes("hello")) == host.sys_crc32("hello"))
+}
+
+/// Test that octal fields encode and decode.
+test "octal fields encode and decode" {
+    assert_eq(ar_octal(420, 6), "000644")
+    assert_eq(ar_octal(0, 3), "000")
+    assert_eq(ar_octal(8, 2), "10")
+    f = ar_octal_field(493, 8)
+    assert_eq(host.sys_arr_len(f), 8)
+    assert_eq(f[7], 0)
+    assert_eq(f[6], 53)
+    assert_eq(ar_parse_octal(f, 0, 8), 493)
+    big = ar_octal_field(1700000000, 12)
+    assert_eq(ar_parse_octal(big, 0, 12), 1700000000)
+    t = ar_text_field("abc", 6)
+    assert_eq(host.sys_arr_len(t), 6)
+    assert_eq(t[3], 0)
+    assert_eq(ar_text_at(t, 0, 6), "abc")
+    assert_eq(host.sys_arr_len(ar_text_field("abcdefgh", 4)), 4)
+    assert_eq(ar_text_at(ar_text_field("abcdefgh", 4), 0, 4), "abcd")
+    assert_eq(ar_block_up(0), 0)
+    assert_eq(ar_block_up(1), 512)
+    assert_eq(ar_block_up(512), 512)
+    assert_eq(ar_block_up(513), 1024)
+}
+
+/// Test that a tar header has the ustar layout.
+test "a tar header has the ustar layout" {
+    e = TarEntry.file("dir/hello.txt", 11, 1700000000)
+    h = ar_tar_header(e) or []
+    assert_eq(host.sys_arr_len(h), 512)
+    assert_eq(ar_text_at(h, 0, 100), "dir/hello.txt")
+    assert_eq(ar_parse_octal(h, 100, 8), 420)
+    assert_eq(ar_parse_octal(h, 124, 12), 11)
+    assert_eq(ar_parse_octal(h, 136, 12), 1700000000)
+    assert_eq(h[156], 48)
+    assert_eq(ar_text_at(h, 257, 5), "ustar")
+    assert_eq(h[262], 0)
+    assert_eq(h[263], 48)
+    assert_eq(h[264], 48)
+    assert_eq(h[154], 0)
+    assert_eq(h[155], 32)
+    assert_eq(ar_parse_octal(h, 148, 8), ar_tar_checksum(h, 0))
+    d = ar_tar_header(TarEntry.dir("d/", 5)) or []
+    assert_eq(d[156], 53)
+    assert_eq(ar_parse_octal(d, 100, 8), 493)
+}
+
+/// Test that tar headers parse back and reject corruption.
+test "tar headers parse back and reject corruption" {
+    e = TarEntry.file("notes.md", 3, 42)
+    h = ar_tar_header(e) or []
+    back = ar_tar_parse_header(h, 0) or TarEntry.file("", -1, 0)
+    assert_eq(back.name, "notes.md")
+    assert_eq(back.size, 3)
+    assert_eq(back.mtime, 42)
+    assert_eq(back.mode, 420)
+    #assert(back.is_file())
+    #assert(!(back.is_dir()))
+    assert_eq(back.data_off, 512)
+    bad = host.sys_arr_set(h, 0, 88)
+    assert_eq((ar_tar_parse_header(bad, 0) or TarEntry.file("", -1, 0)).size, -1)
+    nomagic = host.sys_arr_set(h, 257, 0)
+    assert_eq((ar_tar_parse_header(nomagic, 0) or TarEntry.file("", -1, 0)).size, -1)
+    assert_eq((ar_tar_parse_header([1, 2, 3], 0) or TarEntry.file("", -1, 0)).size, -1)
+    assert_eq((ar_tar_parse_header(h, 1) or TarEntry.file("", -1, 0)).size, -1)
+}
+
+/// Test that long paths split into prefix and name.
+test "long paths split into prefix and name" {
+    short = ar_tar_split("a/b.txt")
+    assert_eq(short[0], "")
+    assert_eq(short[1], "a/b.txt")
+    dir = "d123456789"
+    long = dir
+    for 0..11 { long = long + "/" + dir }
+    long = long + "/file.txt"
+    #assert(host.sys_str_len(long) > 100)
+    parts = ar_tar_split(long)
+    assert_eq(host.sys_arr_len(parts), 2)
+    assert_eq(parts[0] + "/" + parts[1], long)
+    #assert(host.sys_str_len(parts[1]) <= 100)
+    h = ar_tar_header(TarEntry.file(long, 0, 0)) or []
+    back = ar_tar_parse_header(h, 0) or TarEntry.file("", -1, 0)
+    assert_eq(back.name, long)
+    flat = ""
+    for 0..120 { flat = flat + "x" }
+    assert_eq(host.sys_arr_len(ar_tar_split(flat)), 0)
+    assert_eq(host.sys_arr_len(ar_tar_header(TarEntry.file(flat, 0, 0)) or []), 0)
+}
+
+/// Test that a tar archive round trips files and directories.
+test "a tar archive round trips files and directories" {
+    w = TarWriter.new()
+    #assert(@w.add_dir("assets", 100) or false)
+    #assert(@w.add_file("assets/a.txt", host.sys_str_to_bytes("alpha"), 200) or false)
+    big = []
+    for 0..600 { big = host.sys_arr_push(big, it % 251) }
+    #assert(@w.add_file("assets/big.bin", big, 300) or false)
+    #assert(@w.add_file("empty", [], 0) or false)
+    assert_eq(w.count, 4)
+    tar = w.finish()
+    assert_eq(host.sys_arr_len(tar) % 512, 0)
+    assert_eq(host.sys_arr_len(tar), 512 + 1024 + 1536 + 512 + 1024)
+    list = ar_tar_list(tar)
+    assert_eq(host.sys_arr_len(list), 4)
+    assert_eq(list[0].name, "assets/")
+    #assert(list[0].is_dir())
+    assert_eq(list[1].name, "assets/a.txt")
+    assert_eq(list[1].size, 5)
+    assert_eq(list[1].mtime, 200)
+    assert_eq(host.sys_bytes_to_str(ar_tar_data(tar, list[1])), "alpha")
+    assert_eq(list[2].size, 600)
+    data = ar_tar_data(tar, list[2])
+    assert_eq(host.sys_arr_len(data), 600)
+    assert_eq(data[599], 599 % 251)
+    assert_eq(list[3].size, 0)
+    assert_eq(host.sys_arr_len(ar_tar_data(tar, list[3])), 0)
+    #assert(ar_is_zero_block(tar, host.sys_arr_len(tar) - 512))
+    #assert(!(ar_is_zero_block(tar, 0)))
+}
+
+/// Test that tar listing stops safely on damaged archives.
+test "tar listing stops safely on damaged archives" {
+    w = TarWriter.new()
+    @w.add_file("one.txt", host.sys_str_to_bytes("1"), 0) or false
+    @w.add_file("two.txt", host.sys_str_to_bytes("22"), 0) or false
+    tar = w.finish()
+    assert_eq(host.sys_arr_len(ar_tar_list(tar)), 2)
+    assert_eq(host.sys_arr_len(ar_tar_list([])), 0)
+    cut = ar_slice(tar, 0, 512 + 512 + 100)
+    assert_eq(host.sys_arr_len(ar_tar_list(cut)), 1)
+    broken = host.sys_arr_set(tar, 1024, 7)
+    assert_eq(host.sys_arr_len(ar_tar_list(broken)), 1)
+    noend = ar_slice(tar, 0, 1024)
+    assert_eq(host.sys_arr_len(ar_tar_list(noend)), 1)
+    toolong = ""
+    for 0..300 { toolong = toolong + "y" }
+    v = TarWriter.new()
+    #assert(!(@v.add_file(toolong, [], 0) or false))
+    #assert(!(@v.add_dir(toolong, 0) or false))
+    assert_eq(v.count, 0)
+}
+
+/// Test that DOS date and time pack bit fields.
+test "DOS date and time pack bit fields" {
+    assert_eq(ar_dos_time(0, 0, 0), 0)
+    assert_eq(ar_dos_time(12, 30, 10), 12 * 2048 + 30 * 32 + 5)
+    assert_eq(ar_dos_date(1980, 1, 1), 33)
+    assert_eq(ar_dos_date(2024, 6, 15), 44 * 512 + 6 * 32 + 15)
+}
+
+/// Test that a zip local header has the canonical layout.
+test "a zip local header has the canonical layout" {
+    h = ar_zip_local_header("a.txt", 3421780262, 9, 1234, 5678)
+    assert_eq(host.sys_arr_len(h), 30 + 5)
+    assert_eq(h[0], 80)
+    assert_eq(h[1], 75)
+    assert_eq(h[2], 3)
+    assert_eq(h[3], 4)
+    assert_eq(ar_get_u16(h, 4), 20)
+    assert_eq(ar_get_u16(h, 8), 0)
+    assert_eq(ar_get_u16(h, 10), 1234)
+    assert_eq(ar_get_u16(h, 12), 5678)
+    assert_eq(ar_get_u32(h, 14), 3421780262)
+    assert_eq(ar_get_u32(h, 18), 9)
+    assert_eq(ar_get_u32(h, 22), 9)
+    assert_eq(ar_get_u16(h, 26), 5)
+    assert_eq(ar_get_u16(h, 28), 0)
+    assert_eq(ar_text_at(h, 30, 5), "a.txt")
+    c = ar_zip_central_header("a.txt", 3421780262, 9, 1234, 5678, 77)
+    assert_eq(host.sys_arr_len(c), 46 + 5)
+    assert_eq(ar_get_u32(c, 0), 33639248)
+    assert_eq(ar_get_u32(c, 42), 77)
+    assert_eq(ar_get_u16(c, 28), 5)
+    e = ar_zip_eocd(3, 150, 400)
+    assert_eq(host.sys_arr_len(e), 22)
+    assert_eq(ar_get_u32(e, 0), 101010256)
+    assert_eq(ar_get_u16(e, 8), 3)
+    assert_eq(ar_get_u16(e, 10), 3)
+    assert_eq(ar_get_u32(e, 12), 150)
+    assert_eq(ar_get_u32(e, 16), 400)
+}
+
+/// Test that a zip archive round trips stored members.
+test "a zip archive round trips stored members" {
+    z = ZipWriter.new()
+    #assert(@z.add("a.txt", host.sys_str_to_bytes("hello"), 100, 200) or false)
+    #assert(@z.add("dir/b.bin", [0, 1, 2, 255], 300, 400) or false)
+    #assert(@z.add("empty.txt", [], 0, 0) or false)
+    assert_eq(z.count, 3)
+    zip = z.finish()
+    list = ar_zip_list(zip)
+    assert_eq(host.sys_arr_len(list), 3)
+    assert_eq(list[0].name, "a.txt")
+    assert_eq(list[0].size, 5)
+    assert_eq(list[0].crc, ar_crc32(host.sys_str_to_bytes("hello")))
+    assert_eq(list[0].dos_time, 100)
+    assert_eq(list[0].dos_date, 200)
+    assert_eq(host.sys_bytes_to_str(ar_zip_data(zip, list[0])), "hello")
+    assert_eq(list[1].name, "dir/b.bin")
+    assert_eq(list[1].offset, list[0].data_off + 5)
+    b = ar_zip_data(zip, list[1])
+    assert_eq(b[3], 255)
+    assert_eq(list[2].size, 0)
+    #assert(ar_zip_verify(zip, list[0]))
+    #assert(ar_zip_verify(zip, list[1]))
+    #assert(ar_zip_verify(zip, list[2]))
+    n = host.sys_arr_len(zip)
+    assert_eq(ar_get_u32(zip, n - 22), 101010256)
+    assert_eq(ar_get_u16(zip, n - 22 + 10), 3)
+    cd_off = ar_get_u32(zip, n - 22 + 16)
+    assert_eq(ar_get_u32(zip, cd_off), 33639248)
+    assert_eq(cd_off, list[2].data_off)
+    assert_eq(ar_get_u32(zip, n - 22 + 12), n - 22 - cd_off)
+}
+
+/// Test that zip parsing rejects bad input and verification catches corruption.
+test "zip parsing rejects bad input and verification catches corruption" {
+    z = ZipWriter.new()
+    @z.add("x.txt", host.sys_str_to_bytes("data"), 0, 0) or false
+    zip = z.finish()
+    list = ar_zip_list(zip)
+    e = list[0]
+    #assert(ar_zip_verify(zip, e))
+    tampered = host.sys_arr_set(zip, e.data_off, 90)
+    #assert(!(ar_zip_verify(tampered, e)))
+    assert_eq((ar_zip_parse_local(zip, 3) or ZipEntry.{name: "bad", method: -1, flags: 0, crc: 0, comp_size: 0, size: 0, dos_time: 0, dos_date: 0, offset: 0, data_off: 0}).name, "bad")
+    assert_eq((ar_zip_parse_local([1, 2], 0) or ZipEntry.{name: "bad", method: -1, flags: 0, crc: 0, comp_size: 0, size: 0, dos_time: 0, dos_date: 0, offset: 0, data_off: 0}).name, "bad")
+    assert_eq(host.sys_arr_len(ar_zip_list([])), 0)
+    cut = ar_slice(zip, 0, 34)
+    assert_eq(host.sys_arr_len(ar_zip_list(cut)), 0)
+    w = ZipWriter.new()
+    #assert(!(@w.add("", [1], 0, 0) or false))
+    assert_eq(w.count, 0)
+}

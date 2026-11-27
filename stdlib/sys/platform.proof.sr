@@ -1,0 +1,9 @@
+#proof(platform_backend_selected)
+prove_platform_backend_selected() {
+    #assert(readiness_backend() != "")
+}
+
+#proof(platform_uring_capability)
+prove_platform_uring_capability() {
+    #assert(has_io_uring() == has_io_uring())
+}

@@ -1,0 +1,333 @@
+//! std.sys.path — pure path manipulation (POSIX-style `/` separators, no host calls)
+//!
+//! Import with:
+//!   use std.sys.path
+//!
+//! Then:  path_join("assets", "ship.png")   path_ext("a/b.tar.gz")   "a/./b/../c".path_normalize()
+
+/// `PATH_SEP` is `"/"`.
++PATH_SEP = "/"
+
+/// Character length of the path `p`.
++path_len(p: str) : i64 => host.sys_str_len(p)
+
+/// Index of the last occurrence of the single character `ch`, or -1.
++path_last(p: str, ch: str) : i64 {
+    pos = -1
+    for 0..path_len(p) {
+        if p[it] == ch { pos = it }
+    }
+    pos
+}
+
+/// True when `p` is an absolute path.
++path_is_abs(p: str) : bool => p != "" && p[0] == "/"
+
+/// `p` without a trailing separator.
++path_trim_end(p: str) : str {
+    n = path_len(p)
+    cut = n
+    for 0..n {
+        k = n - 1 - it
+        if k > 0 && cut == k + 1 && p[k] == "/" { cut = k }
+    }
+    p[0..cut]
+}
+
+/// Final component of `p`.
++path_basename(p: str) : str {
+    t = path_trim_end(p)
+    ensure t != "/" else { return "/" }
+    at = path_last(t, "/")
+    t[(at + 1)..path_len(t)]
+}
+
+/// Directory containing `p`.
++path_dirname(p: str) : str {
+    t = path_trim_end(p)
+    at = path_last(t, "/")
+    if at < 0 { return "." }
+    if at == 0 { return "/" }
+    t[0..at]
+}
+
+/// Extension without the dot ("" when none). A leading dot is not an extension.
++path_ext(p: str) : str {
+    base = path_basename(p)
+    dot = path_last(base, ".")
+    ensure dot > 0 else { return "" }
+    base[(dot + 1)..path_len(base)]
+}
+
+/// Final component of `p` with its extension removed.
++path_stem(p: str) : str {
+    base = path_basename(p)
+    dot = path_last(base, ".")
+    ensure dot > 0 else { return base }
+    base[0..dot]
+}
+
+/// `p` with its extension replaced by `ext`.
++path_with_ext(p: str, ext: str) : str {
+    dir = path_dirname(p)
+    stem = path_stem(p)
+    name = "{stem}.{ext}"
+    if ext == "" { name = stem }
+    if dir == "." && !path_starts_dot(p) { return name }
+    path_join(dir, name)
+}
+
+/// True when the final component of `p` starts with `.`.
++path_starts_dot(p: str) : bool => path_len(p) >= 2 && p[0] == "." && p[1] == "/"
+
+/// `a` joined with `b`, inserting a separator when needed.
++path_join(a: str, b: str) : str {
+    if path_is_abs(b) { return b }
+    if a == "" { return b }
+    if b == "" { return a }
+    if path_last(a, "/") == path_len(a) - 1 { return "{a}{b}" }
+    "{a}/{b}"
+}
+
+/// Join many segments (Go filepath.Join).
++path_join_all(segs: _) : str {
+    out = ""
+    for segs {
+        piece = it
+        if piece != "" {
+            if path_is_abs(piece) {
+                out = piece
+            } else {
+                if out == "" { out = piece } else { out = path_join(out, piece) }
+            }
+        }
+    }
+    if out == "" { return "." }
+    out
+}
+
+/// True when `p` is `prefix` or a path inside `prefix`.
++path_has_prefix(p: str, prefix: str) : bool {
+    n = path_len(prefix)
+    ensure path_len(p) >= n else { return false }
+    p[0..n] == prefix
+}
+
+/// `PathSplit` is a path split into its directory and its final component.
++PathSplit = {
+    /// Dir on `PathSplit` (`str`). Defaults to `""`.
+    dir: str = ""
+    /// File on `PathSplit` (`str`). Defaults to `""`.
+    file: str = ""
+}
+
+/// Split path into directory and final component (Go path.Split).
++path_split(p: str) : PathSplit {
+    PathSplit.{dir: path_dirname(p), file: path_basename(p)}
+}
+
+/// Relative path from base to target when both share a prefix (simplified filepath.Rel).
++path_rel(base: str, target: str) : str! {
+    bn = path_normalize(base)
+    tn = path_normalize(target)
+    ensure !path_is_abs(bn) == !path_is_abs(tn) else {
+        fail "path_rel: mixed absolute/relative"
+        return
+    }
+    if bn == "." { return tn }
+    if bn == tn { return "." }
+    if path_has_prefix(tn, bn + "/") {
+        return tn[(path_len(bn) + 1)..path_len(tn)]
+    }
+    if path_has_prefix(tn, bn) && path_len(tn) == path_len(bn) { return "." }
+    fail "path_rel: no common prefix"
+}
+
+/// Single-segment glob: `*` matches any run, `?` one char (Go path.Match subset).
++path_match(pattern: str, name: str) : bool {
+    return path_match_at(pattern, 0, name, 0)
+}
+
+/// True when the path pattern matches at this component.
++path_match_at(pat: str, pi: i64, name: str, ni: i64) : bool {
+    pl = path_len(pat)
+    nl = path_len(name)
+    if pi == pl { return ni == nl }
+    pc = pat[pi]
+    if pc == "*" {
+        if path_match_at(pat, pi + 1, name, ni) { return true }
+        if ni < nl { return path_match_at(pat, pi, name, ni + 1) }
+        return false
+    }
+    if ni >= nl { return false }
+    nc = name[ni]
+    if pc == "?" || pc == nc { return path_match_at(pat, pi + 1, name, ni + 1) }
+    false
+}
+
+// --- segments -----------------------------------------------------------------
+
+/// How many components `p` has.
++path_part_count(p: str) : i64 {
+    n = 1
+    for 0..path_len(p) {
+        if p[it] == "/" { n += 1 }
+    }
+    n
+}
+
+/// Component `n` of `p`.
++path_part(p: str, n: i64) : str {
+    ln = path_len(p)
+    piece = 0
+    start = 0
+    out = ""
+    for 0..(ln + 1) {
+        if it == ln || p[it] == "/" {
+            if piece == n { out = p[start..it] }
+            piece += 1
+            start = it + 1
+        }
+    }
+    out
+}
+
+/// Drop last (`segs`).
++path_drop_last(segs: _) {
+    out = []
+    last = -1
+    for segs { last = index }
+    for segs {
+        if index != last { out = host.sys_arr_push(out, it) }
+    }
+    out
+}
+
+/// Collapse `.`, `..` and repeated separators. `..` above the root of an
+/// absolute path is dropped; above a relative path it is preserved.
++path_normalize(p: str) : str {
+    rooted = path_is_abs(p)
+    segs = []
+    count = 0
+    for 0..path_part_count(p) {
+        seg = path_part(p, it)
+        if seg != "" && seg != "." {
+            if seg == ".." {
+                if count > 0 && segs[count - 1] != ".." {
+                    segs = path_drop_last(segs)
+                    count -= 1
+                } else {
+                    if !rooted {
+                        segs = host.sys_arr_push(segs, "..")
+                        count += 1
+                    }
+                }
+            } else {
+                segs = host.sys_arr_push(segs, seg)
+                count += 1
+            }
+        }
+    }
+    out = ""
+    for segs {
+        if index > 0 { out = "{out}/" }
+        out = "{out}{it}"
+    }
+    if rooted { return "/{out}" }
+    if out == "" { return "." }
+    out
+}
+
+// --- tests ---------------------------------------------------------------------
+
+/// Test that path_is_abs.
+test "path_is_abs" {
+    #assert(path_is_abs("/usr/bin"))
+    #assert(!(path_is_abs("usr/bin")))
+    #assert(!(path_is_abs("")))
+}
+
+/// Test that basename.
+test "basename" {
+    assert_eq(path_basename("/a/b/c.txt"), "c.txt")
+    assert_eq(path_basename("c.txt"), "c.txt")
+    assert_eq(path_basename("/a/b/"), "b")
+    assert_eq(path_basename("/"), "/")
+}
+
+/// Test that dirname.
+test "dirname" {
+    assert_eq(path_dirname("/a/b/c.txt"), "/a/b")
+    assert_eq(path_dirname("c.txt"), ".")
+    assert_eq(path_dirname("/c.txt"), "/")
+    assert_eq(path_dirname("a/b/"), "a")
+}
+
+/// Test that ext and stem.
+test "ext and stem" {
+    assert_eq(path_ext("a/b.tar.gz"), "gz")
+    assert_eq(path_ext("a/b"), "")
+    assert_eq(path_ext(".bashrc"), "")
+    assert_eq(path_stem("a/b.tar.gz"), "b.tar")
+    assert_eq(path_stem("a/b"), "b")
+    assert_eq(path_stem(".bashrc"), ".bashrc")
+}
+
+/// Test that join.
+test "join" {
+    assert_eq(path_join("a", "b"), "a/b")
+    assert_eq(path_join("a/", "b"), "a/b")
+    assert_eq(path_join("a", "/b"), "/b")
+    assert_eq(path_join("", "b"), "b")
+    assert_eq(path_join("a", ""), "a")
+    assert_eq(path_join("/", "etc"), "/etc")
+}
+
+/// Test that with_ext.
+test "with_ext" {
+    assert_eq(path_with_ext("src/main.sr", "superb"), "src/main.superb")
+    assert_eq(path_with_ext("main.sr", "txt"), "main.txt")
+    assert_eq(path_with_ext("src/main.sr", ""), "src/main")
+}
+
+/// Test that segments.
+test "segments" {
+    assert_eq(path_part_count("a/b/c"), 3)
+    assert_eq(path_part("a/b/c", 0), "a")
+    assert_eq(path_part("a/b/c", 2), "c")
+    assert_eq(path_part("/a", 0), "")
+    assert_eq(path_part("/a", 1), "a")
+}
+
+/// Test that normalize relative paths.
+test "normalize relative paths" {
+    assert_eq(path_normalize("a/./b/../c//d"), "a/c/d")
+    assert_eq(path_normalize("./a"), "a")
+    assert_eq(path_normalize("a/.."), ".")
+    assert_eq(path_normalize("../a"), "../a")
+    assert_eq(path_normalize("a/../../b"), "../b")
+    assert_eq(path_normalize(""), ".")
+}
+
+/// Test that normalize absolute paths.
+test "normalize absolute paths" {
+    assert_eq(path_normalize("/a/b/../c"), "/a/c")
+    assert_eq(path_normalize("/../a"), "/a")
+    assert_eq(path_normalize("/"), "/")
+    assert_eq(path_normalize("//a///b/"), "/a/b")
+}
+
+/// Test that join_all split rel match.
+test "join_all split rel match" {
+    assert_eq(path_join_all(["a", "b", "c"]), "a/b/c")
+    assert_eq(path_join_all(["/a", "b"]), "/a/b")
+    #assert(path_has_prefix("/a/b", "/a"))
+    sp = path_split("/a/b/c.txt")
+    assert_eq(sp.dir, "/a/b")
+    assert_eq(sp.file, "c.txt")
+    r = path_rel("a/b", "a/b/c") or "!"
+    assert_eq(r, "c")
+    #assert(path_match("*.sr", "main.sr"))
+    #assert(path_match("a?c", "abc"))
+    #assert(!(path_match("a?c", "ac")))
+}

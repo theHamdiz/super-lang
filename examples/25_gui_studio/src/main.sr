@@ -1,0 +1,89 @@
+// GUI — a studio desk. The session owns the tree and paints it.
+//
+// Run: super test examples/25_gui_studio/
+
+use std.gui
+use std.gui.window
+
++Take = {
+    name: str
+    gain: i64
+    mix: i64
+
+    caption(self) : str => "{self.name}  gain {self.gain}  mix {self.mix}"
+}
+
++Studio = {
+    title: str
+
+    desk(self) : Gui {
+        take = Take{name: "Voice", gain: 72, mix: 40}
+        app = Gui.new(self.title, 360, 220)
+        @app.theme("dark")
+        root = @app.column("root")
+        head = @app.panel(root, "head")
+        @app.label(head, "title", self.title)
+        @app.style("title", 230, 24, 20, 1, "start")
+        @app.text(head, "caption", take.caption())
+        desk = @app.grid(root, "desk", 2)
+        @app.slider(desk, "gain", take.gain)
+        @app.progress(desk, "mix", take.mix)
+        @app.button(root, "render", "Render")
+        @app.text(root, "note", "GTK draws the controls.")
+        app
+    }
+
+    picture(self) : str {
+        app = self.desk()
+        @app.layout()
+        @app.paint()
+    }
+
+    scene(self) : str => self.desk().describe()
+
+    mirror(self) : str {
+        take = Take{name: "Voice", gain: 72, mix: 40}
+        app = Gui.new(self.title, 360, 220)
+        @app.theme("dark")
+        root = @app.column("root")
+        @app.label(root, "title", self.title)
+        @app.label(root, "caption", take.caption())
+        @app.button(root, "render", "Render")
+        @app.layout()
+        @app.mirror()
+    }
+}
+
++main() {
+    desk = Studio{title: "Studio"}
+    window_show("Studio", 360, 220, desk.scene())
+}
+
+test "a take captions itself" {
+    take = Take{name: "Voice", gain: 72, mix: 40}
+    assert_eq(take.caption(), "Voice  gain 72  mix 40")
+}
+
+test "the studio paints a dark desk" {
+    desk = Studio{title: "Studio"}
+    frame = desk.picture()
+    #assert(contains(frame, "fill 0 0 360 220"))
+    #assert(contains(frame, "Studio"))
+    #assert(contains(frame, "Render"))
+    #assert(contains(frame, "Voice  gain 72"))
+}
+
+test "the studio scene is a gtk widget document" {
+    desk = Studio{title: "Studio"}
+    scene = desk.scene()
+    #assert(contains(scene, "gui\t1"))
+    #assert(contains(scene, "node\tbutton\trender\tRender"))
+    #assert(contains(scene, "node\tslider\tgain"))
+}
+
+test "the text mirror names the same controls" {
+    desk = Studio{title: "Studio"}
+    text = desk.mirror()
+    #assert(contains(text, "Studio"))
+    #assert(contains(text, "Render"))
+}

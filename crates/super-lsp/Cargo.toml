@@ -1,0 +1,15 @@
+[package]
+name = "super-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Super Language Server (JSON-RPC 2.0 over stdio)"
+
+[dependencies]
+super-core.workspace = true
+super-frontend.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

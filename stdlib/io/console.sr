@@ -1,0 +1,156 @@
+//! std.io.console — CLI-matching colored stdout/stderr
+//!
+//! Import with:
+//!   use std.io.console
+//!
+//!   ok_line("listening on {addr}")
+//!   warn_line("degraded")
+//!   error_line("bind failed")
+//!
+//! Or use the `Console` value:
+//!   c = Console.new()
+//!   @c.ok("…") / @c.warn("…") / @c.error("…")
+//!
+//! Tones match `super` CLI status colors (cyan-green / cyan-yellow / cyan-red).
+//! Color follows `FORCE_COLOR` / `NO_COLOR` / stderr TTY via `sys_wants_color`.
+//! All writes go through `std.io.stdio` — never the builtin `print`.
+//!
+//! Note: free helpers are named `*_line` so they do not collide with `http.ok`
+//! or the `err` keyword used in `or err { … }`.
+
+use std.io.stdio
+use std.core.str
+use std.core.collections
+
+/// Cyan-green (ok / finished), same as the Super CLI.
++CONSOLE_OK = "\u{1b}[38;2;0;214;170m"
+/// Neon yellow (warn) — matches `super b` / GCC warning tone.
++CONSOLE_WARN = "\u{1b}[38;2;255;255;0m"
+/// Cyan-red (error).
++CONSOLE_ERR = "\u{1b}[38;2;255;84;112m"
+/// Dim secondary text.
++CONSOLE_DIM = "\u{1b}[38;2;120;144;156m"
+/// Info / accent (slightly cooler green).
++CONSOLE_INFO = "\u{1b}[38;2;64;196;255m"
++CONSOLE_RESET = "\u{1b}[0m"
++CONSOLE_BOLD = "\u{1b}[1m"
+
+/// True when ANSI color should be emitted.
++wants_color() : bool => host.sys_wants_color()
+
+/// Paint `text` with `code` when color is wanted.
++paint(code: str, text: str) : str {
+    ensure wants_color() else { return text }
+    "{code}{text}{CONSOLE_RESET}"
+}
+
+/// Paint with bold + tone.
++paint_bold(code: str, text: str) : str {
+    ensure wants_color() else { return text }
+    "{CONSOLE_BOLD}{code}{text}{CONSOLE_RESET}"
+}
+
+/// Write a newline-terminated line to stdout (no color).
++console_write(line: str) : i64! => stdout.write_str("{line}\n")
+
+/// Write a newline-terminated line to stderr (no color).
++console_ewrite(line: str) : i64! => stderr.write_str("{line}\n")
+
+/// Ok / success line on stdout (cyan-green).
++ok_line(msg: str) : i64! => console_write(paint(CONSOLE_OK, msg))
+
+/// Informational line on stdout.
++info_line(msg: str) : i64! => console_write(paint(CONSOLE_INFO, msg))
+
+/// Warning line on stderr (cyan-yellow).
++warn_line(msg: str) : i64! => console_ewrite(paint(CONSOLE_WARN, msg))
+
+/// Error line on stderr (cyan-red). Named `error_line` — `err` is a language keyword.
++error_line(msg: str) : i64! => console_ewrite(paint(CONSOLE_ERR, msg))
+
+/// Dim secondary line on stdout.
++dim_line(msg: str) : i64! => console_write(paint(CONSOLE_DIM, msg))
+
+/// `Console` is a named writer that can target stdout or stderr and toggle color.
++Console = {
+    /// Use stderr when true.
+    use_err: bool = false
+    /// Force color on/off/auto: 1 on, 0 off, -1 auto.
+    color_mode: i64 = -1
+    /// Optional prefix on every line.
+    prefix: str = ""
+
+    new() : Console => Console.{use_err: false, color_mode: -1, prefix: ""}
+
+    /// Log to stderr.
+    stderr() : Console => Console.{use_err: true, color_mode: -1, prefix: ""}
+
+    set_prefix(@self, p: str) : str {
+        self.prefix = p
+        p
+    }
+
+    /// Force color on (`1`), off (`0`), or auto (`-1`).
+    set_color(@self, mode: i64) : i64 {
+        self.color_mode = mode
+        mode
+    }
+
+    color_on(self) : bool {
+        if self.color_mode == 1 { return true }
+        if self.color_mode == 0 { return false }
+        wants_color()
+    }
+
+    paint(self, code: str, text: str) : str {
+        ensure self.color_on() else { return text }
+        "{code}{text}{CONSOLE_RESET}"
+    }
+
+    write_line(@self, code: str, msg: str) : i64! {
+        body = msg
+        if self.prefix != "" { body = "{self.prefix}{msg}" }
+        line = self.paint(code, body)
+        if self.use_err {
+            return stderr.write_str("{line}\n")
+        }
+        stdout.write_str("{line}\n")
+    }
+
+    ok(@self, msg: str) : i64! => @self.write_line(CONSOLE_OK, msg)
+    info(@self, msg: str) : i64! => @self.write_line(CONSOLE_INFO, msg)
+    warn(@self, msg: str) : i64! => @self.write_line(CONSOLE_WARN, msg)
+    error(@self, msg: str) : i64! => @self.write_line(CONSOLE_ERR, msg)
+    dim(@self, msg: str) : i64! => @self.write_line(CONSOLE_DIM, msg)
+}
+
+/// Module-level default console (stdout, auto color).
++console = Console.new()
+
+test "paint is identity without color force" {
+    plain = paint(CONSOLE_OK, "x")
+    #assert(byte_len(plain) >= 1)
+}
+
+test "console write paths through stdio capture" {
+    host.sys_stdio_capture_begin() or err {
+        assert_eq(1, 0)
+        return
+    }
+    c = Console.new()
+    @c.set_color(0)
+    n = @c.ok("hello") or 0
+    #assert(n >= 6)
+    out = host.sys_stdio_capture_drain(0)
+    #assert(contains(out, "hello"))
+    #assert(host.sys_stdio_capture_end())
+}
+
+test "module *_line helpers compile" {
+    host.sys_stdio_capture_begin() or false
+    _a = ok_line("a") or 0
+    _b = warn_line("b") or 0
+    _c = error_line("c") or 0
+    host.sys_stdio_capture_end()
+    assert_eq(1, 1)
+}

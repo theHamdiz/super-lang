@@ -1,0 +1,494 @@
+//! std.db.mysql — MySQL-flavoured connection config, pool and query helpers
+//!
+//! Import with:
+//!   use std.db.mysql
+//!
+//!   pool = MysqlPool.new("mysql://app:secret@db.local:3306/shop", 8) or err { return }
+//!   pool = pool.make_table("users", ["id", "name"]) or pool
+//!   pool = pool.add_row("users", ["1", "Amina"]) or pool
+//!
+//! Offline SqlDb driver with MySQL dialect: `?` placeholders, SQLSTATE codes,
+//! AUTO_INCREMENT helpers, LAST_INSERT_ID, multi-result lite, and charset/collation
+//! metadata. MariaDB shares the wire protocol — use the `mariadb` Pod for Maria-specific APIs.
+
+use sql
+use std.core.collections
+
+/// Default MySQL port.
++MYSQL_DEFAULT_PORT = 3306
+/// Duplicate entry for key.
++MYSQL_DUP_ENTRY = "23000"
+/// Table doesn't exist.
++MYSQL_NO_SUCH_TABLE = "42S02"
+/// Unknown column.
++MYSQL_BAD_FIELD = "42S22"
+/// Syntax error.
++MYSQL_SYNTAX = "42000"
+
+/// MySQL connection config.
++MysqlConfig = {
+    host: str = "localhost"
+    port: i64 = 3306
+    user: str = ""
+    password: str = ""
+    dbname: str = ""
+    charset: str = "utf8mb4"
+    collate: str = "utf8mb4_unicode_ci"
+}
+
+/// MySQL connection pool over SqlDb.
++MysqlPool = {
+    cfg: MysqlConfig = MysqlConfig.{host: "localhost", port: 3306, user: "", password: "", dbname: "", charset: "utf8mb4", collate: "utf8mb4_unicode_ci"}
+    inner: SqlPool = SqlPool.{store: SqlDb.{tables: []}, size: 1, in_use: 0}
+    last_insert_id: i64 = 0
+    affected_rows: i64 = 0
+    sequences: _ = []
+    seq_names: _ = []
+
+    empty() : MysqlPool => MysqlPool.{
+        cfg: MysqlConfig.{host: "", port: 0, user: "", password: "", dbname: "", charset: "utf8mb4", collate: "utf8mb4_unicode_ci"},
+        inner: SqlPool.new(SqlDb.new(), 1), last_insert_id: 0, affected_rows: 0, sequences: [], seq_names: []
+    }
+
+    new(url: str, size: i64) : MysqlPool! {
+        ensure size >= 1 else {
+            fail "mysql: pool size must be at least 1"
+            return
+        }
+        cfg = mysql_parse_url(url) or MysqlConfig.{host: "", port: 0, user: "", password: "", dbname: "", charset: "utf8mb4", collate: "utf8mb4_unicode_ci"}
+        ensure cfg.host != "" else {
+            fail "mysql: invalid connection url"
+            return
+        }
+        MysqlPool.{cfg, inner: SqlPool.new(SqlDb.new(), size), last_insert_id: 0, affected_rows: 0, sequences: [], seq_names: []}
+    }
+
+    acquire(self) : MysqlPool! {
+        next = SqlPool.acquire(self.inner) or self.inner
+        ensure next.in_use > self.inner.in_use else {
+            fail "mysql: connection pool exhausted"
+            return
+        }
+        MysqlPool.{cfg: self.cfg, inner: next, last_insert_id: self.last_insert_id, affected_rows: self.affected_rows, sequences: self.sequences, seq_names: self.seq_names}
+    }
+
+    release(self) : MysqlPool => MysqlPool.{cfg: self.cfg, inner: SqlPool.release(self.inner), last_insert_id: self.last_insert_id, affected_rows: self.affected_rows, sequences: self.sequences, seq_names: self.seq_names}
+
+    store(self) : SqlDb => self.inner.store
+
+    with_catalog(self, next: SqlDb) : MysqlPool {
+        inner = SqlPool.{store: next, size: self.inner.size, in_use: self.inner.in_use}
+        MysqlPool.{cfg: self.cfg, inner, last_insert_id: self.last_insert_id, affected_rows: self.affected_rows, sequences: self.sequences, seq_names: self.seq_names}
+    }
+
+    with_meta(self, next: SqlDb, last_id: i64, affected: i64) : MysqlPool {
+        inner = SqlPool.{store: next, size: self.inner.size, in_use: self.inner.in_use}
+        MysqlPool.{cfg: self.cfg, inner, last_insert_id: last_id, affected_rows: affected, sequences: self.sequences, seq_names: self.seq_names}
+    }
+
+    has_capacity(self) : bool => self.inner.in_use < self.inner.size
+
+    make_table(self, name: str, cols: _) : MysqlPool! {
+        ensure self.has_capacity() else {
+            fail "mysql: connection pool exhausted"
+            return
+        }
+        mem = self.store()
+        next = SqlDb.create_table(mem, name, cols) or mem
+        ensure SqlDb.has_table(next, name) else {
+            fail "mysql: cannot create table {name}"
+            return
+        }
+        self.with_catalog(next)
+    }
+
+    drop_table(self, name: str) : MysqlPool! {
+        mem = self.store()
+        ensure SqlDb.has_table(mem, name) else {
+            fail "mysql: Table '{name}' doesn't exist ({MYSQL_NO_SUCH_TABLE})"
+            return
+        }
+        next = SqlDb.drop_table(mem, name) or mem
+        self.with_catalog(next)
+    }
+
+    add_row(self, name: str, row: _) : MysqlPool! {
+        ensure self.has_capacity() else {
+            fail "mysql: connection pool exhausted"
+            return
+        }
+        mem = self.store()
+        ensure SqlDb.has_table(mem, name) else {
+            fail "mysql: Table '{name}' doesn't exist ({MYSQL_NO_SUCH_TABLE})"
+            return
+        }
+        before = SqlDb.count(mem, name)
+        next = SqlDb.insert(mem, name, row) or mem
+        ensure SqlDb.count(next, name) > before else {
+            fail "mysql: insert into {name} failed"
+            return
+        }
+        id = self.last_insert_id
+        if sql_count(row) > 0 {
+            first = row[0]
+            parsed = mysql_to_int(first)
+            if parsed > 0 { id = parsed }
+        }
+        self.with_meta(next, id, 1)
+    }
+
+    /// Insert with AUTO_INCREMENT on column 0.
+    insert_auto(self, name: str, vals: _) : MysqlPool! {
+        mem = self.store()
+        ensure SqlDb.has_table(mem, name) else {
+            fail "mysql: Table '{name}' doesn't exist ({MYSQL_NO_SUCH_TABLE})"
+            return
+        }
+        id = mysql_max_id(mem, name) + 1
+        row = ["{id}"]
+        for vals { row = arr_push(row, it) }
+        self.add_row(name, row)
+    }
+
+    insert_unique(self, name: str, key_col: str, row: _) : MysqlPool! {
+        t = SqlDb.table(self.store(), name)
+        ci = t.col_index(key_col)
+        ensure ci >= 0 else {
+            fail "mysql: Unknown column '{key_col}' ({MYSQL_BAD_FIELD})"
+            return
+        }
+        key = row[ci]
+        dup = SqlDb.rows_where(self.store(), name, key_col, key)
+        ensure sql_count(dup) == 0 else {
+            fail "mysql: Duplicate entry '{key}' for key '{key_col}' ({MYSQL_DUP_ENTRY})"
+            return
+        }
+        self.add_row(name, row)
+    }
+
+    find(self, name: str, col: str, val: str) : _ => SqlDb.rows_where(self.store(), name, col, val)
+
+    count(self, name: str) : i64 => SqlDb.count(self.store(), name)
+
+    update(self, name: str, col: str, val: str, set_col: str, set_val: str) : MysqlPool! {
+        mem = self.store()
+        ensure SqlDb.has_table(mem, name) else {
+            fail "mysql: Table '{name}' doesn't exist ({MYSQL_NO_SUCH_TABLE})"
+            return
+        }
+        hits = sql_count(SqlDb.rows_where(mem, name, col, val))
+        next = SqlDb.update_where(mem, name, col, val, set_col, set_val) or mem
+        self.with_meta(next, self.last_insert_id, hits)
+    }
+
+    delete(self, name: str, col: str, val: str) : MysqlPool! {
+        mem = self.store()
+        ensure SqlDb.has_table(mem, name) else {
+            fail "mysql: Table '{name}' doesn't exist ({MYSQL_NO_SUCH_TABLE})"
+            return
+        }
+        hits = sql_count(SqlDb.rows_where(mem, name, col, val))
+        next = SqlDb.delete_where(mem, name, col, val) or mem
+        self.with_meta(next, self.last_insert_id, hits)
+    }
+
+    begin(self) : MysqlTx => MysqlTx.{cfg: self.cfg, tx: SqlTx.begin(self.store()), last_insert_id: self.last_insert_id}
+
+    commit(self, t: MysqlTx) : MysqlPool {
+        done = SqlTx.commit(t.tx) or self.store()
+        self.with_meta(done, t.last_insert_id, self.affected_rows)
+    }
+
+    rollback(self, t: MysqlTx) : MysqlPool => self.with_catalog(SqlTx.rollback(t.tx))
+
+    /// REPLACE INTO semantics: delete matching key then insert.
+    replace(self, name: str, key_col: str, row: _) : MysqlPool! {
+        t = SqlDb.table(self.store(), name)
+        ci = t.col_index(key_col)
+        ensure ci >= 0 else {
+            fail "mysql: Unknown column '{key_col}' ({MYSQL_BAD_FIELD})"
+            return
+        }
+        key = row[ci]
+        mem = SqlDb.delete_where(self.store(), name, key_col, key) or self.store()
+        p = self.with_catalog(mem)
+        p.add_row(name, row)
+    }
+
+    /// LIMIT/OFFSET style page of matching rows.
+    select_page(self, name: str, col: str, val: str, limit: i64, offset: i64) : _ {
+        rows = SqlDb.rows_where(self.store(), name, col, val)
+        out = []
+        n = 0
+        for rows {
+            if index < offset { continue }
+            if n >= limit { break }
+            out = arr_push(out, it)
+            n += 1
+        }
+        out
+    }
+
+    /// SHOW TABLES names.
+    show_tables(self) : _ {
+        out = []
+        tables = self.store().tables
+        for tables { out = arr_push(out, it.name) }
+        out
+    }
+
+    /// DESCRIBE columns for a table.
+    describe(self, name: str) : _ {
+        t = SqlDb.table(self.store(), name)
+        t.cols
+    }
+}
+
+/// MySQL transaction handle.
++MysqlTx = {
+    cfg: MysqlConfig = MysqlConfig.{host: "localhost", port: 3306, user: "", password: "", dbname: "", charset: "utf8mb4", collate: "utf8mb4_unicode_ci"}
+    tx: SqlTx = SqlTx.{base: SqlDb.{tables: []}, work: SqlDb.{tables: []}, open: true}
+    last_insert_id: i64 = 0
+
+    store(self) : SqlDb => self.tx.work
+    with(self, work: SqlDb) : MysqlTx => MysqlTx.{cfg: self.cfg, tx: SqlTx.with(self.tx, work), last_insert_id: self.last_insert_id}
+}
+
++mysql_to_int(s: str) : i64 {
+    ensure sql_len(s) > 0 else { return 0 }
+    acc = 0
+    for 0..sql_len(s) {
+        d = sql_digit(s[it])
+        if d >= 0 { acc = acc * 10 + d }
+    }
+    acc
+}
+
++mysql_max_id(db: SqlDb, table: str) : i64 {
+    t = SqlDb.table(db, table)
+    best = 0
+    rows = t.rows
+    for rows {
+        v = mysql_to_int(it[0])
+        if v > best { best = v }
+    }
+    best
+}
+
++mysql_find_from(s: str, needle: str, start: i64) : i64 {
+    found = -1
+    n = sql_len(s)
+    for start..n {
+        if found < 0 && s[it] == needle { found = it }
+    }
+    found
+}
+
++mysql_slice(s: str, start: i64, stop: i64) : str {
+    out = ""
+    for start..stop {
+        out = out + s[it]
+    }
+    out
+}
+
++mysql_parse_int(s: str) : i64 {
+    n = -1
+    ensure sql_len(s) > 0 else { return n }
+    acc = 0
+    for 0..sql_len(s) {
+        d = sql_digit(s[it])
+        if d < 0 { return n }
+        acc = acc * 10 + d
+    }
+    acc
+}
+
+/// mysql://user:password@host:port/dbname
++mysql_parse_url(url: str) : MysqlConfig! {
+    scheme_at = mysql_find_from(url, ":", 0)
+    ensure scheme_at > 0 else {
+        fail "mysql: missing scheme"
+        return
+    }
+    scheme = mysql_slice(url, 0, scheme_at)
+    ensure scheme == "mysql" || scheme == "mysql2" else {
+        fail "mysql: unsupported scheme {scheme}"
+        return
+    }
+    n = sql_len(url)
+    ensure url[scheme_at + 1] == "/" && url[scheme_at + 2] == "/" else {
+        fail "mysql: expected // after scheme"
+        return
+    }
+    rest_at = scheme_at + 3
+    q_at = mysql_find_from(url, "?", rest_at)
+    end = n
+    if q_at >= 0 { end = q_at }
+    at = mysql_find_from(url, "@", rest_at)
+    user = ""
+    password = ""
+    host_at = rest_at
+    if at >= 0 && at < end {
+        host_at = at + 1
+        colon = mysql_find_from(url, ":", rest_at)
+        if colon >= 0 && colon < at {
+            user = mysql_slice(url, rest_at, colon)
+            password = mysql_slice(url, colon + 1, at)
+        } else {
+            user = mysql_slice(url, rest_at, at)
+        }
+    }
+    slash = mysql_find_from(url, "/", host_at)
+    ensure slash >= 0 && slash < end else {
+        fail "mysql: missing database name"
+        return
+    }
+    dbname = mysql_slice(url, slash + 1, end)
+    ensure dbname != "" else {
+        fail "mysql: empty database name"
+        return
+    }
+    hostport = mysql_slice(url, host_at, slash)
+    pcolon = mysql_find_from(hostport, ":", 0)
+    host = hostport
+    port = MYSQL_DEFAULT_PORT
+    if pcolon >= 0 {
+        host = mysql_slice(hostport, 0, pcolon)
+        port = mysql_parse_int(mysql_slice(hostport, pcolon + 1, sql_len(hostport)))
+        ensure port > 0 && port < 65536 else {
+            fail "mysql: invalid port"
+            return
+        }
+    }
+    ensure host != "" else {
+        fail "mysql: empty host"
+        return
+    }
+    charset = "utf8mb4"
+    collate = "utf8mb4_unicode_ci"
+    if q_at >= 0 {
+        qs = mysql_slice(url, q_at + 1, n)
+        // charset=...&collation=...
+        if mysql_find_from(qs, "c", 0) >= 0 {
+            // lightweight: look for charset=
+            cpos = -1
+            for 0..sql_len(qs) {
+                if cpos < 0 && qs[it..(it + 8)] == "charset=" { cpos = it + 8 }
+            }
+            if cpos >= 0 {
+                e = mysql_find_from(qs, "&", cpos)
+                if e < 0 { e = sql_len(qs) }
+                charset = mysql_slice(qs, cpos, e)
+            }
+        }
+    }
+    MysqlConfig.{host, port, user, password, dbname, charset, collate}
+}
+
++mysql_redacted(cfg: MysqlConfig) : str {
+    auth = ""
+    if cfg.user != "" { auth = "{cfg.user}@" }
+    "mysql://{auth}{cfg.host}:{cfg.port}/{cfg.dbname}"
+}
+
+/// Count `?` placeholders outside quotes.
++mysql_qmark_count(query: str) : i64 {
+    n = 0
+    in_q = false
+    for 0..sql_len(query) {
+        c = query[it]
+        if c == "'" { in_q = !in_q }
+        if c == "?" && !in_q { n += 1 }
+    }
+    n
+}
+
+/// Bind `?` params (MySQL style).
++mysql_prepare(query: str, params: _) : str! {
+    want = mysql_qmark_count(query)
+    have = sql_count(params)
+    ensure want == have else {
+        fail "mysql: {want} placeholders but {have} params ({MYSQL_SYNTAX})"
+        return
+    }
+    out = ""
+    in_q = false
+    next = 0
+    for 0..sql_len(query) {
+        c = query[it]
+        if c == "'" { in_q = !in_q }
+        if c == "?" && !in_q {
+            out = out + params[next]
+            next += 1
+        } else {
+            out = out + c
+        }
+    }
+    out
+}
+
+/// Backtick-quote an identifier.
++mysql_ident(name: str) : str => "`{name}`"
+
+test "parse mysql url" {
+    cfg = mysql_parse_url("mysql://app:secret@db.local:3307/shop?charset=utf8mb4") or MysqlConfig.{host: "", port: 0, user: "", password: "", dbname: "", charset: "", collate: ""}
+    assert_eq(cfg.host, "db.local")
+    assert_eq(cfg.port, 3307)
+    assert_eq(cfg.user, "app")
+    assert_eq(cfg.password, "secret")
+    assert_eq(cfg.dbname, "shop")
+    assert_eq(cfg.charset, "utf8mb4")
+    plain = mysql_parse_url("mysql://localhost/app") or MysqlConfig.{host: "", port: 0, user: "", password: "", dbname: "", charset: "", collate: ""}
+    assert_eq(plain.port, 3306)
+    assert_eq(plain.dbname, "app")
+    assert_eq(mysql_redacted(cfg), "mysql://app@db.local:3307/shop")
+}
+
+test "mysql crud autoincrement replace page" {
+    pool = MysqlPool.new("mysql://h/d", 4) or MysqlPool.empty()
+    pool = pool.make_table("users", ["id", "name"]) or pool
+    pool = pool.insert_auto("users", ["Amina"]) or pool
+    assert_eq(pool.last_insert_id, 1)
+    pool = pool.insert_auto("users", ["Bo"]) or pool
+    assert_eq(pool.count("users"), 2)
+    pool = pool.update("users", "id", "2", "name", "Bob") or pool
+    assert_eq(pool.affected_rows, 1)
+    page = pool.select_page("users", "name", "Bob", 10, 0)
+    assert_eq(sql_count(page), 1)
+    pool = pool.replace("users", "id", ["2", "Bobby"]) or pool
+    assert_eq(sql_count(pool.find("users", "name", "Bobby")), 1)
+    tables = pool.show_tables()
+    assert_eq(tables[0], "users")
+    cols = pool.describe("users")
+    assert_eq(cols[0], "id")
+    pool = pool.delete("users", "id", "1") or pool
+    assert_eq(pool.count("users"), 1)
+}
+
+test "mysql unique and prepare" {
+    pool = MysqlPool.new("mysql://h/d", 2) or MysqlPool.empty()
+    pool = pool.make_table("t", ["id", "v"]) or pool
+    pool = pool.add_row("t", ["1", "a"]) or pool
+    again = pool.insert_unique("t", "id", ["1", "b"]) or pool
+    assert_eq(again.count("t"), 1)
+    q = mysql_prepare("SELECT * FROM t WHERE id = ? AND v = ?", [sql_int(1), sql_quote("x")]) or "ERR"
+    assert_eq(q, "SELECT * FROM t WHERE id = 1 AND v = 'x'")
+    assert_eq(mysql_prepare("SELECT ?", []) or "ERR", "ERR")
+    assert_eq(mysql_ident("users"), "`users`")
+}
+
+test "mysql transactions and pool" {
+    pool = MysqlPool.new("mysql://h/d", 1) or MysqlPool.empty()
+    pool = pool.make_table("t", ["a"]) or pool
+    pool = pool.add_row("t", ["1"]) or pool
+    tx = pool.begin()
+    grown = SqlDb.insert(tx.store(), "t", ["2"]) or tx.store()
+    tx2 = tx.with(grown)
+    committed = pool.commit(tx2)
+    assert_eq(committed.count("t"), 2)
+    held = pool.acquire() or pool
+    #assert(!(held.has_capacity()))
+    freed = held.release()
+    #assert(freed.has_capacity())
+}

@@ -1,0 +1,1464 @@
+//! std.math.optimize — root finding and minimisation on arrays and f64
+//!
+//! Import with:
+//!   use std.math.optimize
+//!
+//!   f = tape_rosenbrock(2)                       // functions are `ReverseTape` values
+//!   r = bfgs(f, [-1.2, 1.0], 0.000001, 200)      // r.x ~ [1, 1], r.converged == true
+//!   m = nelder_mead(f, [-1.2, 1.0], 0.5, 0.0000000001, 2000)
+//!   w = l_bfgs(f, [-1.2, 1.0], 8, 0.000001, 300)
+//!   a = adamw(tape_sphere([3.0, -1.0]), [0.0, 0.0], 0.1, 0.9, 0.999, 0.00000001, 0.0, 400)
+//!
+//!   lp = linprog([-3.0, -2.0], [1.0, 1.0, 1.0, 3.0, 1.0, 0.0], [4.0, 6.0, 3.0], [], [], 1000)  // min c.x, A x <= b, x >= 0
+//!   qp = quadprog([2.0, 0.0, 0.0, 2.0], [-2.0, -5.0], [1.0, 2.0], [3.0], [], [], 200)           // min x'Qx/2 + c.x, A x <= b
+//!
+//!   g = tape_poly([-2.0, 0.0, 1.0])              // x^2 - 2
+//!   root = brent(g, 0.0, 2.0, 0.000000000001, 100)   // root.x ~ sqrt(2)
+//!   best = brent_min(tape_sphere([1.5]), -4.0, 4.0, 0.00000001, 200)
+//!   sol = newton_system(sys, [2.0, 0.5], 0.000000000001, 50)   // vector tape: n outputs, n inputs
+//!
+//! Function values (closures) leave the typed AOT path, so the objective is a `ReverseTape`
+//! from `std.math.ad` (build it with `input` and the `n_*` methods, or use `tape_poly`,
+//! `tape_sphere`, `tape_rosenbrock`). Gradients come from the tape's reverse sweep and
+//! Jacobians from its forward (dual number) passes, so no step sizes need tuning.
+//! Every solver returns an `OptResult`: `x`, `fx`, `gnorm` (gradient or residual norm),
+//! `iters`, `evals` (function evaluations) and `converged`. `==` on floats is tolerance-based
+//! on the VM, so the numeric kernels compare with `<` and `>` (`opt_eq`).
+//! `linprog` (two-phase simplex) and `quadprog` (primal active-set) are data-driven rather than
+//! tape-driven: matrices are row-major flat arrays and they return a `ProgResult` with a string
+//! `status` ("optimal", "infeasible", "unbounded", "max_iter", "singular" or "invalid").
+//! Public helpers are prefixed `opt_` / `lp_` (modules merge flat).
+
+use std.math.ad
+use std.math.linalg
+
+/// `OPT_GOLDEN` is `(3 - sqrt 5) / 2`.
++OPT_GOLDEN = 0.3819660112501051
+
+/// Result of a solver run.
++OptResult = {
+    /// Final point (an array of length n; one element for the scalar solvers).
+    x: _ = []
+    /// Objective value (or residual norm for `newton_system`) at `x`.
+    fx: f64 = 0.0
+    /// Gradient norm (or residual norm) at `x`.
+    gnorm: f64 = 0.0
+    /// Iterations performed.
+    iters: i64 = 0
+    /// Function evaluations performed.
+    evals: i64 = 0
+    /// True when the stopping tolerance was met.
+    converged: bool = false
+
+    /// Final point as a scalar (first component).
+    x0(self) : f64 {
+        ensure host.sys_arr_len(self.x) > 0 else { return 0.0 }
+        self.x[0]
+    }
+}
+
+// --- array helpers ------------------------------------------------------------------------
+
+/// Exact float equality (`==` is tolerance-based on the VM).
++opt_eq(a: f64, b: f64) : bool => !(a < b) && !(a > b)
+
+/// Absolute value of `x`.
++opt_abs(x: f64) : f64 {
+    if x < 0.0 { return -x }
+    x
+}
+
+/// `a` with the sign of `b` (`b == 0` counts as positive).
++opt_sign(a: f64, b: f64) : f64 {
+    m = opt_abs(a)
+    if b < 0.0 { return -m }
+    m
+}
+
+/// Dot product of two arrays.
++opt_dot(a: _, b: _) : f64 {
+    s = 0.0
+    i = 0
+    n = host.sys_arr_len(a)
+    while i < n {
+        s += a[i] * b[i]
+        i += 1
+    }
+    s
+}
+
+/// Euclidean norm of an array.
++opt_norm(a: _) : f64 => host.sys_sqrt(opt_dot(a, a))
+
+/// Largest absolute component.
++opt_norm_inf(a: _) : f64 {
+    m = 0.0
+    for a {
+        v = opt_abs(it)
+        if v > m { m = v }
+    }
+    m
+}
+
+/// `x + k * d` as a new array.
++opt_axpy(x: _, k: f64, d: _) {
+    out = []
+    i = 0
+    n = host.sys_arr_len(x)
+    while i < n {
+        out = host.sys_arr_push(out, x[i] + k * d[i])
+        i += 1
+    }
+    out
+}
+
+/// `k * x` as a new array.
++opt_scale(x: _, k: f64) {
+    out = []
+    for x { out = host.sys_arr_push(out, it * k) }
+    out
+}
+
+/// An `n`-vector of zeros.
++opt_zeros(n: i64) => host.sys_arr_new(n, 0.0)
+
+/// Identity matrix of order `n`, row-major flat.
++opt_eye(n: i64) {
+    m = host.sys_arr_new(n * n, 0.0)
+    i = 0
+    while i < n {
+        m = host.sys_arr_set(m, i * n + i, 1.0)
+        i += 1
+    }
+    m
+}
+
+/// Row-major matrix-vector product `m x` for an `n x n` matrix.
++opt_matvec(m: _, x: _, n: i64) {
+    out = []
+    r = 0
+    while r < n {
+        s = 0.0
+        c = 0
+        while c < n {
+            s += m[r * n + c] * x[c]
+            c += 1
+        }
+        out = host.sys_arr_push(out, s)
+        r += 1
+    }
+    out
+}
+
+/// A scalar function value: `f(x)` for a one-input tape.
++opt_f1(f: ReverseTape, x: f64) : f64 => f.value([x])
+
+// --- Brent root finding -------------------------------------------------------------------------
+
+/// Brent's root finder (Dekker + inverse quadratic interpolation + bisection) for a one-input tape
+/// on a bracketing interval `[a, b]` (`f(a)` and `f(b)` of opposite sign). `converged` is false when the interval does not bracket a root.
++brent(f: ReverseTape, lo: f64, hi: f64, tol: f64, max_iter: i64) : OptResult {
+    a = lo
+    b = hi
+    fa = opt_f1(f, a)
+    fb = opt_f1(f, b)
+    evals = 2
+    if fa * fb > 0.0 {
+        return OptResult.{x: [a], fx: fa, gnorm: opt_abs(fa), iters: 0, evals, converged: false}
+    }
+    c = a
+    fc = fa
+    d = b - a
+    e = d
+    iters = 0
+    done = false
+    while iters < max_iter && !done {
+        iters += 1
+        if fb * fc > 0.0 {
+            c = a
+            fc = fa
+            d = b - a
+            e = d
+        }
+        if opt_abs(fc) < opt_abs(fb) {
+            a = b
+            b = c
+            c = a
+            fa = fb
+            fb = fc
+            fc = fa
+        }
+        tol1 = 2.0 * 0.0000000000000002220446049250313 * opt_abs(b) + 0.5 * tol
+        xm = 0.5 * (c - b)
+        if opt_abs(xm) <= tol1 || opt_eq(fb, 0.0) {
+            done = true
+        } else {
+            if opt_abs(e) >= tol1 && opt_abs(fa) > opt_abs(fb) {
+                s = fb / fa
+                p = 0.0
+                q = 0.0
+                if opt_eq(a, c) {
+                    p = 2.0 * xm * s
+                    q = 1.0 - s
+                } else {
+                    q = fa / fc
+                    r = fb / fc
+                    p = s * (2.0 * xm * q * (q - r) - (b - a) * (r - 1.0))
+                    q = (q - 1.0) * (r - 1.0) * (s - 1.0)
+                }
+                if p > 0.0 { q = -q }
+                p = opt_abs(p)
+                min1 = 3.0 * xm * q - opt_abs(tol1 * q)
+                min2 = opt_abs(e * q)
+                lim = min1
+                if min2 < lim { lim = min2 }
+                if 2.0 * p < lim {
+                    e = d
+                    d = p / q
+                } else {
+                    d = xm
+                    e = d
+                }
+            } else {
+                d = xm
+                e = d
+            }
+            a = b
+            fa = fb
+            if opt_abs(d) > tol1 {
+                b += d
+            } else {
+                b += opt_sign(tol1, xm)
+            }
+            fb = opt_f1(f, b)
+            evals += 1
+        }
+    }
+    OptResult.{x: [b], fx: fb, gnorm: opt_abs(fb), iters, evals, converged: done}
+}
+
+// --- Brent minimisation ---------------------------------------------------------------------------
+
+/// Brent's minimiser (golden section + parabolic interpolation) of a one-input tape on `[lo, hi]`.
++brent_min(f: ReverseTape, lo: f64, hi: f64, tol: f64, max_iter: i64) : OptResult {
+    a = lo
+    b = hi
+    if a > b {
+        a = hi
+        b = lo
+    }
+    x = a + OPT_GOLDEN * (b - a)
+    w = x
+    v = x
+    fx = opt_f1(f, x)
+    fw = fx
+    fv = fx
+    evals = 1
+    d = 0.0
+    e = 0.0
+    iters = 0
+    done = false
+    while iters < max_iter && !done {
+        iters += 1
+        xm = 0.5 * (a + b)
+        tol1 = tol * opt_abs(x) + 0.0000000001
+        tol2 = 2.0 * tol1
+        if opt_abs(x - xm) <= tol2 - 0.5 * (b - a) {
+            done = true
+        } else {
+            golden_step = true
+            if opt_abs(e) > tol1 {
+                r = (x - w) * (fx - fv)
+                q = (x - v) * (fx - fw)
+                p = (x - v) * q - (x - w) * r
+                q = 2.0 * (q - r)
+                if q > 0.0 { p = -p }
+                q = opt_abs(q)
+                etemp = e
+                e = d
+                if opt_abs(p) >= opt_abs(0.5 * q * etemp) || p <= q * (a - x) || p >= q * (b - x) {
+                    golden_step = true
+                } else {
+                    golden_step = false
+                    d = p / q
+                    u = x + d
+                    if u - a < tol2 || b - u < tol2 { d = opt_sign(tol1, xm - x) }
+                }
+            }
+            if golden_step {
+                if x >= xm { e = a - x } else { e = b - x }
+                d = OPT_GOLDEN * e
+            }
+            u = x
+            if opt_abs(d) >= tol1 { u = x + d } else { u = x + opt_sign(tol1, d) }
+            fu = opt_f1(f, u)
+            evals += 1
+            if fu <= fx {
+                if u >= x { a = x } else { b = x }
+                v = w
+                w = x
+                x = u
+                fv = fw
+                fw = fx
+                fx = fu
+            } else {
+                if u < x { a = u } else { b = u }
+                if fu <= fw || opt_eq(w, x) {
+                    v = w
+                    fv = fw
+                    w = u
+                    fw = fu
+                } else {
+                    if fu <= fv || opt_eq(v, x) || opt_eq(v, w) {
+                        v = u
+                        fv = fu
+                    }
+                }
+            }
+        }
+    }
+    g = f.grad([x])
+    OptResult.{x: [x], fx, gnorm: opt_abs(g[0]), iters, evals, converged: done}
+}
+
+// --- Newton for systems --------------------------------------------------------------------------------
+
+/// Newton's method for `F(x) = 0` where `f` is a tape with `n` inputs and `n` outputs. Each step solves
+/// `J dx = -F` (Jacobian from forward-mode AD) with Gauss-Jordan elimination and halves the step until the
+/// residual norm drops. `fx` and `gnorm` are the final residual norm.
++newton_system(f: ReverseTape, x0: _, tol: f64, max_iter: i64) : OptResult {
+    n = host.sys_arr_len(x0)
+    x = x0
+    r = f.values(x)
+    rn = opt_norm(r)
+    evals = 1
+    iters = 0
+    done = rn <= tol
+    stalled = false
+    while iters < max_iter && !done && !stalled {
+        iters += 1
+        jac = f.jacobian(x)
+        rhs = opt_scale(r, -1.0)
+        m = mat_from(n, n, jac)
+        dx = m.solve(rhs)
+        if host.sys_arr_len(dx) == 0 {
+            stalled = true
+        } else {
+            t = 1.0
+            accepted = false
+            tries = 0
+            while !accepted && tries < 30 {
+                cand = opt_axpy(x, t, dx)
+                rc = f.values(cand)
+                evals += 1
+                nc = opt_norm(rc)
+                if nc < rn || nc <= tol {
+                    x = cand
+                    r = rc
+                    rn = nc
+                    accepted = true
+                } else {
+                    t = t * 0.5
+                    tries += 1
+                }
+            }
+            if !accepted { stalled = true }
+            if rn <= tol { done = true }
+        }
+    }
+    OptResult.{x, fx: rn, gnorm: rn, iters, evals, converged: done}
+}
+
+// --- Nelder-Mead --------------------------------------------------------------------------------------
+
+/// Index of the lowest value in `vals`.
++opt_argmin(vals: _) : i64 {
+    best = 0
+    i = 1
+    while i < host.sys_arr_len(vals) {
+        if vals[i] < vals[best] { best = i }
+        i += 1
+    }
+    best
+}
+
+/// Index of the highest value in `vals`.
++opt_argmax(vals: _) : i64 {
+    best = 0
+    i = 1
+    while i < host.sys_arr_len(vals) {
+        if vals[i] > vals[best] { best = i }
+        i += 1
+    }
+    best
+}
+
+/// Index of the highest value in `vals` other than `skip`.
++opt_argmax_except(vals: _, skip: i64) : i64 {
+    best = -1
+    i = 0
+    while i < host.sys_arr_len(vals) {
+        if i != skip {
+            if best < 0 { best = i } else {
+                if vals[i] > vals[best] { best = i }
+            }
+        }
+        i += 1
+    }
+    best
+}
+
+/// Nelder-Mead simplex search (derivative-free) from `x0` with initial edge length `step`.
+/// Stops when both the value spread and the simplex diameter fall below `tol`.
++nelder_mead(f: ReverseTape, x0: _, step: f64, tol: f64, max_iter: i64) : OptResult {
+    n = host.sys_arr_len(x0)
+    pts = [x0]
+    vals = [f.value(x0)]
+    evals = 1
+    i = 0
+    while i < n {
+        p = x0
+        p = host.sys_arr_set(p, i, p[i] + step)
+        pts = host.sys_arr_push(pts, p)
+        vals = host.sys_arr_push(vals, f.value(p))
+        evals += 1
+        i += 1
+    }
+    iters = 0
+    done = false
+    while iters < max_iter && !done {
+        iters += 1
+        lo = opt_argmin(vals)
+        hi = opt_argmax(vals)
+        nxt = opt_argmax_except(vals, hi)
+        spread = vals[hi] - vals[lo]
+        diam = 0.0
+        k = 0
+        while k <= n {
+            dd = opt_norm(opt_axpy(pts[k], -1.0, pts[lo]))
+            if dd > diam { diam = dd }
+            k += 1
+        }
+        if spread < tol && diam < tol * 100.0 {
+            done = true
+        } else {
+            // centroid of every point except the worst
+            cen = opt_zeros(n)
+            k = 0
+            while k <= n {
+                if k != hi { cen = opt_axpy(cen, 1.0 / host.sys_to_float(n), pts[k]) }
+                k += 1
+            }
+            worst = pts[hi]
+            refl = opt_axpy(cen, 1.0, opt_axpy(cen, -1.0, worst))
+            fr = f.value(refl)
+            evals += 1
+            if fr < vals[lo] {
+                expd = opt_axpy(cen, 2.0, opt_axpy(cen, -1.0, worst))
+                fe = f.value(expd)
+                evals += 1
+                if fe < fr {
+                    pts = host.sys_arr_set(pts, hi, expd)
+                    vals = host.sys_arr_set(vals, hi, fe)
+                } else {
+                    pts = host.sys_arr_set(pts, hi, refl)
+                    vals = host.sys_arr_set(vals, hi, fr)
+                }
+            } else {
+                if fr < vals[nxt] {
+                    pts = host.sys_arr_set(pts, hi, refl)
+                    vals = host.sys_arr_set(vals, hi, fr)
+                } else {
+                    // contraction (outside when the reflection improved on the worst, else inside)
+                    cpt = opt_axpy(cen, 0.5, opt_axpy(worst, -1.0, cen))
+                    if fr < vals[hi] { cpt = opt_axpy(cen, 0.5, opt_axpy(refl, -1.0, cen)) }
+                    fc = f.value(cpt)
+                    evals += 1
+                    limit = vals[hi]
+                    if fr < limit { limit = fr }
+                    if fc < limit {
+                        pts = host.sys_arr_set(pts, hi, cpt)
+                        vals = host.sys_arr_set(vals, hi, fc)
+                    } else {
+                        // shrink toward the best vertex
+                        best = pts[lo]
+                        k = 0
+                        while k <= n {
+                            if k != lo {
+                                moved = opt_axpy(best, 0.5, opt_axpy(pts[k], -1.0, best))
+                                pts = host.sys_arr_set(pts, k, moved)
+                                vals = host.sys_arr_set(vals, k, f.value(moved))
+                                evals += 1
+                            }
+                            k += 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lo = opt_argmin(vals)
+    OptResult.{x: pts[lo], fx: vals[lo], gnorm: opt_norm(f.grad(pts[lo])), iters, evals, converged: done}
+}
+
+// --- line search ------------------------------------------------------------------------------------------
+
+/// Backtracking Armijo line search along descent direction `d` from `x` (value `fx`, gradient `g`).
+/// Returns the accepted step length, or 0 when none found within 40 halvings.
++opt_armijo(f: ReverseTape, x: _, fx: f64, g: _, d: _, t0: f64) : f64 {
+    slope = opt_dot(g, d)
+    t = t0
+    tries = 0
+    while tries < 40 {
+        cand = opt_axpy(x, t, d)
+        fc = f.value(cand)
+        if fc <= fx + 0.0001 * t * slope { return t }
+        t = t * 0.5
+        tries += 1
+    }
+    0.0
+}
+
+// --- BFGS ---------------------------------------------------------------------------------------------------
+
+/// BFGS quasi-Newton minimiser with an inverse-Hessian approximation and Armijo backtracking.
+/// Stops when the gradient 2-norm falls to `tol`.
++bfgs(f: ReverseTape, x0: _, tol: f64, max_iter: i64) : OptResult {
+    n = host.sys_arr_len(x0)
+    x = x0
+    fx = f.value(x)
+    g = f.grad(x)
+    h = opt_eye(n)
+    evals = 1
+    iters = 0
+    done = opt_norm(g) <= tol
+    stalled = false
+    while iters < max_iter && !done && !stalled {
+        iters += 1
+        d = opt_scale(opt_matvec(h, g, n), -1.0)
+        if opt_dot(g, d) >= 0.0 {
+            h = opt_eye(n)
+            d = opt_scale(g, -1.0)
+        }
+        t0 = 1.0
+        if iters == 1 { t0 = 1.0 / (1.0 + opt_norm(g)) }
+        t = opt_armijo(f, x, fx, g, d, t0)
+        if t <= 0.0 {
+            if opt_eq(h[0], 1.0) && n > 0 {
+                stalled = true
+            } else {
+                h = opt_eye(n)
+            }
+        } else {
+            xn = opt_axpy(x, t, d)
+            fn = f.value(xn)
+            evals += 1
+            gn = f.grad(xn)
+            s = opt_axpy(xn, -1.0, x)
+            y = opt_axpy(gn, -1.0, g)
+            sy = opt_dot(s, y)
+            if sy > 0.000000000001 * opt_norm(s) * opt_norm(y) {
+                rho = 1.0 / sy
+                // H <- (I - rho s y^T) H (I - rho y s^T) + rho s s^T
+                hy = opt_matvec(h, y, n)
+                yhy = opt_dot(y, hy)
+                nh = host.sys_arr_new(n * n, 0.0)
+                r = 0
+                while r < n {
+                    c = 0
+                    while c < n {
+                        v = h[r * n + c] - rho * (s[r] * hy[c] + hy[r] * s[c]) + (rho * rho * yhy + rho) * s[r] * s[c]
+                        nh = host.sys_arr_set(nh, r * n + c, v)
+                        c += 1
+                    }
+                    r += 1
+                }
+                h = nh
+            }
+            x = xn
+            fx = fn
+            g = gn
+            if opt_norm(g) <= tol { done = true }
+        }
+    }
+    OptResult.{x, fx, gnorm: opt_norm(g), iters, evals, converged: done}
+}
+
+// --- L-BFGS -------------------------------------------------------------------------------------------------
+
+/// Limited-memory BFGS keeping the last `mem` curvature pairs (two-loop recursion) with Armijo backtracking.
++l_bfgs(f: ReverseTape, x0: _, mem: i64, tol: f64, max_iter: i64) : OptResult {
+    x = x0
+    fx = f.value(x)
+    g = f.grad(x)
+    ss = []
+    ys = []
+    rhos = []
+    evals = 1
+    iters = 0
+    done = opt_norm(g) <= tol
+    stalled = false
+    while iters < max_iter && !done && !stalled {
+        iters += 1
+        q = g
+        k = host.sys_arr_len(ss)
+        alphas = opt_zeros(k)
+        i = k - 1
+        while i >= 0 {
+            a = rhos[i] * opt_dot(ss[i], q)
+            alphas = host.sys_arr_set(alphas, i, a)
+            q = opt_axpy(q, -a, ys[i])
+            i -= 1
+        }
+        gamma0 = 1.0
+        if k > 0 {
+            gamma0 = opt_dot(ss[k - 1], ys[k - 1]) / opt_dot(ys[k - 1], ys[k - 1])
+        } else {
+            gamma0 = 1.0 / (1.0 + opt_norm(g))
+        }
+        r = opt_scale(q, gamma0)
+        i = 0
+        while i < k {
+            b = rhos[i] * opt_dot(ys[i], r)
+            r = opt_axpy(r, alphas[i] - b, ss[i])
+            i += 1
+        }
+        d = opt_scale(r, -1.0)
+        if opt_dot(g, d) >= 0.0 {
+            d = opt_scale(g, -1.0)
+            ss = []
+            ys = []
+            rhos = []
+        }
+        t = opt_armijo(f, x, fx, g, d, 1.0)
+        if t <= 0.0 {
+            if host.sys_arr_len(ss) == 0 {
+                stalled = true
+            } else {
+                ss = []
+                ys = []
+                rhos = []
+            }
+        } else {
+            xn = opt_axpy(x, t, d)
+            fn = f.value(xn)
+            evals += 1
+            gn = f.grad(xn)
+            s = opt_axpy(xn, -1.0, x)
+            y = opt_axpy(gn, -1.0, g)
+            sy = opt_dot(s, y)
+            if sy > 0.000000000001 * opt_norm(s) * opt_norm(y) {
+                ss = host.sys_arr_push(ss, s)
+                ys = host.sys_arr_push(ys, y)
+                rhos = host.sys_arr_push(rhos, 1.0 / sy)
+                if host.sys_arr_len(ss) > mem {
+                    ss = opt_drop_first(ss)
+                    ys = opt_drop_first(ys)
+                    rhos = opt_drop_first(rhos)
+                }
+            }
+            x = xn
+            fx = fn
+            g = gn
+            if opt_norm(g) <= tol { done = true }
+        }
+    }
+    OptResult.{x, fx, gnorm: opt_norm(g), iters, evals, converged: done}
+}
+
+/// `xs` without its first element.
++opt_drop_first(xs: _) {
+    out = []
+    i = 1
+    while i < host.sys_arr_len(xs) {
+        out = host.sys_arr_push(out, xs[i])
+        i += 1
+    }
+    out
+}
+
+// --- AdamW -------------------------------------------------------------------------------------------------------
+
+/// AdamW (Adam with decoupled weight decay) for `steps` iterations with learning rate `lr`.
+/// Early exit when the gradient norm drops below 1e-12.
++adamw(f: ReverseTape, x0: _, lr: f64, b1: f64, b2: f64, eps: f64, decay: f64, steps: i64) : OptResult {
+    n = host.sys_arr_len(x0)
+    x = x0
+    m = opt_zeros(n)
+    v = opt_zeros(n)
+    t = 0
+    p1 = 1.0
+    p2 = 1.0
+    g = f.grad(x)
+    done = opt_norm(g) < 0.000000000001
+    while t < steps && !done {
+        t += 1
+        g = f.grad(x)
+        p1 = p1 * b1
+        p2 = p2 * b2
+        i = 0
+        while i < n {
+            gi = g[i]
+            mi = b1 * m[i] + (1.0 - b1) * gi
+            vi = b2 * v[i] + (1.0 - b2) * gi * gi
+            m = host.sys_arr_set(m, i, mi)
+            v = host.sys_arr_set(v, i, vi)
+            mhat = mi / (1.0 - p1)
+            vhat = vi / (1.0 - p2)
+            x = host.sys_arr_set(x, i, x[i] - lr * (mhat / (host.sys_sqrt(vhat) + eps) + decay * x[i]))
+            i += 1
+        }
+        if opt_norm(g) < 0.000000000001 { done = true }
+    }
+    gf = f.grad(x)
+    OptResult.{x, fx: f.value(x), gnorm: opt_norm(gf), iters: t, evals: t + 1, converged: opt_norm(gf) < 0.001}
+}
+
+// --- linear and quadratic programming --------------------------------------------------------------------------
+
+/// `LP_EPS` is the pivot / feasibility tolerance of the simplex and active-set solvers.
++LP_EPS = 0.000000001
+
+/// Result of `linprog` / `quadprog`.
++ProgResult = {
+    /// Solution (length n; empty when the problem was invalid or infeasible).
+    x: _ = []
+    /// Objective value at `x`.
+    fx: f64 = 0.0
+    /// "optimal", "infeasible", "unbounded", "max_iter", "singular" or "invalid".
+    status: str = "invalid"
+    /// Simplex pivots or active-set iterations performed.
+    iters: i64 = 0
+    /// True when `status` is "optimal".
+    converged: bool = false
+    /// Inequality multipliers (`quadprog`; one per `A x <= b` row, zero when inactive, all `>= 0`).
+    duals: _ = []
+}
+
+/// Dense simplex tableau: `rows` constraint rows plus the objective row, `w = cols + 1` columns.
+LpTab = {
+    t: _ = []
+    basis: _ = []
+    rows: i64 = 0
+    cols: i64 = 0
+    iters: i64 = 0
+    /// 0 optimal, 2 unbounded, 3 iteration limit.
+    status: i64 = 0
+}
+
+/// Pivot the tableau on row `r`, column `c`.
+lp_pivot(t: _, nr: i64, w: i64, r: i64, c: i64) {
+    out = t
+    pv = t[r * w + c]
+    for 0..w { out = host.sys_arr_set(out, r * w + it, t[r * w + it] / pv) }
+    for 0..nr {
+        i = it
+        if i != r {
+            f = t[i * w + c]
+            for 0..w { out = host.sys_arr_set(out, i * w + it, t[i * w + it] - f * out[r * w + it]) }
+        }
+    }
+    out
+}
+
+/// Run the primal simplex on `tab`, letting only columns `0..allowed` enter the basis. Dantzig's
+/// rule is used until the objective stalls, then Bland's rule guarantees termination.
+lp_simplex(tab: LpTab, allowed: i64, max_iter: i64) : LpTab {
+    t = tab.t
+    basis = tab.basis
+    rows = tab.rows
+    cols = tab.cols
+    w = cols + 1
+    iters = tab.iters
+    status = 0
+    stall = 0
+    last = t[rows * w + cols]
+    done = false
+    while !done {
+        enter = -1
+        if stall > rows {
+            for 0..allowed { if enter < 0 && t[rows * w + it] < 0.0 - LP_EPS { enter = it } }
+        } else {
+            best = 0.0 - LP_EPS
+            for 0..allowed {
+                if t[rows * w + it] < best {
+                    best = t[rows * w + it]
+                    enter = it
+                }
+            }
+        }
+        if enter < 0 {
+            done = true
+        } else {
+            if iters >= max_iter {
+                status = 3
+                done = true
+            } else {
+                leave = -1
+                ratio = 0.0
+                for 0..rows {
+                    a = t[it * w + enter]
+                    if a > LP_EPS {
+                        q = t[it * w + cols] / a
+                        if leave < 0 || q < ratio - 0.000000000001 || (q <= ratio + 0.000000000001 && basis[it] < basis[leave]) {
+                            leave = it
+                            ratio = q
+                        }
+                    }
+                }
+                if leave < 0 {
+                    status = 2
+                    done = true
+                } else {
+                    t = lp_pivot(t, rows + 1, w, leave, enter)
+                    basis = host.sys_arr_set(basis, leave, enter)
+                    iters += 1
+                    now = t[rows * w + cols]
+                    if opt_abs(now - last) < LP_EPS { stall += 1 } else { stall = 0 }
+                    last = now
+                }
+            }
+        }
+    }
+    LpTab.{t, basis, rows, cols, iters, status}
+}
+
+/// Minimise `c . x` subject to `A_ub x <= b_ub`, `A_eq x = b_eq` and `x >= 0` with the two-phase
+/// simplex method. Matrices are row-major flat (`len(b_ub)` rows of `len(c)` entries; pass `[]` for
+/// none); other bounds are expressed by shifting variables or adding rows. Reports "infeasible",
+/// "unbounded", "max_iter" (after `max_iter` pivots) or "invalid" (inconsistent sizes) in `status`.
++linprog(c: _, a_ub: _, b_ub: _, a_eq: _, b_eq: _, max_iter: i64) : ProgResult {
+    n = host.sys_arr_len(c)
+    mu = host.sys_arr_len(b_ub)
+    me = host.sys_arr_len(b_eq)
+    ensure n > 0 && host.sys_arr_len(a_ub) == mu * n && host.sys_arr_len(a_eq) == me * n else {
+        return ProgResult.{status: "invalid"}
+    }
+    rows = mu + me
+    ns = n + mu
+    // rows with a negative right-hand side are negated; they, and equalities, get artificials
+    sign = []
+    na = 0
+    for 0..rows {
+        bi = 0.0
+        if it < mu { bi = b_ub[it] } else { bi = b_eq[it - mu] }
+        sg = 1.0
+        if bi < 0.0 { sg = -1.0 }
+        sign = host.sys_arr_push(sign, sg)
+        if it >= mu || bi < 0.0 { na += 1 }
+    }
+    cols = ns + na
+    w = cols + 1
+    t = host.sys_arr_new((rows + 1) * w, 0.0)
+    basis = host.sys_arr_new(rows, 0)
+    art = 0
+    for 0..rows {
+        i = it
+        sg = sign[i]
+        if i < mu {
+            for 0..n { t = host.sys_arr_set(t, i * w + it, sg * a_ub[i * n + it]) }
+            t = host.sys_arr_set(t, i * w + n + i, sg)
+            t = host.sys_arr_set(t, i * w + cols, sg * b_ub[i])
+        } else {
+            k = i - mu
+            for 0..n { t = host.sys_arr_set(t, i * w + it, sg * a_eq[k * n + it]) }
+            t = host.sys_arr_set(t, i * w + cols, sg * b_eq[k])
+        }
+        if i < mu && sg > 0.0 {
+            basis = host.sys_arr_set(basis, i, n + i)
+        } else {
+            t = host.sys_arr_set(t, i * w + ns + art, 1.0)
+            basis = host.sys_arr_set(basis, i, ns + art)
+            art += 1
+        }
+    }
+    iters = 0
+    if na > 0 {
+        // phase 1: minimise the sum of artificials
+        for 0..na { t = host.sys_arr_set(t, rows * w + ns + it, 1.0) }
+        for 0..rows {
+            i = it
+            if basis[i] >= ns {
+                for 0..w { t = host.sys_arr_set(t, rows * w + it, t[rows * w + it] - t[i * w + it]) }
+            }
+        }
+        p1 = lp_simplex(LpTab.{t, basis, rows, cols, iters: 0, status: 0}, ns, max_iter)
+        t = p1.t
+        basis = p1.basis
+        iters = p1.iters
+        if p1.status == 3 { return ProgResult.{status: "max_iter", iters} }
+        scale = 1.0
+        for 0..rows { scale += opt_abs(t[it * w + cols]) }
+        if 0.0 - t[rows * w + cols] > 0.0000001 * scale { return ProgResult.{status: "infeasible", iters} }
+        // pivot degenerate artificials out of the basis (redundant rows stay at zero)
+        for 0..rows {
+            i = it
+            if basis[i] >= ns {
+                pick = -1
+                for 0..ns { if pick < 0 && opt_abs(t[i * w + it]) > 0.000001 { pick = it } }
+                if pick >= 0 {
+                    t = lp_pivot(t, rows + 1, w, i, pick)
+                    basis = host.sys_arr_set(basis, i, pick)
+                }
+            }
+        }
+    }
+    // phase 2: original objective, expressed in the current basis
+    for 0..w { t = host.sys_arr_set(t, rows * w + it, 0.0) }
+    for 0..n { t = host.sys_arr_set(t, rows * w + it, c[it]) }
+    for 0..rows {
+        i = it
+        if basis[i] < n {
+            cb = c[basis[i]]
+            for 0..w { t = host.sys_arr_set(t, rows * w + it, t[rows * w + it] - cb * t[i * w + it]) }
+        }
+    }
+    p2 = lp_simplex(LpTab.{t, basis, rows, cols, iters, status: 0}, ns, max_iter)
+    if p2.status == 2 { return ProgResult.{status: "unbounded", iters: p2.iters} }
+    if p2.status == 3 { return ProgResult.{status: "max_iter", iters: p2.iters} }
+    x = host.sys_arr_new(n, 0.0)
+    for 0..rows { if p2.basis[it] < n { x = host.sys_arr_set(x, p2.basis[it], p2.t[it * w + cols]) } }
+    ProgResult.{x, fx: opt_dot(c, x), status: "optimal", iters: p2.iters, converged: true}
+}
+
+/// A point satisfying `A_ub x <= b_ub` and `A_eq x = b_eq` (free variables), found by `linprog`
+/// on the split `x = u - v`; the returned `ProgResult.x` is empty unless `status` is "optimal".
++lp_feasible_point(n: i64, a_ub: _, b_ub: _, a_eq: _, b_eq: _, max_iter: i64) : ProgResult {
+    mu = host.sys_arr_len(b_ub)
+    me = host.sys_arr_len(b_eq)
+    ub2 = []
+    for 0..mu {
+        i = it
+        for 0..n { ub2 = host.sys_arr_push(ub2, a_ub[i * n + it]) }
+        for 0..n { ub2 = host.sys_arr_push(ub2, 0.0 - a_ub[i * n + it]) }
+    }
+    eq2 = []
+    for 0..me {
+        i = it
+        for 0..n { eq2 = host.sys_arr_push(eq2, a_eq[i * n + it]) }
+        for 0..n { eq2 = host.sys_arr_push(eq2, 0.0 - a_eq[i * n + it]) }
+    }
+    r = linprog(host.sys_arr_new(2 * n, 0.0), ub2, b_ub, eq2, b_eq, max_iter)
+    if !r.converged { return r }
+    x = []
+    for 0..n { x = host.sys_arr_push(x, r.x[it] - r.x[n + it]) }
+    ProgResult.{x, fx: 0.0, status: "optimal", iters: r.iters, converged: true}
+}
+
+/// `x' Q x / 2 + c . x` for a row-major `n x n` matrix `q`.
++qp_value(q: _, c: _, x: _) : f64 {
+    n = host.sys_arr_len(x)
+    qx = opt_matvec(q, x, n)
+    0.5 * opt_dot(x, qx) + opt_dot(c, x)
+}
+
+/// Minimise `x' Q x / 2 + c . x` subject to `A_ub x <= b_ub` and `A_eq x = b_eq` (variables are
+/// free) with a primal active-set method. `Q` is symmetric row-major `n x n` and must be positive
+/// definite on the null space of the active constraints at every iteration (positive definite is
+/// always enough). The start is a feasible point from `lp_feasible_point`; each iteration solves
+/// the KKT system of the working set with `std.math.linalg` LU, steps to the nearest blocking
+/// constraint, or drops the most negative multiplier. `duals` are the `A_ub` multipliers.
+/// `status` is "infeasible" when no feasible point exists, "singular" when a KKT system is
+/// singular (e.g. a non-convex `Q`), "max_iter" after `max_iter` iterations, or "invalid".
++quadprog(q: _, c: _, a_ub: _, b_ub: _, a_eq: _, b_eq: _, max_iter: i64) : ProgResult {
+    n = host.sys_arr_len(c)
+    mu = host.sys_arr_len(b_ub)
+    me = host.sys_arr_len(b_eq)
+    ensure n > 0 && host.sys_arr_len(q) == n * n && host.sys_arr_len(a_ub) == mu * n && host.sys_arr_len(a_eq) == me * n else {
+        return ProgResult.{status: "invalid"}
+    }
+    start = lp_feasible_point(n, a_ub, b_ub, a_eq, b_eq, 100000)
+    if !start.converged { return ProgResult.{status: start.status, iters: start.iters} }
+    x = start.x
+    active = host.sys_arr_new(mu, 0)
+    duals = host.sys_arr_new(mu, 0.0)
+    iters = 0
+    while iters < max_iter {
+        iters += 1
+        // working set: equalities first, then active inequalities
+        wset = []
+        for 0..me { wset = host.sys_arr_push(wset, -1 - it) }
+        for 0..mu { if active[it] == 1 { wset = host.sys_arr_push(wset, it) } }
+        mw = host.sys_arr_len(wset)
+        k = n + mw
+        kkt = host.sys_arr_new(k * k, 0.0)
+        for 0..n {
+            i = it
+            for 0..n { kkt = host.sys_arr_set(kkt, i * k + it, q[i * n + it]) }
+        }
+        for 0..mw {
+            r = it
+            idx = wset[r]
+            for 0..n {
+                coef = 0.0
+                if idx < 0 { coef = a_eq[(-1 - idx) * n + it] } else { coef = a_ub[idx * n + it] }
+                kkt = host.sys_arr_set(kkt, (n + r) * k + it, coef)
+                kkt = host.sys_arr_set(kkt, it * k + n + r, coef)
+            }
+        }
+        qx = opt_matvec(q, x, n)
+        rhs = host.sys_arr_new(k, 0.0)
+        for 0..n { rhs = host.sys_arr_set(rhs, it, 0.0 - (qx[it] + c[it])) }
+        sol = lu(dense(k, k, kkt)).solve(rhs)
+        if host.sys_arr_len(sol) == 0 {
+            return ProgResult.{x, fx: qp_value(q, c, x), status: "singular", iters, duals}
+        }
+        p = []
+        for 0..n { p = host.sys_arr_push(p, sol[it]) }
+        if opt_norm_inf(p) <= 0.000000001 * (1.0 + opt_norm_inf(x)) {
+            worst = -1
+            low = 0.0 - LP_EPS
+            for 0..mu {
+                duals = host.sys_arr_set(duals, it, 0.0)
+            }
+            for 0..mw {
+                idx = wset[it]
+                if idx >= 0 {
+                    lam = sol[n + it]
+                    duals = host.sys_arr_set(duals, idx, lam)
+                    if lam < low {
+                        low = lam
+                        worst = idx
+                    }
+                }
+            }
+            if worst < 0 {
+                return ProgResult.{x, fx: qp_value(q, c, x), status: "optimal", iters, converged: true, duals}
+            }
+            active = host.sys_arr_set(active, worst, 0)
+        } else {
+            alpha = 1.0
+            block = -1
+            for 0..mu {
+                i = it
+                if active[i] == 0 {
+                    ap = 0.0
+                    ax = 0.0
+                    for 0..n {
+                        ap += a_ub[i * n + it] * p[it]
+                        ax += a_ub[i * n + it] * x[it]
+                    }
+                    if ap > 0.000000000001 {
+                        slack = b_ub[i] - ax
+                        if slack < 0.0 { slack = 0.0 }
+                        step = slack / ap
+                        if step < alpha {
+                            alpha = step
+                            block = i
+                        }
+                    }
+                }
+            }
+            x = opt_axpy(x, alpha, p)
+            if block >= 0 { active = host.sys_arr_set(active, block, 1) }
+        }
+    }
+    ProgResult.{x, fx: qp_value(q, c, x), status: "max_iter", iters, duals}
+}
+
+// --- test problems -------------------------------------------------------------------------------------------
+
+/// Tape for the 2-D system `x^2 + y^2 - 4 = 0`, `x y - 1 = 0`.
++opt_circle_hyperbola() : ReverseTape {
+    t = ReverseTape.new()
+    x = @t.input()
+    y = @t.input()
+    xx = @t.n_square(x)
+    yy = @t.n_square(y)
+    s = @t.n_add(xx, yy)
+    f1 = @t.n_addc(s, -4.0)
+    p = @t.n_mul(x, y)
+    f2 = @t.n_addc(p, -1.0)
+    @t.out(f1)
+    @t.out(f2)
+    t
+}
+
+/// Tape for Himmelblau's function `(x^2 + y - 11)^2 + (x + y^2 - 7)^2` (four minima, one at (3, 2)).
++opt_himmelblau() : ReverseTape {
+    t = ReverseTape.new()
+    x = @t.input()
+    y = @t.input()
+    xx = @t.n_square(x)
+    a = @t.n_add(xx, y)
+    a = @t.n_addc(a, -11.0)
+    yy = @t.n_square(y)
+    b = @t.n_add(x, yy)
+    b = @t.n_addc(b, -7.0)
+    a2 = @t.n_square(a)
+    b2 = @t.n_square(b)
+    f = @t.n_add(a2, b2)
+    @t.out(f)
+    t
+}
+
+/// Tape for `cos(x) - x` (single root near 0.739085).
++opt_cos_minus_x() : ReverseTape {
+    t = ReverseTape.new()
+    x = @t.input()
+    c = @t.n_cos(x)
+    f = @t.n_sub(c, x)
+    @t.out(f)
+    t
+}
+
+// --- tests ---------------------------------------------------------------------------------------------------------
+
+/// Test Brent root finding.
+test "brent finds roots" {
+    g = tape_poly([-2.0, 0.0, 1.0])
+    r = brent(g, 0.0, 2.0, 0.000000000001, 100)
+    #assert(r.converged)
+    #assert(opt_abs(r.x0() - 1.4142135623730951) < 1.0e-10)
+    #assert(opt_abs(r.fx) < 1.0e-9)
+    #assert(r.iters < 40)
+    c = brent(opt_cos_minus_x(), 0.0, 1.0, 0.000000000001, 100)
+    #assert(c.converged)
+    #assert(opt_abs(c.x0() - 0.7390851332151607) < 1.0e-10)
+    neg = brent(g, -3.0, -1.0, 0.000000000001, 100)
+    #assert(opt_abs(neg.x0() + 1.4142135623730951) < 1.0e-10)
+    cubic = brent(tape_poly([-6.0, 11.0, -6.0, 1.0]), 2.5, 3.5, 0.000000000001, 100)
+    #assert(opt_abs(cubic.x0() - 3.0) < 1.0e-10)
+    bad = brent(g, 2.0, 3.0, 0.000000000001, 100)
+    #assert(!(bad.converged))
+    assert_eq(bad.iters, 0)
+    exact = brent(g, 1.4142135623730951, 2.0, 0.000000001, 100)
+    #assert(opt_abs(exact.x0() - 1.4142135623730951) < 1.0e-8)
+}
+
+/// Test Brent minimisation.
+test "brent_min finds minima" {
+    r = brent_min(tape_sphere([1.5]), -4.0, 4.0, 0.00000001, 200)
+    #assert(r.converged)
+    #assert(opt_abs(r.x0() - 1.5) < 1.0e-6)
+    #assert(r.fx < 1.0e-12)
+    flipped = brent_min(tape_sphere([-0.5]), 3.0, -3.0, 0.00000001, 200)
+    #assert(opt_abs(flipped.x0() + 0.5) < 1.0e-6)
+    // x^4 - 3x^3 + 2 has its minimum at x = 9/4
+    q = brent_min(tape_poly([2.0, 0.0, 0.0, -3.0, 1.0]), 1.0, 4.0, 0.00000001, 200)
+    #assert(opt_abs(q.x0() - 2.25) < 1.0e-5)
+    #assert(opt_abs(q.gnorm) < 1.0e-3)
+    c = brent_min(opt_cos_minus_x(), 2.0, 4.0, 0.00000001, 200)
+    // cos(x) - x is decreasing, so the minimum is at the upper end
+    #assert(c.x0() > 3.9)
+}
+
+/// Test Newton on nonlinear systems.
+test "newton_system solves nonlinear systems" {
+    sys = opt_circle_hyperbola()
+    r = newton_system(sys, [2.0, 0.5], 0.000000000001, 50)
+    #assert(r.converged)
+    #assert(opt_abs(r.x[0] * r.x[0] + r.x[1] * r.x[1] - 4.0) < 1.0e-10)
+    #assert(opt_abs(r.x[0] * r.x[1] - 1.0) < 1.0e-10)
+    #assert(opt_abs(r.x[0] - 1.9318516525781366) < 1.0e-9)
+    #assert(opt_abs(r.x[1] - 0.5176380902050415) < 1.0e-9)
+    #assert(r.iters < 10)
+    other = newton_system(sys, [-2.0, -0.5], 0.000000000001, 50)
+    #assert(other.converged)
+    #assert(other.x[0] < 0.0)
+    // linear system 2x + y = 5, x - y = 1 converges in one step
+    t = ReverseTape.new()
+    x = @t.input()
+    y = @t.input()
+    a = @t.n_mulc(x, 2.0)
+    a = @t.n_add(a, y)
+    a = @t.n_addc(a, -5.0)
+    b = @t.n_sub(x, y)
+    b = @t.n_addc(b, -1.0)
+    @t.out(a)
+    @t.out(b)
+    lin = newton_system(t, [10.0, -7.0], 0.000000000001, 20)
+    #assert(lin.converged)
+    #assert(lin.iters <= 2)
+    #assert(opt_abs(lin.x[0] - 2.0) < 1.0e-10)
+    #assert(opt_abs(lin.x[1] - 1.0) < 1.0e-10)
+    // singular Jacobian at x = 0 for F(x) = x^2 - 1 started at 0 stalls without converging
+    sing = newton_system(tape_poly([-1.0, 0.0, 1.0]), [0.0], 0.000000000001, 20)
+    #assert(!(sing.converged))
+    // already at a root
+    root = newton_system(sys, [1.9318516525781366, 0.5176380902050415], 0.000001, 20)
+    #assert(root.converged)
+    assert_eq(root.iters, 0)
+}
+
+/// Test Nelder-Mead.
+test "nelder_mead minimises without gradients" {
+    s = nelder_mead(tape_sphere([1.0, -2.0]), [0.0, 0.0], 0.5, 0.0000000001, 1000)
+    #assert(s.converged)
+    #assert(opt_abs(s.x[0] - 1.0) < 1.0e-4)
+    #assert(opt_abs(s.x[1] + 2.0) < 1.0e-4)
+    r = nelder_mead(tape_rosenbrock(2), [-1.2, 1.0], 0.5, 0.0000000001, 2000)
+    #assert(opt_abs(r.x[0] - 1.0) < 1.0e-3)
+    #assert(opt_abs(r.x[1] - 1.0) < 1.0e-3)
+    #assert(r.fx < 1.0e-6)
+    h = nelder_mead(opt_himmelblau(), [0.0, 0.0], 0.5, 0.0000000001, 1000)
+    #assert(h.fx < 1.0e-6)
+    one = nelder_mead(tape_sphere([4.0]), [0.0], 1.0, 0.0000000001, 500)
+    #assert(opt_abs(one.x[0] - 4.0) < 1.0e-4)
+    capped = nelder_mead(tape_rosenbrock(2), [-1.2, 1.0], 0.5, 0.0000000001, 3)
+    #assert(!(capped.converged))
+    assert_eq(capped.iters, 3)
+}
+
+/// Test BFGS.
+test "bfgs converges on quadratics and Rosenbrock" {
+    q = bfgs(tape_sphere([3.0, -1.0, 2.0]), [0.0, 0.0, 0.0], 0.0000001, 100)
+    #assert(q.converged)
+    #assert(opt_abs(q.x[0] - 3.0) < 1.0e-6)
+    #assert(opt_abs(q.x[1] + 1.0) < 1.0e-6)
+    #assert(opt_abs(q.x[2] - 2.0) < 1.0e-6)
+    #assert(q.iters < 20)
+    r = bfgs(tape_rosenbrock(2), [-1.2, 1.0], 0.000001, 300)
+    #assert(r.converged)
+    #assert(opt_abs(r.x[0] - 1.0) < 1.0e-4)
+    #assert(opt_abs(r.x[1] - 1.0) < 1.0e-4)
+    #assert(r.fx < 1.0e-8)
+    #assert(r.iters < 100)
+    #assert(r.evals >= r.iters)
+    h = bfgs(opt_himmelblau(), [1.0, 1.0], 0.000001, 200)
+    #assert(h.fx < 1.0e-10)
+    r4 = bfgs(tape_rosenbrock(4), [-1.0, 1.0, -1.0, 1.0], 0.00001, 500)
+    #assert(r4.fx < 1.0e-6)
+    start = bfgs(tape_sphere([0.0]), [0.0], 0.000001, 10)
+    #assert(start.converged)
+    assert_eq(start.iters, 0)
+}
+
+/// Test L-BFGS.
+test "l_bfgs matches bfgs" {
+    q = l_bfgs(tape_sphere([3.0, -1.0, 2.0]), [0.0, 0.0, 0.0], 5, 0.0000001, 100)
+    #assert(q.converged)
+    #assert(opt_abs(q.x[0] - 3.0) < 1.0e-6)
+    #assert(opt_abs(q.x[2] - 2.0) < 1.0e-6)
+    r = l_bfgs(tape_rosenbrock(2), [-1.2, 1.0], 8, 0.000001, 400)
+    #assert(r.converged)
+    #assert(opt_abs(r.x[0] - 1.0) < 1.0e-4)
+    #assert(opt_abs(r.x[1] - 1.0) < 1.0e-4)
+    r6 = l_bfgs(tape_rosenbrock(6), [-1.0, 1.0, -1.0, 1.0, -1.0, 1.0], 6, 0.00001, 1000)
+    #assert(r6.fx < 1.0e-6)
+    tiny = l_bfgs(tape_rosenbrock(2), [-1.2, 1.0], 1, 0.000001, 1500)
+    #assert(tiny.fx < 1.0e-6)
+    h = l_bfgs(opt_himmelblau(), [-1.0, -1.0], 5, 0.000001, 200)
+    #assert(h.fx < 1.0e-10)
+}
+
+/// Test AdamW.
+test "adamw reaches the minimum and decays weights" {
+    a = adamw(tape_sphere([3.0, -1.0]), [0.0, 0.0], 0.1, 0.9, 0.999, 0.00000001, 0.0, 600)
+    #assert(opt_abs(a.x[0] - 3.0) < 0.01)
+    #assert(opt_abs(a.x[1] + 1.0) < 0.01)
+    #assert(a.iters <= 600)
+    #assert(a.fx < 0.0001)
+    // decoupled decay pulls the optimum of the sphere toward zero
+    d = adamw(tape_sphere([3.0]), [0.0], 0.05, 0.9, 0.999, 0.00000001, 0.5, 2000)
+    #assert(d.x[0] < 3.0)
+    #assert(d.x[0] > 1.5)
+    z = adamw(tape_sphere([1.0]), [1.0], 0.1, 0.9, 0.999, 0.00000001, 0.0, 50)
+    assert_eq(z.iters, 0)
+    #assert(z.converged)
+}
+
+/// Test array helpers.
+test "optimizer array helpers" {
+    assert_eq(opt_dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]), 32.0)
+    assert_eq(opt_norm([3.0, 4.0]), 5.0)
+    assert_eq(opt_norm_inf([1.0, -7.0, 3.0]), 7.0)
+    ax = opt_axpy([1.0, 2.0], 2.0, [10.0, 20.0])
+    assert_eq(ax[0], 21.0)
+    assert_eq(ax[1], 42.0)
+    sc = opt_scale([1.0, -2.0], 3.0)
+    assert_eq(sc[1], -6.0)
+    eye = opt_eye(2)
+    mv = opt_matvec(eye, [7.0, 8.0], 2)
+    assert_eq(mv[0], 7.0)
+    assert_eq(mv[1], 8.0)
+    assert_eq(opt_argmin([3.0, 1.0, 2.0]), 1)
+    assert_eq(opt_argmax([3.0, 1.0, 5.0]), 2)
+    assert_eq(opt_argmax_except([3.0, 1.0, 5.0], 2), 0)
+    assert_eq(opt_sign(3.0, -1.0), -3.0)
+    assert_eq(opt_sign(-3.0, 1.0), 3.0)
+    #assert(!(opt_eq(1.0, 1.0 + 1.0e-12)))
+    assert_eq(host.sys_arr_len(opt_drop_first([1.0, 2.0, 3.0])), 2)
+    assert_eq(host.sys_arr_len(opt_zeros(4)), 4)
+}
+
+test "linprog solves classic linear programs" {
+    // max 3x + 2y  s.t. x + y <= 4, x + 3y <= 6, x <= 3  (degenerate vertex at (3, 1))
+    r = linprog([-3.0, -2.0], [1.0, 1.0, 1.0, 3.0, 1.0, 0.0], [4.0, 6.0, 3.0], [], [], 1000)
+    assert_eq(r.status, "optimal")
+    #assert(r.converged)
+    #assert(opt_abs(r.fx + 11.0) < 1.0e-9)
+    #assert(opt_abs(r.x[0] - 3.0) < 1.0e-9)
+    #assert(opt_abs(r.x[1] - 1.0) < 1.0e-9)
+    #assert(r.iters > 0)
+    // diet problem: min 2x + 3y s.t. x + 2y >= 4, 3x + y >= 6 (negative right-hand sides)
+    d = linprog([2.0, 3.0], [-1.0, -2.0, -3.0, -1.0], [-4.0, -6.0], [], [], 1000)
+    assert_eq(d.status, "optimal")
+    #assert(opt_abs(d.fx - 6.8) < 1.0e-9)
+    #assert(opt_abs(d.x[0] - 1.6) < 1.0e-9)
+    #assert(opt_abs(d.x[1] - 1.2) < 1.0e-9)
+    // equality + bound: min x + 2y s.t. x + y = 3, x <= 2
+    e = linprog([1.0, 2.0], [1.0, 0.0], [2.0], [1.0, 1.0], [3.0], 1000)
+    assert_eq(e.status, "optimal")
+    #assert(opt_abs(e.fx - 4.0) < 1.0e-9)
+    #assert(opt_abs(e.x[0] - 2.0) < 1.0e-9)
+    #assert(opt_abs(e.x[1] - 1.0) < 1.0e-9)
+    // no constraints at all and a non-negative cost: optimum at the origin
+    z = linprog([1.0, 2.0], [], [], [], [], 10)
+    assert_eq(z.status, "optimal")
+    assert_eq(z.fx, 0.0)
+    assert_eq(z.iters, 0)
+}
+
+test "linprog handles transportation and mixed problems (scipy HiGHS references)" {
+    // supplies 20, 30; demands 10, 25, 15; unit costs [[8, 6, 10], [9, 12, 13]]
+    cost = [8.0, 6.0, 10.0, 9.0, 12.0, 13.0]
+    aeq = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
+    tr = linprog(cost, [], [], aeq, [20.0, 30.0, 10.0, 25.0, 15.0], 1000)
+    assert_eq(tr.status, "optimal")
+    #assert(opt_abs(tr.fx - 465.0) < 1.0e-8)
+    for 0..6 { #assert(tr.x[it] > 0.0 - 1.0e-9) }
+    // every equality row holds at the solution
+    for 0..5 {
+        i = it
+        acc = 0.0
+        for 0..6 { acc += aeq[i * 6 + it] * tr.x[it] }
+        want = [20.0, 30.0, 10.0, 25.0, 15.0][i]
+        #assert(opt_abs(acc - want) < 1.0e-8)
+    }
+    // mixed: min -x1 - 2 x2 - 3 x3 + x4 with <= and = rows
+    aub = [1.0, 1.0, 1.0, 1.0, 1.0, -1.0, 0.0, 2.0, 0.0, 1.0, -1.0, 0.0]
+    m = linprog([-1.0, -2.0, -3.0, 1.0], aub, [10.0, 4.0, -1.0], [1.0, 2.0, 0.0, -1.0], [3.0], 1000)
+    assert_eq(m.status, "optimal")
+    #assert(opt_abs(m.fx + 28.5) < 1.0e-8)
+    #assert(opt_abs(m.x[1] - 1.5) < 1.0e-8)
+    #assert(opt_abs(m.x[2] - 8.5) < 1.0e-8)
+    #assert(opt_abs(m.x[0]) < 1.0e-8)
+    #assert(opt_abs(m.x[3]) < 1.0e-8)
+}
+
+test "linprog reports infeasible, unbounded, capped and invalid problems" {
+    // x + y <= 1 and x + y >= 3
+    inf = linprog([1.0, 1.0], [1.0, 1.0, -1.0, -1.0], [1.0, -3.0], [], [], 1000)
+    assert_eq(inf.status, "infeasible")
+    #assert(!(inf.converged))
+    assert_eq(host.sys_arr_len(inf.x), 0)
+    // contradictory equalities
+    ie = linprog([1.0], [], [], [1.0, 1.0], [1.0, 2.0], 100)
+    assert_eq(ie.status, "infeasible")
+    // min -x s.t. x - y <= 1: x grows without bound
+    ub = linprog([-1.0, 0.0], [1.0, -1.0], [1.0], [], [], 1000)
+    assert_eq(ub.status, "unbounded")
+    #assert(!(ub.converged))
+    // pivot cap
+    cap = linprog([-3.0, -2.0], [1.0, 1.0, 1.0, 3.0, 1.0, 0.0], [4.0, 6.0, 3.0], [], [], 1)
+    assert_eq(cap.status, "max_iter")
+    #assert(!(cap.converged))
+    // size mismatches
+    assert_eq(linprog([], [], [], [], [], 10).status, "invalid")
+    assert_eq(linprog([1.0, 1.0], [1.0], [1.0], [], [], 10).status, "invalid")
+    assert_eq(linprog([1.0, 1.0], [], [], [1.0, 1.0, 1.0], [1.0], 10).status, "invalid")
+    // redundant equality rows are tolerated
+    red = linprog([1.0, 1.0], [], [], [1.0, 1.0, 2.0, 2.0], [2.0, 4.0], 100)
+    assert_eq(red.status, "optimal")
+    #assert(opt_abs(red.fx - 2.0) < 1.0e-9)
+}
+
+test "lp_feasible_point returns a feasible free-variable point" {
+    // x + y <= 4, -x <= -5 (x >= 5), y = -2
+    p = lp_feasible_point(2, [1.0, 1.0, -1.0, 0.0], [4.0, -5.0], [0.0, 1.0], [-2.0], 1000)
+    assert_eq(p.status, "optimal")
+    #assert(opt_abs(p.x[1] + 2.0) < 1.0e-9)
+    #assert(p.x[0] >= 5.0 - 1.0e-9)
+    #assert(p.x[0] + p.x[1] <= 4.0 + 1.0e-9)
+    q = lp_feasible_point(1, [1.0, -1.0], [1.0, -3.0], [], [], 100)
+    assert_eq(q.status, "infeasible")
+}
+
+test "quadprog solves convex quadratic programs (scipy SLSQP references)" {
+    // min x^2 + y^2 - 2x - 5y  s.t. x + 2y <= 3
+    r = quadprog([2.0, 0.0, 0.0, 2.0], [-2.0, -5.0], [1.0, 2.0], [3.0], [], [], 200)
+    assert_eq(r.status, "optimal")
+    #assert(r.converged)
+    #assert(opt_abs(r.x[0] - 0.4) < 1.0e-8)
+    #assert(opt_abs(r.x[1] - 1.3) < 1.0e-8)
+    #assert(opt_abs(r.fx + 5.45) < 1.0e-8)
+    #assert(opt_abs(r.duals[0] - 1.2) < 1.0e-8)
+    #assert(opt_abs(qp_value([2.0, 0.0, 0.0, 2.0], [-2.0, -5.0], r.x) - r.fx) < 1.0e-12)
+    // long-only portfolio on the simplex: min x'Qx/2 - 1.x s.t. x >= 0, sum x = 1
+    q = [4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0]
+    a = [-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]
+    p = quadprog(q, [-1.0, -1.0, -1.0], a, [0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [1.0], 200)
+    assert_eq(p.status, "optimal")
+    #assert(opt_abs(p.fx + 0.3989271597967249) < 1.0e-8)
+    #assert(opt_abs(p.x[0] - 0.15584416) < 1.0e-7)
+    #assert(opt_abs(p.x[1] - 0.31338227) < 1.0e-7)
+    #assert(opt_abs(p.x[2] - 0.53077357) < 1.0e-7)
+    #assert(opt_abs(p.x[0] + p.x[1] + p.x[2] - 1.0) < 1.0e-9)
+    // two coupled inequalities with several active-set changes
+    m = quadprog([2.0, 0.5, 0.5, 1.0], [-3.0, -1.0], [1.0, 1.0, -1.0, 0.0, 0.0, -1.0, 1.0, -2.0], [2.0, 0.0, 0.0, 1.0], [], [], 200)
+    assert_eq(m.status, "optimal")
+    #assert(opt_abs(m.x[0] - 1.4285714285714286) < 1.0e-8)
+    #assert(opt_abs(m.x[1] - 0.2857142857142857) < 1.0e-8)
+    #assert(opt_abs(m.fx + 2.2857142857142856) < 1.0e-8)
+}
+
+test "quadprog projections, equalities and KKT conditions" {
+    // projection of t = (1.5, -0.5, 0.3) onto the box [0, 1]^3
+    t = [1.5, 0.0 - 0.5, 0.3]
+    a = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]
+    b = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+    r = quadprog(opt_eye(3), opt_scale(t, -1.0), a, b, [], [], 200)
+    assert_eq(r.status, "optimal")
+    #assert(opt_abs(r.x[0] - 1.0) < 1.0e-9)
+    #assert(opt_abs(r.x[1]) < 1.0e-9)
+    #assert(opt_abs(r.x[2] - 0.3) < 1.0e-9)
+    // KKT: stationarity Q x + c + A' lambda = 0, dual feasibility, complementary slackness
+    g = opt_axpy(opt_scale(r.x, 1.0), 1.0, opt_scale(t, -1.0))
+    for 0..3 {
+        i = it
+        s = g[i]
+        for 0..6 { s += r.duals[it] * a[it * 3 + i] }
+        #assert(opt_abs(s) < 1.0e-8)
+    }
+    for 0..6 {
+        i = it
+        #assert(r.duals[i] > 0.0 - 1.0e-9)
+        ax = 0.0
+        for 0..3 { ax += a[i * 3 + it] * r.x[it] }
+        #assert(opt_abs(r.duals[i] * (b[i] - ax)) < 1.0e-8)
+    }
+    #assert(r.duals[0] > 0.4)
+    #assert(r.duals[4] > 0.4)
+    // equality only: min |x|^2 / 2 s.t. x1 + x2 + x3 = 3 gives (1, 1, 1)
+    e = quadprog(opt_eye(3), [0.0, 0.0, 0.0], [], [], [1.0, 1.0, 1.0], [3.0], 50)
+    assert_eq(e.status, "optimal")
+    for 0..3 { #assert(opt_abs(e.x[it] - 1.0) < 1.0e-9) }
+    #assert(opt_abs(e.fx - 1.5) < 1.0e-9)
+    // unconstrained minimum: Q x = -c
+    u = quadprog([2.0, 0.0, 0.0, 4.0], [-4.0, -8.0], [], [], [], [], 50)
+    assert_eq(u.status, "optimal")
+    #assert(opt_abs(u.x[0] - 2.0) < 1.0e-9)
+    #assert(opt_abs(u.x[1] - 2.0) < 1.0e-9)
+    // the unconstrained optimum already satisfies a loose inequality: no active constraint
+    loose = quadprog([2.0, 0.0, 0.0, 4.0], [-4.0, -8.0], [1.0, 1.0], [100.0], [], [], 50)
+    assert_eq(loose.status, "optimal")
+    #assert(opt_abs(loose.duals[0]) < 1.0e-12)
+    #assert(opt_abs(loose.x[0] - 2.0) < 1.0e-9)
+}
+
+test "quadprog reports infeasible, singular, capped and invalid problems" {
+    inf = quadprog(opt_eye(2), [0.0, 0.0], [1.0, 1.0, -1.0, -1.0], [1.0, -3.0], [], [], 50)
+    assert_eq(inf.status, "infeasible")
+    #assert(!(inf.converged))
+    // a zero Hessian makes the unconstrained KKT system singular
+    sing = quadprog([0.0], [1.0], [1.0], [5.0], [], [], 50)
+    assert_eq(sing.status, "singular")
+    #assert(!(sing.converged))
+    cap = quadprog([2.0, 0.0, 0.0, 2.0], [-2.0, -5.0], [1.0, 2.0], [3.0], [], [], 1)
+    assert_eq(cap.status, "max_iter")
+    #assert(!(cap.converged))
+    assert_eq(quadprog([1.0], [], [], [], [], [], 10).status, "invalid")
+    assert_eq(quadprog([1.0, 0.0], [1.0], [], [], [], [], 10).status, "invalid")
+    assert_eq(quadprog([1.0], [1.0], [1.0, 1.0], [1.0], [], [], 10).status, "invalid")
+}

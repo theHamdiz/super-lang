@@ -1,0 +1,111 @@
+//! elevenlabs — ElevenLabs TTS / STT / sound effects
+//!
+//!   use elevenlabs
+//!   el = ElevenLabs.new("xi-…")
+//!   res = @el.tts("hello", "21m00Tcm4TlvDq8ikWAM", "eleven_multilingual_v2")
+
+use std.ai.client
+use std.core.str
+
++ELEVEN_BASE = "https://api.elevenlabs.io"
+
++ElevenLabs = {
+    client: AiClient = AiClient.new("elevenlabs", "", "")
+
+    new(api_key: str) : ElevenLabs {
+        ElevenLabs.{client: AiClient.with_auth("elevenlabs", ELEVEN_BASE, api_key, AI_AUTH_XI_API_KEY)}
+    }
+
+    set_offline(@self, on: bool) : bool {
+        c = self.client
+        @c.set_offline(on)
+        self.client = c
+        on
+    }
+
+    set_timeout(@self, ms: i64) : i64 {
+        c = self.client
+        @c.set_timeout(ms)
+        self.client = c
+        ms
+    }
+
+    push_mock(@self, body: str) : i64 {
+        c = self.client
+        n = @c.push_mock(body)
+        self.client = c
+        n
+    }
+
+    -run(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        c = self.client
+        res = @c.request(path, req, body)
+        self.client = c
+        res
+    }
+
+    tts(@self, text: str, voice_id: str, model: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_TTS, messages: [], prompt: text, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: voice_id, size: "", duration_s: 0, stop: []
+        }
+        body = "{\"text\":" + ai_json_str(text) + ",\"model_id\":" + ai_json_str(model) + "}"
+        @self.run("/v1/text-to-speech/" + voice_id, req, body)
+    }
+
+    tts_with_settings(@self, text: str, voice_id: str, model: str, stability: f64, similarity: f64) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_TTS, messages: [], prompt: text, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: voice_id, size: "", duration_s: 0, stop: []
+        }
+        body = "{\"text\":" + ai_json_str(text) + ",\"model_id\":" + ai_json_str(model)
+        body = body + ",\"voice_settings\":{\"stability\":" + "{stability}" + ",\"similarity_boost\":" + "{similarity}" + "}}"
+        @self.run("/v1/text-to-speech/" + voice_id, req, body)
+    }
+
+    stt(@self, media_url: str, model: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_STT, messages: [], prompt: "", system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url,
+            voice: "", size: "", duration_s: 0, stop: []
+        }
+        body = "{\"model_id\":" + ai_json_str(model) + ",\"cloud_storage_url\":" + ai_json_str(media_url) + "}"
+        @self.run("/v1/speech-to-text", req, body)
+    }
+
+    sfx(@self, prompt: str, duration_s: i64) : AiResponse {
+        req = AiRequest.{
+            model: "sound-effects", modality: AI_AUDIO, messages: [], prompt, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: "", size: "", duration_s, stop: []
+        }
+        body = "{\"text\":" + ai_json_str(prompt) + ",\"duration_seconds\":" + "{duration_s}" + "}"
+        @self.run("/v1/sound-generation", req, body)
+    }
+}
+
+test "elevenlabs tts offline" {
+    el = ElevenLabs.new("xi-test")
+    @el.push_mock("{\"text\":\"audio-ok\"}")
+    res = @el.tts("hello", "voice1", "eleven_multilingual_v2")
+    #assert(res.ok)
+    #assert(contains(el.client.last_url, "text-to-speech"))
+}
+
+test "elevenlabs voice settings body" {
+    el = ElevenLabs.new("xi")
+    @el.push_mock("{}")
+    _ = @el.tts_with_settings("hi", "v1", "eleven_multilingual_v2", 0.5, 0.75)
+    #assert(contains(el.client.last_body, "voice_settings"))
+    #assert(contains(el.client.last_body, "similarity_boost"))
+}
+
+test "elevenlabs auth header" {
+    el = ElevenLabs.new("xi-key")
+    hs = el.client.auth_headers()
+    joined = ""
+    for hs { joined = joined + it + "|" }
+    #assert(contains(joined, "xi-api-key"))
+}

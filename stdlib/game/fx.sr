@@ -1,0 +1,108 @@
+//! std.game.fx — sprites, frame clips, and sound cues
+//!
+//! Import with:
+//!   use std.game.fx
+//!
+//!   ball = Sprite{name: "ball", x: 10, y: 20, w: 8, h: 8, frame: 0, frames: 4}
+//!   @ball.step()
+//!   cue = Cue{name: "bounce", gain: 80}
+//!   cue.play()
+//!
+//! `Sprite` declares `Widget`, so a window can adopt `sprite.paint()`.
+//! Sound is a display-list line (`sound bounce 80`), not a device.
+
+use std.gui.widgets
+use std.core.str
+use std.core.collections
+
+/// One cel of a sprite sheet. `frame` advances with `step`.
++Sprite: Widget = {
+    name: str = "sprite"
+    x: i64 = 0
+    y: i64 = 0
+    w: i64 = 16
+    h: i64 = 16
+    frame: i64 = 0
+    frames: i64 = 1
+
+    paint(self) : str => "sprite {self.x} {self.y} {self.w} {self.h} {self.name} {self.frame}\n"
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, self.x, self.y, self.w, self.h)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.w)
+
+    step(@self) : i64 {
+        ensure self.frames > 0 else { return self.frame }
+        self.frame = self.frame + 1
+        frame = self.frame
+        limit = self.frames
+        if frame >= limit { self.frame = 0 }
+        self.frame
+    }
+}
+
+/// Named animation that only tracks a frame.
++Clip = {
+    name: str = ""
+    frame: i64 = 0
+    frames: i64 = 1
+
+    tick(@self) : i64 {
+        ensure self.frames > 0 else { return self.frame }
+        self.frame = self.frame + 1
+        frame = self.frame
+        limit = self.frames
+        if frame >= limit { self.frame = 0 }
+        self.frame
+    }
+}
+
+/// One sound cue. `play` is a display-list line.
++Cue = {
+    name: str = ""
+    gain: i64 = 80
+
+    play(self) : str => "sound {self.name} {self.gain}\n"
+}
+
+/// Ordered cues. `mix` concatenates their play lines.
++Mixer = {
+    cues: _ = []
+
+    hear(@self, name: str, gain: i64) : i64 {
+        self.cues = arr_push(self.cues, Cue{name, gain})
+        len(self.cues)
+    }
+
+    mix(self) : str {
+        out = ""
+        n = len(self.cues)
+        for 0..n {
+            cue = self.cues[it]
+            out = "{out}{cue.play()}"
+        }
+        out
+    }
+}
+
+test "a sprite steps frames and paints a cel" {
+    ball = Sprite{name: "ball", x: 3, y: 4, w: 8, h: 8, frame: 0, frames: 3}
+    #assert(contains(ball.paint(), "sprite 3 4 8 8 ball 0"))
+    #assert(ball.hit(4, 5))
+    assert_eq(@ball.step(), 1)
+    assert_eq(@ball.step(), 2)
+    assert_eq(@ball.step(), 0)
+    assert_eq(ball.measure(4), 4)
+}
+
+test "a clip loops and a mixer writes sound lines" {
+    walk = Clip{name: "walk", frame: 0, frames: 2}
+    assert_eq(@walk.tick(), 1)
+    assert_eq(@walk.tick(), 0)
+    mix = Mixer{cues: []}
+    assert_eq(@mix.hear("bounce", 80), 1)
+    assert_eq(@mix.hear("break", 90), 2)
+    heard = mix.mix()
+    #assert(contains(heard, "sound bounce 80"))
+    #assert(contains(heard, "sound break 90"))
+}

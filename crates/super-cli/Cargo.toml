@@ -1,0 +1,33 @@
+[package]
+name = "super-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Super CLI: run, test, build, check, lsp, mcp"
+
+[[bin]]
+name = "super"
+path = "src/main.rs"
+
+[dependencies]
+super-core.workspace = true
+super-frontend.workspace = true
+super-runtime.workspace = true
+super-ffi = { path = "../super-ffi" }
+super-host = { path = "../super-host" }
+super-lsp = { path = "../super-lsp" }
+super-mcp = { path = "../super-mcp" }
+clap.workspace = true
+clap_complete.workspace = true
+serde.workspace = true
+toml.workspace = true
+semver.workspace = true
+tar = "0.4.44"
+zstd = "0.13.3"
+sha2 = "0.10.9"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

@@ -1,0 +1,95 @@
+//! Human-locked laws for `std.data.expr`: three-valued (Kleene) logic of filter predicates.
+//! Implementation: `cell_logic` / `cell_unary` in `expr.sr`.
+//! AI agents must not edit this file; put discharges in `expr.proof.sr`.
+//!
+//! Truth values are modelled as `0` (false) < `1` (null) < `2` (true): conjunction is `min`, disjunction is `max` and
+//! negation is `2 - x`. The `kleene conformance` test in `expr.sr` checks `cell_logic` / `cell_unary` against this
+//! model on every input, so the laws below transfer to the implementation.
+
+kl_min(a: i64, b: i64) : i64 {
+    if a < b { return a }
+    b
+}
+
+kl_max(a: i64, b: i64) : i64 {
+    if a > b { return a }
+    b
+}
+
+kl_not(a: i64) : i64 => 2 - a
+
+#law("AND is commutative on tri-state truth values")
+kleene_and_commutative(a: i64, b: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 else { return }
+    #assert(kl_min(a, b) == kl_min(b, a))
+}
+
+#law("OR is commutative on tri-state truth values")
+kleene_or_commutative(a: i64, b: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 else { return }
+    #assert(kl_max(a, b) == kl_max(b, a))
+}
+
+#law("AND is associative on tri-state truth values")
+kleene_and_associative(a: i64, b: i64, c: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 && c >= 0 && c <= 2 else { return }
+    #assert(kl_min(kl_min(a, b), c) == kl_min(a, kl_min(b, c)))
+}
+
+#law("OR is associative on tri-state truth values")
+kleene_or_associative(a: i64, b: i64, c: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 && c >= 0 && c <= 2 else { return }
+    #assert(kl_max(kl_max(a, b), c) == kl_max(a, kl_max(b, c)))
+}
+
+#law("negation is an involution")
+kleene_double_negation(a: i64) {
+    ensure a >= 0 && a <= 2 else { return }
+    #assert(kl_not(kl_not(a)) == a)
+}
+
+#law("De Morgan: NOT (a AND b) == NOT a OR NOT b")
+kleene_de_morgan_and(a: i64, b: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 else { return }
+    #assert(kl_not(kl_min(a, b)) == kl_max(kl_not(a), kl_not(b)))
+}
+
+#law("De Morgan: NOT (a OR b) == NOT a AND NOT b")
+kleene_de_morgan_or(a: i64, b: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 else { return }
+    #assert(kl_not(kl_max(a, b)) == kl_min(kl_not(a), kl_not(b)))
+}
+
+#law("OR distributes over AND")
+kleene_distributive(a: i64, b: i64, c: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 && c >= 0 && c <= 2 else { return }
+    #assert(kl_max(a, kl_min(b, c)) == kl_min(kl_max(a, b), kl_max(a, c)))
+}
+
+#law("absorption: a OR (a AND b) == a")
+kleene_absorption(a: i64, b: i64) {
+    ensure a >= 0 && a <= 2 && b >= 0 && b <= 2 else { return }
+    #assert(kl_max(a, kl_min(a, b)) == a)
+}
+
+#law("false annihilates AND and true annihilates OR, even against null")
+kleene_annihilators(a: i64) {
+    ensure a >= 0 && a <= 2 else { return }
+    #assert(kl_min(0, a) == 0)
+    #assert(kl_max(2, a) == 2)
+}
+
+#law("true is the identity of AND and false the identity of OR")
+kleene_identities(a: i64) {
+    ensure a >= 0 && a <= 2 else { return }
+    #assert(kl_min(2, a) == a)
+    #assert(kl_max(0, a) == a)
+}
+
+#law("null is a fixed point of negation and idempotent under AND and OR")
+kleene_null_fixed_point(a: i64) {
+    ensure a == 1 else { return }
+    #assert(kl_not(a) == a)
+    #assert(kl_min(a, a) == a)
+    #assert(kl_max(a, a) == a)
+}

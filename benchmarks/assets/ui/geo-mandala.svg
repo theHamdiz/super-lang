@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 480" fill="none" aria-hidden="true">
+  <!-- Flower-of-life / interlocking-circle mandala — stroke art for CSS mask -->
+  <g stroke="#000" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="240" cy="240" r="36"/>
+    <circle cx="240" cy="240" r="72"/>
+    <circle cx="240" cy="240" r="108"/>
+    <circle cx="240" cy="240" r="144"/>
+    <circle cx="240" cy="240" r="180"/>
+    <!-- hex ring 1 -->
+    <circle cx="240" cy="177.718" r="72"/>
+    <circle cx="293.923" cy="208.859" r="72"/>
+    <circle cx="293.923" cy="271.141" r="72"/>
+    <circle cx="240" cy="302.282" r="72"/>
+    <circle cx="186.077" cy="271.141" r="72"/>
+    <circle cx="186.077" cy="208.859" r="72"/>
+    <!-- hex ring 2 -->
+    <circle cx="240" cy="115.436" r="72"/>
+    <circle cx="347.846" cy="177.718" r="72"/>
+    <circle cx="347.846" cy="302.282" r="72"/>
+    <circle cx="240" cy="364.564" r="72"/>
+    <circle cx="132.154" cy="302.282" r="72"/>
+    <circle cx="132.154" cy="177.718" r="72"/>
+    <circle cx="293.923" cy="146.577" r="72"/>
+    <circle cx="347.846" cy="240" r="72"/>
+    <circle cx="293.923" cy="333.423" r="72"/>
+    <circle cx="186.077" cy="333.423" r="72"/>
+    <circle cx="132.154" cy="240" r="72"/>
+    <circle cx="186.077" cy="146.577" r="72"/>
+    <!-- outer guide -->
+    <circle cx="240" cy="240" r="216"/>
+    <!-- thin radial construction -->
+    <line x1="240" y1="24" x2="240" y2="456"/>
+    <line x1="24" y1="240" x2="456" y2="240"/>
+    <line x1="87.16" y1="87.16" x2="392.84" y2="392.84"/>
+    <line x1="392.84" y1="87.16" x2="87.16" y2="392.84"/>
+    <!-- nested hex -->
+    <polygon points="240,96 348,168 348,312 240,384 132,312 132,168"/>
+    <polygon points="240,132 318,177 318,303 240,348 162,303 162,177"/>
+  </g>
+</svg>

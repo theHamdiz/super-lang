@@ -1,0 +1,1877 @@
+//! std.net.smtp — SMTP (RFC 5321) command builders, reply parser, client session and MIME bodies
+//!
+//! Import with:
+//!   use std.net.smtp
+//!
+//! Everything here is transport-free: builders return the exact bytes to write (CRLF terminated),
+//! the parser consumes what the server wrote, and `SmtpSession` is a client state machine that
+//! turns server replies into the next command. Feed it from any socket (`std.net.tcp`) and upgrade
+//! the socket with `std.net.tls` when it reports `wants_upgrade()`.
+//!
+//!   cmd = smtp_mail_from("amina@example.com", 0, false) or ""     // MAIL FROM:<amina@example.com>
+//!   reply = smtp_parse_reply("250-mail.example.com\r\n250 STARTTLS\r\n") or none
+//!   sess = SmtpSession.new("client.example.com", "a@x.org", ["b@y.org"], "Hi!", true, "", "")
+//!   next_cmd = @sess.on_reply("220 mail.y.org ESMTP\r\n") or ""   // EHLO client.example.com
+//!
+//! `SmtpMock` is a deterministic in-memory server and `smtp_dialogue` runs a whole session against it,
+//! so delivery logic can be tested offline.
+//!
+//! Safety: every builder rejects CR, LF and NUL in user supplied values (command and header
+//! injection), AUTH PLAIN is refused over a cleartext connection, and DATA bodies are dot-stuffed.
+
+use std.core.str
+use std.core.collections
+use std.sec.encoding
+
+/// Line terminator of every SMTP command, reply and DATA line.
++SMTP_CRLF = "\r\n"
+/// Capability keyword and marker for the STARTTLS extension (RFC 3207).
++SMTP_STARTTLS_MARK = "STARTTLS"
+/// Well-known SMTP port (server to server relay).
++SMTP_PORT = 25
+/// Mail submission port (STARTTLS, RFC 6409).
++SMTP_SUBMISSION_PORT = 587
+/// Implicit TLS submission port (RFC 8314).
++SMTP_SMTPS_PORT = 465
+/// Longest text line allowed in a message, excluding CRLF (RFC 5321 4.5.3.1.6).
++SMTP_MAX_TEXT_LINE = 998
+
+/// Session phase: waiting for the 220 greeting.
++SMTP_PH_GREETING = 0
+/// Session phase: EHLO (or HELO) sent.
++SMTP_PH_EHLO = 1
+/// Session phase: STARTTLS sent.
++SMTP_PH_STARTTLS = 2
+/// Session phase: server agreed, the host must run the TLS handshake then call `tls_established`.
++SMTP_PH_UPGRADE = 3
+/// Session phase: AUTH sent.
++SMTP_PH_AUTH = 4
+/// Session phase: MAIL FROM sent.
++SMTP_PH_MAIL = 5
+/// Session phase: RCPT TO commands in flight.
++SMTP_PH_RCPT = 6
+/// Session phase: DATA sent.
++SMTP_PH_DATA = 7
+/// Session phase: message body sent.
++SMTP_PH_BODY = 8
+/// Session phase: QUIT sent.
++SMTP_PH_QUIT = 9
+/// Session phase: finished successfully.
++SMTP_PH_DONE = 10
+/// Session phase: terminated by an error; see `SmtpSession.error`.
++SMTP_PH_FAILED = 11
+
+// --- small string helpers -------------------------------------------------------------------
+
+/// Split `text` on every occurrence of `sep` (never empty); one pass.
++smtp_split(text: str, sep: str) : _ {
+    out = []
+    n = host.sys_str_len(text)
+    k = host.sys_str_len(sep)
+    pos = 0
+    going = true
+    while going {
+        at = find_from(text, sep, pos)
+        if at < 0 {
+            out = host.sys_arr_push(out, text[pos..n])
+            going = false
+        } else {
+            out = host.sys_arr_push(out, text[pos..at])
+            pos = at + k
+        }
+    }
+    out
+}
+
+/// `parts` joined with `sep` between them.
++smtp_join(parts: _, sep: str) : str {
+    out = ""
+    i = 0
+    n = host.sys_arr_len(parts)
+    while i < n {
+        if i > 0 { out = "{out}{sep}" }
+        piece = parts[i]
+        out = "{out}{piece}"
+        i = i + 1
+    }
+    out
+}
+
+/// UTF-8 byte length of `s`.
++smtp_byte_len(s: str) : i64 {
+    bytes = host.sys_str_to_bytes(s)
+    host.sys_arr_len(bytes)
+}
+
+/// True when `s` holds no CR, LF or NUL (safe to place inside one protocol line).
++smtp_ctl_free(s: str) : bool {
+    if find(s, "\r") >= 0 { return false }
+    if find(s, "\n") >= 0 { return false }
+    nul = host.sys_chr(0)
+    find(s, nul) < 0
+}
+
+/// True when every character of `s` is 7-bit ASCII.
++smtp_ascii_only(s: str) : bool {
+    n = host.sys_str_len(s)
+    ok = true
+    i = 0
+    while i < n {
+        if host.sys_ord(s[i]) > 127 { ok = false }
+        i = i + 1
+    }
+    ok
+}
+
+/// `src` bytes appended to `dst`.
+smtp_push_all(dst: _, src: _) : _ {
+    out = dst
+    i = 0
+    n = host.sys_arr_len(src)
+    while i < n {
+        out = host.sys_arr_push(out, src[i])
+        i = i + 1
+    }
+    out
+}
+
+/// `s` with bare LF and bare CR turned into CRLF.
++smtp_normalize_crlf(s: str) : str {
+    a = replace(s, "\r\n", "\n")
+    b = replace(a, "\r", "\n")
+    replace(b, "\n", SMTP_CRLF)
+}
+
+// --- addresses ------------------------------------------------------------------------------
+
+/// True for a plain `local@domain` mailbox with no spaces, brackets or control characters.
++smtp_valid_address(addr: str) : bool {
+    n = host.sys_str_len(addr)
+    if n < 3 { return false }
+    if n > 254 { return false }
+    if !smtp_ctl_free(addr) { return false }
+    if find(addr, " ") >= 0 { return false }
+    if find(addr, "<") >= 0 { return false }
+    if find(addr, ">") >= 0 { return false }
+    if find(addr, ",") >= 0 { return false }
+    at = find(addr, "@")
+    if at < 1 { return false }
+    if at > 64 { return false }
+    if find_from(addr, "@", at + 1) >= 0 { return false }
+    if at + 1 >= n { return false }
+    domain = addr[(at + 1)..n]
+    if starts_with(domain, ".") { return false }
+    if ends_with(domain, ".") { return false }
+    find(domain, "..") < 0
+}
+
+/// The mailbox of `Display Name <a@b.c>` or of a bare `a@b.c`; fails when it is not valid.
++smtp_extract_address(field: str) : str! {
+    t = trim(field)
+    lt = find(t, "<")
+    addr = t
+    if lt >= 0 {
+        gt = find_from(t, ">", lt + 1)
+        ensure gt > lt else {
+            fail "smtp: unterminated angle address in '{field}'"
+            return
+        }
+        addr = t[(lt + 1)..gt]
+    }
+    ensure smtp_valid_address(addr) else {
+        fail "smtp: invalid address '{addr}'"
+        return
+    }
+    addr
+}
+
+// --- command builders -----------------------------------------------------------------------
+
+/// A domain or address literal usable in EHLO/HELO.
+smtp_valid_domain(domain: str) : bool {
+    if host.sys_str_len(domain) < 1 { return false }
+    if host.sys_str_len(domain) > 255 { return false }
+    if !smtp_ctl_free(domain) { return false }
+    find(domain, " ") < 0
+}
+
+/// `EHLO <domain>` (use an address literal such as `[192.0.2.1]` when you have no name).
++smtp_ehlo(domain: str) : str! {
+    ensure smtp_valid_domain(domain) else {
+        fail "smtp: invalid EHLO domain '{domain}'"
+        return
+    }
+    "EHLO {domain}{SMTP_CRLF}"
+}
+
+/// `HELO <domain>`, the pre-ESMTP greeting.
++smtp_helo(domain: str) : str! {
+    ensure smtp_valid_domain(domain) else {
+        fail "smtp: invalid HELO domain '{domain}'"
+        return
+    }
+    "HELO {domain}{SMTP_CRLF}"
+}
+
+/// `MAIL FROM:<addr>` with optional `SIZE=` (when > 0) and `SMTPUTF8` parameters. An empty `addr`
+/// is the null reverse path used by bounces.
++smtp_mail_from(addr: str, size: i64, utf8: bool) : str! {
+    if addr != "" {
+        ensure smtp_valid_address(addr) else {
+            fail "smtp: invalid sender '{addr}'"
+            return
+        }
+    }
+    ensure size >= 0 else {
+        fail "smtp: negative SIZE"
+        return
+    }
+    line = "MAIL FROM:<{addr}>"
+    if size > 0 { line = "{line} SIZE={size}" }
+    if utf8 { line = "{line} SMTPUTF8" }
+    "{line}{SMTP_CRLF}"
+}
+
+/// `RCPT TO:<addr>`.
++smtp_rcpt_to(addr: str) : str! {
+    ensure smtp_valid_address(addr) else {
+        fail "smtp: invalid recipient '{addr}'"
+        return
+    }
+    "RCPT TO:<{addr}>{SMTP_CRLF}"
+}
+
+/// `DATA`.
++smtp_data() : str => "DATA\r\n"
+
+/// `STARTTLS`; after a 220 reply the connection must be upgraded and EHLO repeated.
++smtp_starttls() : str => "STARTTLS\r\n"
+
+/// `QUIT`.
++smtp_quit() : str => "QUIT\r\n"
+
+/// `RSET`.
++smtp_rset() : str => "RSET\r\n"
+
+/// `NOOP`.
++smtp_noop() : str => "NOOP\r\n"
+
+/// `AUTH PLAIN <initial response>` (RFC 4616): base64 of `NUL user NUL secret`.
++smtp_auth_plain(user: str, secret: str) : str! {
+    ensure user != "" else {
+        fail "smtp: AUTH needs a user name"
+        return
+    }
+    ensure smtp_ctl_free(user) else {
+        fail "smtp: control character in user name"
+        return
+    }
+    ensure smtp_ctl_free(secret) else {
+        fail "smtp: control character in secret"
+        return
+    }
+    zero = [0]
+    buf = smtp_push_all(zero, host.sys_str_to_bytes(user))
+    buf = host.sys_arr_push(buf, 0)
+    buf = smtp_push_all(buf, host.sys_str_to_bytes(secret))
+    "AUTH PLAIN {base64_encode_bytes(buf)}{SMTP_CRLF}"
+}
+
+/// One base64 line of the AUTH LOGIN dialogue (send the user, then the secret).
++smtp_auth_login_line(value: str) : str {
+    encoded = base64_encode_bytes(host.sys_str_to_bytes(value))
+    "{encoded}{SMTP_CRLF}"
+}
+
+/// `AUTH LOGIN` that starts the legacy login dialogue.
++smtp_auth_login() : str => "AUTH LOGIN\r\n"
+
+// --- DATA body ------------------------------------------------------------------------------
+
+/// Longest line (without CRLF) of the CRLF separated `text`, in characters.
++smtp_longest_line(text: str) : i64 {
+    parts = smtp_split(text, SMTP_CRLF)
+    best = 0
+    i = 0
+    n = host.sys_arr_len(parts)
+    while i < n {
+        k = host.sys_str_len(parts[i])
+        if k > best { best = k }
+        i = i + 1
+    }
+    best
+}
+
+/// Dot-stuffing (RFC 5321 4.5.2): every line that starts with `.` gets an extra leading `.`.
++smtp_dot_stuff(text: str) : str {
+    parts = smtp_split(text, SMTP_CRLF)
+    out = []
+    i = 0
+    n = host.sys_arr_len(parts)
+    while i < n {
+        line = parts[i]
+        if starts_with(line, ".") { line = ".{line}" }
+        out = host.sys_arr_push(out, line)
+        i = i + 1
+    }
+    smtp_join(out, SMTP_CRLF)
+}
+
+/// Undo `smtp_dot_stuff` on CRLF separated text.
++smtp_dot_unstuff(text: str) : str {
+    parts = smtp_split(text, SMTP_CRLF)
+    out = []
+    i = 0
+    n = host.sys_arr_len(parts)
+    while i < n {
+        line = parts[i]
+        if starts_with(line, "..") { line = line[1..host.sys_str_len(line)] }
+        out = host.sys_arr_push(out, line)
+        i = i + 1
+    }
+    smtp_join(out, SMTP_CRLF)
+}
+
+/// Everything to write after a 354 reply: the normalized, dot-stuffed `body` ended by `<CRLF>.<CRLF>`.
++smtp_data_payload(body: str) : str! {
+    ensure find(body, host.sys_chr(0)) < 0 else {
+        fail "smtp: NUL byte in message body"
+        return
+    }
+    norm = smtp_normalize_crlf(body)
+    ensure smtp_longest_line(norm) <= SMTP_MAX_TEXT_LINE else {
+        fail "smtp: message line longer than {SMTP_MAX_TEXT_LINE} characters"
+        return
+    }
+    stuffed = smtp_dot_stuff(norm)
+    if stuffed == "" { return ".{SMTP_CRLF}" }
+    if ends_with(stuffed, SMTP_CRLF) { return "{stuffed}.{SMTP_CRLF}" }
+    "{stuffed}{SMTP_CRLF}.{SMTP_CRLF}"
+}
+
+/// The message carried by a DATA payload (terminator removed, dots unstuffed); fails when the
+/// payload is not properly terminated.
++smtp_data_unpack(payload: str) : str! {
+    n = host.sys_str_len(payload)
+    ensure ends_with(payload, ".{SMTP_CRLF}") else {
+        fail "smtp: DATA payload lacks the terminating dot line"
+        return
+    }
+    if n == 3 { return "" }
+    ensure ends_with(payload, "{SMTP_CRLF}.{SMTP_CRLF}") else {
+        fail "smtp: terminating dot must be alone on its line"
+        return
+    }
+    smtp_dot_unstuff(payload[0..(n - 3)])
+}
+
+// --- reply parsing --------------------------------------------------------------------------
+
+/// One parsed reply line.
++SmtpLine = {
+    /// Three digit reply code. Defaults to `0`.
+    code: i64 = 0
+    /// True for `250-text` continuation lines. Defaults to `false`.
+    more: bool = false
+    /// Text after the code and separator. Defaults to `""`.
+    text: str = ""
+    /// False when the line is malformed (see `problem`). Defaults to `false`.
+    ok: bool = false
+    /// Why the line was rejected. Defaults to `""`.
+    problem: str = ""
+}
+
+/// Parse a single reply line (without CRLF): `250 OK`, `250-SIZE 100`, or a bare `250`.
++smtp_parse_line(line: str) : SmtpLine {
+    n = host.sys_str_len(line)
+    if n < 3 { return SmtpLine.{problem: "reply line shorter than 3 characters"} }
+    code = 0
+    bad = false
+    i = 0
+    while i < 3 {
+        d = find(DIGITS, line[i])
+        if d < 0 { bad = true } else { code = code * 10 + d }
+        i = i + 1
+    }
+    if bad { return SmtpLine.{problem: "reply code is not three digits"} }
+    if code < 200 { return SmtpLine.{code, problem: "reply code below 200"} }
+    if code > 599 { return SmtpLine.{code, problem: "reply code above 599"} }
+    if n == 3 { return SmtpLine.{code, ok: true} }
+    sep = line[3]
+    text = line[4..n]
+    if sep == "-" { return SmtpLine.{code, more: true, text, ok: true} }
+    if sep == " " { return SmtpLine.{code, text, ok: true} }
+    SmtpLine.{code, problem: "reply code must be followed by space or hyphen"}
+}
+
+/// Enhanced status code (RFC 3463, e.g. `2.1.0`) leading `text`, or `""`.
++smtp_enhanced(text: str) : str {
+    sp = find(text, " ")
+    tok = text
+    if sp >= 0 { tok = text[0..sp] }
+    parts = smtp_split(tok, ".")
+    if host.sys_arr_len(parts) != 3 { return "" }
+    ok = true
+    i = 0
+    while i < 3 {
+        p = parts[i]
+        k = host.sys_str_len(p)
+        if k < 1 { ok = false }
+        if k > 3 { ok = false }
+        j = 0
+        while j < k {
+            if find(DIGITS, p[j]) < 0 { ok = false }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if !ok { return "" }
+    cls = parts[0]
+    if cls != "2" {
+        if cls != "4" {
+            if cls != "5" { return "" }
+        }
+    }
+    tok
+}
+
+/// A complete (possibly multi-line) server reply.
++SmtpReply = {
+    /// The reply code shared by all lines. Defaults to `0`.
+    code: i64 = 0
+    /// Text of each line without code and separator. Defaults to `[]`.
+    lines: _ = []
+    /// Enhanced status code of the first line, or `""`. Defaults to `""`.
+    enhanced: str = ""
+
+    /// All line texts joined with newlines.
+    text(self) : str => smtp_join(self.lines, "\n")
+
+    /// 2yz: the command completed.
+    positive(self) : bool => self.code / 100 == 2
+
+    /// 3yz: the server waits for more input.
+    intermediate(self) : bool => self.code / 100 == 3
+
+    /// 4yz: temporary failure, retry later.
+    transient(self) : bool => self.code / 100 == 4
+
+    /// 5yz: permanent failure.
+    permanent(self) : bool => self.code / 100 == 5
+}
+
+/// Parse a full reply (CRLF or LF terminated lines). Fails on malformed lines, a code that changes
+/// mid-reply, or a continuation line without a final line.
++smtp_parse_reply(text: str) : SmtpReply! {
+    norm = replace(text, "\r\n", "\n")
+    parts = smtp_split(norm, "\n")
+    n = host.sys_arr_len(parts)
+    if n > 0 {
+        if parts[n - 1] == "" { n = n - 1 }
+    }
+    ensure n > 0 else {
+        fail "smtp: empty reply"
+        return
+    }
+    code = 0
+    texts = []
+    problem = ""
+    i = 0
+    while i < n {
+        ln = smtp_parse_line(parts[i])
+        if !ln.ok {
+            if problem == "" { problem = "smtp: {ln.problem} in line {i + 1}" }
+        } else {
+            if i == 0 { code = ln.code }
+            if ln.code != code {
+                if problem == "" { problem = "smtp: reply code changed from {code} to {ln.code}" }
+            }
+            last = i == n - 1
+            if ln.more {
+                if last {
+                    if problem == "" { problem = "smtp: incomplete multi-line reply" }
+                }
+            } else {
+                if !last {
+                    if problem == "" { problem = "smtp: text after the final reply line" }
+                }
+            }
+            texts = host.sys_arr_push(texts, ln.text)
+        }
+        i = i + 1
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    SmtpReply.{code, lines: texts, enhanced: smtp_enhanced(texts[0])}
+}
+
+/// True when `buf` ends with a final reply line (so `smtp_parse_reply` can be called).
++smtp_reply_complete(buf: str) : bool {
+    if !ends_with(buf, "\n") { return false }
+    trimmed = strip_suffix(strip_suffix(buf, "\n"), "\r")
+    parts = smtp_split(trimmed, "\n")
+    last = strip_suffix(parts[host.sys_arr_len(parts) - 1], "\r")
+    if host.sys_str_len(last) < 3 { return false }
+    if host.sys_str_len(last) == 3 { return true }
+    last[3] != "-"
+}
+
+/// Result of `smtp_take_reply`.
++SmtpTake = {
+    /// The first complete reply in the buffer, or `""` when more bytes are needed. Defaults to `""`.
+    reply: str = ""
+    /// Bytes after that reply. Defaults to `""`.
+    rest: str = ""
+    /// True when a complete reply was found. Defaults to `false`.
+    ok: bool = false
+}
+
+/// Cut the first complete reply off a receive buffer (replies are pipelined by servers).
++smtp_take_reply(buf: str) : SmtpTake {
+    n = host.sys_str_len(buf)
+    pos = 0
+    found = -1
+    while found < 0 {
+        nl = find_from(buf, "\n", pos)
+        if nl < 0 { break }
+        line = strip_suffix(buf[pos..nl], "\r")
+        k = host.sys_str_len(line)
+        final = false
+        if k == 3 { final = true }
+        if k > 3 {
+            if line[3] != "-" { final = true }
+        }
+        if final { found = nl + 1 }
+        pos = nl + 1
+    }
+    if found < 0 { return SmtpTake.{rest: buf} }
+    SmtpTake.{reply: buf[0..found], rest: buf[found..n], ok: true}
+}
+
+// --- EHLO capabilities ----------------------------------------------------------------------
+
+/// Extension lines of an EHLO reply (everything after the greeting line), upper-cased.
++smtp_capabilities(reply: SmtpReply) : _ {
+    out = []
+    i = 1
+    n = host.sys_arr_len(reply.lines)
+    while i < n {
+        out = host.sys_arr_push(out, to_upper(trim(reply.lines[i])))
+        i = i + 1
+    }
+    out
+}
+
+/// Parameters after `name` in capability `caps` (`""` when it has none), or `none` marker `"-"`
+/// when the capability is absent.
+smtp_cap_find(caps: _, name: str) : str {
+    key = to_upper(name)
+    found = "-"
+    i = 0
+    n = host.sys_arr_len(caps)
+    while i < n {
+        line = caps[i]
+        sp = find(line, " ")
+        word = line
+        params = ""
+        if sp >= 0 {
+            word = line[0..sp]
+            params = trim(line[(sp + 1)..host.sys_str_len(line)])
+        }
+        if word == key { found = params }
+        i = i + 1
+    }
+    found
+}
+
+/// True when the capability list offers `name` (case-insensitive).
++smtp_cap_has(caps: _, name: str) : bool => smtp_cap_find(caps, name) != "-"
+
+/// Server SIZE limit in bytes, or 0 when absent or unlimited.
++smtp_cap_size(caps: _) : i64 {
+    p = smtp_cap_find(caps, "SIZE")
+    if p == "-" { return 0 }
+    if p == "" { return 0 }
+    to_i64(p) or 0
+}
+
+/// Advertised AUTH mechanisms (upper-case).
++smtp_cap_auth(caps: _) : _ {
+    p = smtp_cap_find(caps, "AUTH")
+    if p == "-" { return [] }
+    fields(p)
+}
+
+/// The queue id of a final DATA reply such as `2.0.0 Ok: queued as 4F2A91`, or `""`.
++smtp_queue_id(text: str) : str {
+    mark = "queued as "
+    at = find(text, mark)
+    if at < 0 { return "" }
+    start = at + host.sys_str_len(mark)
+    n = host.sys_str_len(text)
+    end = start
+    while end < n {
+        if is_space(text[end]) { break }
+        end = end + 1
+    }
+    text[start..end]
+}
+
+// --- client session -------------------------------------------------------------------------
+
+/// A client delivering one message: feed it each server reply, send what it returns.
+///
+/// Phases are the `SMTP_PH_*` constants. State lives in flat public fields because nested
+/// mutation through `@self.field.method()` is not persisted.
++SmtpSession = {
+    /// Current `SMTP_PH_*` phase. Defaults to `0`.
+    phase: i64 = 0
+    /// Domain announced in EHLO. Defaults to `""`.
+    domain: str = ""
+    /// Envelope sender. Defaults to `""`.
+    sender: str = ""
+    /// Envelope recipients. Defaults to `[]`.
+    rcpts: _ = []
+    /// Full message (headers and body) to send. Defaults to `""`.
+    body: str = ""
+    /// Require STARTTLS before anything else. Defaults to `false`.
+    want_tls: bool = false
+    /// True once the transport has been upgraded. Defaults to `false`.
+    tls_active: bool = false
+    /// AUTH user, empty for none. Defaults to `""`.
+    auth_user: str = ""
+    /// AUTH secret. Defaults to `""`.
+    auth_secret: str = ""
+    /// True once the server accepted our credentials. Defaults to `false`.
+    authed: bool = false
+    /// True after a HELO fallback was sent. Defaults to `false`.
+    tried_helo: bool = false
+    /// Upper-cased extension lines of the last EHLO reply. Defaults to `[]`.
+    caps: _ = []
+    /// Index of the recipient currently awaiting a reply. Defaults to `0`.
+    rcpt_idx: i64 = 0
+    /// Recipients the server accepted. Defaults to `[]`.
+    accepted: _ = []
+    /// Recipients the server refused. Defaults to `[]`.
+    rejected: _ = []
+    /// Why each recipient was refused, parallel to `rejected`. Defaults to `[]`.
+    reject_reasons: _ = []
+    /// Queue id reported after DATA. Defaults to `""`.
+    queue_id: str = ""
+    /// Code of the last reply. Defaults to `0`.
+    last_code: i64 = 0
+    /// Text of the last reply. Defaults to `""`.
+    last_text: str = ""
+    /// Failure message, empty while healthy. Defaults to `""`.
+    error: str = ""
+
+    /// A session for one message. `body` is the complete RFC 5322 message; pass an empty
+    /// `auth_user` to skip authentication.
+    new(domain: str, sender: str, rcpts: _, body: str, want_tls: bool, auth_user: str, auth_secret: str) : SmtpSession => SmtpSession.{domain, sender, rcpts, body, want_tls, auth_user, auth_secret}
+
+    /// True when the dialogue finished successfully.
+    done(self) : bool => self.phase == 10
+
+    /// True when the dialogue was aborted.
+    failed(self) : bool => self.phase == 11
+
+    /// True while the host must run a TLS handshake and then call `tls_established`.
+    wants_upgrade(self) : bool => self.phase == 3
+
+    /// True once at least one recipient was accepted and the message queued.
+    delivered(self) : bool {
+        if self.phase != 10 { return false }
+        host.sys_arr_len(self.accepted) > 0
+    }
+
+    /// Record `msg` as the failure and return it.
+    die(@self, msg: str) : str {
+        self.phase = 11
+        self.error = msg
+        msg
+    }
+
+    /// The command that follows a successful EHLO/AUTH: STARTTLS, AUTH PLAIN or MAIL FROM.
+    proceed(@self) : str! {
+        if self.want_tls {
+            if !self.tls_active {
+                if smtp_cap_has(self.caps, SMTP_STARTTLS_MARK) {
+                    self.phase = 2
+                    return smtp_starttls()
+                }
+                m = @self.die("smtp: server does not offer STARTTLS")
+                fail "{m}"
+            }
+        }
+        if self.auth_user != "" {
+            if !self.authed {
+                if !self.tls_active {
+                    m = @self.die("smtp: refusing AUTH PLAIN over a cleartext connection")
+                    fail "{m}"
+                }
+                mechs = smtp_cap_auth(self.caps)
+                has_plain = false
+                i = 0
+                while i < host.sys_arr_len(mechs) {
+                    if mechs[i] == "PLAIN" { has_plain = true }
+                    i = i + 1
+                }
+                if !has_plain {
+                    m = @self.die("smtp: server does not offer AUTH PLAIN")
+                    fail "{m}"
+                }
+                auth = smtp_auth_plain(self.auth_user, self.auth_secret) or err {
+                    m = @self.die("{err}")
+                    fail "{m}"
+                }
+                self.phase = 4
+                return auth
+            }
+        }
+        if host.sys_arr_len(self.rcpts) == 0 {
+            m = @self.die("smtp: no recipients")
+            fail "{m}"
+        }
+        limit = smtp_cap_size(self.caps)
+        size = smtp_byte_len(self.body)
+        if limit > 0 {
+            if size > limit {
+                m = @self.die("smtp: message of {size} bytes exceeds server SIZE limit {limit}")
+                fail "{m}"
+            }
+        }
+        mail = smtp_mail_from(self.sender, size, false) or err {
+            m = @self.die("{err}")
+            fail "{m}"
+        }
+        self.phase = 5
+        mail
+    }
+
+    /// Next RCPT TO command for `rcpt_idx`.
+    rcpt_command(@self) : str! {
+        rcpt = self.rcpts[self.rcpt_idx]
+        cmd = smtp_rcpt_to(rcpt) or err {
+            m = @self.die("{err}")
+            fail "{m}"
+        }
+        self.phase = 6
+        cmd
+    }
+
+    /// Consume one server reply (full text, CRLF terminated) and return the command or data to
+    /// send next. An empty string means "send nothing" (TLS upgrade pending or dialogue over).
+    on_reply(@self, text: str) : str! {
+        ensure self.phase < 10 else {
+            fail "smtp: reply after the dialogue ended"
+            return
+        }
+        reply = smtp_parse_reply(text) or err {
+            m = @self.die("smtp: malformed reply: {err}")
+            fail "{m}"
+        }
+        self.last_code = reply.code
+        self.last_text = reply.text()
+        ph = self.phase
+        if ph == 0 {
+            if reply.code != 220 {
+                m = @self.die("smtp: server refused the connection: {reply.code} {self.last_text}")
+                fail "{m}"
+            }
+            self.phase = 1
+            hello = smtp_ehlo(self.domain) or err {
+                m = @self.die("{err}")
+                fail "{m}"
+            }
+            return hello
+        }
+        if ph == 1 {
+            if reply.code == 250 {
+                self.caps = smtp_capabilities(reply)
+                return @self.proceed()
+            }
+            legacy = false
+            if reply.code == 500 { legacy = true }
+            if reply.code == 502 { legacy = true }
+            if reply.code == 504 { legacy = true }
+            if legacy {
+                if !self.tried_helo {
+                    self.tried_helo = true
+                    helo = smtp_helo(self.domain) or err {
+                        m = @self.die("{err}")
+                        fail "{m}"
+                    }
+                    return helo
+                }
+            }
+            m = @self.die("smtp: greeting rejected: {reply.code} {self.last_text}")
+            fail "{m}"
+        }
+        if ph == 2 {
+            if reply.code != 220 {
+                m = @self.die("smtp: STARTTLS refused: {reply.code} {self.last_text}")
+                fail "{m}"
+            }
+            self.phase = 3
+            return ""
+        }
+        if ph == 3 {
+            m = @self.die("smtp: reply received while the TLS upgrade was pending")
+            fail "{m}"
+        }
+        if ph == 4 {
+            if reply.code != 235 {
+                m = @self.die("smtp: authentication failed: {reply.code} {self.last_text}")
+                fail "{m}"
+            }
+            self.authed = true
+            return @self.proceed()
+        }
+        if ph == 5 {
+            if reply.code != 250 {
+                m = @self.die("smtp: sender refused: {reply.code} {self.last_text}")
+                fail "{m}"
+            }
+            self.rcpt_idx = 0
+            return @self.rcpt_command()
+        }
+        if ph == 6 {
+            current = self.rcpts[self.rcpt_idx]
+            if reply.code == 421 {
+                m = @self.die("smtp: service closing: {self.last_text}")
+                fail "{m}"
+            }
+            if reply.positive() {
+                self.accepted = host.sys_arr_push(self.accepted, current)
+            } else {
+                if reply.code < 400 {
+                    m = @self.die("smtp: unexpected RCPT reply {reply.code}")
+                    fail "{m}"
+                }
+                self.rejected = host.sys_arr_push(self.rejected, current)
+                self.reject_reasons = host.sys_arr_push(self.reject_reasons, "{reply.code} {self.last_text}")
+            }
+            self.rcpt_idx = self.rcpt_idx + 1
+            if self.rcpt_idx < host.sys_arr_len(self.rcpts) {
+                return @self.rcpt_command()
+            }
+            if host.sys_arr_len(self.accepted) == 0 {
+                m = @self.die("smtp: no recipient was accepted")
+                fail "{m}"
+            }
+            self.phase = 7
+            return smtp_data()
+        }
+        if ph == 7 {
+            if reply.code != 354 {
+                m = @self.die("smtp: DATA refused: {reply.code} {self.last_text}")
+                fail "{m}"
+            }
+            payload = smtp_data_payload(self.body) or err {
+                m = @self.die("{err}")
+                fail "{m}"
+            }
+            self.phase = 8
+            return payload
+        }
+        if ph == 8 {
+            if !reply.positive() {
+                m = @self.die("smtp: message rejected: {reply.code} {self.last_text}")
+                fail "{m}"
+            }
+            self.queue_id = smtp_queue_id(self.last_text)
+            self.phase = 9
+            return smtp_quit()
+        }
+        if reply.code != 221 {
+            m = @self.die("smtp: unexpected QUIT reply {reply.code}")
+            fail "{m}"
+        }
+        self.phase = 10
+        ""
+    }
+
+    /// Call after the TLS handshake finished on the upgraded transport; returns the new EHLO.
+    tls_established(@self) : str! {
+        ensure self.phase == 3 else {
+            fail "smtp: no TLS upgrade is pending"
+            return
+        }
+        self.tls_active = true
+        self.caps = []
+        self.phase = 1
+        hello = smtp_ehlo(self.domain) or err {
+            m = @self.die("{err}")
+            fail "{m}"
+        }
+        hello
+    }
+}
+
+// --- MIME -----------------------------------------------------------------------------------
+
+/// RFC 2047 encoded-word form of a header value; plain ASCII is returned unchanged. Fails when
+/// the value contains CR, LF or NUL.
++smtp_encode_header(value: str) : str! {
+    ensure smtp_ctl_free(value) else {
+        fail "smtp: control character in header value"
+        return
+    }
+    if smtp_ascii_only(value) { return value }
+    n = host.sys_str_len(value)
+    words = []
+    i = 0
+    while i < n {
+        j = i + 10
+        if j > n { j = n }
+        piece = value[i..j]
+        encoded = base64_encode_bytes(host.sys_str_to_bytes(piece))
+        words = host.sys_arr_push(words, "=?UTF-8?B?{encoded}?=")
+        i = j
+    }
+    smtp_join(words, " ")
+}
+
+/// Wrap a base64 string to 76 character CRLF separated lines (RFC 2045).
++smtp_wrap76(b64: str) : str {
+    n = host.sys_str_len(b64)
+    rows = []
+    i = 0
+    while i < n {
+        j = i + 76
+        if j > n { j = n }
+        rows = host.sys_arr_push(rows, b64[i..j])
+        i = j
+    }
+    smtp_join(rows, SMTP_CRLF)
+}
+
+/// Common RFC 5322 headers (without Content-*), each ended by CRLF.
+smtp_headers(from: str, to: _, subject: str, date: str, msgid: str) : str! {
+    _from_addr = smtp_extract_address(from) or err { fail "{err}" }
+    ensure host.sys_arr_len(to) > 0 else {
+        fail "smtp: message has no recipients"
+        return
+    }
+    ensure smtp_ctl_free(from) else {
+        fail "smtp: control character in From"
+        return
+    }
+    ensure smtp_ctl_free(date) else {
+        fail "smtp: control character in Date"
+        return
+    }
+    ensure smtp_ctl_free(msgid) else {
+        fail "smtp: control character in Message-ID"
+        return
+    }
+    subj = smtp_encode_header(subject) or err { fail "{err}" }
+    checked = []
+    i = 0
+    n = host.sys_arr_len(to)
+    bad = ""
+    while i < n {
+        rcpt = to[i]
+        extracted = smtp_extract_address(rcpt) or ""
+        if extracted == "" {
+            if bad == "" { bad = rcpt }
+        }
+        checked = host.sys_arr_push(checked, rcpt)
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "smtp: invalid recipient '{bad}'"
+        return
+    }
+    tos = smtp_join(checked, ", ")
+    "Date: {date}{SMTP_CRLF}From: {from}{SMTP_CRLF}To: {tos}{SMTP_CRLF}Subject: {subj}{SMTP_CRLF}Message-ID: <{msgid}>{SMTP_CRLF}MIME-Version: 1.0{SMTP_CRLF}"
+}
+
+/// A single-part `text/plain; charset=utf-8` message ready for `SmtpSession`.
++smtp_message(from: str, to: _, subject: str, body: str, date: str, msgid: str) : str! {
+    head = smtp_headers(from, to, subject, date, msgid) or err { fail "{err}" }
+    norm = smtp_normalize_crlf(body)
+    encoding = "8bit"
+    if smtp_ascii_only(norm) { encoding = "7bit" }
+    "{head}Content-Type: text/plain; charset=utf-8{SMTP_CRLF}Content-Transfer-Encoding: {encoding}{SMTP_CRLF}{SMTP_CRLF}{norm}"
+}
+
+/// True when `boundary` is 1..70 characters of the RFC 2046 boundary alphabet.
+smtp_valid_boundary(boundary: str) : bool {
+    n = host.sys_str_len(boundary)
+    if n < 1 { return false }
+    if n > 70 { return false }
+    ok = true
+    i = 0
+    allowed = "{ALPHA_LOWER}{ALPHA_UPPER}{DIGITS}'()+_,-./:=?"
+    while i < n {
+        if find(allowed, boundary[i]) < 0 { ok = false }
+        i = i + 1
+    }
+    ok
+}
+
+/// One part of a multipart body: `Content-Type` header, blank line, then `content`.
+smtp_part(boundary: str, ctype: str, content: str) : str {
+    "--{boundary}{SMTP_CRLF}Content-Type: {ctype}{SMTP_CRLF}{SMTP_CRLF}{content}{SMTP_CRLF}"
+}
+
+/// A `multipart/alternative` message carrying a plain text and an HTML rendering.
++smtp_multipart(from: str, to: _, subject: str, text: str, html: str, date: str, msgid: str, boundary: str) : str! {
+    ensure smtp_valid_boundary(boundary) else {
+        fail "smtp: invalid MIME boundary '{boundary}'"
+        return
+    }
+    t = smtp_normalize_crlf(text)
+    h = smtp_normalize_crlf(html)
+    marker = "--{boundary}"
+    ensure find(t, marker) < 0 else {
+        fail "smtp: text part contains the boundary"
+        return
+    }
+    ensure find(h, marker) < 0 else {
+        fail "smtp: html part contains the boundary"
+        return
+    }
+    head = smtp_headers(from, to, subject, date, msgid) or err { fail "{err}" }
+    p1 = smtp_part(boundary, "text/plain; charset=utf-8", t)
+    p2 = smtp_part(boundary, "text/html; charset=utf-8", h)
+    "{head}Content-Type: multipart/alternative; boundary=\"{boundary}\"{SMTP_CRLF}{SMTP_CRLF}{p1}{p2}--{boundary}--{SMTP_CRLF}"
+}
+
+/// A `multipart/mixed` message: a text body plus one base64 attachment.
++smtp_with_attachment(from: str, to: _, subject: str, text: str, date: str, msgid: str, boundary: str, filename: str, ctype: str, data: _) : str! {
+    ensure smtp_valid_boundary(boundary) else {
+        fail "smtp: invalid MIME boundary '{boundary}'"
+        return
+    }
+    ensure smtp_ctl_free(filename) else {
+        fail "smtp: control character in attachment name"
+        return
+    }
+    ensure find(filename, "\"") < 0 else {
+        fail "smtp: quote in attachment name"
+        return
+    }
+    ensure smtp_ctl_free(ctype) else {
+        fail "smtp: control character in attachment type"
+        return
+    }
+    t = smtp_normalize_crlf(text)
+    ensure find(t, "--{boundary}") < 0 else {
+        fail "smtp: text part contains the boundary"
+        return
+    }
+    head = smtp_headers(from, to, subject, date, msgid) or err { fail "{err}" }
+    p1 = smtp_part(boundary, "text/plain; charset=utf-8", t)
+    wrapped = smtp_wrap76(base64_encode_bytes(data))
+    p2 = "--{boundary}{SMTP_CRLF}Content-Type: {ctype}; name=\"{filename}\"{SMTP_CRLF}Content-Transfer-Encoding: base64{SMTP_CRLF}Content-Disposition: attachment; filename=\"{filename}\"{SMTP_CRLF}{SMTP_CRLF}{wrapped}{SMTP_CRLF}"
+    "{head}Content-Type: multipart/mixed; boundary=\"{boundary}\"{SMTP_CRLF}{SMTP_CRLF}{p1}{p2}--{boundary}--{SMTP_CRLF}"
+}
+
+// --- offline mock server --------------------------------------------------------------------
+
+/// Deterministic in-memory SMTP server for offline tests. Feed it each command or DATA payload
+/// with `handle` and read the reply text it returns.
++SmtpMock = {
+    /// Offer and accept STARTTLS. Defaults to `true`.
+    offer_tls: bool = true
+    /// Pretend to be a pre-ESMTP server that rejects EHLO. Defaults to `false`.
+    legacy: bool = false
+    /// Accepted AUTH user (empty disables AUTH). Defaults to `""`.
+    user: str = ""
+    /// Accepted AUTH secret. Defaults to `""`.
+    secret: str = ""
+    /// Recipients answered with 550. Defaults to `[]`.
+    reject: _ = []
+    /// Largest message advertised through SIZE. Defaults to `1000000`.
+    max_size: i64 = 1000000
+    /// True once the transport was upgraded. Defaults to `false`.
+    tls_on: bool = false
+    /// True after a successful EHLO/HELO. Defaults to `false`.
+    greeted: bool = false
+    /// Envelope sender of the transaction in progress, `"-"` before MAIL FROM. Defaults to `"-"`.
+    mail_from: str = "-"
+    /// Recipients accepted in the transaction in progress. Defaults to `[]`.
+    rcpts: _ = []
+    /// True while the next input is the DATA payload. Defaults to `false`.
+    in_data: bool = false
+    /// Messages accepted so far (unpacked bodies). Defaults to `[]`.
+    inbox: _ = []
+    /// Every command line received, in order. Defaults to `[]`.
+    log: _ = []
+    /// Number of queued messages. Defaults to `0`.
+    queued: i64 = 0
+
+    /// The 220 greeting a client sees on connect.
+    greeting(_self) : str => "220 mock.example.com ESMTP ready\r\n"
+
+    /// Extension list shown in the EHLO reply.
+    ehlo_reply(self, arg: str) : str {
+        out = "250-mock.example.com Hello {arg}{SMTP_CRLF}250-SIZE {self.max_size}{SMTP_CRLF}250-8BITMIME{SMTP_CRLF}"
+        if self.offer_tls {
+            if !self.tls_on { out = "{out}250-STARTTLS{SMTP_CRLF}" }
+        }
+        if self.user != "" {
+            if self.tls_on { out = "{out}250-AUTH PLAIN LOGIN{SMTP_CRLF}" }
+        }
+        "{out}250 SMTPUTF8{SMTP_CRLF}"
+    }
+
+    /// Reset the mail transaction (RSET, or after a completed DATA).
+    reset(@self) : str {
+        self.mail_from = "-"
+        self.rcpts = []
+        self.in_data = false
+        "250 2.0.0 Ok{SMTP_CRLF}"
+    }
+
+    /// Handle one client input and return the reply text.
+    handle(@self, input: str) : str {
+        if self.in_data {
+            body = smtp_data_unpack(input) or "-"
+            if body == "-" {
+                self.in_data = false
+                return "451 4.3.0 Error: malformed DATA terminator{SMTP_CRLF}"
+            }
+            self.inbox = host.sys_arr_push(self.inbox, body)
+            self.queued = self.queued + 1
+            self.mail_from = "-"
+            self.rcpts = []
+            self.in_data = false
+            return "250 2.0.0 Ok: queued as Q{self.queued}{SMTP_CRLF}"
+        }
+        line = strip_suffix(input, SMTP_CRLF)
+        self.log = host.sys_arr_push(self.log, line)
+        cut = str_cut(line, " ")
+        verb = to_upper(cut.head)
+        arg = trim(cut.tail)
+        if verb == "EHLO" {
+            if self.legacy { return "502 5.5.1 Error: command not implemented{SMTP_CRLF}" }
+            self.greeted = true
+            self.mail_from = "-"
+            self.rcpts = []
+            return self.ehlo_reply(arg)
+        }
+        if verb == "HELO" {
+            self.greeted = true
+            return "250 mock.example.com{SMTP_CRLF}"
+        }
+        if verb == "STARTTLS" {
+            if !self.offer_tls { return "454 4.7.0 TLS not available due to temporary reason{SMTP_CRLF}" }
+            self.tls_on = true
+            self.greeted = false
+            return "220 2.0.0 Ready to start TLS{SMTP_CRLF}"
+        }
+        if verb == "AUTH" {
+            if self.user == "" { return "503 5.5.1 Error: authentication not enabled{SMTP_CRLF}" }
+            if !self.tls_on { return "538 5.7.11 Encryption required for requested authentication mechanism{SMTP_CRLF}" }
+            ac = str_cut(arg, " ")
+            if to_upper(ac.head) != "PLAIN" { return "504 5.5.4 Unrecognized authentication type{SMTP_CRLF}" }
+            decoded = base64_decode_bytes(ac.tail) or []
+            expected = smtp_push_all([0], host.sys_str_to_bytes(self.user))
+            expected = host.sys_arr_push(expected, 0)
+            expected = smtp_push_all(expected, host.sys_str_to_bytes(self.secret))
+            if host.sys_arr_len(decoded) != host.sys_arr_len(expected) { return "535 5.7.8 Authentication credentials invalid{SMTP_CRLF}" }
+            same = true
+            i = 0
+            while i < host.sys_arr_len(expected) {
+                if decoded[i] != expected[i] { same = false }
+                i = i + 1
+            }
+            if !same { return "535 5.7.8 Authentication credentials invalid{SMTP_CRLF}" }
+            return "235 2.7.0 Authentication successful{SMTP_CRLF}"
+        }
+        if verb == "MAIL" {
+            if !self.greeted { return "503 5.5.1 Error: send HELO/EHLO first{SMTP_CRLF}" }
+            upper = to_upper(arg)
+            if !starts_with(upper, "FROM:<") { return "501 5.5.4 Syntax: MAIL FROM:<address>{SMTP_CRLF}" }
+            gt = find(arg, ">")
+            if gt < 0 { return "501 5.1.7 Bad sender address syntax{SMTP_CRLF}" }
+            addr = arg[6..gt]
+            if addr != "" {
+                if !smtp_valid_address(addr) { return "553 5.1.7 Bad sender address syntax{SMTP_CRLF}" }
+            }
+            self.mail_from = addr
+            self.rcpts = []
+            return "250 2.1.0 Ok{SMTP_CRLF}"
+        }
+        if verb == "RCPT" {
+            if self.mail_from == "-" { return "503 5.5.1 Error: need MAIL command{SMTP_CRLF}" }
+            upper = to_upper(arg)
+            if !starts_with(upper, "TO:<") { return "501 5.5.4 Syntax: RCPT TO:<address>{SMTP_CRLF}" }
+            gt = find(arg, ">")
+            if gt < 0 { return "501 5.1.3 Bad recipient address syntax{SMTP_CRLF}" }
+            addr = arg[4..gt]
+            if !smtp_valid_address(addr) { return "501 5.1.3 Bad recipient address syntax{SMTP_CRLF}" }
+            blocked = false
+            i = 0
+            while i < host.sys_arr_len(self.reject) {
+                if self.reject[i] == addr { blocked = true }
+                i = i + 1
+            }
+            if blocked { return "550 5.1.1 <{addr}>: Recipient address rejected: User unknown{SMTP_CRLF}" }
+            self.rcpts = host.sys_arr_push(self.rcpts, addr)
+            return "250 2.1.5 Ok{SMTP_CRLF}"
+        }
+        if verb == "DATA" {
+            if host.sys_arr_len(self.rcpts) == 0 { return "554 5.5.1 Error: no valid recipients{SMTP_CRLF}" }
+            self.in_data = true
+            return "354 End data with <CR><LF>.<CR><LF>{SMTP_CRLF}"
+        }
+        if verb == "RSET" {
+            done = @self.reset()
+            return done
+        }
+        if verb == "NOOP" { return "250 2.0.0 Ok{SMTP_CRLF}" }
+        if verb == "QUIT" { return "221 2.0.0 Bye{SMTP_CRLF}" }
+        "500 5.5.2 Error: command not recognized{SMTP_CRLF}"
+    }
+}
+
+/// Final state of `smtp_dialogue`.
++SmtpOutcome = {
+    /// The client session after the dialogue. Defaults to an empty session.
+    session: SmtpSession = SmtpSession.{}
+    /// The mock server after the dialogue. Defaults to a fresh mock.
+    server: SmtpMock = SmtpMock.{}
+}
+
+/// Run a full delivery of `body` against the mock `server` and return both final states.
++smtp_dialogue(domain: str, sender: str, rcpts: _, body: str, want_tls: bool, user: str, secret: str, server: SmtpMock) : SmtpOutcome {
+    sess = SmtpSession.new(domain, sender, rcpts, body, want_tls, user, secret)
+    mock = server
+    cmd = @sess.on_reply(mock.greeting()) or ""
+    steps = 0
+    while steps < 64 {
+        if sess.phase == 3 { cmd = @sess.tls_established() or "" }
+        if cmd == "" { break }
+        wire = @mock.handle(cmd)
+        cmd = @sess.on_reply(wire) or ""
+        steps = steps + 1
+    }
+    SmtpOutcome.{session: sess, server: mock}
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+test "smtp command builders" {
+    assert_eq(smtp_ehlo("client.example.com") or "bad", "EHLO client.example.com\r\n")
+    assert_eq(smtp_ehlo("[192.0.2.7]") or "bad", "EHLO [192.0.2.7]\r\n")
+    assert_eq(smtp_helo("c.example") or "bad", "HELO c.example\r\n")
+    assert_eq(smtp_ehlo("") or "bad", "bad")
+    assert_eq(smtp_ehlo("two words") or "bad", "bad")
+    assert_eq(smtp_ehlo("x\r\nQUIT") or "bad", "bad")
+    assert_eq(smtp_helo("x\ny") or "bad", "bad")
+    assert_eq(smtp_mail_from("amina@example.com", 0, false) or "bad", "MAIL FROM:<amina@example.com>\r\n")
+    assert_eq(smtp_mail_from("amina@example.com", 4096, false) or "bad", "MAIL FROM:<amina@example.com> SIZE=4096\r\n")
+    assert_eq(smtp_mail_from("amina@example.com", 10, true) or "bad", "MAIL FROM:<amina@example.com> SIZE=10 SMTPUTF8\r\n")
+    assert_eq(smtp_mail_from("", 0, false) or "bad", "MAIL FROM:<>\r\n")
+    assert_eq(smtp_mail_from("no-at-sign", 0, false) or "bad", "bad")
+    assert_eq(smtp_mail_from("a@b.c", -1, false) or "bad", "bad")
+    assert_eq(smtp_mail_from("a@b.c>\r\nRCPT TO:<x@y.z", 0, false) or "bad", "bad")
+    assert_eq(smtp_rcpt_to("bola@example.org") or "bad", "RCPT TO:<bola@example.org>\r\n")
+    assert_eq(smtp_rcpt_to("bola example.org") or "bad", "bad")
+    assert_eq(smtp_rcpt_to("") or "bad", "bad")
+    assert_eq(smtp_data(), "DATA\r\n")
+    assert_eq(smtp_starttls(), "STARTTLS\r\n")
+    assert_eq(smtp_quit(), "QUIT\r\n")
+    assert_eq(smtp_rset(), "RSET\r\n")
+    assert_eq(smtp_noop(), "NOOP\r\n")
+    assert_eq(smtp_auth_login(), "AUTH LOGIN\r\n")
+    assert_eq(SMTP_STARTTLS_MARK, "STARTTLS")
+}
+
+test "smtp auth builders" {
+    assert_eq(smtp_auth_plain("tim", "tanstaaftanstaaf") or "bad", "AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n")
+    assert_eq(smtp_auth_plain("", "x") or "bad", "bad")
+    assert_eq(smtp_auth_plain("u\r\nv", "x") or "bad", "bad")
+    assert_eq(smtp_auth_plain("u", "x\ny") or "bad", "bad")
+    assert_eq(smtp_auth_login_line("user"), "dXNlcg==\r\n")
+    assert_eq(smtp_auth_login_line(""), "\r\n")
+    assert_eq(smtp_auth_login_line("secret"), "c2VjcmV0\r\n")
+}
+
+test "smtp address validation" {
+    #assert(smtp_valid_address("amina@example.com"))
+    #assert(smtp_valid_address("a.b+tag@sub.example.co.uk"))
+    #assert(smtp_valid_address("root@localhost"))
+    #assert(smtp_valid_address("a@b"))
+    #assert(!(smtp_valid_address("@example.com")))
+    #assert(!(smtp_valid_address("amina@")))
+    #assert(!(smtp_valid_address("a@@b.c")))
+    #assert(!(smtp_valid_address("a@b@c.d")))
+    #assert(!(smtp_valid_address("a b@c.d")))
+    #assert(!(smtp_valid_address("a@b..c")))
+    #assert(!(smtp_valid_address("a@.b.c")))
+    #assert(!(smtp_valid_address("a@b.c.")))
+    #assert(!(smtp_valid_address("<a@b.c>")))
+    #assert(!(smtp_valid_address("a@b.c\r\n")))
+    #assert(!(smtp_valid_address("a,b@c.d")))
+    #assert(!(smtp_valid_address("ab")))
+    #assert(!(smtp_valid_address("")))
+    long_local = repeat("x", 65)
+    #assert(!(smtp_valid_address("{long_local}@a.b")))
+    ok_local = repeat("x", 64)
+    #assert(smtp_valid_address("{ok_local}@a.b"))
+    #assert(smtp_ctl_free("plain text"))
+    #assert(!(smtp_ctl_free("a\rb")))
+    #assert(!(smtp_ctl_free("a\nb")))
+    nul = host.sys_chr(0)
+    #assert(!(smtp_ctl_free("a{nul}b")))
+}
+
+test "smtp extract address" {
+    assert_eq(smtp_extract_address("amina@example.com") or "bad", "amina@example.com")
+    assert_eq(smtp_extract_address("  amina@example.com  ") or "bad", "amina@example.com")
+    assert_eq(smtp_extract_address("Amina Diallo <amina@example.com>") or "bad", "amina@example.com")
+    assert_eq(smtp_extract_address("<amina@example.com>") or "bad", "amina@example.com")
+    assert_eq(smtp_extract_address("Amina <amina@example.com") or "bad", "bad")
+    assert_eq(smtp_extract_address("Amina <not an address>") or "bad", "bad")
+    assert_eq(smtp_extract_address("plainly wrong") or "bad", "bad")
+}
+
+test "smtp dot stuffing and data payload" {
+    assert_eq(smtp_dot_stuff("a\r\n.b\r\n..c\r\n."), "a\r\n..b\r\n...c\r\n..")
+    assert_eq(smtp_dot_unstuff("a\r\n..b\r\n...c\r\n.."), "a\r\n.b\r\n..c\r\n.")
+    assert_eq(smtp_dot_unstuff(smtp_dot_stuff(".\r\n..\r\nx")), ".\r\n..\r\nx")
+    assert_eq(smtp_data_payload("Hello\r\nWorld") or "bad", "Hello\r\nWorld\r\n.\r\n")
+    assert_eq(smtp_data_payload("Hello\r\nWorld\r\n") or "bad", "Hello\r\nWorld\r\n.\r\n")
+    assert_eq(smtp_data_payload("a\nb\rc") or "bad", "a\r\nb\r\nc\r\n.\r\n")
+    assert_eq(smtp_data_payload(".hidden\r\n.\r\nend") or "bad", "..hidden\r\n..\r\nend\r\n.\r\n")
+    assert_eq(smtp_data_payload("") or "bad", ".\r\n")
+    long_line = repeat("y", 999)
+    assert_eq(smtp_data_payload(long_line) or "bad", "bad")
+    edge_line = repeat("y", 998)
+    assert_eq(smtp_data_payload(edge_line) or "bad", "{edge_line}\r\n.\r\n")
+    nul = host.sys_chr(0)
+    assert_eq(smtp_data_payload("a{nul}b") or "bad", "bad")
+    assert_eq(smtp_longest_line("ab\r\nabcd\r\nabc"), 4)
+    assert_eq(smtp_longest_line(""), 0)
+}
+
+test "smtp data unpack inverts payload" {
+    assert_eq(smtp_data_unpack("Hello\r\n.\r\n") or "bad", "Hello\r\n")
+    assert_eq(smtp_data_unpack(".\r\n") or "bad", "")
+    assert_eq(smtp_data_unpack("..x\r\n.\r\n") or "bad", ".x\r\n")
+    assert_eq(smtp_data_unpack("no terminator\r\n") or "bad", "bad")
+    assert_eq(smtp_data_unpack("x.\r\n") or "bad", "bad")
+    msg = "Line one\r\n.starts with dot\r\n..double\r\nlast"
+    payload = smtp_data_payload(msg) or ""
+    assert_eq(smtp_data_unpack(payload) or "bad", "{msg}\r\n")
+}
+
+test "smtp normalize crlf" {
+    assert_eq(smtp_normalize_crlf("a\nb"), "a\r\nb")
+    assert_eq(smtp_normalize_crlf("a\rb"), "a\r\nb")
+    assert_eq(smtp_normalize_crlf("a\r\nb"), "a\r\nb")
+    assert_eq(smtp_normalize_crlf("a\n\nb"), "a\r\n\r\nb")
+    assert_eq(smtp_normalize_crlf(""), "")
+}
+
+test "smtp parse single lines" {
+    a = smtp_parse_line("250 OK")
+    #assert(a.ok)
+    assert_eq(a.code, 250)
+    #assert(!(a.more))
+    assert_eq(a.text, "OK")
+    b = smtp_parse_line("250-SIZE 100")
+    #assert(b.ok)
+    #assert(b.more)
+    assert_eq(b.text, "SIZE 100")
+    c = smtp_parse_line("354")
+    #assert(c.ok)
+    assert_eq(c.code, 354)
+    assert_eq(c.text, "")
+    #assert(!(smtp_parse_line("25").ok))
+    #assert(!(smtp_parse_line("2x0 hi").ok))
+    #assert(!(smtp_parse_line("199 low").ok))
+    #assert(!(smtp_parse_line("600 high").ok))
+    #assert(!(smtp_parse_line("250xOK").ok))
+    assert_eq(smtp_parse_line("250xOK").problem, "reply code must be followed by space or hyphen")
+    assert_eq(smtp_parse_line("").problem, "reply line shorter than 3 characters")
+}
+
+test "smtp parse replies" {
+    r = smtp_parse_reply("250 2.1.0 Ok\r\n") or SmtpReply.{}
+    assert_eq(r.code, 250)
+    assert_eq(r.enhanced, "2.1.0")
+    assert_eq(r.text(), "2.1.0 Ok")
+    #assert(r.positive())
+    #assert(!(r.permanent()))
+    m = smtp_parse_reply("250-mail.example.com greets you\r\n250-SIZE 35882577\r\n250-8BITMIME\r\n250 STARTTLS\r\n") or SmtpReply.{}
+    assert_eq(m.code, 250)
+    assert_eq(host.sys_arr_len(m.lines), 4)
+    assert_eq(m.lines[0], "mail.example.com greets you")
+    assert_eq(m.lines[3], "STARTTLS")
+    assert_eq(m.enhanced, "")
+    lf = smtp_parse_reply("221 bye\n") or SmtpReply.{}
+    assert_eq(lf.code, 221)
+    bare = smtp_parse_reply("220 ready") or SmtpReply.{}
+    assert_eq(bare.code, 220)
+    t = smtp_parse_reply("354 go ahead\r\n") or SmtpReply.{}
+    #assert(t.intermediate())
+    #assert(!(t.positive()))
+    tr = smtp_parse_reply("451 4.3.0 try later\r\n") or SmtpReply.{}
+    #assert(tr.transient())
+    assert_eq(tr.enhanced, "4.3.0")
+    pe = smtp_parse_reply("550 5.1.1 no such user\r\n") or SmtpReply.{}
+    #assert(pe.permanent())
+    assert_eq(smtp_parse_reply("") or SmtpReply.{code: 1}, SmtpReply.{code: 1})
+}
+
+test "smtp malformed replies fail" {
+    assert_eq(smtp_parse_reply("250-a\r\n251 b\r\n") or SmtpReply.{code: -1}.code, -1)
+    assert_eq(smtp_parse_reply("250-a\r\n250-b\r\n") or SmtpReply.{code: -1}.code, -1)
+    assert_eq(smtp_parse_reply("250 a\r\n250 b\r\n") or SmtpReply.{code: -1}.code, -1)
+    assert_eq(smtp_parse_reply("hello\r\n") or SmtpReply.{code: -1}.code, -1)
+    assert_eq(smtp_parse_reply("25\r\n") or SmtpReply.{code: -1}.code, -1)
+    assert_eq(smtp_parse_reply("999 nope\r\n") or SmtpReply.{code: -1}.code, -1)
+    assert_eq(smtp_parse_reply("250ok\r\n") or SmtpReply.{code: -1}.code, -1)
+}
+
+test "smtp enhanced status codes" {
+    assert_eq(smtp_enhanced("2.0.0 Ok"), "2.0.0")
+    assert_eq(smtp_enhanced("5.7.1 denied"), "5.7.1")
+    assert_eq(smtp_enhanced("4.2.2 mailbox full"), "4.2.2")
+    assert_eq(smtp_enhanced("2.0.0"), "2.0.0")
+    assert_eq(smtp_enhanced("3.0.0 bad class"), "")
+    assert_eq(smtp_enhanced("Ok fine"), "")
+    assert_eq(smtp_enhanced("2.0 short"), "")
+    assert_eq(smtp_enhanced("2.0.0.1 long"), "")
+    assert_eq(smtp_enhanced("2.a.0 x"), "")
+    assert_eq(smtp_enhanced("2..0 x"), "")
+    assert_eq(smtp_enhanced(""), "")
+}
+
+test "smtp reply completeness and buffering" {
+    #assert(smtp_reply_complete("250 OK\r\n"))
+    #assert(!(smtp_reply_complete("250-OK\r\n")))
+    #assert(smtp_reply_complete("250-A\r\n250 B\r\n"))
+    #assert(!(smtp_reply_complete("250 OK")))
+    #assert(smtp_reply_complete("354\r\n"))
+    #assert(!(smtp_reply_complete("")))
+    t1 = smtp_take_reply("250-A\r\n250 B\r\n354 go\r\n")
+    #assert(t1.ok)
+    assert_eq(t1.reply, "250-A\r\n250 B\r\n")
+    assert_eq(t1.rest, "354 go\r\n")
+    t2 = smtp_take_reply(t1.rest)
+    assert_eq(t2.reply, "354 go\r\n")
+    assert_eq(t2.rest, "")
+    t3 = smtp_take_reply("250-A\r\n250")
+    #assert(!(t3.ok))
+    assert_eq(t3.rest, "250-A\r\n250")
+    t4 = smtp_take_reply("")
+    #assert(!(t4.ok))
+    t5 = smtp_take_reply("220 hi\n")
+    #assert(t5.ok)
+    assert_eq(t5.reply, "220 hi\n")
+}
+
+test "smtp capabilities" {
+    r = smtp_parse_reply("250-mail.example.com Hello\r\n250-SIZE 35882577\r\n250-8bitmime\r\n250-AUTH plain Login\r\n250-StartTLS\r\n250 SMTPUTF8\r\n") or SmtpReply.{}
+    caps = smtp_capabilities(r)
+    assert_eq(host.sys_arr_len(caps), 5)
+    assert_eq(caps[0], "SIZE 35882577")
+    #assert(smtp_cap_has(caps, "starttls"))
+    #assert(smtp_cap_has(caps, "8BITMIME"))
+    #assert(!(smtp_cap_has(caps, "PIPELINING")))
+    assert_eq(smtp_cap_size(caps), 35882577)
+    mechs = smtp_cap_auth(caps)
+    assert_eq(host.sys_arr_len(mechs), 2)
+    assert_eq(mechs[0], "PLAIN")
+    assert_eq(mechs[1], "LOGIN")
+    assert_eq(smtp_cap_size(["SIZE"]), 0)
+    assert_eq(smtp_cap_size(["SIZE 0"]), 0)
+    assert_eq(smtp_cap_size([]), 0)
+    assert_eq(host.sys_arr_len(smtp_cap_auth([])), 0)
+    #assert(!(smtp_cap_has([], "STARTTLS")))
+}
+
+test "smtp queue id extraction" {
+    assert_eq(smtp_queue_id("2.0.0 Ok: queued as 4F2A91"), "4F2A91")
+    assert_eq(smtp_queue_id("Ok: queued as ABC trailing words"), "ABC")
+    assert_eq(smtp_queue_id("accepted for delivery"), "")
+    assert_eq(smtp_queue_id("queued as "), "")
+}
+
+test "smtp full delivery without tls" {
+    server = SmtpMock.{offer_tls: false}
+    msg = smtp_message("Amina <amina@example.com>", ["bola@example.org"], "Hello", "Line one\n.dot line\nlast", "Mon, 23 Nov 2026 10:00:00 +0000", "id1@example.com") or "bad"
+    pair = smtp_dialogue("client.example.com", "amina@example.com", ["bola@example.org"], msg, false, "", "", server)
+    sess = pair.session
+    mock = pair.server
+    #assert(sess.done())
+    #assert(!(sess.failed()))
+    #assert(sess.delivered())
+    assert_eq(sess.queue_id, "Q1")
+    assert_eq(host.sys_arr_len(sess.accepted), 1)
+    assert_eq(host.sys_arr_len(sess.rejected), 0)
+    assert_eq(host.sys_arr_len(mock.inbox), 1)
+    stored = mock.inbox[0]
+    #assert(find(stored, ".dot line") >= 0)
+    #assert(find(stored, "\r\n..dot line") < 0)
+    assert_eq(stored, "{msg}\r\n")
+    assert_eq(mock.log[0], "EHLO client.example.com")
+    #assert(starts_with(mock.log[1], "MAIL FROM:<amina@example.com> SIZE="))
+    assert_eq(mock.log[2], "RCPT TO:<bola@example.org>")
+    assert_eq(mock.log[3], "DATA")
+    assert_eq(mock.log[4], "QUIT")
+    assert_eq(host.sys_arr_len(mock.log), 5)
+}
+
+test "smtp delivery upgrades with starttls" {
+    server = SmtpMock.{}
+    pair = smtp_dialogue("c.example.com", "a@x.org", ["b@y.org", "c@y.org"], "Subject: hi\r\n\r\nbody", true, "", "", server)
+    sess = pair.session
+    mock = pair.server
+    #assert(sess.done())
+    #assert(sess.tls_active)
+    #assert(mock.tls_on)
+    assert_eq(host.sys_arr_len(sess.accepted), 2)
+    assert_eq(mock.log[0], "EHLO c.example.com")
+    assert_eq(mock.log[1], "STARTTLS")
+    assert_eq(mock.log[2], "EHLO c.example.com")
+    #assert(starts_with(mock.log[3], "MAIL FROM:<a@x.org>"))
+    assert_eq(mock.log[4], "RCPT TO:<b@y.org>")
+    assert_eq(mock.log[5], "RCPT TO:<c@y.org>")
+    assert_eq(host.sys_arr_len(mock.inbox), 1)
+}
+
+test "smtp starttls required but unavailable" {
+    server = SmtpMock.{offer_tls: false}
+    pair = smtp_dialogue("c.example.com", "a@x.org", ["b@y.org"], "x", true, "", "", server)
+    sess = pair.session
+    mock = pair.server
+    #assert(sess.failed())
+    assert_eq(sess.error, "smtp: server does not offer STARTTLS")
+    assert_eq(host.sys_arr_len(mock.inbox), 0)
+    assert_eq(host.sys_arr_len(mock.log), 1)
+}
+
+test "smtp authentication over tls" {
+    server = SmtpMock.{user: "tim", secret: "tanstaaftanstaaf"}
+    pair = smtp_dialogue("c.example.com", "a@x.org", ["b@y.org"], "x", true, "tim", "tanstaaftanstaaf", server)
+    sess = pair.session
+    mock = pair.server
+    #assert(sess.done())
+    #assert(sess.authed)
+    assert_eq(mock.log[3], "AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm")
+    bad = smtp_dialogue("c.example.com", "a@x.org", ["b@y.org"], "x", true, "tim", "wrong", server)
+    s2 = bad.session
+    #assert(s2.failed())
+    #assert(starts_with(s2.error, "smtp: authentication failed: 535"))
+    assert_eq(host.sys_arr_len(bad.server.inbox), 0)
+}
+
+test "smtp refuses auth plain over cleartext" {
+    server = SmtpMock.{offer_tls: false, user: "tim", secret: "pw"}
+    pair = smtp_dialogue("c.example.com", "a@x.org", ["b@y.org"], "x", false, "tim", "pw", server)
+    sess = pair.session
+    #assert(sess.failed())
+    assert_eq(sess.error, "smtp: refusing AUTH PLAIN over a cleartext connection")
+    assert_eq(host.sys_arr_len(pair.server.log), 1)
+}
+
+test "smtp partial recipient rejection" {
+    server = SmtpMock.{offer_tls: false, reject: ["ghost@y.org"]}
+    pair = smtp_dialogue("c.example.com", "a@x.org", ["b@y.org", "ghost@y.org", "d@y.org"], "hi", false, "", "", server)
+    sess = pair.session
+    #assert(sess.done())
+    assert_eq(host.sys_arr_len(sess.accepted), 2)
+    assert_eq(sess.accepted[0], "b@y.org")
+    assert_eq(sess.accepted[1], "d@y.org")
+    assert_eq(host.sys_arr_len(sess.rejected), 1)
+    assert_eq(sess.rejected[0], "ghost@y.org")
+    #assert(starts_with(sess.reject_reasons[0], "550 5.1.1"))
+    assert_eq(host.sys_arr_len(pair.server.inbox), 1)
+}
+
+test "smtp every recipient rejected" {
+    server = SmtpMock.{offer_tls: false, reject: ["ghost@y.org"]}
+    pair = smtp_dialogue("c.example.com", "a@x.org", ["ghost@y.org"], "hi", false, "", "", server)
+    sess = pair.session
+    #assert(sess.failed())
+    assert_eq(sess.error, "smtp: no recipient was accepted")
+    #assert(!(sess.delivered()))
+    assert_eq(host.sys_arr_len(pair.server.inbox), 0)
+    assert_eq(pair.server.log[host.sys_arr_len(pair.server.log) - 1], "RCPT TO:<ghost@y.org>")
+}
+
+test "smtp helo fallback for legacy servers" {
+    server = SmtpMock.{offer_tls: false, legacy: true}
+    pair = smtp_dialogue("old.example.com", "a@x.org", ["b@y.org"], "hi", false, "", "", server)
+    sess = pair.session
+    mock = pair.server
+    #assert(sess.done())
+    #assert(sess.tried_helo)
+    assert_eq(mock.log[0], "EHLO old.example.com")
+    assert_eq(mock.log[1], "HELO old.example.com")
+    legacy_tls = SmtpMock.{legacy: true}
+    wants = smtp_dialogue("old.example.com", "a@x.org", ["b@y.org"], "hi", true, "", "", legacy_tls)
+    #assert(wants.session.failed())
+    assert_eq(wants.session.error, "smtp: server does not offer STARTTLS")
+}
+
+test "smtp session state machine direct drive" {
+    sess = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hello", false, "", "")
+    assert_eq(sess.phase, SMTP_PH_GREETING)
+    c1 = @sess.on_reply("220 mx ESMTP\r\n") or "bad"
+    assert_eq(c1, "EHLO c.example.com\r\n")
+    assert_eq(sess.phase, SMTP_PH_EHLO)
+    c2 = @sess.on_reply("250-mx\r\n250 SIZE 100000\r\n") or "bad"
+    assert_eq(c2, "MAIL FROM:<a@x.org> SIZE=5\r\n")
+    assert_eq(sess.phase, SMTP_PH_MAIL)
+    c3 = @sess.on_reply("250 2.1.0 Ok\r\n") or "bad"
+    assert_eq(c3, "RCPT TO:<b@y.org>\r\n")
+    assert_eq(sess.phase, SMTP_PH_RCPT)
+    c4 = @sess.on_reply("250 2.1.5 Ok\r\n") or "bad"
+    assert_eq(c4, "DATA\r\n")
+    assert_eq(sess.phase, SMTP_PH_DATA)
+    c5 = @sess.on_reply("354 go\r\n") or "bad"
+    assert_eq(c5, "hello\r\n.\r\n")
+    assert_eq(sess.phase, SMTP_PH_BODY)
+    c6 = @sess.on_reply("250 2.0.0 Ok: queued as XYZ9\r\n") or "bad"
+    assert_eq(c6, "QUIT\r\n")
+    assert_eq(sess.queue_id, "XYZ9")
+    c7 = @sess.on_reply("221 bye\r\n") or "bad"
+    assert_eq(c7, "")
+    #assert(sess.done())
+    assert_eq(sess.last_code, 221)
+    assert_eq(@sess.on_reply("250 late\r\n") or "ended", "ended")
+}
+
+test "smtp session failure modes" {
+    s1 = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", false, "", "")
+    assert_eq(@s1.on_reply("554 no service\r\n") or "bad", "bad")
+    #assert(s1.failed())
+    #assert(starts_with(s1.error, "smtp: server refused the connection: 554"))
+    s2 = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", false, "", "")
+    assert_eq(@s2.on_reply("garbage\r\n") or "bad", "bad")
+    #assert(s2.failed())
+    s3 = SmtpSession.new("bad domain", "a@x.org", ["b@y.org"], "hi", false, "", "")
+    assert_eq(@s3.on_reply("220 hi\r\n") or "bad", "bad")
+    #assert(s3.failed())
+    s4 = SmtpSession.new("c.example.com", "a@x.org", [], "hi", false, "", "")
+    c = @s4.on_reply("220 hi\r\n") or "bad"
+    assert_eq(c, "EHLO c.example.com\r\n")
+    assert_eq(@s4.on_reply("250 mx\r\n") or "bad", "bad")
+    assert_eq(s4.error, "smtp: no recipients")
+    s5 = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "this message is far too big", false, "", "")
+    c5 = @s5.on_reply("220 hi\r\n") or "bad"
+    assert_eq(c5, "EHLO c.example.com\r\n")
+    assert_eq(@s5.on_reply("250-mx\r\n250 SIZE 10\r\n") or "bad", "bad")
+    #assert(starts_with(s5.error, "smtp: message of 27 bytes exceeds server SIZE limit 10"))
+    s6 = SmtpSession.new("c.example.com", "not-an-address", ["b@y.org"], "hi", false, "", "")
+    c6 = @s6.on_reply("220 hi\r\n") or "bad"
+    assert_eq(c6, "EHLO c.example.com\r\n")
+    assert_eq(@s6.on_reply("250 mx\r\n") or "bad", "bad")
+    #assert(s6.failed())
+}
+
+test "smtp session server errors mid dialogue" {
+    s1 = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", false, "", "")
+    @s1.on_reply("220 hi\r\n") or "bad"
+    @s1.on_reply("250 mx\r\n") or "bad"
+    assert_eq(@s1.on_reply("553 5.1.8 sender rejected\r\n") or "bad", "bad")
+    #assert(starts_with(s1.error, "smtp: sender refused: 553"))
+    s2 = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", false, "", "")
+    @s2.on_reply("220 hi\r\n") or "bad"
+    @s2.on_reply("250 mx\r\n") or "bad"
+    @s2.on_reply("250 ok\r\n") or "bad"
+    assert_eq(@s2.on_reply("421 shutting down\r\n") or "bad", "bad")
+    #assert(starts_with(s2.error, "smtp: service closing"))
+    s3 = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", false, "", "")
+    @s3.on_reply("220 hi\r\n") or "bad"
+    @s3.on_reply("250 mx\r\n") or "bad"
+    @s3.on_reply("250 ok\r\n") or "bad"
+    @s3.on_reply("250 ok\r\n") or "bad"
+    assert_eq(@s3.on_reply("554 5.5.1 transaction failed\r\n") or "bad", "bad")
+    #assert(starts_with(s3.error, "smtp: DATA refused: 554"))
+    s4 = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", false, "", "")
+    @s4.on_reply("220 hi\r\n") or "bad"
+    @s4.on_reply("250 mx\r\n") or "bad"
+    @s4.on_reply("250 ok\r\n") or "bad"
+    @s4.on_reply("250 ok\r\n") or "bad"
+    @s4.on_reply("354 go\r\n") or "bad"
+    assert_eq(@s4.on_reply("452 4.3.1 insufficient storage\r\n") or "bad", "bad")
+    #assert(starts_with(s4.error, "smtp: message rejected: 452"))
+    #assert(!(s4.delivered()))
+}
+
+test "smtp tls upgrade protocol" {
+    sess = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", true, "", "")
+    @sess.on_reply("220 hi\r\n") or "bad"
+    c = @sess.on_reply("250-mx\r\n250 STARTTLS\r\n") or "bad"
+    assert_eq(c, "STARTTLS\r\n")
+    assert_eq(sess.phase, SMTP_PH_STARTTLS)
+    pending = @sess.on_reply("220 2.0.0 Ready\r\n") or "bad"
+    assert_eq(pending, "")
+    #assert(sess.wants_upgrade())
+    assert_eq(sess.phase, SMTP_PH_UPGRADE)
+    hello = @sess.tls_established() or "bad"
+    assert_eq(hello, "EHLO c.example.com\r\n")
+    #assert(sess.tls_active)
+    #assert(!(sess.wants_upgrade()))
+    idle = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", true, "", "")
+    assert_eq(@idle.tls_established() or "bad", "bad")
+    refused = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", true, "", "")
+    @refused.on_reply("220 hi\r\n") or "bad"
+    @refused.on_reply("250-mx\r\n250 STARTTLS\r\n") or "bad"
+    assert_eq(@refused.on_reply("454 4.7.0 TLS not available\r\n") or "bad", "bad")
+    #assert(starts_with(refused.error, "smtp: STARTTLS refused: 454"))
+    stray = SmtpSession.new("c.example.com", "a@x.org", ["b@y.org"], "hi", true, "", "")
+    @stray.on_reply("220 hi\r\n") or "bad"
+    @stray.on_reply("250-mx\r\n250 STARTTLS\r\n") or "bad"
+    @stray.on_reply("220 go\r\n") or "bad"
+    assert_eq(@stray.on_reply("250 unexpected\r\n") or "bad", "bad")
+    #assert(stray.failed())
+}
+
+test "smtp mock server protocol rules" {
+    m = SmtpMock.{offer_tls: false}
+    #assert(starts_with(m.greeting(), "220 "))
+    assert_eq(@m.handle("MAIL FROM:<a@x.org>\r\n"), "503 5.5.1 Error: send HELO/EHLO first\r\n")
+    ehlo = @m.handle("EHLO me\r\n")
+    #assert(starts_with(ehlo, "250-mock.example.com Hello me"))
+    #assert(find(ehlo, "STARTTLS") < 0)
+    #assert(find(ehlo, "SIZE 1000000") >= 0)
+    assert_eq(@m.handle("RCPT TO:<b@y.org>\r\n"), "503 5.5.1 Error: need MAIL command\r\n")
+    assert_eq(@m.handle("MAIL FROM:<bad address>\r\n"), "553 5.1.7 Bad sender address syntax\r\n")
+    assert_eq(@m.handle("MAIL a@x.org\r\n"), "501 5.5.4 Syntax: MAIL FROM:<address>\r\n")
+    assert_eq(@m.handle("MAIL FROM:<>\r\n"), "250 2.1.0 Ok\r\n")
+    assert_eq(@m.handle("DATA\r\n"), "554 5.5.1 Error: no valid recipients\r\n")
+    assert_eq(@m.handle("RCPT TO:<nope>\r\n"), "501 5.1.3 Bad recipient address syntax\r\n")
+    assert_eq(@m.handle("RCPT b@y.org\r\n"), "501 5.5.4 Syntax: RCPT TO:<address>\r\n")
+    assert_eq(@m.handle("RCPT TO:<b@y.org>\r\n"), "250 2.1.5 Ok\r\n")
+    assert_eq(@m.handle("NOOP\r\n"), "250 2.0.0 Ok\r\n")
+    assert_eq(@m.handle("VRFY b\r\n"), "500 5.5.2 Error: command not recognized\r\n")
+    assert_eq(@m.handle("STARTTLS\r\n"), "454 4.7.0 TLS not available due to temporary reason\r\n")
+    assert_eq(@m.handle("AUTH PLAIN abc\r\n"), "503 5.5.1 Error: authentication not enabled\r\n")
+    assert_eq(@m.handle("RSET\r\n"), "250 2.0.0 Ok\r\n")
+    assert_eq(host.sys_arr_len(m.rcpts), 0)
+    assert_eq(m.mail_from, "-")
+    assert_eq(@m.handle("QUIT\r\n"), "221 2.0.0 Bye\r\n")
+    assert_eq(@m.handle("mail from:<a@x.org>\r\n"), "250 2.1.0 Ok\r\n")
+}
+
+test "smtp mock server data and auth edges" {
+    m = SmtpMock.{user: "u", secret: "p"}
+    @m.handle("EHLO me\r\n")
+    assert_eq(@m.handle("AUTH PLAIN abc\r\n"), "538 5.7.11 Encryption required for requested authentication mechanism\r\n")
+    assert_eq(@m.handle("STARTTLS\r\n"), "220 2.0.0 Ready to start TLS\r\n")
+    #assert(m.tls_on)
+    ehlo = @m.handle("EHLO me\r\n")
+    #assert(find(ehlo, "AUTH PLAIN LOGIN") >= 0)
+    #assert(find(ehlo, "STARTTLS") < 0)
+    assert_eq(@m.handle("AUTH LOGIN\r\n"), "504 5.5.4 Unrecognized authentication type\r\n")
+    assert_eq(@m.handle("AUTH PLAIN %%%\r\n"), "535 5.7.8 Authentication credentials invalid\r\n")
+    good = smtp_auth_plain("u", "p") or ""
+    assert_eq(@m.handle(good), "235 2.7.0 Authentication successful\r\n")
+    wrong = smtp_auth_plain("u", "q") or ""
+    assert_eq(@m.handle(wrong), "535 5.7.8 Authentication credentials invalid\r\n")
+    @m.handle("MAIL FROM:<a@x.org>\r\n")
+    @m.handle("RCPT TO:<b@y.org>\r\n")
+    assert_eq(@m.handle("DATA\r\n"), "354 End data with <CR><LF>.<CR><LF>\r\n")
+    assert_eq(@m.handle("no terminator\r\n"), "451 4.3.0 Error: malformed DATA terminator\r\n")
+    #assert(!(m.in_data))
+    assert_eq(host.sys_arr_len(m.inbox), 0)
+    @m.handle("MAIL FROM:<a@x.org>\r\n")
+    @m.handle("RCPT TO:<b@y.org>\r\n")
+    @m.handle("DATA\r\n")
+    assert_eq(@m.handle("hi\r\n.\r\n"), "250 2.0.0 Ok: queued as Q1\r\n")
+    assert_eq(m.inbox[0], "hi\r\n")
+    assert_eq(m.queued, 1)
+}
+
+test "smtp header encoding" {
+    assert_eq(smtp_encode_header("Plain subject") or "bad", "Plain subject")
+    assert_eq(smtp_encode_header("h\u{00e9}llo") or "bad", "=?UTF-8?B?aMOpbGxv?=")
+    assert_eq(smtp_encode_header("x\r\nBcc: evil@x.org") or "bad", "bad")
+    long_text = repeat("\u{00e9}", 25)
+    encoded = smtp_encode_header(long_text) or ""
+    words = smtp_split(encoded, " ")
+    assert_eq(host.sys_arr_len(words), 3)
+    #assert(starts_with(words[0], "=?UTF-8?B?"))
+    #assert(ends_with(words[2], "?="))
+    #assert(host.sys_str_len(words[0]) <= 75)
+    #assert(smtp_ascii_only("abc"))
+    #assert(!(smtp_ascii_only("h\u{00e9}")))
+}
+
+test "smtp wrap76" {
+    assert_eq(smtp_wrap76(""), "")
+    assert_eq(smtp_wrap76("abc"), "abc")
+    seventy_six = repeat("A", 76)
+    assert_eq(smtp_wrap76(seventy_six), seventy_six)
+    assert_eq(smtp_wrap76("{seventy_six}B"), "{seventy_six}\r\nB")
+    assert_eq(smtp_longest_line(smtp_wrap76(repeat("Z", 500))), 76)
+}
+
+test "smtp plain message" {
+    msg = smtp_message("Amina Diallo <amina@example.com>", ["bola@example.org", "Chi <chi@example.net>"], "Greetings", "Hello Bola\nSee you", "Mon, 23 Nov 2026 10:00:00 +0000", "m1@example.com") or "bad"
+    #assert(starts_with(msg, "Date: Mon, 23 Nov 2026 10:00:00 +0000\r\nFrom: Amina Diallo <amina@example.com>\r\nTo: bola@example.org, Chi <chi@example.net>\r\nSubject: Greetings\r\n"))
+    #assert(find(msg, "Message-ID: <m1@example.com>\r\n") >= 0)
+    #assert(find(msg, "MIME-Version: 1.0\r\n") >= 0)
+    #assert(find(msg, "Content-Type: text/plain; charset=utf-8\r\n") >= 0)
+    #assert(find(msg, "Content-Transfer-Encoding: 7bit\r\n\r\nHello Bola\r\nSee you") >= 0)
+    utf = smtp_message("a@x.org", ["b@y.org"], "caf\u{00e9}", "cr\u{00e8}me", "d", "i") or "bad"
+    #assert(find(utf, "Content-Transfer-Encoding: 8bit") >= 0)
+    #assert(find(utf, "Subject: =?UTF-8?B?") >= 0)
+}
+
+test "smtp message injection is refused" {
+    d = "Mon, 23 Nov 2026 10:00:00 +0000"
+    assert_eq(smtp_message("a@x.org", ["b@y.org"], "hi\r\nBcc: evil@x.org", "body", d, "i") or "bad", "bad")
+    assert_eq(smtp_message("a@x.org\r\nBcc: e@x.org", ["b@y.org"], "hi", "body", d, "i") or "bad", "bad")
+    assert_eq(smtp_message("a@x.org", ["b@y.org,e@x.org"], "hi", "body", d, "i") or "bad", "bad")
+    assert_eq(smtp_message("a@x.org", [], "hi", "body", d, "i") or "bad", "bad")
+    assert_eq(smtp_message("nobody", ["b@y.org"], "hi", "body", d, "i") or "bad", "bad")
+    assert_eq(smtp_message("a@x.org", ["b@y.org"], "hi", "body", "bad\ndate", "i") or "bad", "bad")
+    assert_eq(smtp_message("a@x.org", ["b@y.org"], "hi", "body", d, "x>\r\nBcc: e") or "bad", "bad")
+}
+
+test "smtp multipart alternative" {
+    msg = smtp_multipart("a@x.org", ["b@y.org"], "News", "plain text", "<p>html</p>", "d", "i", "BOUND123") or "bad"
+    #assert(find(msg, "Content-Type: multipart/alternative; boundary=\"BOUND123\"\r\n\r\n") >= 0)
+    #assert(find(msg, "--BOUND123\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nplain text\r\n") >= 0)
+    #assert(find(msg, "--BOUND123\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>html</p>\r\n") >= 0)
+    #assert(ends_with(msg, "--BOUND123--\r\n"))
+    assert_eq(smtp_multipart("a@x.org", ["b@y.org"], "s", "t", "h", "d", "i", "bad boundary") or "bad", "bad")
+    assert_eq(smtp_multipart("a@x.org", ["b@y.org"], "s", "t", "h", "d", "i", "") or "bad", "bad")
+    assert_eq(smtp_multipart("a@x.org", ["b@y.org"], "s", "a\n--B1\nb", "h", "d", "i", "B1") or "bad", "bad")
+    assert_eq(smtp_multipart("a@x.org", ["b@y.org"], "s", "t", "<x>--B1</x>", "d", "i", "B1") or "bad", "bad")
+}
+
+test "smtp attachment message" {
+    data = [72, 101, 108, 108, 111]
+    msg = smtp_with_attachment("a@x.org", ["b@y.org"], "File", "see attached", "d", "i", "MIXB", "hello.txt", "text/plain", data) or "bad"
+    #assert(find(msg, "Content-Type: multipart/mixed; boundary=\"MIXB\"") >= 0)
+    #assert(find(msg, "Content-Type: text/plain; name=\"hello.txt\"\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"hello.txt\"\r\n\r\nSGVsbG8=\r\n") >= 0)
+    #assert(ends_with(msg, "--MIXB--\r\n"))
+    assert_eq(smtp_with_attachment("a@x.org", ["b@y.org"], "s", "t", "d", "i", "MIXB", "a\"b.txt", "text/plain", data) or "bad", "bad")
+    assert_eq(smtp_with_attachment("a@x.org", ["b@y.org"], "s", "t", "d", "i", "MIXB", "a\r\nb.txt", "text/plain", data) or "bad", "bad")
+    assert_eq(smtp_with_attachment("a@x.org", ["b@y.org"], "s", "t", "d", "i", "MIXB", "f.bin", "x\ny", data) or "bad", "bad")
+    assert_eq(smtp_with_attachment("a@x.org", ["b@y.org"], "s", "t", "d", "i", "bad boundary", "f.bin", "x/y", data) or "bad", "bad")
+    big = host.sys_arr_new(300, 65)
+    wide = smtp_with_attachment("a@x.org", ["b@y.org"], "s", "t", "d", "i", "MIXB", "f.bin", "application/octet-stream", big) or ""
+    #assert(smtp_longest_line(wide) <= 76 + 0)
+}
+
+test "smtp end to end with mime and dot stuffing" {
+    body = smtp_multipart("Amina <amina@example.com>", ["bola@example.org"], "Weekly", ".leading dot\nsecond line", "<p>.html</p>", "Mon, 23 Nov 2026 10:00:00 +0000", "w1@example.com", "WK") or "bad"
+    server = SmtpMock.{}
+    pair = smtp_dialogue("client.example.com", "amina@example.com", ["bola@example.org"], body, true, "", "", server)
+    sess = pair.session
+    mock = pair.server
+    #assert(sess.done())
+    assert_eq(host.sys_arr_len(mock.inbox), 1)
+    stored = mock.inbox[0]
+    #assert(starts_with(stored, "Date: "))
+    #assert(find(stored, "\r\n.leading dot") >= 0)
+    #assert(find(stored, "multipart/alternative") >= 0)
+    again = smtp_data_payload(stored) or ""
+    assert_eq(smtp_data_unpack(again) or "bad", stored)
+}

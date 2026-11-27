@@ -1,0 +1,500 @@
+//! std.game.app — fixed-timestep loop, scene stack, input actions, cooldowns
+//!
+//! Import with:
+//!   use std.game.app
+//!
+//!   a = App.new(60)                                    // 60 simulation ticks per second
+//!   @a.bind("jump", "space")
+//!   @a.bind("left", "a")
+//!   @a.bind("left", "left_arrow")
+//!   @a.push("menu")
+//!
+//!   // once per rendered frame:
+//!   poll = App.poll()                                   // e.g. window_poll()
+//!   @a.apply_keys(poll.keys)
+//!   ticks = @a.advance(real_dt)
+//!   for 0..ticks { update(a.dt) }                      // deterministic fixed step
+//!   draw(a.alpha())                                       // 0..1 render interpolation
+//!   @a.end_frame()
+//!
+//! `advance` is the classic accumulator loop: real time is clamped (so a stall can't
+//! trigger a spiral of death), scaled by `a.scale`, and converted into whole fixed ticks
+//! capped at `a.max_steps` per frame. Paused apps keep rendering but run no ticks. Input
+//! is edge-aware: `pressed` / `released` compare this frame's key set with the one
+//! captured by the previous `end_frame`. Many keys may map to one action.
+//!
+//! `Cooldown` is a small helper for fire-rate / ability timers. `App.open_window` /
+//! `App.poll` wrap the host window calls (headless in the stock runtime).
+
+use std.core.collections
+use std.math.core
+use std.gui.window
+
+/// `App` is a fixed-timestep game loop with scenes, input, and FPS.
++App = {
+    /// Fixed simulation rate. Defaults to `60`.
+    hz: i64 = 60
+    /// Fixed step length in seconds. Defaults to `0.016666666666666666`.
+    dt: f64 = 0.016666666666666666
+    /// Acc on `App` (`f64`). Defaults to `0.0`.
+    acc: f64 = 0.0
+    /// Time on `App` (`f64`). Defaults to `0.0`.
+    time: f64 = 0.0
+    /// Frame on `App` (`i64`). Defaults to `0`.
+    frame: i64 = 0
+    /// Ticks on `App` (`i64`). Defaults to `0`.
+    ticks: i64 = 0
+    /// Max steps on `App` (`i64`). Defaults to `5`.
+    max_steps: i64 = 5
+    /// Max frame on `App` (`f64`). Defaults to `0.25`.
+    max_frame: f64 = 0.25
+    /// Scale on `App` (`f64`). Defaults to `1.0`.
+    scale: f64 = 1.0
+    /// True when `update` is not stepped. Defaults to `false`.
+    paused: bool = false
+    /// Scenes on `App`. Defaults to `[]`.
+    scenes: _ = []
+    /// Bind actions on `App`. Defaults to `[]`.
+    bind_actions: _ = []
+    /// Bind keys on `App`. Defaults to `[]`.
+    bind_keys: _ = []
+    /// Down on `App`. Defaults to `[]`.
+    down: _ = []
+    /// Prev on `App`. Defaults to `[]`.
+    prev: _ = []
+    /// Fps on `App` (`f64`). Defaults to `0.0`.
+    fps: f64 = 0.0
+    /// Fps acc on `App` (`f64`). Defaults to `0.0`.
+    fps_acc: f64 = 0.0
+    /// Fps frames on `App` (`i64`). Defaults to `0`.
+    fps_frames: i64 = 0
+
+    /// Create a fresh `App`.
+    new(hz: i64) : App {
+        rate = hz
+        if rate < 1 { rate = 1 }
+        App.{hz: rate, dt: 1.0 / rate, acc: 0.0, time: 0.0, frame: 0, ticks: 0, max_steps: 5, max_frame: 0.25, scale: 1.0, paused: false, scenes: [], bind_actions: [], bind_keys: [], down: [], prev: [], fps: 0.0, fps_acc: 0.0, fps_frames: 0}
+    }
+
+    /// Feed one rendered frame's real elapsed seconds; returns how many fixed ticks to run.
+    advance(@self, real_dt: f64) : i64 {
+        d = real_dt
+        if d < 0.0 { d = 0.0 }
+        if d > (self.max_frame) { d = self.max_frame }
+        self.frame = self.frame + 1
+        self.fps_acc = self.fps_acc + d
+        self.fps_frames = self.fps_frames + 1
+        if self.fps_acc >= 0.5 {
+            self.fps = self.fps_frames / self.fps_acc
+            self.fps_acc = 0.0
+            self.fps_frames = 0
+        }
+        if (self.paused) { return 0 }
+        self.acc = self.acc + d * self.scale
+        n = to_int(self.acc / self.dt + 0.000000001)
+        if n > (self.max_steps) {
+            // Too far behind: run the cap and drop the backlog.
+            self.ticks = self.ticks + self.max_steps
+            self.time = self.time + self.max_steps * self.dt
+            self.acc = 0.0
+            self.max_steps
+        } else {
+            self.acc = self.acc - n * self.dt
+            if self.acc < 0.0 { self.acc = 0.0 }
+            self.ticks = self.ticks + n
+            self.time = self.time + n * self.dt
+            n
+        }
+    }
+
+    /// Fraction of a tick left in the accumulator, for render interpolation.
+    alpha(self) : f64 => self.acc / self.dt
+
+    /// Pause the simulation when `on` is true, and resume it when `on` is false.
+    pause(@self, on: bool) : bool {
+        self.paused = on
+        on
+    }
+
+    /// Set scale on this `App` (`s`). Returns `f64`.
+    set_scale(@self, s: f64) : f64 {
+        v = s
+        if v < 0.0 { v = 0.0 }
+        self.scale = v
+        v
+    }
+
+    /// Run `frames` frames of `real_dt` headlessly; returns the total ticks produced.
+    run_frames(@self, frames: i64, real_dt: f64) : i64 {
+        total = 0
+        for 0..frames {
+            total += @self.advance(real_dt)
+        }
+        total
+    }
+
+    /// Push the scene named `name`.
+    push(@self, name: str) : i64 {
+        self.scenes = arr_push(self.scenes, name)
+        len(self.scenes)
+    }
+
+    /// Pop the current scene and return its name.
+    pop(@self) : str {
+        n = len(self.scenes)
+        ensure n > 0 else { return "" }
+        top = self.scenes[n - 1]
+        self.scenes = self.scenes[0..(n - 1)]
+        top
+    }
+
+    /// Swap the top scene (or push when the stack is empty).
+    replace(@self, name: str) : i64 {
+        n = len(self.scenes)
+        if n == 0 { return @self.push(name) }
+        self.scenes = arr_set(self.scenes, n - 1, name)
+        n
+    }
+
+    /// Name of the current scene.
+    scene(self) : str {
+        n = len(self.scenes)
+        ensure n > 0 else { return "" }
+        self.scenes[n - 1]
+    }
+
+    /// Same as `len`.
+    depth(self) : i64 => len(self.scenes)
+
+    /// Map `key` to `action` (an action may have several keys).
+    bind(@self, action: str, key: str) : i64 {
+        self.bind_actions = arr_push(self.bind_actions, action)
+        self.bind_keys = arr_push(self.bind_keys, key)
+        len(self.bind_actions)
+    }
+
+    /// Key on this `App` (`key`, `is_down`).
+    key(@self, key: str, is_down: bool) : bool {
+        present = input_has(self.down, key)
+        if is_down && present == false {
+            self.down = arr_push(self.down, key)
+            true
+        } else {
+            if is_down == false && present {
+                kept = []
+                held = self.down
+                for held {
+                    if it != key { kept = arr_push(kept, it) }
+                }
+                self.down = kept
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// Replace the held-key set (e.g. with `App.poll().keys`).
+    apply_keys(@self, keys: _) : i64 {
+        self.down = keys
+        len(keys)
+    }
+
+    /// Same as `input_down`.
+    down(self, action: str) : bool => input_down(self, action)
+
+    /// Went down this frame.
+    pressed(self, action: str) : bool {
+        ensure input_down(self, action) else { return false }
+        input_actions_down(self.prev, self, action) == false
+    }
+
+    /// Went up this frame.
+    released(self, action: str) : bool {
+        ensure input_down(self, action) == false else { return false }
+        input_actions_down(self.prev, self, action)
+    }
+
+    /// -1, 0 or +1 from a pair of actions.
+    axis(self, neg: str, pos: str) : f64 {
+        v = 0.0
+        if self.down(pos) { v += 1.0 }
+        if self.down(neg) { v -= 1.0 }
+        v
+    }
+
+    /// Call once per frame after reading input edges.
+    end_frame(@self) : i64 {
+        self.prev = self.down
+        len(self.prev)
+    }
+
+    /// Same as `window_open`.
+    open_window(title: str, width: i64, height: i64)  => window_open(width, height, title)
+
+    /// Same as `window_poll`.
+    poll()  => window_poll()
+}
+
+/// Input has (`keys`, `key`).
++input_has(keys: _, key: str) : bool {
+    found = false
+    for keys {
+        if it == key { found = true }
+    }
+    found
+}
+
+/// Same as `input_actions_down`.
++input_down(a: App, action: str) : bool => input_actions_down(a.down, a, action)
+
+/// Input actions down (`keys`, `a`, `action`).
++input_actions_down(keys: _, a: App, action: str) : bool {
+    hit = false
+    n = len(a.bind_actions)
+    for 0..n {
+        if a.bind_actions[it] == action && input_has(keys, a.bind_keys[it]) { hit = true }
+    }
+    hit
+}
+
+/// `Cooldown` is a timer that becomes ready again after `period`.
++Cooldown = {
+    /// Period on `Cooldown` (`f64`).
+    period: f64
+    /// Left on `Cooldown` (`f64`). Defaults to `0.0`.
+    left: f64 = 0.0
+
+    /// Starts ready.
+    new(period: f64) : Cooldown => Cooldown.{period, left: 0.0}
+
+    /// Tick on this `Cooldown` (`dt`). Returns `f64`.
+    tick(@self, dt: f64) : f64 {
+        self.left = self.left - dt
+        if self.left < 0.0 { self.left = 0.0 }
+        self.left
+    }
+
+    /// Ready on this `Cooldown`.
+    ready(self) : bool => self.left <= 0.0
+
+    /// Consume the cooldown: true (and re-arm) if it was ready.
+    use(@self) : bool {
+        ensure self.left <= 0.0 else { return false }
+        self.left = self.period
+        true
+    }
+
+    /// 0 = just used, 1 = ready.
+    progress(self) : f64 {
+        if self.period <= 0.0 { return 1.0 }
+        if self.left <= 0.0 { return 1.0 }
+        1.0 - self.left / self.period
+    }
+}
+
+// --- tests ------------------------------------------------------------------------------------------------------
+
+/// Test that new app derives dt from the tick rate.
+test "new app derives dt from the tick rate" {
+    a = App.new(10)
+    assert_eq(a.hz, 10)
+    assert_eq(a.dt, 0.1)
+    assert_eq(a.ticks, 0)
+    #assert(!(a.paused))
+    z = App.new(0)
+    assert_eq(z.hz, 1)
+    assert_eq(z.dt, 1.0)
+}
+
+/// Test that accumulator converts real time into whole ticks.
+test "accumulator converts real time into whole ticks" {
+    a = App.new(10)
+    assert_eq(@a.advance(0.25), 2)
+    #assert(a.alpha() > 0.49 && a.alpha() < 0.51)
+    assert_eq(@a.advance(0.05), 1)
+    assert_eq(@a.advance(0.04), 0)
+    assert_eq(a.ticks, 3)
+    assert_eq(a.frame, 3)
+    #assert(a.time > 0.299 && a.time < 0.301)
+}
+
+/// Test that steady frame rate yields the expected tick total.
+test "steady frame rate yields the expected tick total" {
+    a = App.new(60)
+    total = @a.run_frames(120, 1.0 / 60.0)
+    assert_eq(total, 120)
+    b = App.new(30)
+    assert_eq(@b.run_frames(60, 1.0 / 60.0), 30)
+    c = App.new(120)
+    assert_eq(@c.run_frames(60, 1.0 / 60.0), 120)
+}
+
+/// Test that stalls are clamped and capped.
+test "stalls are clamped and capped" {
+    a = App.new(10)
+    n = @a.advance(5.0)
+    assert_eq(n, 2)
+    b = App.new(100)
+    m = @b.advance(1.0)
+    assert_eq(m, 5)
+    assert_eq(b.acc, 0.0)
+    assert_eq(b.ticks, 5)
+    neg = App.new(10)
+    assert_eq(@neg.advance(-1.0), 0)
+}
+
+/// Test that pause and time scale.
+test "pause and time scale" {
+    a = App.new(10)
+    #assert(@a.pause(true))
+    assert_eq(@a.advance(0.5), 0)
+    assert_eq(a.frame, 1)
+    assert_eq(a.ticks, 0)
+    @a.pause(false)
+    assert_eq(@a.set_scale(0.5), 0.5)
+    assert_eq(@a.advance(0.2), 1)
+    @a.set_scale(2.0)
+    assert_eq(@a.advance(0.1), 2)
+    assert_eq(@a.set_scale(-3.0), 0.0)
+    assert_eq(@a.advance(0.1), 0)
+}
+
+/// Test that fps estimate refreshes every half second.
+test "fps estimate refreshes every half second" {
+    a = App.new(60)
+    assert_eq(a.fps, 0.0)
+    for 0..31 { @a.advance(1.0 / 60.0) }
+    #assert(a.fps > 59.0 && a.fps < 61.0)
+    b = App.new(60)
+    for 0..10 { @b.advance(0.01) }
+    assert_eq(b.fps, 0.0)
+}
+
+/// Test that scene stack push pop replace.
+test "scene stack push pop replace" {
+    a = App.new(60)
+    assert_eq(a.scene(), "")
+    assert_eq(@a.pop(), "")
+    assert_eq(@a.push("menu"), 1)
+    assert_eq(@a.push("game"), 2)
+    assert_eq(a.scene(), "game")
+    assert_eq(a.depth(), 2)
+    assert_eq(@a.replace("pause"), 2)
+    assert_eq(a.scene(), "pause")
+    assert_eq(@a.pop(), "pause")
+    assert_eq(a.scene(), "menu")
+    assert_eq(@a.pop(), "menu")
+    assert_eq(a.depth(), 0)
+    assert_eq(@a.replace("title"), 1)
+    assert_eq(a.scene(), "title")
+}
+
+/// Test that actions map to several keys.
+test "actions map to several keys" {
+    a = App.new(60)
+    assert_eq(@a.bind("left", "a"), 1)
+    assert_eq(@a.bind("left", "left_arrow"), 2)
+    @a.bind("jump", "space")
+    #assert(!(a.down("left")))
+    #assert(@a.key("left_arrow", true))
+    #assert(a.down("left"))
+    #assert(!(a.down("jump")))
+    #assert(!(@a.key("left_arrow", true)))
+    #assert(@a.key("a", true))
+    #assert(@a.key("left_arrow", false))
+    #assert(a.down("left"))
+    #assert(@a.key("a", false))
+    #assert(!(a.down("left")))
+    #assert(!(@a.key("a", false)))
+    #assert(!(a.down("unbound")))
+}
+
+/// Test that pressed and released are single-frame edges.
+test "pressed and released are single-frame edges" {
+    a = App.new(60)
+    @a.bind("fire", "x")
+    @a.key("x", true)
+    #assert(a.pressed("fire"))
+    #assert(!(a.released("fire")))
+    @a.end_frame()
+    #assert(!(a.pressed("fire")))
+    #assert(a.down("fire"))
+    @a.key("x", false)
+    #assert(a.released("fire"))
+    #assert(!(a.down("fire")))
+    @a.end_frame()
+    #assert(!(a.released("fire")))
+    #assert(!(a.pressed("fire")))
+}
+
+/// Test that axis combines opposing actions.
+test "axis combines opposing actions" {
+    a = App.new(60)
+    @a.bind("left", "a")
+    @a.bind("right", "d")
+    assert_eq(a.axis("left", "right"), 0.0)
+    @a.key("d", true)
+    assert_eq(a.axis("left", "right"), 1.0)
+    @a.key("a", true)
+    assert_eq(a.axis("left", "right"), 0.0)
+    @a.key("d", false)
+    assert_eq(a.axis("left", "right"), -1.0)
+}
+
+/// Test that apply keys replaces the held set.
+test "apply keys replaces the held set" {
+    a = App.new(60)
+    @a.bind("up", "w")
+    @a.bind("down", "s")
+    assert_eq(@a.apply_keys(["w", "shift"]), 2)
+    #assert(a.down("up"))
+    #assert(!(a.down("down")))
+    @a.end_frame()
+    assert_eq(@a.apply_keys(["s"]), 1)
+    #assert(!(a.down("up")))
+    #assert(a.released("up"))
+    #assert(a.pressed("down"))
+    assert_eq(@a.apply_keys([]), 0)
+    #assert(!(a.down("down")))
+}
+
+/// Test that cooldowns gate repeated use.
+test "cooldowns gate repeated use" {
+    c = Cooldown.new(0.5)
+    #assert(c.ready())
+    assert_eq(c.progress(), 1.0)
+    #assert(@c.use())
+    #assert(!(c.ready()))
+    #assert(!(@c.use()))
+    assert_eq(c.progress(), 0.0)
+    assert_eq(@c.tick(0.25), 0.25)
+    assert_eq(c.progress(), 0.5)
+    #assert(!(c.ready()))
+    assert_eq(@c.tick(0.5), 0.0)
+    #assert(c.ready())
+    #assert(@c.use())
+    z = Cooldown.new(0.0)
+    #assert(@z.use())
+    assert_eq(z.progress(), 1.0)
+}
+
+/// Test that headless window wrappers return a surface and an empty poll.
+test "headless window wrappers return a surface and an empty poll" {
+    win = App.open_window("demo", 80, 24)
+    assert_eq(win.width, 80)
+    assert_eq(win.height, 24)
+    assert_eq(win.title, "demo")
+    p = App.poll()
+    #assert(!(p.quit))
+    assert_eq(len(p.keys), 0)
+    a = App.new(60)
+    assert_eq(@a.apply_keys(p.keys), 0)
+}
+
+/// Test that explicit UFCS on mutable methods.
+test "explicit UFCS on mutable methods" {
+    a = App.new(60)
+    assert_eq(App.advance(a, 1.0 / 60.0), 1)
+    assert_eq(App.advance(@a, 1.0 / 60.0), 1)
+}

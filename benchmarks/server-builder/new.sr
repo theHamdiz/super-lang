@@ -1,0 +1,9 @@
+use std.net.http
+use std.sys.env
+
++main() {
+    addr = env_get_or("SUPER_ADDR", "127.0.0.1:3021")
+    app = App.new()
+    app = @app.get("/ping", |_req| { ok("pong") })
+    @app.serve(addr) or 1
+}

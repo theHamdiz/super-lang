@@ -1,0 +1,89 @@
+// TUI — an operations board. Each service knows its status; the board only draws.
+//
+// Run: super test examples/23_tui_ops/
+
+use std.tui
+use std.sys.time
+
++Service = {
+    name: str
+    lag_ms: i64
+    load: i64
+
+    status(self) : str {
+        if self.lag_ms < 20 { return "ok" }
+        if self.lag_ms < 80 { return "warn" }
+        "down"
+    }
+
+    ratio(self) : f64 => self.load / 100.0
+
+    row(self) : str => "{self.name} {self.status()} {self.lag_ms}ms"
+}
+
++Board = {
+    title: str = "ops"
+
+    frame(self) : str {
+        ink = theme("accent")
+        ok = theme("ok")
+        view = Screen.new(46, 14)
+        @view.clear(7, 0)
+        @view.block(Rect.new(0, 0, 46, 14), " {self.title} ")
+        api = Service{name: "api", lag_ms: 12, load: 80}
+        worker = Service{name: "worker", lag_ms: 40, load: 55}
+        store = Service{name: "db", lag_ms: 8, load: 96}
+        @view.gauge(Rect.new(2, 2, 16, 1), api.ratio(), "")
+        @view.print_at(20, 2, api.row(), ok.fg, 0, 0)
+        @view.gauge(Rect.new(2, 3, 16, 1), worker.ratio(), "")
+        @view.print_at(20, 3, worker.row(), ink.fg, 0, 1)
+        @view.gauge(Rect.new(2, 4, 16, 1), store.ratio(), "")
+        @view.print_at(20, 4, store.row(), ok.fg, 0, 0)
+        @view.sparkline(Rect.new(2, 6, 16, 1), [2, 4, 7, 5, 8, 6, 9])
+        @view.table(
+            Rect.new(2, 8, 42, 4),
+            ["SERVICE", "STATUS", "LAG"],
+            ["api", api.status(), "12ms", "worker", worker.status(), "40ms", "db", store.status(), "8ms"],
+            3
+        )
+        view.plain()
+    }
+}
+
++main() {
+    board = Board{}
+    term = Term.open()
+    if term.raw == false {
+        print(board.frame())
+        return
+    }
+    quit = false
+    while quit == false {
+        term.write("\x1b[H")
+        term.write(board.frame())
+        key = term.poll()
+        if key.kind == "esc" || key.kind == "q" || key.ch == "q" { quit = true }
+        if key.kind == "ctrl" && key.ch == "c" { quit = true }
+        if quit == false { sleep_ms(40) }
+    }
+    @term.close()
+}
+
+test "a service names its own status" {
+    api = Service{name: "api", lag_ms: 12, load: 80}
+    worker = Service{name: "worker", lag_ms: 40, load: 55}
+    down = Service{name: "edge", lag_ms: 90, load: 10}
+    assert_eq(api.status(), "ok")
+    assert_eq(worker.status(), "warn")
+    assert_eq(down.status(), "down")
+    assert_eq(api.row(), "api ok 12ms")
+}
+
+test "the board draws a titled frame" {
+    board = Board{}
+    text = board.frame()
+    #assert(contains(text, "ops"))
+    #assert(contains(text, "api ok 12ms"))
+    #assert(contains(text, "worker warn 40ms"))
+    #assert(contains(text, "SERVICE"))
+}

@@ -1,0 +1,15 @@
+[pod]
+name = "law_verify"
+version = "0.1.0"
+kind = "bin"
+
+[build]
+profile = "dev"
+backend = "c23"
+mode = "aot"
+
+[verify]
+require-on-release = false
+solver = "auto"
+
+[dependencies]

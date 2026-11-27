@@ -1,0 +1,13 @@
+//! Laws for std.fmt.yaml — real-body (`yaml_is_ws`).
+//! `yaml_len` is host.sys_str_len (sidecar limit for length laws).
+//! AI agents must not edit this file; put discharges in `yaml.proof.sr`.
+
+#law("yaml_is_ws marks space")
+yaml_is_ws_space() {
+    #assert(yaml_is_ws(" "))
+}
+
+#law("yaml_is_ws marks tab")
+yaml_is_ws_tab() {
+    #assert(yaml_is_ws("\t"))
+}

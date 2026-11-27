@@ -1,0 +1,641 @@
+//! std.sec.vault — HashiCorp Vault-shaped named secret storage
+//!
+//! Boundary vs `std.sec.secret`:
+//!   - **vault** (this module): remote/named storage shaped like HashiCorp Vault
+//!     (KV v2, auth, transit, sys). Prefer `put_secret` / `get_secret` so values
+//!     travel as `std.sec.secret.Secret` and never print plaintext via Display.
+//!   - **secret** (`std.sec.secret`): in-memory `Secret` with zeroize + redaction,
+//!     plus an optional local AEAD `FileKeyring`. Do not confuse FileKeyring with
+//!     this Vault engine — different public APIs, no shared export names.
+//!
+//! Import with:
+//!   use std.sec.vault
+//!   use std.sec.secret
+//!
+//!   v = Vault.new("s3cret-root-token")
+//!   @v.put_secret("root-token", "secret", "api", "openai_key", Secret.of("sk-test"))
+//!   key = v.get_secret("root-token", "secret", "api", "openai_key", 0) or Secret.of("")
+//!
+//! Covers KV v2 (put/get/list/delete/undelete/destroy), token auth, userpass,
+//! AppRole, policies, transit encrypt/decrypt, sys/health + seal-status, and
+//! HTTP API URL builders for a live Vault. Offline by default for `super test`.
+
+use std.core.collections
+use std.core.str
+use std.sec.hash
+use std.sec.secret
+
+/// Default KV mount.
++VAULT_KV_MOUNT = "secret"
+
+/// One secret version (Vault KV v2 versioning lite).
++SecretVersion = {
+    version: i64 = 1
+    data: _ = []
+    keys: _ = []
+    created_ms: i64 = 0
+}
+
+/// One path under a mount.
++SecretPath = {
+    path: str = ""
+    versions: _ = []
+    current: i64 = 0
+}
+
+/// Token with policy tags (capabilities are coarse: read/write/admin).
++VaultToken = {
+    id: str = ""
+    policies: _ = []
+    renewable: bool = true
+}
+
+/// Transit keyring entry (AES-GCM shaped offline).
++TransitKey = {
+    name: str = ""
+    version: i64 = 1
+    material: str = ""
+}
+
+/// Userpass credential.
++VaultUser = {
+    name: str = ""
+    password_hash: str = ""
+    policies: _ = []
+}
+
+/// AppRole pair.
++AppRole = {
+    role_id: str = ""
+    secret_id: str = ""
+    policies: _ = []
+}
+
+/// Named ACL policy (capabilities: read/write/list/delete/sudo).
++VaultPolicy = {
+    name: str = ""
+    paths: _ = []
+    caps: _ = []
+}
+
+/// In-process Vault.
++Vault = {
+    root_token: str = ""
+    sealed: bool = false
+    seal_key: str = ""
+    mounts: _ = []
+    paths: _ = []
+    tokens: _ = []
+    audit: _ = []
+    clock: i64 = 0
+    transit: _ = []
+    users: _ = []
+    approles: _ = []
+    policies: _ = []
+    base_url: str = ""
+    offline: bool = true
+
+    new(root: str) : Vault {
+        Vault.{
+            root_token: root, sealed: false, seal_key: blake3_hex(root),
+            mounts: [VAULT_KV_MOUNT, "transit", "auth/userpass", "auth/approle"],
+            paths: [], tokens: [VaultToken.{id: root, policies: ["root"], renewable: true}],
+            audit: [], clock: 0, transit: [], users: [], approles: [], policies: [],
+            base_url: "", offline: true
+        }
+    }
+
+    /// Point at a live Vault HTTP API (`https://vault.example:8200`).
+    set_addr(@self, url: str) : str {
+        self.base_url = url
+        self.offline = url == ""
+        url
+    }
+
+    set_clock(@self, ms: i64) : i64 {
+        self.clock = ms
+        ms
+    }
+
+    /// Seal the vault (reads and writes fail until unseal).
+    seal(@self) : bool {
+        self.sealed = true
+        self.audit = arr_push(self.audit, "seal")
+        true
+    }
+
+    /// Unseal with the derived seal key (or the root token for demos).
+    unseal(@self, key: str) : bool! {
+        ok = key == self.seal_key || key == self.root_token
+        ensure ok else {
+            fail "vault: bad unseal key"
+            return
+        }
+        self.sealed = false
+        self.audit = arr_push(self.audit, "unseal")
+        true
+    }
+
+    ensure_open(self) : bool! {
+        ensure !self.sealed else {
+            fail "vault: sealed"
+            return
+        }
+        true
+    }
+
+    auth(self, token: str) : bool {
+        ts = self.tokens
+        for ts {
+            if it.id == token { return true }
+        }
+        false
+    }
+
+    find_path(self, full: str) : i64 {
+        pos = -1
+        ps = self.paths
+        for ps {
+            if it.path == full { pos = index }
+        }
+        pos
+    }
+
+    /// Write key/value under `mount/path`. Requires a valid token.
+    put(@self, token: str, mount: str, path: str, key: str, value: str) : i64! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        full = "{mount}/{path}"
+        at = self.find_path(full)
+        if at < 0 {
+            sp = SecretPath.{path: full, versions: [], current: 0}
+            self.paths = arr_push(self.paths, sp)
+            at = len(self.paths) - 1
+        }
+        sp = self.paths[at]
+        ver_n = sp.current + 1
+        keys = [key]
+        data = [value]
+        // Merge into previous version's map when updating the same path.
+        if sp.current > 0 {
+            prev = sp.versions[len(sp.versions) - 1]
+            keys = prev.keys
+            data = prev.data
+            slot = -1
+            for keys {
+                if it == key { slot = index }
+            }
+            if slot >= 0 {
+                data = arr_set(data, slot, value)
+            } else {
+                keys = arr_push(keys, key)
+                data = arr_push(data, value)
+            }
+        }
+        sv = SecretVersion.{version: ver_n, data, keys, created_ms: self.clock}
+        sp.versions = arr_push(sp.versions, sv)
+        sp.current = ver_n
+        self.paths = arr_set(self.paths, at, sp)
+        self.audit = arr_push(self.audit, "put:{full}:{key}")
+        ver_n
+    }
+
+    /// Read a key. Optional `version` (0 = current).
+    get(self, token: str, mount: str, path: str, key: str, version: i64) : str! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        full = "{mount}/{path}"
+        at = self.find_path(full)
+        ensure at >= 0 else {
+            fail "vault: not found"
+            return
+        }
+        sp = self.paths[at]
+        want = version
+        if want <= 0 { want = sp.current }
+        hit = ""
+        found = false
+        vs = sp.versions
+        for vs {
+            if it.version == want {
+                ks = it.keys
+                ds = it.data
+                for ks {
+                    if it == key {
+                        hit = ds[index]
+                        found = true
+                    }
+                }
+            }
+        }
+        ensure found else {
+            fail "vault: key not found"
+            return
+        }
+        hit
+    }
+
+    /// Store a `Secret` under mount/path/key (plaintext never logged).
+    put_secret(@self, token: str, mount: str, path: str, key: str, secret: Secret) : i64! {
+        @self.put(token, mount, path, key, secret.reveal())
+    }
+
+    /// Load a `Secret` from mount/path/key.
+    get_secret(self, token: str, mount: str, path: str, key: str, version: i64) : Secret! {
+        v = self.get(token, mount, path, key, version) or err {
+            fail err
+            return
+        }
+        Secret.of(v)
+    }
+
+    /// Delete the latest version of a path (metadata remains).
+    delete(@self, token: str, mount: str, path: str) : bool! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        full = "{mount}/{path}"
+        at = self.find_path(full)
+        ensure at >= 0 else {
+            fail "vault: not found"
+            return
+        }
+        sp = self.paths[at]
+        sp.current = 0
+        self.paths = arr_set(self.paths, at, sp)
+        self.audit = arr_push(self.audit, "delete:{full}")
+        true
+    }
+
+    /// Issue a child token with policies.
+    issue_token(@self, parent: str, id: str, policies: _) : VaultToken! {
+        self.ensure_open() or err { return }
+        ensure self.auth(parent) else {
+            fail "vault: permission denied"
+            return
+        }
+        t = VaultToken.{id, policies, renewable: true}
+        self.tokens = arr_push(self.tokens, t)
+        self.audit = arr_push(self.audit, "token:{id}")
+        t
+    }
+
+    audit_len(self) : i64 => len(self.audit)
+
+    /// Export all current secrets as `path\tkey\tvalue` lines (admin dump).
+    export_tsv(self, token: str) : str! {
+        self.ensure_open() or err { return }
+        ensure token == self.root_token else {
+            fail "vault: root required"
+            return
+        }
+        out = ""
+        ps = self.paths
+        for ps {
+            sp = it
+            if sp.current <= 0 { continue }
+            vs = sp.versions
+            cur = vs[len(vs) - 1]
+            ks = cur.keys
+            ds = cur.data
+            for ks {
+                out = out + sp.path + "\t" + it + "\t" + ds[index] + "\n"
+            }
+        }
+        out
+    }
+
+    /// List secret paths under `mount/` (KV list).
+    list(self, token: str, mount: str) : _! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        out = []
+        prefix = "{mount}/"
+        ps = self.paths
+        for ps {
+            if starts_with(it.path, prefix) && it.current > 0 {
+                out = arr_push(out, it.path)
+            }
+        }
+        out
+    }
+
+    /// Soft-delete then restore a path's current pointer to the latest version.
+    undelete(@self, token: str, mount: str, path: str) : bool! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        full = "{mount}/{path}"
+        at = self.find_path(full)
+        ensure at >= 0 else {
+            fail "vault: not found"
+            return
+        }
+        sp = self.paths[at]
+        n = len(sp.versions)
+        ensure n > 0 else {
+            fail "vault: no versions"
+            return
+        }
+        sp.current = sp.versions[n - 1].version
+        self.paths = arr_set(self.paths, at, sp)
+        self.audit = arr_push(self.audit, "undelete:{full}")
+        true
+    }
+
+    /// Permanently drop all versions of a path.
+    destroy(@self, token: str, mount: str, path: str) : bool! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        full = "{mount}/{path}"
+        at = self.find_path(full)
+        ensure at >= 0 else {
+            fail "vault: not found"
+            return
+        }
+        keep = []
+        ps = self.paths
+        for ps {
+            if index != at { keep = arr_push(keep, it) }
+        }
+        self.paths = keep
+        self.audit = arr_push(self.audit, "destroy:{full}")
+        true
+    }
+
+    /// Enable an additional secrets/auth mount name.
+    enable_mount(@self, token: str, name: str) : bool! {
+        ensure token == self.root_token else {
+            fail "vault: root required"
+            return
+        }
+        ms = self.mounts
+        for ms {
+            if it == name { return true }
+        }
+        self.mounts = arr_push(self.mounts, name)
+        self.audit = arr_push(self.audit, "mount:{name}")
+        true
+    }
+
+    /// Write a named ACL policy.
+    write_policy(@self, token: str, name: str, paths: _, caps: _) : bool! {
+        ensure token == self.root_token else {
+            fail "vault: root required"
+            return
+        }
+        p = VaultPolicy.{name, paths, caps}
+        self.policies = arr_push(self.policies, p)
+        self.audit = arr_push(self.audit, "policy:{name}")
+        true
+    }
+
+    /// Create a userpass login.
+    userpass_create(@self, token: str, user: str, password: str, policies: _) : bool! {
+        ensure token == self.root_token else {
+            fail "vault: root required"
+            return
+        }
+        u = VaultUser.{name: user, password_hash: blake3_hex(password), policies}
+        self.users = arr_push(self.users, u)
+        self.audit = arr_push(self.audit, "userpass:{user}")
+        true
+    }
+
+    /// Login via userpass; returns a new token id.
+    userpass_login(@self, user: str, password: str) : str! {
+        self.ensure_open() or err { return }
+        want = blake3_hex(password)
+        us = self.users
+        for us {
+            if it.name == user && it.password_hash == want {
+                tid = "tok-{user}-{self.clock}"
+                t = VaultToken.{id: tid, policies: it.policies, renewable: true}
+                self.tokens = arr_push(self.tokens, t)
+                self.audit = arr_push(self.audit, "login:{user}")
+                return tid
+            }
+        }
+        fail "vault: invalid credentials"
+        return
+    }
+
+    /// Create an AppRole.
+    approle_create(@self, token: str, role_id: str, secret_id: str, policies: _) : bool! {
+        ensure token == self.root_token else {
+            fail "vault: root required"
+            return
+        }
+        self.approles = arr_push(self.approles, AppRole.{role_id, secret_id, policies})
+        self.audit = arr_push(self.audit, "approle:{role_id}")
+        true
+    }
+
+    /// Login via AppRole.
+    approle_login(@self, role_id: str, secret_id: str) : str! {
+        self.ensure_open() or err { return }
+        ars = self.approles
+        for ars {
+            if it.role_id == role_id && it.secret_id == secret_id {
+                tid = "approle-{role_id}-{self.clock}"
+                t = VaultToken.{id: tid, policies: it.policies, renewable: true}
+                self.tokens = arr_push(self.tokens, t)
+                self.audit = arr_push(self.audit, "approle-login:{role_id}")
+                return tid
+            }
+        }
+        fail "vault: invalid approle"
+        return
+    }
+
+    /// Create a transit key.
+    transit_create(@self, token: str, name: str) : bool! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        mat = blake3_hex("{name}:{self.clock}:{token}")
+        self.transit = arr_push(self.transit, TransitKey.{name, version: 1, material: mat})
+        self.audit = arr_push(self.audit, "transit-create:{name}")
+        true
+    }
+
+    find_transit(self, name: str) : i64 {
+        pos = -1
+        ts = self.transit
+        for ts {
+            if it.name == name { pos = index }
+        }
+        pos
+    }
+
+    /// Encrypt plaintext → vault:v1:<hex> ciphertext.
+    transit_encrypt(self, token: str, key: str, plaintext: str) : str! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        at = self.find_transit(key)
+        ensure at >= 0 else {
+            fail "vault: unknown transit key"
+            return
+        }
+        tk = self.transit[at]
+        ct = blake3_hex("{tk.material}:{plaintext}")
+        "vault:v{tk.version}:{ct}"
+    }
+
+    /// Decrypt a ciphertext produced by `transit_encrypt` (integrity check).
+    transit_decrypt(self, token: str, key: str, ciphertext: str, plaintext: str) : bool! {
+        self.ensure_open() or err { return }
+        ensure self.auth(token) else {
+            fail "vault: permission denied"
+            return
+        }
+        expect = self.transit_encrypt(token, key, plaintext) or ""
+        ensure expect == ciphertext else {
+            fail "vault: ciphertext mismatch"
+            return
+        }
+        true
+    }
+
+    /// `sys/health`-shaped status map as a string.
+    health(self) : str {
+        sealed = "false"
+        if self.sealed { sealed = "true" }
+        off = "false"
+        if self.offline { off = "true" }
+        "{\"initialized\":true,\"sealed\":{sealed},\"standby\":false,\"offline\":{off}}"
+    }
+
+    /// `sys/seal-status` payload.
+    seal_status(self) : str {
+        sealed = "false"
+        if self.sealed { sealed = "true" }
+        "{\"type\":\"shamir\",\"initialized\":true,\"sealed\":{sealed},\"t\":1,\"n\":1,\"progress\":0}"
+    }
+
+    /// HTTP path for KV v2 data (`/v1/{mount}/data/{path}`).
+    http_kv_url(self, mount: str, path: str) : str {
+        base = self.base_url
+        if base == "" { base = "http://127.0.0.1:8200" }
+        "{base}/v1/{mount}/data/{path}"
+    }
+
+    /// HTTP path for sys/health.
+    http_health_url(self) : str {
+        base = self.base_url
+        if base == "" { base = "http://127.0.0.1:8200" }
+        "{base}/v1/sys/health"
+    }
+}
+
+test "put get roundtrip" {
+    v = Vault.new("root-token")
+    @v.set_clock(1700000000000)
+    assert_eq(@v.put("root-token", "secret", "api", "openai_key", "sk-test") or 0, 1)
+    assert_eq(v.get("root-token", "secret", "api", "openai_key", 0) or "", "sk-test")
+}
+
+test "seal blocks reads until unseal" {
+    v = Vault.new("root")
+    @v.put("root", "secret", "x", "k", "v") or 0
+    #assert(@v.seal())
+    bad = v.get("root", "secret", "x", "k", 0)
+    // fail path → or default
+    assert_eq(bad or "sealed", "sealed")
+    #assert(@v.unseal("root") or false)
+    assert_eq(v.get("root", "secret", "x", "k", 0) or "", "v")
+}
+
+test "token policies and versioning" {
+    v = Vault.new("root")
+    t = @v.issue_token("root", "app", ["read", "write"]) or VaultToken.{id: "", policies: [], renewable: false}
+    assert_eq(t.id, "app")
+    assert_eq(@v.put("app", "secret", "svc", "a", "1") or 0, 1)
+    assert_eq(@v.put("app", "secret", "svc", "a", "2") or 0, 2)
+    assert_eq(v.get("app", "secret", "svc", "a", 1) or "", "1")
+    assert_eq(v.get("app", "secret", "svc", "a", 0) or "", "2")
+}
+
+test "audit log grows" {
+    v = Vault.new("root")
+    @v.put("root", "secret", "p", "k", "v") or 0
+    #assert(v.audit_len() >= 1)
+}
+
+test "put_secret/get_secret wrap Secret without log leaks" {
+    v = Vault.new("root")
+    s = Secret.of("sk-vault-never-log")
+    assert_eq(@v.put_secret("root", "secret", "api", "openai_key", s) or 0, 1)
+    got = v.get_secret("root", "secret", "api", "openai_key", 0) or Secret.of("")
+    assert_eq(got.reveal(), "sk-vault-never-log")
+    assert_eq("{got}", "Secret(***)")
+    #assert(host.sys_str_find("{got}", "sk-vault") < 0)
+    // Audit records path/key names only, never the payload.
+    dump = ""
+    n = host.sys_arr_len(v.audit)
+    for 0..n {
+        dump = dump + v.audit[it]
+    }
+    #assert(host.sys_str_find(dump, "sk-vault") < 0)
+}
+
+test "list undelete destroy and mounts" {
+    v = Vault.new("root")
+    @v.put("root", "secret", "api", "k", "v1") or 0
+    @v.put("root", "secret", "db", "k", "v2") or 0
+    listed = v.list("root", "secret") or []
+    assert_eq(len(listed), 2)
+    @v.delete("root", "secret", "api") or false
+    listed2 = v.list("root", "secret") or []
+    assert_eq(len(listed2), 1)
+    #assert(@v.undelete("root", "secret", "api") or false)
+    assert_eq(v.get("root", "secret", "api", "k", 0) or "", "v1")
+    #assert(@v.destroy("root", "secret", "api") or false)
+    assert_eq((v.get("root", "secret", "api", "k", 0) or "gone"), "gone")
+    #assert(@v.enable_mount("root", "kv2") or false)
+}
+
+test "userpass approle policies transit health" {
+    v = Vault.new("root")
+    @v.set_clock(42)
+    #assert(@v.write_policy("root", "apps", ["secret/*"], ["read", "write"]) or false)
+    #assert(@v.userpass_create("root", "amina", "pw", ["apps"]) or false)
+    tok = @v.userpass_login("amina", "pw") or ""
+    #assert(tok != "")
+    #assert(@v.approle_create("root", "role-a", "sec-a", ["apps"]) or false)
+    atok = @v.approle_login("role-a", "sec-a") or ""
+    #assert(atok != "")
+    #assert(@v.transit_create("root", "pay") or false)
+    ct = v.transit_encrypt("root", "pay", "hello") or ""
+    #assert(starts_with(ct, "vault:v1:"))
+    #assert(v.transit_decrypt("root", "pay", ct, "hello") or false)
+    #assert(!(v.transit_decrypt("root", "pay", ct, "nope") or false))
+    h = v.health()
+    #assert(starts_with(h, "{\"initialized\":true"))
+    assert_eq(@v.set_addr("https://vault.local:8200"), "https://vault.local:8200")
+    assert_eq(v.http_kv_url("secret", "api"), "https://vault.local:8200/v1/secret/data/api")
+    assert_eq(v.http_health_url(), "https://vault.local:8200/v1/sys/health")
+    ss = v.seal_status()
+    #assert(starts_with(ss, "{\"type\":\"shamir\""))
+}

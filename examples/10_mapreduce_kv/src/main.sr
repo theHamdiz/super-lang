@@ -1,0 +1,96 @@
+// Parallel Map-Reduce word / n-gram frequency engine
+//
+// Run: super test examples/10_mapreduce_kv/
+
+use std.core.collections
+use std.diag.log
+
+#NGRAM_LEN = 3
+#COMBINE_FACTOR = #NGRAM_LEN + 7
+#COMBINE_BATCH = #COMBINE_FACTOR * #NGRAM_LEN
+
++Batch = {
+    id: i64 = 0
+    count: i64 = 0
+}
+
++map_words(text_len: i64) : i64 {
+    // Approximate token count.
+    text_len / 5
+}
+
++reduce_merge(a: i64, b: i64) : i64 {
+    a + b
+}
+
++mapreduce(n_mappers: i64, batch_size: i64) : i64 {
+    batches = chan[Batch](64)
+    reduced = shared 0
+    scope {
+        reducer = spawn {
+            n = 0
+            for b in batches {
+                @reduced += b.count
+                n += 1
+            }
+            n
+        }
+        for 0..n_mappers {
+            m = spawn {
+                batches.send(Batch{id: it, count: batch_size})
+                batch_size
+            }
+            await m
+        }
+        batches.close()
+        parts = await reducer
+        reduced.load() + parts
+    }
+}
+
++ngram_count(tokens: i64, n: i64) : i64 {
+    if tokens < n {
+        0
+    } else {
+        tokens - n + 1
+    }
+}
+
++combine_batch_size() : i64 {
+    #COMBINE_BATCH
+}
+
+test "map words" {
+    assert_eq(map_words(25), 5)
+}
+
+test "reduce merge" {
+    assert_eq(reduce_merge(3, 4), 7)
+}
+
+test "mapreduce pipeline" {
+    // 4 mappers * batch 10 = 40 reduced; 4 parts → 44
+    assert_eq(mapreduce(4, 10), 44)
+}
+
+test "ngrams" {
+    assert_eq(ngram_count(10, 3), 8)
+    assert_eq(ngram_count(2, 3), 0)
+}
+
+test "comptime ngram constants" {
+    assert_eq(#NGRAM_LEN, 3)
+    assert_eq(combine_batch_size(), 30)
+}
+
+test "stdlib: collections ring buffer + log line for reduce stage" {
+    rb = RingBuf.new(2)
+    @rb.push(1)
+    @rb.push(2)
+    #assert(rb.is_full())
+    assert_eq(@rb.pop() or 0 - 1, 1)
+    lg = Logger.new("mr")
+    @lg.set_clock(0)
+    @lg.info("reduce done")
+    assert_eq(lg.last(), "1970-01-01T00:00:00.000Z INFO  [mr] reduce done")
+}

@@ -1,0 +1,198 @@
+//! std.sys.cli — argv tokenizer (implementation detail for `std.cli.cmd`)
+//!
+//! Application code should **`use std.cli.cmd`** (or `use std.cli` / `use std.clap`)
+//! only. That module re-exports `cli_args`, `cli_parse`, and `CliArgs`, and adds
+//! structured commands. This file is the tokenizer those re-exports wrap — do not
+//! import `std.sys.cli` / `std.cli.args` from apps.
+//!
+//! Grammar:  --name=value   --name   -v   -abc (three short flags)
+//!           --              everything after is positional
+//!           -               a lone dash is positional (stdin convention)
+//!
+//! Length, search, integers, and padding come from `std.core.str`.
+
+use std.core.str
+use std.core.collections
+
+/// `CliArgs` is a parsed argv: positional args plus named options.
++CliArgs = {
+    /// Positional on `CliArgs`. Defaults to `[]`.
+    positional: _ = []
+    /// Names on `CliArgs`. Defaults to `[]`.
+    names: _ = []
+    /// Values on `CliArgs`. Defaults to `[]`.
+    values: _ = []
+
+    /// Create a fresh `CliArgs`.
+    new() : CliArgs => CliArgs.{positional: [], names: [], values: []}
+
+    /// Record option `name` = `value`.
+    set(@self, name: str, value: str) : i64 {
+        self.names = arr_push(self.names, name)
+        self.values = arr_push(self.values, value)
+        0
+    }
+
+    /// Slot of option `name`, or -1.
+    slot(self, name: str) : i64 {
+        pos = -1
+        names = self.names
+        for names {
+            if it == name { pos = index }
+        }
+        pos
+    }
+
+    /// True when option `name` was present.
+    has(self, name: str) : bool => self.slot(name) >= 0
+
+    /// Value of option `name`, or `default` when it was omitted.
+    opt(self, name: str, default: str) : str {
+        at = self.slot(name)
+        ensure at >= 0 else { return default }
+        values = self.values
+        values[at]
+    }
+
+    /// True when boolean flag `name` was set.
+    flag(self, name: str) : bool {
+        v = self.opt(name, "false")
+        v == "true" || v == "1" || v == "yes"
+    }
+
+    /// Integer value of option `name`, or `default` when it was omitted.
+    int(self, name: str, default: i64) : i64 {
+        v = self.opt(name, "")
+        to_i64(v) or default
+    }
+
+    /// How many positional arguments there are.
+    pos_count(self) : i64 => len(self.positional)
+
+    /// Positional argument at index `i`.
+    pos(self, i: i64, default: str) : str {
+        ensure i >= 0 && i < self.pos_count() else { return default }
+        items = self.positional
+        items[i]
+    }
+}
+
+/// Length of the argument text `s`.
++cli_len(s: str) : i64 => byte_len(s)
+
+/// Index of `=` in `s`, or -1.
++cli_find_eq(s: str) : i64 => find(s, "=")
+
+/// Raw process arguments (excluding the program name); empty without a host.
++cli_args() {
+    argv = host.sys_args() or []
+    argv
+}
+
+/// Parse `args` into positional args and named options.
++cli_parse(args: _) : CliArgs {
+    out = CliArgs.new()
+    only_positional = false
+    for args {
+        arg = it
+        n = cli_len(arg)
+        if only_positional || n < 2 || arg[0] != "-" {
+            out.positional = arr_push(out.positional, arg)
+        } else {
+            if arg == "--" {
+                only_positional = true
+            } else {
+                if arg[1] == "-" {
+                    body = arg[2..n]
+                    eq = cli_find_eq(body)
+                    if eq >= 0 {
+                        @out.set(body[0..eq], body[(eq + 1)..cli_len(body)])
+                    } else {
+                        @out.set(body, "true")
+                    }
+                } else {
+                    for 1..n { @out.set(arg[it], "true") }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// True when `c` is a digit.
++cli_digit(c: str) : i64 => find(DIGITS, c)
+
+/// Left-aligned help row: "  --port      listen port".
++cli_help_row(flag: str, text: str, width: i64) : str {
+    pad = pad_right(flag, width, " ")
+    "  {pad}  {text}"
+}
+
+// --- tests ---------------------------------------------------------------------
+
+/// Test that positionals and long options.
+test "positionals and long options" {
+    a = cli_parse(["build", "--release", "--out=dist", "main.sr"])
+    assert_eq(a.pos_count(), 2)
+    assert_eq(a.pos(0, "?"), "build")
+    assert_eq(a.pos(1, "?"), "main.sr")
+    #assert(a.flag("release"))
+    assert_eq(a.opt("out", ""), "dist")
+    #assert(!(a.has("missing")))
+}
+
+/// Test that short flags expand one per letter.
+test "short flags expand one per letter" {
+    a = cli_parse(["-vq", "-x"])
+    #assert(a.flag("v"))
+    #assert(a.flag("q"))
+    #assert(a.flag("x"))
+    #assert(!(a.flag("z")))
+    assert_eq(a.pos_count(), 0)
+}
+
+/// Test that double dash ends options and lone dash is positional.
+test "double dash ends options and lone dash is positional" {
+    a = cli_parse(["--fast", "--", "--not-a-flag", "-"])
+    #assert(a.flag("fast"))
+    #assert(!(a.has("not-a-flag")))
+    assert_eq(a.pos(0, "?"), "--not-a-flag")
+    assert_eq(a.pos(1, "?"), "-")
+}
+
+/// Test that cli_int parses and falls back.
+test "cli_int parses and falls back" {
+    a = cli_parse(["--port=9090", "--bad=9x", "--empty="])
+    assert_eq(a.int("port", 8080), 9090)
+    assert_eq(a.int("bad", 8080), 8080)
+    assert_eq(a.int("empty", 7), 7)
+    assert_eq(a.int("absent", 3000), 3000)
+}
+
+/// Test that later options override earlier ones.
+test "later options override earlier ones" {
+    a = cli_parse(["--mode=dev", "--mode=prod"])
+    assert_eq(a.opt("mode", ""), "prod")
+}
+
+/// Test that defaults for missing positionals.
+test "defaults for missing positionals" {
+    a = cli_parse([])
+    assert_eq(a.pos(0, "main.sr"), "main.sr")
+    assert_eq(a.pos_count(), 0)
+    assert_eq(a.opt("x", "d"), "d")
+}
+
+/// Test that help rows align.
+test "help rows align" {
+    assert_eq(cli_help_row("--port", "listen port", 8), "  --port    listen port")
+}
+
+/// Test that cli_parse of no arguments is empty; cli_args is host-provided.
+test "cli_parse of no arguments is empty; cli_args is host-provided" {
+    a = cli_parse([])
+    assert_eq(a.pos_count(), 0)
+    // The host supplies the real process argv; it is always an array.
+    live = cli_parse(cli_args())
+    #assert(live.pos_count() >= 0)
+}

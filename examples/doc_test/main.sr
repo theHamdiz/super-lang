@@ -1,0 +1,12 @@
+//! Built-in `test` blocks (stripped on `super build --release`).
+//! Run: super test examples/doc_test/
+
++add(a: i64, b: i64) : i64 => a + b
+
++main() {
+    print("sum={add(2, 3)}")
+}
+
+test "add sums" {
+    assert_eq(add(2, 3), 5)
+}

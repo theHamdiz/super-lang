@@ -1,0 +1,17 @@
+// Super product tokens — keep in sync with generated site.css
+$ink: #050f16;
+$field: #ffffff;
+$ground: #ff7a1f;
+$muted: rgba(5, 15, 22, 0.62);
+$surface: #f6f1eb;
+$band-ink: $ink;
+$accent: $ground;
+
+:root {
+  --ink: #{$ink};
+  --field: #{$field};
+  --ground: #{$ground};
+  --accent: #{$accent};
+  --muted: #{$muted};
+  --surface: #{$surface};
+}

@@ -1,0 +1,647 @@
+//! std.data.io — read and write data frames as CSV and Excel (.xlsx)
+//!
+//! Import with:
+//!   use std.data.io
+//!
+//!   f = read_csv("sales.csv") or Frame.new()                      // typed columns: int | float | bool | str, empty cells are nulls
+//!   top = scan_csv("sales.csv") or lazy_csv("", true)             // lazy plan: the text is parsed when collected
+//!   out = top.where("qty > 2").group_by(["region"], [agg_sum("qty", "total")]).collect() or Frame.new()
+//!   write_csv("out.csv", out) or false
+//!   text = frame_to_csv(out)                                      // header + rows, RFC 4180 quoting
+//!
+//!   write_xlsx("out.xlsx", out, "Totals") or false                // one sheet, header row first
+//!   g = read_xlsx("out.xlsx", "Totals") or Frame.new()            // by sheet name; read_xlsx(path, "") takes the first sheet
+//!   wb = frame_to_workbook(out, "Totals")                         // in-memory XlWorkbook (std.fmt.xlsx)
+//!   h = frame_from_sheet(wb.sheet(0), true)
+//!   write_xlsx_sheets("book.xlsx", ["Q1", "Q2"], [q1, q2]) or false   // several sheets in one workbook
+//!   names = xlsx_sheet_names("book.xlsx") or []                  // ["Q1", "Q2"]
+//!   frames = read_xlsx_all("book.xlsx") or []                    // one frame per sheet, in order
+//!   plan = scan_xlsx("book.xlsx", "Q1") or lazy_csv("", true)    // lazy plan over a sheet (windows, join_asof, ...)
+//!   bytes = frame_to_xlsx_bytes(out, "Totals") or []             // in-memory .xlsx (e.g. an HTTP response body)
+//!   back = frame_from_xlsx_bytes(bytes, "Totals") or Frame.new()
+//!
+//! CSV goes through `std.fmt.csv` (`csv_parse` / `csv_encode_row`) and the text-to-column inference of
+//! `frame_from_rows` (`std.data.frame`): a column is `int` when every non-empty cell is an integer, `float` when all
+//! are numbers, `bool` for `true`/`false`, otherwise `str`; empty cells become nulls. Sheets keep their cell types:
+//! a column of numbers becomes `int` when every value is integral (else `float`), booleans become `bool`, and any
+//! mixed column becomes `str` (numbers rendered like Excel would show them). Writing keeps ints as numbers, nulls as
+//! empty cells and strings as text (so `"007"` survives a round trip as text). Public helpers are prefixed `io_`.
+
+use std.core.str
+use std.core.collections
+use std.data.column
+use std.data.expr
+use std.data.frame
+use std.data.plan
+use std.fmt.csv
+use std.fmt.xlsx
+use std.sys.fs
+
+// --- CSV ---------------------------------------------------------------------------------------
+
+/// Frame from CSV text (`has_header` says whether the first row names the columns).
++frame_from_csv(text: str, has_header: bool) : Frame => frame_from_rows(csv_parse(text), has_header)
+
+/// CSV text of a frame: a header line, then one line per row (nulls are empty fields).
++frame_to_csv(f: Frame) : str {
+    csv_lines = []
+    csv_lines = host.sys_arr_push(csv_lines, csv_encode_row(f.names))
+    row = 0
+    while row < f.nrows {
+        cells = []
+        ci = 0
+        while ci < f.width() {
+            cells = host.sys_arr_push(cells, f.text_at(row, ci))
+            ci += 1
+        }
+        csv_lines = host.sys_arr_push(csv_lines, csv_encode_row(cells))
+        row += 1
+    }
+    body = join(csv_lines, "\n")
+    "{body}\n"
+}
+
+/// Read the CSV file `path` (with a header row) into a frame.
++read_csv(path: str) : Frame! {
+    text = fs_read_str(path) or err {
+        fail "{err}"
+        return
+    }
+    frame_from_csv(text, true)
+}
+
+/// Write `f` to the CSV file `path`.
++write_csv(path: str, f: Frame) : bool! {
+    fs_write_str(path, frame_to_csv(f)) or err {
+        fail "{err}"
+        return
+    }
+    true
+}
+
+/// Lazy plan over the CSV file `path` (with a header row). The file is read now, parsed at `collect()`.
++scan_csv(path: str) : LazyFrame! {
+    text = fs_read_str(path) or err {
+        fail "{err}"
+        return
+    }
+    lazy_csv(text, true)
+}
+
+/// Like `scan_csv`, for files without a header row (columns are `c0`, `c1`, ...).
++scan_csv_raw(path: str) : LazyFrame! {
+    text = fs_read_str(path) or err {
+        fail "{err}"
+        return
+    }
+    lazy_csv(text, false)
+}
+
+// --- sheets --------------------------------------------------------------------------------------
+
+/// `name` made unique among the columns of `f` (`_2`, `_3`, ... suffixes) and never empty.
++io_unique_name(f: Frame, name: str, ci: i64) : str {
+    base = name
+    if base == "" { base = "c{ci}" }
+    out = base
+    dup = 2
+    while f.has_col(out) {
+        out = "{base}_{dup}"
+        dup += 1
+    }
+    out
+}
+
+/// Kind a sheet column should become: `DT_INT`, `DT_FLOAT`, `DT_BOOL` or `DT_STR`.
++io_column_kind(sh: XlSheet, ci: i64, first: i64) : i64 {
+    nums = 0
+    ints = 0
+    flags = 0
+    others = 0
+    row = first
+    while row < sh.height() {
+        cell = sh.get(row, ci)
+        if cell.kind == XL_NUM {
+            nums += 1
+            whole = host.sys_floor(cell.num)
+            if cell.num - whole < 1.0e-300 && cell.num < 9.0e15 && cell.num > -9.0e15 { ints += 1 }
+        }
+        if cell.kind == XL_BOOL { flags += 1 }
+        if cell.kind == XL_STR { others += 1 }
+        row += 1
+    }
+    if others > 0 { return DT_STR }
+    if nums > 0 && flags > 0 { return DT_STR }
+    if nums > 0 {
+        if ints == nums { return DT_INT }
+        return DT_FLOAT
+    }
+    if flags > 0 { return DT_BOOL }
+    DT_STR
+}
+
+/// Frame from a sheet. With `has_header` the first row names the columns, otherwise they are `c0`, `c1`, ...
++frame_from_sheet(sh: XlSheet, has_header: bool) : Frame {
+    out = Frame.new()
+    width = sh.width()
+    first = 0
+    if has_header { first = 1 }
+    ci = 0
+    while ci < width {
+        name = "c{ci}"
+        if has_header { name = sh.get(0, ci).show() }
+        name = io_unique_name(out, name, ci)
+        kind = io_column_kind(sh, ci, first)
+        if kind == DT_INT {
+            c = IntCol.new(name)
+            row = first
+            while row < sh.height() {
+                cell = sh.get(row, ci)
+                if cell.kind == XL_NUM { @c.push(host.sys_to_int(cell.num)) } else { @c.push_null() }
+                row += 1
+            }
+            @out.add_int(c)
+        }
+        if kind == DT_FLOAT {
+            c = FloatCol.new(name)
+            row = first
+            while row < sh.height() {
+                cell = sh.get(row, ci)
+                if cell.kind == XL_NUM { @c.push(cell.num) } else { @c.push_null() }
+                row += 1
+            }
+            @out.add_float(c)
+        }
+        if kind == DT_BOOL {
+            c = BoolCol.new(name)
+            row = first
+            while row < sh.height() {
+                cell = sh.get(row, ci)
+                if cell.kind == XL_BOOL { @c.push(cell.flag) } else { @c.push_null() }
+                row += 1
+            }
+            @out.add_bool(c)
+        }
+        if kind == DT_STR {
+            c = StrCol.new(name)
+            row = first
+            while row < sh.height() {
+                cell = sh.get(row, ci)
+                if cell.kind == XL_EMPTY { @c.push_null() } else { @c.push(cell.show()) }
+                row += 1
+            }
+            @out.add_str(c)
+        }
+        ci += 1
+    }
+    out
+}
+
+/// Spreadsheet cell for a frame cell (nulls are empty cells).
++io_cell(c: Cell) : XlCell {
+    if c.null { return xl_empty() }
+    if c.kind == DT_INT { return xl_num(host.sys_to_float(c.i)) }
+    if c.kind == DT_FLOAT { return xl_num(c.f) }
+    if c.kind == DT_BOOL { return xl_bool(c.b) }
+    xl_text(c.s)
+}
+
+/// Sheet called `name` holding `f`: the header row, then one row per frame row.
++frame_to_sheet(f: Frame, name: str) : XlSheet {
+    rows = []
+    head = []
+    for f.names { head = host.sys_arr_push(head, xl_text(it)) }
+    rows = host.sys_arr_push(rows, head)
+    row = 0
+    while row < f.nrows {
+        cells = []
+        ci = 0
+        while ci < f.width() {
+            cells = host.sys_arr_push(cells, io_cell(f.cell(row, ci)))
+            ci += 1
+        }
+        rows = host.sys_arr_push(rows, cells)
+        row += 1
+    }
+    XlSheet.{name, rows}
+}
+
+/// One-sheet workbook holding `f` on a sheet called `sheet_name` (fails only for invalid sheet names, which fall
+/// back to `Sheet1`).
++frame_to_workbook(f: Frame, sheet_name: str) : XlWorkbook {
+    name = sheet_name
+    if !xl_valid_sheet_name(name) { name = "Sheet1" }
+    wb = XlWorkbook.new()
+    wb.sheets = host.sys_arr_push(wb.sheets, frame_to_sheet(f, name))
+    wb
+}
+
+/// Frame from sheet `index` of a workbook (an empty frame when the index is out of range).
++frame_from_workbook(wb: XlWorkbook, index: i64, has_header: bool) : Frame {
+    if index < 0 || index >= wb.sheet_count() { return Frame.new() }
+    frame_from_sheet(wb.sheet(index), has_header)
+}
+
+/// Write `f` to the `.xlsx` file `path` as a single sheet called `sheet_name`.
++write_xlsx(path: str, f: Frame, sheet_name: str) : bool! {
+    xlsx_write_file(path, frame_to_workbook(f, sheet_name)) or err {
+        fail "{err}"
+        return
+    }
+    true
+}
+
+/// Read one sheet of the `.xlsx` file `path` (a header row first). `sheet_name` `""` selects the first sheet.
++read_xlsx(path: str, sheet_name: str) : Frame! {
+    wb = xlsx_read_file(path) or err {
+        fail "{err}"
+        return
+    }
+    index = 0
+    if sheet_name != "" { index = wb.sheet_index(sheet_name) }
+    if index < 0 {
+        fail "xlsx: no sheet named {sheet_name}"
+        return
+    }
+    frame_from_sheet(wb.sheet(index), true)
+}
+
+/// Sheet names of the `.xlsx` file `path`, in workbook order.
++xlsx_sheet_names(path: str) : _! {
+    wb = xlsx_read_file(path) or err {
+        fail "{err}"
+        return
+    }
+    wb.sheet_names()
+}
+
+/// Every sheet of the `.xlsx` file `path` as a frame (header row first), in workbook order.
++read_xlsx_all(path: str) : _! {
+    wb = xlsx_read_file(path) or err {
+        fail "{err}"
+        return
+    }
+    out = []
+    i = 0
+    while i < wb.sheet_count() {
+        out = host.sys_arr_push(out, frame_from_sheet(wb.sheet(i), true))
+        i += 1
+    }
+    out
+}
+
+/// Write `frames[i]` to the sheet `names[i]` of one `.xlsx` workbook. Fails when the lists differ in length or a sheet
+/// name is invalid or repeated (names are compared case-insensitively, like Excel).
++write_xlsx_sheets(path: str, names, frames) : bool! {
+    if host.sys_arr_len(names) != host.sys_arr_len(frames) {
+        fail "xlsx: {host.sys_arr_len(names)} sheet names for {host.sys_arr_len(frames)} frames"
+        return
+    }
+    wb = XlWorkbook.new()
+    i = 0
+    while i < host.sys_arr_len(names) {
+        nm = names[i]
+        idx = @wb.add_sheet(nm)
+        if idx < 0 {
+            fail "xlsx: invalid or duplicate sheet name {nm}"
+            return
+        }
+        item = frames[i]
+        fr: Frame = item
+        wb.sheets = xl_replace(wb.sheets, idx, frame_to_sheet(fr, nm))
+        i += 1
+    }
+    xlsx_write_file(path, wb) or err {
+        fail "{err}"
+        return
+    }
+    true
+}
+
+/// Lazy plan over one sheet of the `.xlsx` file `path` (`""` takes the first sheet); the sheet is read now, typed like
+/// `read_xlsx`.
++scan_xlsx(path: str, sheet_name: str) : LazyFrame! {
+    f = read_xlsx(path, sheet_name) or err {
+        fail "{err}"
+        return
+    }
+    lazy(f)
+}
+
+/// The bytes of a one-sheet `.xlsx` workbook holding `f`.
++frame_to_xlsx_bytes(f: Frame, sheet_name: str) : _! {
+    frame_to_workbook(f, sheet_name).to_bytes() or err {
+        fail "{err}"
+        return
+    }
+}
+
+/// Frame from the sheet called `sheet_name` (`""` for the first) of in-memory `.xlsx` bytes.
++frame_from_xlsx_bytes(bytes: _, sheet_name: str) : Frame! {
+    wb = xlsx_read(bytes) or err {
+        fail "{err}"
+        return
+    }
+    index = 0
+    if sheet_name != "" { index = wb.sheet_index(sheet_name) }
+    if index < 0 {
+        fail "xlsx: no sheet named {sheet_name}"
+        return
+    }
+    frame_from_sheet(wb.sheet(index), true)
+}
+
+// --- tests ------------------------------------------------------------------------------------------
+
+io_sales() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("region", ["EU", "US", "EU", "APAC"]))
+    @f.add_float(float_col("price", [10.5, 20.0, 30.25, 5.0]))
+    @f.add_int(int_col("qty", [3, 1, 2, 10]))
+    @f.add_bool(bool_col("rush", [true, false, false, true]))
+    f
+}
+
+io_tmp(name: str) : str => "{fs_temp_dir()}/super_data_io_{host.sys_unix_ns()}_{name}"
+
+test "csv text round trip keeps types" {
+    f = io_sales()
+    text = frame_to_csv(f)
+    assert_eq(text, "region,price,qty,rush\nEU,10.5,3,true\nUS,20,1,false\nEU,30.25,2,false\nAPAC,5,10,true\n")
+    back = frame_from_csv(text, true)
+    assert_eq(back.height(), 4)
+    assert_eq(back.kind_of("region"), DT_STR)
+    assert_eq(back.kind_of("price"), DT_FLOAT)
+    assert_eq(back.kind_of("qty"), DT_INT)
+    assert_eq(back.kind_of("rush"), DT_BOOL)
+    assert_eq(back.get_float("price").total(), 65.75)
+    assert_eq(back.get_int("qty").total(), 16)
+    #assert(back.same_as(f))
+}
+
+test "csv quoting, nulls and empty frames" {
+    f = Frame.new()
+    c = StrCol.new("note")
+    @c.push("plain")
+    @c.push("has,comma")
+    @c.push("has \"quote\"")
+    @c.push("two\nlines")
+    @c.push_null()
+    @f.add_str(c)
+    @f.add_int(int_col("n", [1, 2, 3, 4, 5]))
+    text = frame_to_csv(f)
+    back = frame_from_csv(text, true)
+    assert_eq(back.height(), 5)
+    assert_eq(back.get_str("note").get(1), "has,comma")
+    assert_eq(back.get_str("note").get(2), "has \"quote\"")
+    assert_eq(back.get_str("note").get(3), "two\nlines")
+    #assert(back.get_str("note").is_null(4))
+    assert_eq(back.get_int("n").total(), 15)
+    assert_eq(frame_to_csv(Frame.new()), "\n")
+    assert_eq(frame_from_csv("", true).width(), 0)
+    assert_eq(frame_from_csv("a,b\n", true).height(), 0)
+    assert_eq(frame_from_csv("a,b\n", true).width(), 2)
+    raw = frame_from_csv("1,2\n3,4\n", false)
+    assert_eq(raw.names[1], "c1")
+    assert_eq(raw.get_int("c0").total(), 4)
+    // CRLF input
+    crlf = frame_from_csv("a,b\r\n1,x\r\n2,y\r\n", true)
+    assert_eq(crlf.height(), 2)
+    assert_eq(crlf.get_str("b").get(1), "y")
+}
+
+test "csv files and lazy scans" {
+    path = io_tmp("sales.csv")
+    #assert(write_csv(path, io_sales()) or false)
+    f = read_csv(path) or Frame.new()
+    #assert(f.same_as(io_sales()))
+    lf = scan_csv(path) or lazy_csv("", true)
+    assert_eq(lf.explain(), "Scan(csv)")
+    out = lf.where("qty >= 2").group_by(["region"], [agg_sum("qty", "total")]).sort_by("total", true).collect() or Frame.new()
+    assert_eq(out.height(), 2)
+    assert_eq(out.text_at(0, 0), "APAC")
+    assert_eq(out.get_int("total").get(0), 10)
+    assert_eq(out.text_at(1, 0), "EU")
+    assert_eq(out.get_int("total").get(1), 5)
+    nohead = fs_write_str(path, "1,2\n3,4\n") or false
+    #assert(nohead)
+    raw = (scan_csv_raw(path) or lazy_csv("", false)).collect() or Frame.new()
+    assert_eq(raw.height(), 2)
+    assert_eq(raw.get_int("c1").total(), 6)
+    fs_remove(path) or false
+    assert_eq((read_csv(path) or Frame.new()).width(), 0)
+    assert_eq((scan_csv(path) or lazy_csv("", true)).explain(), "Scan(csv)")
+    assert_eq((scan_csv_raw(path) or lazy_csv("", true)).explain(), "Scan(csv)")
+    #assert(!(write_csv("/nonexistent_dir_super/x.csv", io_sales()) or false))
+}
+
+test "sheet conversion keeps column types" {
+    f = io_sales()
+    wb = frame_to_workbook(f, "Sales")
+    assert_eq(wb.sheet_count(), 1)
+    sh = wb.sheet(0)
+    assert_eq(sh.name, "Sales")
+    assert_eq(sh.height(), 5)
+    assert_eq(sh.width(), 4)
+    assert_eq(sh.get(0, 2).text, "qty")
+    assert_eq(sh.get(1, 1).num, 10.5)
+    assert_eq(sh.get(1, 2).num, 3.0)
+    #assert(sh.get(1, 3).flag)
+    back = frame_from_sheet(sh, true)
+    assert_eq(back.kind_of("qty"), DT_INT)
+    assert_eq(back.kind_of("price"), DT_FLOAT)
+    assert_eq(back.kind_of("rush"), DT_BOOL)
+    assert_eq(back.kind_of("region"), DT_STR)
+    #assert(back.same_as(f))
+    // through the binary format too
+    again = xlsx_read(wb.to_bytes() or []) or XlWorkbook.new()
+    #assert(frame_from_workbook(again, 0, true).same_as(f))
+    assert_eq(frame_from_workbook(again, 3, true).width(), 0)
+    assert_eq(frame_from_workbook(again, -1, true).width(), 0)
+    // an invalid sheet name falls back
+    assert_eq(frame_to_workbook(f, "bad/name").sheet(0).name, "Sheet1")
+}
+
+test "nulls and text that looks like numbers survive xlsx" {
+    f = Frame.new()
+    codes = StrCol.new("code")
+    @codes.push("007")
+    @codes.push("12")
+    @codes.push_null()
+    @f.add_str(codes)
+    amounts = FloatCol.new("amount")
+    @amounts.push(1.5)
+    @amounts.push_null()
+    @amounts.push(-2.0)
+    @f.add_float(amounts)
+    counts = IntCol.new("n")
+    @counts.push_null()
+    @counts.push(4)
+    @counts.push(5)
+    @f.add_int(counts)
+    wb = frame_to_workbook(f, "T")
+    back = frame_from_workbook(xlsx_read(wb.to_bytes() or []) or XlWorkbook.new(), 0, true)
+    assert_eq(back.kind_of("code"), DT_STR)
+    assert_eq(back.get_str("code").get(0), "007")
+    #assert(back.get_str("code").is_null(2))
+    assert_eq(back.kind_of("amount"), DT_FLOAT)
+    #assert(back.get_float("amount").is_null(1))
+    assert_eq(back.get_float("amount").total(), -0.5)
+    assert_eq(back.kind_of("n"), DT_INT)
+    #assert(back.get_int("n").is_null(0))
+    assert_eq(back.get_int("n").total(), 9)
+    #assert(back.same_as(f))
+}
+
+test "sheet column typing rules" {
+    sh = XlSheet.{name: "x", rows: [
+        [xl_text("ints"), xl_text("floats"), xl_text("flags"), xl_text("mixed"), xl_text("nums_and_flags"), xl_text("blank"), xl_text("ints")],
+        [xl_num(1.0), xl_num(1.5), xl_bool(true), xl_num(1.0), xl_num(1.0), xl_empty(), xl_text("dup")],
+        [xl_num(-4.0), xl_num(2.0), xl_bool(false), xl_text("two"), xl_bool(true), xl_empty(), xl_text("dup2")],
+        [xl_empty(), xl_empty(), xl_empty(), xl_empty(), xl_empty(), xl_empty(), xl_empty()]
+    ]}
+    f = frame_from_sheet(sh, true)
+    assert_eq(f.width(), 7)
+    assert_eq(f.height(), 3)
+    assert_eq(f.kind_of("ints"), DT_INT)
+    assert_eq(f.get_int("ints").null_count(), 1)
+    assert_eq(f.kind_of("floats"), DT_FLOAT)
+    assert_eq(f.kind_of("flags"), DT_BOOL)
+    assert_eq(f.kind_of("mixed"), DT_STR)
+    assert_eq(f.get_str("mixed").get(0), "1")
+    assert_eq(f.get_str("mixed").get(1), "two")
+    assert_eq(f.kind_of("nums_and_flags"), DT_STR)
+    assert_eq(f.get_str("nums_and_flags").get(1), "true")
+    assert_eq(f.kind_of("blank"), DT_STR)
+    assert_eq(f.get_str("blank").null_count(), 3)
+    assert_eq(f.names[6], "ints_2")
+    assert_eq(io_column_kind(sh, 0, 1), DT_INT)
+    assert_eq(io_column_kind(sh, 99, 1), DT_STR)
+    // headerless: columns are c0.. and the first row is data
+    raw = frame_from_sheet(XlSheet.{name: "y", rows: [[xl_num(1.0), xl_num(2.0)], [xl_num(3.0)]]}, false)
+    assert_eq(raw.names[0], "c0")
+    assert_eq(raw.height(), 2)
+    assert_eq(raw.get_int("c0").total(), 4)
+    assert_eq(raw.get_int("c1").null_count(), 1)
+    // a header cell that is empty gets a generated name
+    anon = frame_from_sheet(XlSheet.{name: "z", rows: [[xl_empty(), xl_text("a")], [xl_num(1.0), xl_num(2.0)]]}, true)
+    assert_eq(anon.names[0], "c0")
+    assert_eq(anon.names[1], "a")
+    assert_eq(io_unique_name(anon, "a", 5), "a_2")
+    assert_eq(io_unique_name(anon, "", 5), "c5")
+    assert_eq(io_cell(cell_null()).kind, XL_EMPTY)
+    assert_eq(io_cell(cell_int(3)).num, 3.0)
+    assert_eq(io_cell(cell_float(0.5)).num, 0.5)
+    #assert(io_cell(cell_bool(true)).flag)
+    assert_eq(io_cell(cell_str("s")).text, "s")
+}
+
+test "xlsx files" {
+    path = io_tmp("report.xlsx")
+    f = io_sales()
+    #assert(write_xlsx(path, f, "Q1") or false)
+    first = read_xlsx(path, "") or Frame.new()
+    #assert(first.same_as(f))
+    named = read_xlsx(path, "q1") or Frame.new()
+    assert_eq(named.height(), 4)
+    assert_eq((read_xlsx(path, "Nope") or Frame.new()).width(), 0)
+    msg = read_xlsx(path, "Nope") or err { "{err}" }
+    assert_eq(msg, "xlsx: no sheet named Nope")
+    fs_remove(path) or false
+    assert_eq((read_xlsx(path, "") or Frame.new()).width(), 0)
+    #assert(!(write_xlsx("/nonexistent_dir_super/x.xlsx", f, "S") or false))
+}
+
+test "a lazy pipeline reads csv, aggregates and exports xlsx" {
+    csv = "region,units,price\nEU,3,2.5\nUS,1,4.0\nEU,5,2.5\nAPAC,2,10.0\nUS,4,4.0\n"
+    plan = lazy_csv(csv, true)
+        .with_expr("revenue", "units * price")
+        .group_by(["region"], [agg_sum("revenue", "total"), agg_rows("orders")])
+        .sort_by("total", true)
+    out = plan.optimize().collect() or Frame.new()
+    assert_eq(out.height(), 3)
+    assert_eq(out.text_at(0, 0), "EU")
+    assert_eq(out.get_float("total").get(0), 20.0)
+    assert_eq(out.get_float("total").get(1), 20.0)
+    assert_eq(out.get_int("orders").total(), 5)
+    wb = frame_to_workbook(out, "Revenue")
+    back = frame_from_workbook(xlsx_read(wb.to_bytes() or []) or XlWorkbook.new(), 0, true)
+    // sheets keep text and flags exactly, but whole-number floats read back as ints
+    assert_eq(back.kind_of("total"), DT_INT)
+    assert_eq(back.get_int("total").total(), 60)
+    assert_eq(back.get_str("region").get(2), "APAC")
+    assert_eq(back.get_int("orders").total(), 5)
+    // CSV carries no types: whole-number floats come back as ints
+    via_csv = frame_from_csv(frame_to_csv(out), true)
+    assert_eq(via_csv.kind_of("total"), DT_INT)
+    assert_eq(via_csv.get_int("total").total(), 60)
+    assert_eq(via_csv.get_int("orders").total(), 5)
+}
+
+test "multi-sheet workbooks, bytes and lazy xlsx scans" {
+    path = io_tmp("book.xlsx")
+    q1 = io_sales()
+    q2 = io_sales().head(2)
+    #assert(write_xlsx_sheets(path, ["Q1", "Q2"], [q1, q2]) or false)
+    names = xlsx_sheet_names(path) or []
+    assert_eq(host.sys_arr_len(names), 2)
+    assert_eq(names[0], "Q1")
+    assert_eq(names[1], "Q2")
+    all = read_xlsx_all(path) or []
+    assert_eq(host.sys_arr_len(all), 2)
+    first: Frame = all[0]
+    second: Frame = all[1]
+    #assert(first.same_as(q1))
+    #assert(second.same_as(q2))
+    assert_eq((read_xlsx(path, "q2") or Frame.new()).height(), 2)
+    // lazy scan of a sheet feeds the plan engine
+    plan = (scan_xlsx(path, "Q1") or lazy_csv("", true)).where("qty >= 2").group_by(["region"], [agg_sum("qty", "total")]).sort_by("total", true)
+    out = plan.collect() or Frame.new()
+    assert_eq(out.height(), 2)
+    assert_eq(out.get_int("total").get(0), 10)
+    assert_eq((scan_xlsx(path, "Nope") or lazy_csv("", true)).explain(), "Scan(csv)")
+    assert_eq((scan_xlsx(path, "") or lazy_csv("", true)).explain(), "Scan(frame 4x4)")
+    // failures
+    duplicate_names = ["A", "a"]
+    duplicate_frames = [q1, q2]
+    invalid_names = ["bad/name"]
+    one_frame = [q1]
+    one_name = ["A"]
+    no_frames = []
+    #assert(!(write_xlsx_sheets(path, duplicate_names, duplicate_frames) or false))
+    #assert(!(write_xlsx_sheets(path, invalid_names, one_frame) or false))
+    #assert(!(write_xlsx_sheets(path, one_name, no_frames) or false))
+    fs_remove(path) or false
+    assert_eq(len(xlsx_sheet_names(path) or []), 0)
+    assert_eq(len(read_xlsx_all(path) or []), 0)
+    // in-memory round trip
+    bytes = frame_to_xlsx_bytes(q1, "Totals") or []
+    #assert(host.sys_arr_len(bytes) > 100)
+    #assert((frame_from_xlsx_bytes(bytes, "") or Frame.new()).same_as(q1))
+    assert_eq((frame_from_xlsx_bytes(bytes, "totals") or Frame.new()).height(), 4)
+    assert_eq((frame_from_xlsx_bytes(bytes, "Nope") or Frame.new()).width(), 0)
+    invalid_xlsx = [1, 2, 3]
+    assert_eq((frame_from_xlsx_bytes(invalid_xlsx, "") or Frame.new()).width(), 0)
+}
+
+test "windows, as-of joins and dynamic groups survive an xlsx round trip" {
+    f = Frame.new()
+    @f.add_str(str_col("sym", ["A", "A", "B", "A", "B"]))
+    @f.add_int(int_col("t", [1, 2, 2, 7, 9]))
+    @f.add_float(float_col("px", [10.5, 11.0, 20.0, 12.5, 21.0]))
+    bytes = frame_to_xlsx_bytes(f, "Ticks") or []
+    back = frame_from_xlsx_bytes(bytes, "Ticks") or Frame.new()
+    #assert(back.same_as(f))
+    w = back.over(["sym"], ["t"], [win_cum_sum("px", "run"), win_lag("px", "prev", 1), win_rolling_mean("px", "avg2", 2)])
+    assert_eq(w.get_float("run").get(3), 34.0)
+    assert_eq(w.get_float("prev").get(3), 11.0)
+    assert_eq(w.get_float("avg2").get(3), 11.75)
+    asof = back.join_asof(back.rename("px", "px_q").select(["sym", "t", "px_q"]), "t", ["sym"], "backward", -1.0)
+    assert_eq(asof.get_float("px_q").get(3), 12.5)
+    dyn = back.group_by_dynamic("t", 5, ["sym"], [agg_sum("px", "total")])
+    assert_eq(dyn.height(), 4)
+    assert_eq(dyn.get_float("total").total(), 75.0)
+    // streaming a scan of the same data gives the same totals
+    plan = lazy(back).group_by(["sym"], [agg_sum("px", "total"), agg_mean("px", "avg")]).sort_by("sym", false)
+    #assert((plan.collect_streaming(2) or Frame.new()).same_as(plan.collect() or Frame.new()))
+}

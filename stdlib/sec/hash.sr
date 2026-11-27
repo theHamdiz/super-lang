@@ -1,0 +1,132 @@
+//! std.sec.hash — high-performance hashing (host crypto + pure-Super non-crypto digests)
+//!
+//! Import: use std.sec.hash
+//!
+//! Cryptographic (Tier-1 host):
+//!   blake3_hex blake2s_hex blake2b_hex sha3_256_hex sha3_512_hex
+//!   keccak256_hex shake128_hex shake256_hex sha256_hex sha512_hex
+//!
+//! Non-cryptographic (pure Super + comptime constants):
+//!   crc32 fnv1a32 djb2
+
+/// `HASH_CRC_POLY` is `3988292384`.
++HASH_CRC_POLY = 3988292384
+/// `HASH_FNV_OFFSET32` is `2166136261`.
++HASH_FNV_OFFSET32 = 2166136261
+/// `HASH_FNV_PRIME32` is `16777619`.
++HASH_FNV_PRIME32 = 16777619
+
+/// Lowercase hex BLAKE3 of `s`.
++blake3_hex(s: str) : str => host.sys_blake3(s)
+/// Lowercase hex BLAKE2s of `s`.
++blake2s_hex(s: str) : str => host.sys_blake2s(s)
+/// Lowercase hex BLAKE2b of `s`.
++blake2b_hex(s: str) : str => host.sys_blake2b(s)
+/// Lowercase hex SHA3-256 of `s`.
++sha3_256_hex(s: str) : str => host.sys_sha3_256(s)
+/// Lowercase hex SHA3-512 of `s`.
++sha3_512_hex(s: str) : str => host.sys_sha3_512(s)
+/// Lowercase hex Keccak-256 of `s`.
++keccak256_hex(s: str) : str => host.sys_keccak256(s)
+/// Lowercase hex SHAKE128 of `s`.
++shake128_hex(s: str, n: i64) : str => host.sys_shake128(s, n)
+/// Lowercase hex SHAKE256 of `s`.
++shake256_hex(s: str, n: i64) : str => host.sys_shake256(s, n)
+/// Lowercase hex SHA-256 of `s`.
++sha256_hex(s: str) : str => host.sys_sha256(s)
+/// Raw SHA-256 of `s`.
++sha256(s: str) : str => sha256_hex(s)
+/// Base64 SHA-1 of `s`.
++sha1_base64(s: str) : str => host.sys_sha1_base64(s)
+/// Lowercase hex SHA-512 of `s`.
++sha512_hex(s: str) : str => host.sys_sha512(s)
+/// Lowercase hex HMAC-SHA256 of `msg` under key `key`.
++hmac_sha256_hex(key: str, msg: str) : str => host.sys_hmac_sha256(key, msg)
+/// SHA3-based key derivation of `ikm`.
++kdf_sha3_hex(ikm: str, info: str, n: i64) : str => host.sys_kdf_sha3(ikm, info, n)
+
+/// 32-bit hash of `x`.
++hash_u32(x: i64) : i64 {
+    v = x % 4294967296
+    if v < 0 { v = v + 4294967296 }
+    v
+}
+
+/// XOR-fold `a` down to 32 bits.
++hash_xor32(a: i64, b: i64) : i64 {
+    (hash_u32(a) ^ hash_u32(b)) & 4294967295
+}
+
+/// `CRC32_LUT` type.
++CRC32_LUT = #for i in 0..256 {
+    crc = i
+    for 0..8 {
+        if (crc & 1) == 1 {
+            crc = (crc >> 1) ^ HASH_CRC_POLY
+        } else {
+            crc = crc >> 1
+        }
+    }
+    crc & 4294967295
+}
+
+/// IEEE CRC-32 (ISO 3309) over the UTF-8 bytes of `s`, host-native.
++crc32(s: str) : i64 => host.sys_crc32(s)
+
+/// FNV-1a 32-bit — fast hash-map keying.
++fnv1a32(s: str) : i64 {
+    h = HASH_FNV_OFFSET32
+    n = host.sys_str_len(s)
+    for 0..n {
+        h = hash_xor32(h, host.sys_ord(s[it]))
+        h = hash_u32(h * HASH_FNV_PRIME32)
+    }
+    h
+}
+
+/// djb2 hash of `s`.
++djb2(s: str) : i64 {
+    h = 5381
+    n = host.sys_str_len(s)
+    for 0..n {
+        h = hash_u32(h * 33 + host.sys_ord(s[it]))
+    }
+    h
+}
+
+/// Test that stdlib.hash blake3 and sha3 lengths.
+test "stdlib.hash blake3 and sha3 lengths" {
+    assert_eq(host.sys_str_len(blake3_hex("abc")), 64)
+    assert_eq(host.sys_str_len(sha3_256_hex("abc")), 64)
+    assert_eq(host.sys_str_len(blake2s_hex("abc")), 64)
+    assert_eq(host.sys_str_len(blake2b_hex("abc")), 128)
+    assert_eq(host.sys_str_len(keccak256_hex("abc")), 64)
+    assert_eq(host.sys_str_len(shake128_hex("abc", 16)), 32)
+    assert_eq(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+}
+
+/// Test that stdlib.hash noncrypto digests.
+test "stdlib.hash noncrypto digests" {
+    assert_eq(crc32(""), 0)
+    #assert(fnv1a32("a") != fnv1a32("b"))
+    #assert(djb2("hello") != 0)
+}
+
+/// Test that stdlib.hash crc32 known vectors.
+test "stdlib.hash crc32 known vectors" {
+    assert_eq(crc32(""), 0)
+    assert_eq(crc32("123456789"), 3421780262)
+    assert_eq(crc32("a"), 3904355907)
+    assert_eq(crc32("The quick brown fox jumps over the lazy dog"), 1095738169)
+    assert_eq(crc32("abc"), 891568578)
+}
+
+/// Test that stdlib.hash sha256 alias and sha1_base64.
+test "stdlib.hash sha256 alias and sha1_base64" {
+    assert_eq(sha256("abc"), sha256_hex("abc"))
+    assert_eq(sha256(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_eq(sha1_base64("abc"), "qZk+NkcGgWq6PiVxeFDCbJzQ2J0=")
+    assert_eq(sha1_base64(""), "2jmj7l5rSw0yVb/vlWAYkK/YBwk=")
+    // RFC 6455 section 1.3 handshake example
+    assert_eq(sha1_base64("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}

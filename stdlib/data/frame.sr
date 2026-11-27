@@ -1,0 +1,4353 @@
+//! std.data.frame — in-memory columnar data frames
+//!
+//! Import with:
+//!   use std.data.frame
+//!
+//!   f = Frame.new()
+//!   @f.add_str(str_col("region", ["EU", "US", "EU", "APAC"]))
+//!   @f.add_float(float_col("price", [10.0, 20.0, 30.0, 5.0]))
+//!   @f.add_int(int_col("qty", [3, 1, 2, 10]))
+//!
+//!   big = f.filter(expr("price * qty >= 50") or fail_expr())      // 3 rows
+//!   cols = f.select(["region", "qty"])
+//!   rev = f.with_column("revenue", expr("price * qty") or fail_expr())
+//!   by = rev.group_by(["region"], [agg_sum("revenue", "total"), agg_rows("n")])
+//!   top = by.sort_by("total", true)
+//!   joined = f.join(prices, ["region"], "left")                    // inner | left | right | outer
+//!   print(top.to_text(10))
+//!
+//! A `Frame` is a set of equal-length typed, null-aware columns (`std.data.column`) addressed by name.
+//! Operations return new frames and never touch the input. Rows are evaluated with `std.data.expr`
+//! (`Cell` results; a predicate keeps a row only when it is non-null `true`). Group keys and join keys compare by
+//! text, so `1` (int) and `"1"` (str) are the same key; nulls group together but never join. Groups appear in
+//! first-seen order. Public helpers are prefixed `fr_`; aggregation specs are built with `agg_*`.
+
+use std.core.str
+use std.core.collections
+use std.data.column
+use std.data.expr
+
+/// Aggregate: sum of non-null values (int stays int).
++AG_SUM = 0
+/// Aggregate: mean of non-null values.
++AG_MEAN = 1
+/// Aggregate: minimum (numbers, bools and strings).
++AG_MIN = 2
+/// Aggregate: maximum (numbers, bools and strings).
++AG_MAX = 3
+/// Aggregate: number of non-null values.
++AG_COUNT = 4
+/// Aggregate: number of rows in the group.
++AG_ROWS = 5
+/// Aggregate: first non-null value.
++AG_FIRST = 6
+/// Aggregate: last non-null value.
++AG_LAST = 7
+/// Aggregate: sample standard deviation.
++AG_STD = 8
+/// Aggregate: number of distinct non-null values.
++AG_NUNIQUE = 9
+
+/// One aggregation: apply `op` to column `col` and call the result `out`.
++AggSpec = {
+    op: i64 = 0
+    col: str = ""
+    out: str = ""
+}
+
+/// Sum of `col` per group.
++agg_sum(col: str, out: str) : AggSpec => AggSpec.{op: AG_SUM, col, out}
+/// Mean of `col` per group.
++agg_mean(col: str, out: str) : AggSpec => AggSpec.{op: AG_MEAN, col, out}
+/// Minimum of `col` per group.
++agg_min(col: str, out: str) : AggSpec => AggSpec.{op: AG_MIN, col, out}
+/// Maximum of `col` per group.
++agg_max(col: str, out: str) : AggSpec => AggSpec.{op: AG_MAX, col, out}
+/// Non-null count of `col` per group.
++agg_count(col: str, out: str) : AggSpec => AggSpec.{op: AG_COUNT, col, out}
+/// Row count per group.
++agg_rows(out: str) : AggSpec => AggSpec.{op: AG_ROWS, col: "", out}
+/// First non-null value of `col` per group.
++agg_first(col: str, out: str) : AggSpec => AggSpec.{op: AG_FIRST, col, out}
+/// Last non-null value of `col` per group.
++agg_last(col: str, out: str) : AggSpec => AggSpec.{op: AG_LAST, col, out}
+/// Sample standard deviation of `col` per group.
++agg_std(col: str, out: str) : AggSpec => AggSpec.{op: AG_STD, col, out}
+/// Distinct non-null count of `col` per group.
++agg_nunique(col: str, out: str) : AggSpec => AggSpec.{op: AG_NUNIQUE, col, out}
+
+// --- window specs ---------------------------------------------------------------------------------
+
+/// Window: 1-based position of the row inside its (ordered) partition.
++WN_ROW_NUMBER = 20
+/// Window: rank by the `over` order keys; ties share the smallest rank and leave gaps (SQL `RANK`).
++WN_RANK = 21
+/// Window: like `WN_RANK` without gaps (SQL `DENSE_RANK`).
++WN_DENSE_RANK = 22
+/// Window: value `n` rows earlier in the partition (null before the start).
++WN_LAG = 23
+/// Window: value `n` rows later in the partition (null past the end).
++WN_LEAD = 24
+/// Window: running sum (null input rows stay null and are skipped).
++WN_CUM_SUM = 25
+/// Window: running minimum.
++WN_CUM_MIN = 26
+/// Window: running maximum.
++WN_CUM_MAX = 27
+/// Window: running count of non-null values.
++WN_CUM_COUNT = 28
+/// Window: sum over the last `n` rows (including the current one).
++WN_ROLL_SUM = 30
+/// Window: mean over the last `n` rows.
++WN_ROLL_MEAN = 31
+/// Window: sample standard deviation over the last `n` rows.
++WN_ROLL_STD = 32
+/// Window: minimum over the last `n` rows.
++WN_ROLL_MIN = 33
+/// Window: maximum over the last `n` rows.
++WN_ROLL_MAX = 34
+
+/// One window expression for `Frame.over`: apply `op` to column `col` and call the result `out`. `op` is any `AG_*`
+/// aggregate (broadcast over the whole partition, like Polars `agg.over(...)`) or a `WN_*` operation. `n` is the
+/// lag/lead offset or the rolling window length; `min_periods` is the number of non-null values a rolling window
+/// needs before it yields a value (defaults to `n`).
++WinSpec = {
+    op: i64 = 0
+    col: str = ""
+    out: str = ""
+    n: i64 = 1
+    min_periods: i64 = 1
+}
+
+/// Partition-wide sum of `col`, repeated on every row.
++win_sum(col: str, out: str) : WinSpec => WinSpec.{op: AG_SUM, col, out, n: 1, min_periods: 1}
+/// Partition-wide mean.
++win_mean(col: str, out: str) : WinSpec => WinSpec.{op: AG_MEAN, col, out, n: 1, min_periods: 1}
+/// Partition-wide minimum.
++win_min(col: str, out: str) : WinSpec => WinSpec.{op: AG_MIN, col, out, n: 1, min_periods: 1}
+/// Partition-wide maximum.
++win_max(col: str, out: str) : WinSpec => WinSpec.{op: AG_MAX, col, out, n: 1, min_periods: 1}
+/// Partition-wide non-null count.
++win_count(col: str, out: str) : WinSpec => WinSpec.{op: AG_COUNT, col, out, n: 1, min_periods: 1}
+/// Partition-wide row count.
++win_rows(out: str) : WinSpec => WinSpec.{op: AG_ROWS, col: "", out, n: 1, min_periods: 1}
+/// Partition-wide sample standard deviation.
++win_std(col: str, out: str) : WinSpec => WinSpec.{op: AG_STD, col, out, n: 1, min_periods: 1}
+/// Partition-wide first non-null value (in the `over` order).
++win_first(col: str, out: str) : WinSpec => WinSpec.{op: AG_FIRST, col, out, n: 1, min_periods: 1}
+/// Partition-wide last non-null value (in the `over` order).
++win_last(col: str, out: str) : WinSpec => WinSpec.{op: AG_LAST, col, out, n: 1, min_periods: 1}
+/// Partition-wide distinct non-null count.
++win_nunique(col: str, out: str) : WinSpec => WinSpec.{op: AG_NUNIQUE, col, out, n: 1, min_periods: 1}
+/// 1-based position inside the partition.
++win_row_number(out: str) : WinSpec => WinSpec.{op: WN_ROW_NUMBER, col: "", out, n: 1, min_periods: 1}
+/// Rank by the order keys (ties share the smallest rank).
++win_rank(out: str) : WinSpec => WinSpec.{op: WN_RANK, col: "", out, n: 1, min_periods: 1}
+/// Dense rank by the order keys.
++win_dense_rank(out: str) : WinSpec => WinSpec.{op: WN_DENSE_RANK, col: "", out, n: 1, min_periods: 1}
+/// Value of `col` `n` rows earlier.
++win_lag(col: str, out: str, n: i64) : WinSpec => WinSpec.{op: WN_LAG, col, out, n, min_periods: 1}
+/// Value of `col` `n` rows later.
++win_lead(col: str, out: str, n: i64) : WinSpec => WinSpec.{op: WN_LEAD, col, out, n, min_periods: 1}
+/// Running sum of `col`.
++win_cum_sum(col: str, out: str) : WinSpec => WinSpec.{op: WN_CUM_SUM, col, out, n: 1, min_periods: 1}
+/// Running minimum of `col`.
++win_cum_min(col: str, out: str) : WinSpec => WinSpec.{op: WN_CUM_MIN, col, out, n: 1, min_periods: 1}
+/// Running maximum of `col`.
++win_cum_max(col: str, out: str) : WinSpec => WinSpec.{op: WN_CUM_MAX, col, out, n: 1, min_periods: 1}
+/// Running non-null count of `col`.
++win_cum_count(col: str, out: str) : WinSpec => WinSpec.{op: WN_CUM_COUNT, col, out, n: 1, min_periods: 1}
+/// Sum of the last `window` rows (needs `window` non-null values unless `win_min_periods` lowers it).
++win_rolling_sum(col: str, out: str, window: i64) : WinSpec => WinSpec.{op: WN_ROLL_SUM, col, out, n: window, min_periods: window}
+/// Mean of the last `window` rows.
++win_rolling_mean(col: str, out: str, window: i64) : WinSpec => WinSpec.{op: WN_ROLL_MEAN, col, out, n: window, min_periods: window}
+/// Sample standard deviation of the last `window` rows (needs at least two values).
++win_rolling_std(col: str, out: str, window: i64) : WinSpec => WinSpec.{op: WN_ROLL_STD, col, out, n: window, min_periods: window}
+/// Minimum of the last `window` rows.
++win_rolling_min(col: str, out: str, window: i64) : WinSpec => WinSpec.{op: WN_ROLL_MIN, col, out, n: window, min_periods: window}
+/// Maximum of the last `window` rows.
++win_rolling_max(col: str, out: str, window: i64) : WinSpec => WinSpec.{op: WN_ROLL_MAX, col, out, n: window, min_periods: window}
+/// Copy of `spec` that yields a rolling value once `k` non-null values are in the window.
++win_min_periods(spec: WinSpec, k: i64) : WinSpec => WinSpec.{op: spec.op, col: spec.col, out: spec.out, n: spec.n, min_periods: k}
+
+// --- key index ------------------------------------------------------------------------------------
+
+/// Maps distinct strings to dense ids `0, 1, 2, ...` in first-seen order (hash table with probing on collisions).
++KeyIndex = {
+    map: _ = []
+    keys: _ = []
+
+    /// Empty index.
+    new() : KeyIndex => KeyIndex.{map: HashMap.new(), keys: []}
+
+    /// Number of distinct keys.
+    size(self) : i64 => host.sys_arr_len(self.keys)
+
+    /// Id of `key`, or `-1`.
+    find(self, key: str) : i64 {
+        m: HashMap = self.map
+        probe = dt_hash_str(key)
+        while true {
+            slot = m.get(probe) or -1
+            if slot < 0 { return -1 }
+            if self.keys[slot] == key { return slot }
+            probe += 1
+        }
+        -1
+    }
+
+    /// Id of `key`, inserting it when new.
+    find_or_add(@self, key: str) : i64 {
+        probe = dt_hash_str(key)
+        while true {
+            m: HashMap = self.map
+            slot = m.get(probe) or -1
+            if slot < 0 {
+                id = host.sys_arr_len(self.keys)
+                @m.put(probe, id)
+                self.map = m
+                self.keys = host.sys_arr_push(self.keys, key)
+                return id
+            }
+            if self.keys[slot] == key { return slot }
+            probe += 1
+        }
+        -1
+    }
+}
+
+// --- the frame ---------------------------------------------------------------------------------
+
+/// A collection of equal-length typed columns. `kinds[c]` is the dtype of column `c` and `slots[c]` its position in the
+/// matching typed array (`ints`, `floats`, `bools` or `strs`).
++Frame = {
+    names: _ = []
+    kinds: _ = []
+    slots: _ = []
+    ints: _ = []
+    floats: _ = []
+    bools: _ = []
+    strs: _ = []
+    nrows: i64 = 0
+
+    /// Frame with no columns and no rows.
+    new() : Frame => Frame.{names: [], kinds: [], slots: [], ints: [], floats: [], bools: [], strs: [], nrows: 0}
+
+    /// Number of columns.
+    width(self) : i64 => host.sys_arr_len(self.names)
+
+    /// Number of rows.
+    height(self) : i64 => self.nrows
+
+    /// Index of column `name`, or `-1`.
+    col_index(self, name: str) : i64 {
+        i = 0
+        n = host.sys_arr_len(self.names)
+        while i < n {
+            if self.names[i] == name { return i }
+            i += 1
+        }
+        -1
+    }
+
+    /// True when column `name` exists.
+    has_col(self, name: str) : bool => self.col_index(name) >= 0
+
+    /// Dtype tag of column `name`, or `-1`.
+    kind_of(self, name: str) : i64 {
+        ci = self.col_index(name)
+        ensure ci >= 0 else { return -1 }
+        self.kinds[ci]
+    }
+
+    /// True when a column of `n` rows can join this frame.
+    accepts(self, n: i64) : bool => host.sys_arr_len(self.names) == 0 || n == self.nrows
+
+    /// Remove column `name` in place (a no-op when absent).
+    clear_name(@self, name: str) : i64 {
+        ci = self.col_index(name)
+        ensure ci >= 0 else { return 0 }
+        rebuilt = fr_without(self, name)
+        self.names = rebuilt.names
+        self.kinds = rebuilt.kinds
+        self.slots = rebuilt.slots
+        self.ints = rebuilt.ints
+        self.floats = rebuilt.floats
+        self.bools = rebuilt.bools
+        self.strs = rebuilt.strs
+        self.nrows = rebuilt.nrows
+        1
+    }
+
+    /// Register a column in the bookkeeping arrays; returns its index.
+    register(@self, name: str, kind: i64, slot: i64, n: i64) : i64 {
+        if host.sys_arr_len(self.names) == 0 { self.nrows = n }
+        self.names = host.sys_arr_push(self.names, name)
+        self.kinds = host.sys_arr_push(self.kinds, kind)
+        self.slots = host.sys_arr_push(self.slots, slot)
+        host.sys_arr_len(self.names) - 1
+    }
+
+    /// Add (or replace) an integer column; `-1` when its length differs from the frame's.
+    add_int(@self, c: IntCol) : i64 {
+        ensure self.accepts(c.size()) else { return -1 }
+        @self.clear_name(c.name)
+        slot = host.sys_arr_len(self.ints)
+        self.ints = host.sys_arr_push(self.ints, c)
+        @self.register(c.name, DT_INT, slot, c.size())
+    }
+
+    /// Add (or replace) a float column; `-1` when its length differs from the frame's.
+    add_float(@self, c: FloatCol) : i64 {
+        ensure self.accepts(c.size()) else { return -1 }
+        @self.clear_name(c.name)
+        slot = host.sys_arr_len(self.floats)
+        self.floats = host.sys_arr_push(self.floats, c)
+        @self.register(c.name, DT_FLOAT, slot, c.size())
+    }
+
+    /// Add (or replace) a boolean column; `-1` when its length differs from the frame's.
+    add_bool(@self, c: BoolCol) : i64 {
+        ensure self.accepts(c.size()) else { return -1 }
+        @self.clear_name(c.name)
+        slot = host.sys_arr_len(self.bools)
+        self.bools = host.sys_arr_push(self.bools, c)
+        @self.register(c.name, DT_BOOL, slot, c.size())
+    }
+
+    /// Add (or replace) a string column; `-1` when its length differs from the frame's.
+    add_str(@self, c: StrCol) : i64 {
+        ensure self.accepts(c.size()) else { return -1 }
+        @self.clear_name(c.name)
+        slot = host.sys_arr_len(self.strs)
+        self.strs = host.sys_arr_push(self.strs, c)
+        @self.register(c.name, DT_STR, slot, c.size())
+    }
+
+    /// Add a column built from evaluated cells; the dtype is inferred (`str` if any string, else `float` if any float,
+    /// else `int`, else `bool`; all-null columns become float). `-1` on a length mismatch.
+    /// Field reads only (no Dyn method Call — `it.text()` / `it.num()` on soft arrays yield `none`).
+    add_cells(@self, name: str, cells: _) : i64 {
+        ensure self.accepts(host.sys_arr_len(cells)) else { return -1 }
+        has_str = false
+        has_float = false
+        has_int = false
+        has_bool = false
+        for cells {
+            if !it.null {
+                if it.kind == DT_STR { has_str = true }
+                if it.kind == DT_FLOAT { has_float = true }
+                if it.kind == DT_INT { has_int = true }
+                if it.kind == DT_BOOL { has_bool = true }
+            }
+        }
+        mixed = (has_bool && (has_str || has_float || has_int)) || has_str
+        if mixed {
+            c = StrCol.new(name)
+            for cells {
+                if it.null {
+                    @c.push_null()
+                } else {
+                    t = ""
+                    if it.kind == DT_INT { t = "{it.i}" }
+                    if it.kind == DT_FLOAT { t = "{it.f}" }
+                    if it.kind == DT_BOOL {
+                        if it.b { t = "true" } else { t = "false" }
+                    }
+                    if it.kind == DT_STR { t = it.s }
+                    @c.push(t)
+                }
+            }
+            return @self.add_str(c)
+        }
+        if has_float || (!has_int && !has_bool) {
+            c = FloatCol.new(name)
+            for cells {
+                if it.null {
+                    @c.push_null()
+                } else {
+                    v = it.f
+                    if it.kind == DT_INT { v = host.sys_to_float(it.i) }
+                    @c.push(v)
+                }
+            }
+            return @self.add_float(c)
+        }
+        if has_int {
+            c = IntCol.new(name)
+            for cells { if it.null { @c.push_null() } else { @c.push(it.i) } }
+            return @self.add_int(c)
+        }
+        c = BoolCol.new(name)
+        for cells { if it.null { @c.push_null() } else { @c.push(it.b) } }
+        @self.add_bool(c)
+    }
+
+    /// Integer column `name` (empty when missing or of another dtype).
+    get_int(self, name: str) : IntCol {
+        ci = self.col_index(name)
+        ensure ci >= 0 && self.kinds[ci] == DT_INT else { return IntCol.new(name) }
+        self.ints[self.slots[ci]]
+    }
+
+    /// Float column `name` (empty when missing or of another dtype).
+    get_float(self, name: str) : FloatCol {
+        ci = self.col_index(name)
+        ensure ci >= 0 && self.kinds[ci] == DT_FLOAT else { return FloatCol.new(name) }
+        self.floats[self.slots[ci]]
+    }
+
+    /// Boolean column `name` (empty when missing or of another dtype).
+    get_bool(self, name: str) : BoolCol {
+        ci = self.col_index(name)
+        ensure ci >= 0 && self.kinds[ci] == DT_BOOL else { return BoolCol.new(name) }
+        self.bools[self.slots[ci]]
+    }
+
+    /// String column `name` (empty when missing or of another dtype).
+    get_str(self, name: str) : StrCol {
+        ci = self.col_index(name)
+        ensure ci >= 0 && self.kinds[ci] == DT_STR else { return StrCol.new(name) }
+        self.strs[self.slots[ci]]
+    }
+
+    /// Cell at (`row`, column index `ci`).
+    cell(self, row: i64, ci: i64) : Cell {
+        k = self.kinds[ci]
+        s = self.slots[ci]
+        if (k == DT_INT) {
+            c: IntCol = self.ints[s]
+            if c.is_null(row) { return cell_null() }
+            return cell_int(c.get(row))
+        }
+        if (k == DT_FLOAT) {
+            c: FloatCol = self.floats[s]
+            if c.is_null(row) { return cell_null() }
+            return cell_float(c.get(row))
+        }
+        if (k == DT_BOOL) {
+            c: BoolCol = self.bools[s]
+            if c.is_null(row) { return cell_null() }
+            return cell_bool(c.get(row))
+        }
+        c: StrCol = self.strs[s]
+        if c.is_null(row) { return cell_null() }
+        cell_str(c.get(row))
+    }
+
+    /// True when (`row`, `ci`) is null.
+    is_null_at(self, row: i64, ci: i64) : bool {
+        k = self.kinds[ci]
+        s = self.slots[ci]
+        if (k == DT_INT) {
+            c: IntCol = self.ints[s]
+            return c.is_null(row)
+        }
+        if (k == DT_FLOAT) {
+            c: FloatCol = self.floats[s]
+            return c.is_null(row)
+        }
+        if (k == DT_BOOL) {
+            c: BoolCol = self.bools[s]
+            return c.is_null(row)
+        }
+        c: StrCol = self.strs[s]
+        c.is_null(row)
+    }
+
+    /// Text of (`row`, `ci`) (`""` for a null).
+    text_at(self, row: i64, ci: i64) : str {
+        k = self.kinds[ci]
+        s = self.slots[ci]
+        if (k == DT_INT) {
+            c: IntCol = self.ints[s]
+            return c.text_at(row)
+        }
+        if (k == DT_FLOAT) {
+            c: FloatCol = self.floats[s]
+            return c.text_at(row)
+        }
+        if (k == DT_BOOL) {
+            c: BoolCol = self.bools[s]
+            return c.text_at(row)
+        }
+        c: StrCol = self.strs[s]
+        c.text_at(row)
+    }
+
+    /// Rows gathered by index (`-1` gives an all-null row).
+    take(self, idx: _) : Frame {
+        out = Frame.new()
+        ci = 0
+        w = host.sys_arr_len(self.names)
+        while ci < w {
+            k = self.kinds[ci]
+            s = self.slots[ci]
+            if (k == DT_INT) {
+                c: IntCol = self.ints[s]
+                @out.add_int(c.take(idx))
+            }
+            if (k == DT_FLOAT) {
+                c: FloatCol = self.floats[s]
+                @out.add_float(c.take(idx))
+            }
+            if (k == DT_BOOL) {
+                c: BoolCol = self.bools[s]
+                @out.add_bool(c.take(idx))
+            }
+            if (k == DT_STR) {
+                c: StrCol = self.strs[s]
+                @out.add_str(c.take(idx))
+            }
+            ci += 1
+        }
+        out
+    }
+
+    /// Like `take`, but every index is assumed in-range (filter/keep). Uses `take_dense` on numeric cols.
+    take_dense(self, idx: _) : Frame {
+        out = Frame.new()
+        ci = 0
+        w = host.sys_arr_len(self.names)
+        while ci < w {
+            k = self.kinds[ci]
+            s = self.slots[ci]
+            if (k == DT_INT) {
+                c: IntCol = self.ints[s]
+                @out.add_int(c.take_dense(idx))
+            }
+            if (k == DT_FLOAT) {
+                c: FloatCol = self.floats[s]
+                @out.add_float(c.take_dense(idx))
+            }
+            if (k == DT_BOOL) {
+                c: BoolCol = self.bools[s]
+                @out.add_bool(c.take(idx))
+            }
+            if (k == DT_STR) {
+                c: StrCol = self.strs[s]
+                @out.add_str(c.take(idx))
+            }
+            ci += 1
+        }
+        out
+    }
+
+    /// Only the named columns, in the order given (unknown names are skipped).
+    select(self, names: _) : Frame {
+        out = Frame.new()
+        for names {
+            ci = self.col_index(it)
+            if ci >= 0 { fr_copy_col(self, ci, @out, self.names[ci]) }
+        }
+        out
+    }
+
+    /// Everything except the named columns.
+    drop(self, names: _) : Frame {
+        out = Frame.new()
+        ci = 0
+        w = host.sys_arr_len(self.names)
+        while ci < w {
+            skip = false
+            for names { if it == self.names[ci] { skip = true } }
+            if !skip { fr_copy_col(self, ci, @out, self.names[ci]) }
+            ci += 1
+        }
+        out
+    }
+
+    /// Rename column `old` to `new_name` (a no-op when `old` is absent).
+    rename(self, old: str, new_name: str) : Frame {
+        out = Frame.new()
+        ci = 0
+        w = host.sys_arr_len(self.names)
+        while ci < w {
+            if self.names[ci] == old {
+                fr_copy_col(self, ci, @out, new_name)
+            } else {
+                fr_copy_col(self, ci, @out, self.names[ci])
+            }
+            ci += 1
+        }
+        out
+    }
+
+    /// Rows for which `e` evaluates to a non-null `true`.
+    filter(self, e: Expr) : Frame {
+        idx = host.sys_arr_new(0, 0)
+        ensure e.root >= 0 else { return self.take(idx) }
+        bound = fr_bind(self, e)
+        // Fast path: `col cmp lit` / `and` of those — scan typed columns, no per-row Cell.
+        cmps = fr_compile_cmps(bound)
+        ncmp = host.sys_arr_len(cmps)
+        if ncmp > 0 {
+            buf = host.sys_arr_new(self.nrows, 0)
+            at = 0
+            // Hot path: one float cmp + one int cmp (e.g. `amt >= 20.0 and qty > 1`).
+            if ncmp == 2 {
+                a = cmps[0]
+                b = cmps[1]
+                fa = a.is_float || self.kinds[a.ci] == DT_FLOAT
+                fb = b.is_float || self.kinds[b.ci] == DT_FLOAT
+                if fa != fb {
+                    fc = a
+                    ic = b
+                    if fb {
+                        fc = b
+                        ic = a
+                    }
+                    fslot = self.slots[fc.ci]
+                    islot = self.slots[ic.ci]
+                    fcol: FloatCol = self.floats[fslot]
+                    icol: IntCol = self.ints[islot]
+                    fop = fc.op
+                    iop = ic.op
+                    fv = fc.fv
+                    if !fc.is_float { fv = host.sys_to_float(fc.iv) }
+                    iv = ic.iv
+                    row = 0
+                    while row < self.nrows {
+                        if fcol.nulls[row] != 1 && icol.nulls[row] != 1 {
+                            x = fcol.vals[row]
+                            y = icol.vals[row]
+                            okf = false
+                            oki = false
+                            if fop == EX_GE { okf = !(x < fv) }
+                            if fop == EX_GT { okf = x > fv }
+                            if fop == EX_LE { okf = !(x > fv) }
+                            if fop == EX_LT { okf = x < fv }
+                            if fop == EX_EQ { okf = dt_same(x, fv) }
+                            if fop == EX_NE { okf = !dt_same(x, fv) }
+                            if iop == EX_GT { oki = y > iv }
+                            if iop == EX_GE { oki = y >= iv }
+                            if iop == EX_LT { oki = y < iv }
+                            if iop == EX_LE { oki = y <= iv }
+                            if iop == EX_EQ { oki = y == iv }
+                            if iop == EX_NE { oki = y != iv }
+                            if okf && oki {
+                                buf = host.sys_arr_set(buf, at, row)
+                                at += 1
+                            }
+                        }
+                        row += 1
+                    }
+                } else {
+                    row = 0
+                    while row < self.nrows {
+                        if fr_row_matches_cmps(self, cmps, row) {
+                            buf = host.sys_arr_set(buf, at, row)
+                            at += 1
+                        }
+                        row += 1
+                    }
+                }
+            } else {
+                row = 0
+                while row < self.nrows {
+                    if fr_row_matches_cmps(self, cmps, row) {
+                        buf = host.sys_arr_set(buf, at, row)
+                        at += 1
+                    }
+                    row += 1
+                }
+            }
+            idx = host.sys_arr_new(at, 0)
+            i = 0
+            while i < at {
+                idx = host.sys_arr_set(idx, i, buf[i])
+                i += 1
+            }
+            return self.take_dense(idx)
+        }
+        row = 0
+        while row < self.nrows {
+            c = fr_eval(self, bound, bound.root, row)
+            // Inline `Cell.truthy` (avoids Dyn method Call that keeps filter boxed).
+            if !c.null && c.kind == DT_BOOL && c.b { idx = host.sys_arr_push(idx, row) }
+            row += 1
+        }
+        self.take_dense(idx)
+    }
+
+    /// Frame with an extra (or replaced) column computed by `e` for every row.
+    with_column(self, name: str, e: Expr) : Frame {
+        out = fr_copy(self)
+        ensure e.root >= 0 else { return out }
+        bound = fr_bind(self, e)
+        cells = []
+        row = 0
+        while row < self.nrows {
+            cells = host.sys_arr_push(cells, fr_eval(self, bound, bound.root, row))
+            row += 1
+        }
+        @out.add_cells(name, cells)
+        out
+    }
+
+    /// First `n` rows.
+    head(self, n: i64) : Frame {
+        idx = []
+        i = 0
+        while i < n && i < self.nrows {
+            idx = host.sys_arr_push(idx, i)
+            i += 1
+        }
+        self.take(idx)
+    }
+
+    /// Last `n` rows.
+    tail(self, n: i64) : Frame {
+        idx = []
+        i = self.nrows - n
+        if i < 0 { i = 0 }
+        while i < self.nrows {
+            idx = host.sys_arr_push(idx, i)
+            i += 1
+        }
+        self.take(idx)
+    }
+
+    /// Rows sorted (stably, nulls last) by column `name`; unknown names leave the order unchanged.
+    sort_by(self, name: str, descending: bool) : Frame {
+        ci = self.col_index(name)
+        ensure ci >= 0 else { return fr_copy(self) }
+        self.take(fr_order(self, ci, descending))
+    }
+
+    /// Rows sorted by several columns (first name is the primary key); `descending[i]` pairs with `names[i]`.
+    sort_by_many(self, names: _, descending: _) : Frame {
+        cur = fr_copy(self)
+        k = host.sys_arr_len(names) - 1
+        while k >= 0 {
+            cur = cur.sort_by(names[k], descending[k])
+            k -= 1
+        }
+        cur
+    }
+
+    /// Distinct rows, keeping the first occurrence of each.
+    unique(self) : Frame {
+        cis = []
+        i = 0
+        while i < host.sys_arr_len(self.names) {
+            cis = host.sys_arr_push(cis, i)
+            i += 1
+        }
+        ki = KeyIndex.new()
+        keep = []
+        row = 0
+        while row < self.nrows {
+            before = ki.size()
+            @ki.find_or_add(fr_row_key(self, cis, row))
+            if ki.size() > before { keep = host.sys_arr_push(keep, row) }
+            row += 1
+        }
+        self.take(keep)
+    }
+
+    /// Group rows by the key columns `keys` and aggregate (`AggSpec` values from `agg_*`). The result has the key
+    /// columns followed by one column per aggregate, one row per group in first-seen order. Unknown key columns give
+    /// an empty frame; aggregates over unknown columns yield null columns.
+    group_by(self, keys: _, aggs: _) : Frame {
+        cis = []
+        for keys {
+            ci = self.col_index(it)
+            if ci < 0 { return Frame.new() }
+            cis = host.sys_arr_push(cis, ci)
+        }
+        gids = host.sys_arr_new(self.nrows, 0)
+        firsts = []
+        sizes = []
+        // Single int key: HashMap on i64 (no fr_row_key strings).
+        if host.sys_arr_len(cis) == 1 && self.kinds[cis[0]] == DT_INT {
+            m = HashMap.with_capacity(64)
+            pci = cis[0]
+            kslot = self.slots[pci]
+            kcol: IntCol = self.ints[kslot]
+            row = 0
+            while row < self.nrows {
+                key = -9223372036854775807
+                if kcol.nulls[row] != 1 { key = kcol.vals[row] }
+                g = m.get(key) or -1
+                if g < 0 {
+                    g = host.sys_arr_len(firsts)
+                    @m.put(key, g)
+                    firsts = host.sys_arr_push(firsts, row)
+                    sizes = host.sys_arr_push(sizes, 0)
+                }
+                sizes = host.sys_arr_set(sizes, g, sizes[g] + 1)
+                gids = host.sys_arr_set(gids, row, g)
+                row += 1
+            }
+        } else {
+            ki = KeyIndex.new()
+            row = 0
+            while row < self.nrows {
+                before = ki.size()
+                g = @ki.find_or_add(fr_row_key(self, cis, row))
+                if ki.size() > before {
+                    firsts = host.sys_arr_push(firsts, row)
+                    sizes = host.sys_arr_push(sizes, 0)
+                }
+                sizes = host.sys_arr_set(sizes, g, sizes[g] + 1)
+                gids = host.sys_arr_set(gids, row, g)
+                row += 1
+            }
+        }
+        ng = host.sys_arr_len(firsts)
+        // Order/counting-sort only for non-streaming aggs (FIRST/LAST/STD/NUNIQUE, …).
+        // Order rebuild only when some agg cannot stream via gids (str/bool min/max, first/last/std/…).
+        need_order = false
+        for aggs {
+            item = it
+            spec: AggSpec = item
+            op = spec.op
+            if op != AG_ROWS {
+                ci = self.col_index(spec.col)
+                kind = -1
+                if ci >= 0 { kind = self.kinds[ci] }
+                stream = (kind == DT_INT || kind == DT_FLOAT) && (op == AG_SUM || op == AG_MEAN || op == AG_MIN || op == AG_MAX || op == AG_COUNT)
+                if !stream { need_order = true }
+            }
+        }
+        starts = host.sys_arr_new(0, 0)
+        order = host.sys_arr_new(0, 0)
+        if need_order {
+            starts = host.sys_arr_new(ng + 1, 0)
+            g = 0
+            while g < ng {
+                starts = host.sys_arr_set(starts, g + 1, starts[g] + sizes[g])
+                g += 1
+            }
+            fill = host.sys_arr_new(ng, 0)
+            g = 0
+            while g < ng {
+                fill = host.sys_arr_set(fill, g, starts[g])
+                g += 1
+            }
+            order = host.sys_arr_new(self.nrows, 0)
+            row = 0
+            while row < self.nrows {
+                gid = gids[row]
+                order = host.sys_arr_set(order, fill[gid], row)
+                fill = host.sys_arr_set(fill, gid, fill[gid] + 1)
+                row += 1
+            }
+        }
+        out = self.select(keys).take(firsts)
+        for aggs {
+            item = it
+            spec: AggSpec = item
+            // AG_ROWS: sizes already counted — no column scan.
+            if spec.op == AG_ROWS {
+                @out.add_int(IntCol.{name: spec.out, vals: sizes, nulls: dt_repeat(ng, 0)})
+            } else {
+                ci = self.col_index(spec.col)
+                kind = -1
+                if ci >= 0 { kind = self.kinds[ci] }
+                op = spec.op
+                // Streaming typed aggs: one sequential pass via gids[row] (no order rebuild).
+                if ci >= 0 && kind == DT_INT && (op == AG_SUM || op == AG_MAX || op == AG_MIN || op == AG_COUNT || op == AG_MEAN) {
+                    slot = self.slots[ci]
+                    c: IntCol = self.ints[slot]
+                    if op == AG_MEAN {
+                        sums = host.sys_arr_new(ng, 0)
+                        valid = host.sys_arr_new(ng, 0)
+                        row = 0
+                        while row < self.nrows {
+                            if c.nulls[row] != 1 {
+                                g = gids[row]
+                                sums = host.sys_arr_set(sums, g, sums[g] + c.vals[row])
+                                valid = host.sys_arr_set(valid, g, valid[g] + 1)
+                            }
+                            row += 1
+                        }
+                        vals = host.sys_arr_new(ng, 0.0)
+                        nulls = host.sys_arr_new(ng, 1)
+                        g = 0
+                        while g < ng {
+                            if valid[g] > 0 {
+                                vals = host.sys_arr_set(vals, g, host.sys_to_float(sums[g]) / host.sys_to_float(valid[g]))
+                                nulls = host.sys_arr_set(nulls, g, 0)
+                            }
+                            g += 1
+                        }
+                        @out.add_float(FloatCol.{name: spec.out, vals, nulls})
+                    } else {
+                        vals = host.sys_arr_new(ng, 0)
+                        nulls = host.sys_arr_new(ng, 1)
+                        seen = host.sys_arr_new(ng, 0)
+                        row = 0
+                        while row < self.nrows {
+                            if c.nulls[row] != 1 {
+                                g = gids[row]
+                                v = c.vals[row]
+                                if op == AG_COUNT {
+                                    vals = host.sys_arr_set(vals, g, vals[g] + 1)
+                                    nulls = host.sys_arr_set(nulls, g, 0)
+                                } else {
+                                    if seen[g] == 0 {
+                                        vals = host.sys_arr_set(vals, g, v)
+                                        seen = host.sys_arr_set(seen, g, 1)
+                                        nulls = host.sys_arr_set(nulls, g, 0)
+                                    } else {
+                                        if op == AG_SUM { vals = host.sys_arr_set(vals, g, vals[g] + v) }
+                                        if op == AG_MAX && v > vals[g] { vals = host.sys_arr_set(vals, g, v) }
+                                        if op == AG_MIN && v < vals[g] { vals = host.sys_arr_set(vals, g, v) }
+                                    }
+                                }
+                            }
+                            row += 1
+                        }
+                        if op == AG_COUNT {
+                            // empty groups stay 0 / non-null
+                            g = 0
+                            while g < ng {
+                                nulls = host.sys_arr_set(nulls, g, 0)
+                                g += 1
+                            }
+                        }
+                        @out.add_int(IntCol.{name: spec.out, vals, nulls})
+                    }
+                } else {
+                    if ci >= 0 && kind == DT_FLOAT && (op == AG_SUM || op == AG_MEAN || op == AG_COUNT || op == AG_MAX || op == AG_MIN) {
+                        slot = self.slots[ci]
+                        c: FloatCol = self.floats[slot]
+                        if op == AG_COUNT {
+                            vals = host.sys_arr_new(ng, 0)
+                            nulls = host.sys_arr_new(ng, 0)
+                            row = 0
+                            while row < self.nrows {
+                                if c.nulls[row] != 1 {
+                                    g = gids[row]
+                                    vals = host.sys_arr_set(vals, g, vals[g] + 1)
+                                }
+                                row += 1
+                            }
+                            @out.add_int(IntCol.{name: spec.out, vals, nulls})
+                        } else {
+                            vals = host.sys_arr_new(ng, 0.0)
+                            nulls = host.sys_arr_new(ng, 1)
+                            seen = host.sys_arr_new(ng, 0)
+                            valid = host.sys_arr_new(ng, 0)
+                            row = 0
+                            while row < self.nrows {
+                                if c.nulls[row] != 1 {
+                                    g = gids[row]
+                                    v = c.vals[row]
+                                    if seen[g] == 0 {
+                                        vals = host.sys_arr_set(vals, g, v)
+                                        seen = host.sys_arr_set(seen, g, 1)
+                                        nulls = host.sys_arr_set(nulls, g, 0)
+                                    } else {
+                                        if op == AG_SUM || op == AG_MEAN { vals = host.sys_arr_set(vals, g, vals[g] + v) }
+                                        if op == AG_MAX && v > vals[g] { vals = host.sys_arr_set(vals, g, v) }
+                                        if op == AG_MIN && v < vals[g] { vals = host.sys_arr_set(vals, g, v) }
+                                    }
+                                    valid = host.sys_arr_set(valid, g, valid[g] + 1)
+                                }
+                                row += 1
+                            }
+                            if op == AG_MEAN {
+                                g = 0
+                                while g < ng {
+                                    if valid[g] > 0 {
+                                        vals = host.sys_arr_set(vals, g, vals[g] / host.sys_to_float(valid[g]))
+                                    }
+                                    g += 1
+                                }
+                            }
+                            @out.add_float(FloatCol.{name: spec.out, vals, nulls})
+                        }
+                    } else {
+                        cells = host.sys_arr_new(ng, cell_null())
+                        g = 0
+                        while g < ng {
+                            cells = host.sys_arr_set(cells, g, fr_aggregate(self, ci, spec.op, order, starts[g], starts[g + 1]))
+                            g += 1
+                        }
+                        @out.add_cells(spec.out, cells)
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Join with `other` on the columns `on` (same names on both sides). `how` is `"inner"`, `"left"`, `"right"` or
+    /// `"outer"`. Key columns come first (taking the right side's value for right-only rows), then the remaining left
+    /// columns, then the remaining right columns (suffix `_right` on a name clash). Rows with a null key never match.
+    join(self, other: Frame, on: _, how: str) : Frame {
+        lcis = []
+        rcis = []
+        for on {
+            lc = self.col_index(it)
+            rc = other.col_index(it)
+            if lc < 0 || rc < 0 { return Frame.new() }
+            lcis = host.sys_arr_push(lcis, lc)
+            rcis = host.sys_arr_push(rcis, rc)
+        }
+        keep_left = how == "left" || how == "outer"
+        keep_right = how == "right" || how == "outer"
+        // Single int↔int key: HashMap on i64 (no string fr_row_key).
+        if host.sys_arr_len(lcis) == 1 && self.kinds[lcis[0]] == DT_INT && other.kinds[rcis[0]] == DT_INT {
+            return fr_join_int1(self, other, lcis[0], rcis[0], keep_left, keep_right)
+        }
+        ki = KeyIndex.new()
+        head = []
+        tailp = []
+        nxt = host.sys_arr_new(other.nrows, -1)
+        rrow = 0
+        while rrow < other.nrows {
+            if !fr_key_has_null(other, rcis, rrow) {
+                before = ki.size()
+                g = @ki.find_or_add(fr_row_key(other, rcis, rrow))
+                if ki.size() > before {
+                    head = host.sys_arr_push(head, rrow)
+                    tailp = host.sys_arr_push(tailp, rrow)
+                } else {
+                    nxt = host.sys_arr_set(nxt, tailp[g], rrow)
+                    tailp = host.sys_arr_set(tailp, g, rrow)
+                }
+            }
+            rrow += 1
+        }
+        lidx = []
+        ridx = []
+        matched = host.sys_arr_new(other.nrows, 0)
+        lrow = 0
+        while lrow < self.nrows {
+            g = -1
+            if !fr_key_has_null(self, lcis, lrow) { g = ki.find(fr_row_key(self, lcis, lrow)) }
+            if g >= 0 {
+                r = head[g]
+                while r >= 0 {
+                    lidx = host.sys_arr_push(lidx, lrow)
+                    ridx = host.sys_arr_push(ridx, r)
+                    matched = host.sys_arr_set(matched, r, 1)
+                    r = nxt[r]
+                }
+            } else {
+                if keep_left {
+                    lidx = host.sys_arr_push(lidx, lrow)
+                    ridx = host.sys_arr_push(ridx, -1)
+                }
+            }
+            lrow += 1
+        }
+        if keep_right {
+            rrow = 0
+            while rrow < other.nrows {
+                if matched[rrow] == 0 {
+                    lidx = host.sys_arr_push(lidx, -1)
+                    ridx = host.sys_arr_push(ridx, rrow)
+                }
+                rrow += 1
+            }
+        }
+        fr_join_assemble(self, other, lcis, rcis, lidx, ridx)
+    }
+
+    /// Rows of `self` followed by rows of `other` (same column names required, any order); an empty frame otherwise.
+    vstack(self, other: Frame) : Frame {
+        ensure self.width() == other.width() else { return Frame.new() }
+        out = Frame.new()
+        ci = 0
+        while ci < self.width() {
+            oc = other.col_index(self.names[ci])
+            ensure oc >= 0 else { return Frame.new() }
+            cells = []
+            row = 0
+            while row < self.nrows {
+                cells = host.sys_arr_push(cells, self.cell(row, ci))
+                row += 1
+            }
+            row = 0
+            while row < other.nrows {
+                cells = host.sys_arr_push(cells, other.cell(row, oc))
+                row += 1
+            }
+            @out.add_cells(self.names[ci], cells)
+            ci += 1
+        }
+        out
+    }
+
+    /// Window columns: for every row, evaluate each `WinSpec` (`win_*`) inside the row's partition. Rows keep their
+    /// original order; one column per spec is appended. `partition_by` may be `[]` (one partition) and `order_by`
+    /// (ascending, nulls last) fixes the order used by rank / lag / lead / cum / rolling. Unknown columns give an
+    /// empty frame.
+    over(self, partition_by: _, order_by: _, wins: _) : Frame => fr_over(self, partition_by, order_by, [], wins)
+
+    /// Like `over` with one descending flag per `order_by` column.
+    over_desc(self, partition_by: _, order_by: _, descending: _, wins: _) : Frame =>
+        fr_over(self, partition_by, order_by, descending, wins)
+
+    /// As-of join: every row of `self` takes the nearest `other` row on the numeric key `on` (int or float, e.g. a
+    /// timestamp), matching equal `by` columns. `strategy` is `"backward"` (last right key <= left key), `"forward"`
+    /// (first right key >= left key) or `"nearest"` (ties go backward). `tolerance >= 0.0` drops matches farther
+    /// than that; pass a negative value for no limit. The result is `self` plus the unmatched-as-null columns of
+    /// `other` (not `on` / `by`; `_right` suffix on a clash). Neither input has to be sorted.
+    join_asof(self, other: Frame, on: str, by: _, strategy: str, tolerance: f64) : Frame =>
+        fr_join_asof(self, other, on, by, strategy, tolerance)
+
+    /// Tumbling windows over the int column `ts_col` (a timestamp in any unit; see `fr_duration`): windows of width
+    /// `every` aligned to multiples of `every`, one output row per non-empty (`by` group, window), labelled by the
+    /// window start in a column named like `ts_col`. Output: `by` columns, the label column, then the aggregates.
+    group_by_dynamic(self, ts_col: str, every: i64, by: _, aggs: _) : Frame =>
+        fr_group_dynamic(self, ts_col, every, every, 0, by, aggs)
+
+    /// `group_by_dynamic` with a window `period` (longer than `every` gives overlapping windows) and an `offset`
+    /// shifting the window grid. Windows are `[start, start + period)`.
+    group_by_dynamic_with(self, ts_col: str, every: i64, period: i64, offset: i64, by: _, aggs: _) : Frame =>
+        fr_group_dynamic(self, ts_col, every, period, offset, by, aggs)
+
+    /// Column names except `names` (a selector for `select`; unknown names are ignored).
+    exclude(self, names: _) : _ {
+        out = []
+        ci = 0
+        while ci < host.sys_arr_len(self.names) {
+            keep = true
+            for names { if it == self.names[ci] { keep = false } }
+            if keep { out = host.sys_arr_push(out, self.names[ci]) }
+            ci += 1
+        }
+        out
+    }
+
+    /// Names of the columns whose dtype is `kind` (`DT_INT` ...), in frame order.
+    dtype_cols(self, kind: i64) : _ {
+        out = []
+        ci = 0
+        while ci < host.sys_arr_len(self.names) {
+            if self.kinds[ci] == kind { out = host.sys_arr_push(out, self.names[ci]) }
+            ci += 1
+        }
+        out
+    }
+
+    /// Names of the int and float columns.
+    numeric_cols(self) : _ {
+        out = []
+        ci = 0
+        while ci < host.sys_arr_len(self.names) {
+            if self.kinds[ci] == DT_INT || self.kinds[ci] == DT_FLOAT { out = host.sys_arr_push(out, self.names[ci]) }
+            ci += 1
+        }
+        out
+    }
+
+    /// Only the columns of dtype `kind`.
+    select_dtype(self, kind: i64) : Frame => self.select(self.dtype_cols(kind))
+
+    /// Add column `out` joining the text of `cols` with `sep`. A null input makes the result null unless
+    /// `ignore_nulls`, which skips null parts instead. Unknown columns leave the frame unchanged.
+    concat_str(self, cols: _, sep: str, out: str, ignore_nulls: bool) : Frame {
+        res = fr_copy(self)
+        cis = []
+        for cols {
+            ci = self.col_index(it)
+            if ci < 0 { return res }
+            cis = host.sys_arr_push(cis, ci)
+        }
+        cells = []
+        row = 0
+        while row < self.nrows {
+            text = ""
+            first = true
+            anynull = false
+            for cis {
+                if self.is_null_at(row, it) {
+                    anynull = true
+                } else {
+                    part = self.text_at(row, it)
+                    if first { text = part } else { text = "{text}{sep}{part}" }
+                    first = false
+                }
+            }
+            if anynull && !ignore_nulls { cells = host.sys_arr_push(cells, cell_null()) } else { cells = host.sys_arr_push(cells, cell_str(text)) }
+            row += 1
+        }
+        @res.add_cells(out, cells)
+        res
+    }
+
+    /// True when both frames have the same column names, dtypes and cell texts.
+    same_as(self, other: Frame) : bool {
+        ensure self.width() == other.width() && self.nrows == other.nrows else { return false }
+        ci = 0
+        while ci < self.width() {
+            ensure self.names[ci] == other.names[ci] && self.kinds[ci] == other.kinds[ci] else { return false }
+            row = 0
+            while row < self.nrows {
+                if self.is_null_at(row, ci) != other.is_null_at(row, ci) { return false }
+                if self.text_at(row, ci) != other.text_at(row, ci) { return false }
+                row += 1
+            }
+            ci += 1
+        }
+        true
+    }
+
+    /// Fixed-width text table of the header and at most `max_rows` rows.
+    to_text(self, max_rows: i64) : str {
+        w = host.sys_arr_len(self.names)
+        ensure w > 0 else { return "(empty frame)" }
+        shown = self.nrows
+        if shown > max_rows { shown = max_rows }
+        widths = []
+        ci = 0
+        while ci < w {
+            wd = char_count(self.names[ci])
+            row = 0
+            while row < shown {
+                t = self.text_at(row, ci)
+                if self.is_null_at(row, ci) { t = "null" }
+                if char_count(t) > wd { wd = char_count(t) }
+                row += 1
+            }
+            widths = host.sys_arr_push(widths, wd)
+            ci += 1
+        }
+        out = ""
+        ci = 0
+        while ci < w {
+            if ci > 0 { out = "{out} | " }
+            hp = pad_right(self.names[ci], widths[ci], " ")
+            out = "{out}{hp}"
+            ci += 1
+        }
+        out = "{out}\n"
+        row = 0
+        while row < shown {
+            ci = 0
+            while ci < w {
+                if ci > 0 { out = "{out} | " }
+                t = self.text_at(row, ci)
+                if self.is_null_at(row, ci) { t = "null" }
+                cp = pad_right(t, widths[ci], " ")
+                out = "{out}{cp}"
+                ci += 1
+            }
+            out = "{out}\n"
+            row += 1
+        }
+        if self.nrows > shown { out = "{out}... {self.nrows - shown} more rows\n" }
+        out
+    }
+}
+
+// --- helpers --------------------------------------------------------------------------------------
+
+/// Copy column `ci` of `src` into `dst` under `name`.
++fr_copy_col(src: Frame, ci: i64, @dst: Frame, name: str) : i64 {
+    k = src.kinds[ci]
+    s = src.slots[ci]
+    if (k == DT_INT) {
+        c: IntCol = src.ints[s]
+        return @dst.add_int(c.named(name))
+    }
+    if (k == DT_FLOAT) {
+        c: FloatCol = src.floats[s]
+        return @dst.add_float(c.named(name))
+    }
+    if (k == DT_BOOL) {
+        c: BoolCol = src.bools[s]
+        return @dst.add_bool(c.named(name))
+    }
+    c: StrCol = src.strs[s]
+    @dst.add_str(c.named(name))
+}
+
+/// A copy of `f` (columns are values, so this is cheap).
++fr_copy(f: Frame) : Frame {
+    out = Frame.new()
+    ci = 0
+    while ci < f.width() {
+        fr_copy_col(f, ci, @out, f.names[ci])
+        ci += 1
+    }
+    out
+}
+
+/// Shallow Frame view: shares column arrays with `f`. Safe when the result only **adds** columns
+/// (e.g. `over`) and never mutates existing column payloads.
++fr_share(f: Frame) : Frame =>
+    Frame.{names: f.names, kinds: f.kinds, slots: f.slots, ints: f.ints, floats: f.floats, bools: f.bools, strs: f.strs, nrows: f.nrows}
+
+/// `f` without column `name`.
++fr_without(f: Frame, name: str) : Frame {
+    out = Frame.new()
+    ci = 0
+    while ci < f.width() {
+        if f.names[ci] != name { fr_copy_col(f, ci, @out, f.names[ci]) }
+        ci += 1
+    }
+    if out.width() == 0 { return Frame.new() }
+    out
+}
+
+/// Unambiguous text key of the key columns at `row`: length-prefixed parts, `n;` for a null.
++fr_row_key(f: Frame, cis: _, row: i64) : str {
+    key = ""
+    for cis {
+        if f.is_null_at(row, it) {
+            key = "{key}n;"
+        } else {
+            t = f.text_at(row, it)
+            key = "{key}{host.sys_str_len(t)}:{t};"
+        }
+    }
+    key
+}
+
+/// True when any key column is null at `row`.
++fr_key_has_null(f: Frame, cis: _, row: i64) : bool {
+    for cis { if f.is_null_at(row, it) { return true } }
+    false
+}
+
+/// One compiled `col cmp literal` leaf used by the filter fast path.
++FrCmp = {
+    ci: i64 = -1
+    op: i64 = 0
+    is_float: bool = false
+    iv: i64 = 0
+    fv: f64 = 0.0
+}
+
+/// Try to parse node `k` as `col <op> lit` (either side). Returns a zero-`ci` sentinel on failure.
++fr_parse_cmp(e: Expr, k: i64) : FrCmp {
+    op = e.ops[k]
+    ensure op >= EX_EQ && op <= EX_GE else { return FrCmp.{} }
+    la, lb = e.a[k], e.b[k]
+    ensure la >= 0 && lb >= 0 else { return FrCmp.{} }
+    loa, lob = e.ops[la], e.ops[lb]
+    if loa == EX_COL && (lob == EX_INT || lob == EX_FLOAT || lob == EX_BOOL) {
+        ci = e.a[la]
+        ensure ci >= 0 else { return FrCmp.{} }
+        if lob == EX_FLOAT { return FrCmp.{ci, op, is_float: true, fv: e.floats[lb]} }
+        return FrCmp.{ci, op, iv: e.ints[lb]}
+    }
+    if lob == EX_COL && (loa == EX_INT || loa == EX_FLOAT || loa == EX_BOOL) {
+        // Flip comparison so column is on the left.
+        ci = e.a[lb]
+        ensure ci >= 0 else { return FrCmp.{} }
+        rop = op
+        if op == EX_LT { rop = EX_GT }
+        if op == EX_LE { rop = EX_GE }
+        if op == EX_GT { rop = EX_LT }
+        if op == EX_GE { rop = EX_LE }
+        if loa == EX_FLOAT { return FrCmp.{ci, op: rop, is_float: true, fv: e.floats[la]} }
+        return FrCmp.{ci, op: rop, iv: e.ints[la]}
+    }
+    FrCmp.{}
+}
+
+/// Flatten `and`-trees of simple comparisons into a list (empty = not applicable).
++fr_compile_cmps(e: Expr) : _ {
+    out = []
+    ensure e.root >= 0 else { return out }
+    stack = [e.root]
+    while host.sys_arr_len(stack) > 0 {
+        sp = host.sys_arr_len(stack) - 1
+        k = stack[sp]
+        ns = []
+        i = 0
+        while i < sp {
+            ns = host.sys_arr_push(ns, stack[i])
+            i += 1
+        }
+        stack = ns
+        if e.ops[k] == EX_AND {
+            stack = host.sys_arr_push(stack, e.a[k])
+            stack = host.sys_arr_push(stack, e.b[k])
+        } else {
+            c = fr_parse_cmp(e, k)
+            ensure c.ci >= 0 else { return [] }
+            out = host.sys_arr_push(out, c)
+        }
+    }
+    out
+}
+
+/// Numeric value at (`row`,`ci`) as float (caller checked non-null).
++fr_num_at(f: Frame, row: i64, ci: i64) : f64 {
+    k = f.kinds[ci]
+    s = f.slots[ci]
+    if (k == DT_FLOAT) {
+        c: FloatCol = f.floats[s]
+        return c.get(row)
+    }
+    if (k == DT_INT) {
+        c: IntCol = f.ints[s]
+        return host.sys_to_float(c.get(row))
+    }
+    if (k == DT_BOOL) {
+        c: BoolCol = f.bools[s]
+        if c.get(row) { return 1.0 }
+        return 0.0
+    }
+    0.0
+}
+
+/// Integer/bool value at (`row`,`ci`) as i64 (caller checked non-null).
++fr_int_at(f: Frame, row: i64, ci: i64) : i64 {
+    k = f.kinds[ci]
+    s = f.slots[ci]
+    if (k == DT_INT) {
+        c: IntCol = f.ints[s]
+        return c.get(row)
+    }
+    if (k == DT_BOOL) {
+        c: BoolCol = f.bools[s]
+        if c.get(row) { return 1 }
+        return 0
+    }
+    0
+}
+
+/// Row matches every compiled comparison (null column → false).
++fr_row_matches_cmps(f: Frame, cmps: _, row: i64) : bool {
+    for cmps {
+        ci = it.ci
+        ensure ci >= 0 && ci < host.sys_arr_len(f.kinds) else { return false }
+        ensure !f.is_null_at(row, ci) else { return false }
+        k = f.kinds[ci]
+        op = it.op
+        if (k == DT_FLOAT || it.is_float) {
+            fv = it.fv
+            if !it.is_float { fv = host.sys_to_float(it.iv) }
+            x = fr_num_at(f, row, ci)
+            if op == EX_EQ { ensure dt_same(x, fv) else { return false } }
+            if op == EX_NE { ensure !dt_same(x, fv) else { return false } }
+            if op == EX_LT { ensure x < fv else { return false } }
+            if op == EX_LE { ensure !(x > fv) else { return false } }
+            if op == EX_GT { ensure x > fv else { return false } }
+            if op == EX_GE { ensure !(x < fv) else { return false } }
+        } else {
+            ensure k == DT_INT || k == DT_BOOL else { return false }
+            x = fr_int_at(f, row, ci)
+            y = it.iv
+            if op == EX_EQ { ensure x == y else { return false } }
+            if op == EX_NE { ensure x != y else { return false } }
+            if op == EX_LT { ensure x < y else { return false } }
+            if op == EX_LE { ensure x <= y else { return false } }
+            if op == EX_GT { ensure x > y else { return false } }
+            if op == EX_GE { ensure x >= y else { return false } }
+        }
+    }
+    true
+}
+
+/// Copy of `e` with every column node resolved to its index in `f` (`-1` for unknown columns).
+/// Built with typed `sys_arr_*` only (no `@Expr` CallMut) so AOT can unbox filter/where/pl_apply.
++fr_bind(f: Frame, e: Expr) : Expr {
+    ops = host.sys_arr_new(0, 0)
+    a = host.sys_arr_new(0, 0)
+    b = host.sys_arr_new(0, 0)
+    ints = host.sys_arr_new(0, 0)
+    floats = host.sys_arr_new(0, 0.0)
+    strs = host.sys_arr_new(0, "")
+    i = 0
+    n = host.sys_arr_len(e.ops)
+    while i < n {
+        if e.ops[i] == EX_COL {
+            ops = host.sys_arr_push(ops, EX_COL)
+            a = host.sys_arr_push(a, f.col_index(e.strs[i]))
+            b = host.sys_arr_push(b, -1)
+            ints = host.sys_arr_push(ints, 0)
+            floats = host.sys_arr_push(floats, 0.0)
+            strs = host.sys_arr_push(strs, e.strs[i])
+        } else {
+            ops = host.sys_arr_push(ops, e.ops[i])
+            a = host.sys_arr_push(a, e.a[i])
+            b = host.sys_arr_push(b, e.b[i])
+            ints = host.sys_arr_push(ints, e.ints[i])
+            floats = host.sys_arr_push(floats, e.floats[i])
+            strs = host.sys_arr_push(strs, e.strs[i])
+        }
+        i += 1
+    }
+    Expr.{ops, a, b, ints, floats, strs, root: e.root}
+}
+
+/// Evaluate node `k` of the bound expression `e` at `row` of `f`.
++fr_eval(f: Frame, e: Expr, k: i64, row: i64) : Cell {
+    op = e.ops[k]
+    if op == EX_COL {
+        ci = e.a[k]
+        ensure ci >= 0 else { return cell_null() }
+        return f.cell(row, ci)
+    }
+    if op == EX_INT { return cell_int(e.ints[k]) }
+    if op == EX_FLOAT { return cell_float(e.floats[k]) }
+    if op == EX_STR { return cell_str(e.strs[k]) }
+    if op == EX_BOOL { return cell_bool(e.ints[k] == 1) }
+    if op == EX_NOT || op == EX_NEG || op == EX_ISNULL || op == EX_NOTNULL || (op >= EX_ABS && op <= EX_LEN) {
+        return cell_unary(op, fr_eval(f, e, e.a[k], row))
+    }
+    if op == EX_WHEN {
+        cond = fr_eval(f, e, e.a[k], row)
+        if !cond.null && cond.kind == DT_BOOL && cond.b { return fr_eval(f, e, e.b[k], row) }
+        return fr_eval(f, e, e.ints[k], row)
+    }
+    cell_binary(op, fr_eval(f, e, e.a[k], row), fr_eval(f, e, e.b[k], row))
+}
+
+/// Aggregate rows `order[lo..hi)` of column `ci` with operation `op` (see `AG_*`).
++fr_aggregate(f: Frame, ci: i64, op: i64, order: _, lo: i64, hi: i64) : Cell {
+    if op == AG_ROWS { return cell_int(hi - lo) }
+    ensure ci >= 0 else { return cell_null() }
+    kind = f.kinds[ci]
+    // Typed fast paths (no Cell / Welford) for the common group_by ops.
+    if (kind == DT_INT) && (op == AG_SUM || op == AG_MAX || op == AG_MIN || op == AG_COUNT || op == AG_MEAN) {
+        slot = f.slots[ci]
+        c: IntCol = f.ints[slot]
+        valid = 0
+        si = 0
+        best = 0
+        p = lo
+        while p < hi {
+            row = order[p]
+            if c.nulls[row] != 1 {
+                v = c.vals[row]
+                if valid == 0 { best = v }
+                valid += 1
+                si += v
+                if op == AG_MAX && v > best { best = v }
+                if op == AG_MIN && v < best { best = v }
+            }
+            p += 1
+        }
+        if op == AG_COUNT { return cell_int(valid) }
+        ensure valid > 0 else { return cell_null() }
+        if op == AG_SUM { return cell_int(si) }
+        if op == AG_MEAN { return cell_float(host.sys_to_float(si) / host.sys_to_float(valid)) }
+        return cell_int(best)
+    }
+    if (kind == DT_FLOAT) && (op == AG_SUM || op == AG_MEAN || op == AG_COUNT || op == AG_MAX || op == AG_MIN) {
+        slot = f.slots[ci]
+        c: FloatCol = f.floats[slot]
+        valid = 0
+        sf = 0.0
+        best = 0.0
+        p = lo
+        while p < hi {
+            row = order[p]
+            if c.nulls[row] != 1 {
+                v = c.vals[row]
+                if valid == 0 { best = v }
+                valid += 1
+                sf += v
+                if op == AG_MAX && v > best { best = v }
+                if op == AG_MIN && v < best { best = v }
+            }
+            p += 1
+        }
+        if op == AG_COUNT { return cell_int(valid) }
+        ensure valid > 0 else { return cell_null() }
+        if op == AG_SUM { return cell_float(sf) }
+        if op == AG_MEAN { return cell_float(sf / host.sys_to_float(valid)) }
+        return cell_float(best)
+    }
+    valid = 0
+    si = 0
+    sf = 0.0
+    mean = 0.0
+    m2 = 0.0
+    best = cell_null()
+    first = cell_null()
+    last = cell_null()
+    seen = KeyIndex.new()
+    p = lo
+    while p < hi {
+        row = order[p]
+        if !f.is_null_at(row, ci) {
+            x = f.cell(row, ci)
+            valid += 1
+            if valid == 1 { first = x }
+            last = x
+            if op == AG_NUNIQUE { @seen.find_or_add(x.text()) }
+            if kind == DT_INT {
+                si += x.i
+                sf += host.sys_to_float(x.i)
+            }
+            if kind == DT_FLOAT { sf += x.f }
+            if kind == DT_BOOL {
+                if x.b {
+                    si += 1
+                    sf += 1.0
+                }
+            }
+            if kind != DT_STR {
+                v = x.num()
+                if kind == DT_BOOL {
+                    v = 0.0
+                    if x.b { v = 1.0 }
+                }
+                delta = v - mean
+                mean += delta / host.sys_to_float(valid)
+                m2 += delta * (v - mean)
+            }
+            if op == AG_MIN || op == AG_MAX {
+                if valid == 1 {
+                    best = x
+                } else {
+                    c = cell_compare(EX_LT, x, best)
+                    if kind == DT_BOOL {
+                        less = !x.b && best.b
+                        greater = x.b && !best.b
+                        if op == AG_MIN && less { best = x }
+                        if op == AG_MAX && greater { best = x }
+                    } else {
+                        if op == AG_MIN && c.b { best = x }
+                        if op == AG_MAX {
+                            g = cell_compare(EX_GT, x, best)
+                            if g.b { best = x }
+                        }
+                    }
+                }
+            }
+        }
+        p += 1
+    }
+    if op == AG_COUNT { return cell_int(valid) }
+    if op == AG_NUNIQUE { return cell_int(seen.size()) }
+    ensure valid > 0 else { return cell_null() }
+    if op == AG_FIRST { return first }
+    if op == AG_LAST { return last }
+    if op == AG_MIN || op == AG_MAX { return best }
+    ensure kind != DT_STR else { return cell_null() }
+    if op == AG_SUM {
+        if kind == DT_FLOAT { return cell_float(sf) }
+        return cell_int(si)
+    }
+    if op == AG_MEAN { return cell_float(sf / host.sys_to_float(valid)) }
+    ensure valid > 1 else { return cell_null() }
+    cell_float(host.sys_sqrt(m2 / host.sys_to_float(valid - 1)))
+}
+
+/// Stable merge sort of `idx` by key; numeric keys live in `kf`, string keys in `ks` (`use_str`), nulls sort last.
++fr_msort(idx: _, kf: _, ks: _, nulls: _, use_str: bool, desc: bool) {
+    n = host.sys_arr_len(idx)
+    // Float-key path: inline compares (no fr_before Call) and ping-pong two buffers.
+    if !use_str {
+        return fr_msort_num(idx, kf, nulls, desc)
+    }
+    src = idx
+    width = 1
+    while width < n {
+        dst = host.sys_arr_new(n, 0)
+        lo = 0
+        while lo < n {
+            mid = lo + width
+            if mid > n { mid = n }
+            hi = lo + 2 * width
+            if hi > n { hi = n }
+            i = lo
+            j = mid
+            k = lo
+            while k < hi {
+                take_right = false
+                if i >= mid {
+                    take_right = true
+                } else {
+                    if j < hi { take_right = fr_before(kf, ks, nulls, use_str, desc, src[j], src[i]) }
+                }
+                if take_right {
+                    dst = host.sys_arr_set(dst, k, src[j])
+                    j += 1
+                } else {
+                    dst = host.sys_arr_set(dst, k, src[i])
+                    i += 1
+                }
+                k += 1
+            }
+            lo = lo + 2 * width
+        }
+        src = dst
+        width = width * 2
+    }
+    src
+}
+
+/// Stable merge-sort of row indices by float keys (nulls last); ping-pongs two buffers.
++fr_msort_num(idx: _, kf: _, nulls: _, desc: bool) {
+    n = host.sys_arr_len(idx)
+    a = idx
+    b = host.sys_arr_new(n, 0)
+    width = 1
+    while width < n {
+        lo = 0
+        while lo < n {
+            mid = lo + width
+            if mid > n { mid = n }
+            hi = lo + 2 * width
+            if hi > n { hi = n }
+            i = lo
+            j = mid
+            k = lo
+            while k < hi {
+                take_right = false
+                if i >= mid {
+                    take_right = true
+                } else {
+                    if j < hi {
+                        ra = a[i]
+                        rb = a[j]
+                        na = nulls[ra]
+                        nb = nulls[rb]
+                        if na == 1 || nb == 1 {
+                            take_right = na == 1 && nb == 0
+                        } else {
+                            if desc {
+                                take_right = kf[rb] > kf[ra]
+                            } else {
+                                take_right = kf[rb] < kf[ra]
+                            }
+                        }
+                    }
+                }
+                if take_right {
+                    b = host.sys_arr_set(b, k, a[j])
+                    j += 1
+                } else {
+                    b = host.sys_arr_set(b, k, a[i])
+                    i += 1
+                }
+                k += 1
+            }
+            lo = lo + 2 * width
+        }
+        // Swap a/b via tmp binding.
+        tmp = a
+        a = b
+        b = tmp
+        width = width * 2
+    }
+    a
+}
+
+/// True when row `a` must come strictly before row `b` (nulls last in both directions).
++fr_before(kf: _, ks: _, nulls: _, use_str: bool, desc: bool, a: i64, b: i64) : bool {
+    na = nulls[a]
+    nb = nulls[b]
+    if na == 1 || nb == 1 { return na == 0 && nb == 1 }
+    c = 0
+    if use_str {
+        c = compare(ks[a], ks[b])
+    } else {
+        if kf[a] < kf[b] { c = -1 }
+        if kf[a] > kf[b] { c = 1 }
+    }
+    if desc { return c > 0 }
+    c < 0
+}
+
+/// Sort keys of column `ci` indexed by row: `[nulls, floats, strings]` (`1` marks a null).
++fr_sort_keys(f: Frame, ci: i64) {
+    n = f.nrows
+    nulls = host.sys_arr_new(n, 0)
+    kf = host.sys_arr_new(n, 0.0)
+    ks = host.sys_arr_new(n, "")
+    kind = f.kinds[ci]
+    if (kind == DT_INT) {
+        slot = f.slots[ci]
+        c: IntCol = f.ints[slot]
+        row = 0
+        while row < n {
+            if c.nulls[row] == 1 {
+                nulls = host.sys_arr_set(nulls, row, 1)
+            } else {
+                kf = host.sys_arr_set(kf, row, host.sys_to_float(c.vals[row]))
+            }
+            row += 1
+        }
+        return [nulls, kf, ks]
+    }
+    if (kind == DT_FLOAT) {
+        slot = f.slots[ci]
+        c: FloatCol = f.floats[slot]
+        row = 0
+        while row < n {
+            if c.nulls[row] == 1 {
+                nulls = host.sys_arr_set(nulls, row, 1)
+            } else {
+                kf = host.sys_arr_set(kf, row, c.vals[row])
+            }
+            row += 1
+        }
+        return [nulls, kf, ks]
+    }
+    row = 0
+    while row < n {
+        isnull = f.is_null_at(row, ci)
+        if isnull {
+            nulls = host.sys_arr_set(nulls, row, 1)
+        }
+        if kind == DT_STR {
+            if !isnull { ks = host.sys_arr_set(ks, row, f.text_at(row, ci)) }
+        } else {
+            x = f.cell(row, ci)
+            v = 0.0
+            if !x.null {
+                if x.kind == DT_BOOL {
+                    if x.b { v = 1.0 }
+                } else {
+                    v = x.num()
+                }
+            }
+            kf = host.sys_arr_set(kf, row, v)
+        }
+        row += 1
+    }
+    return [nulls, kf, ks]
+}
+
+/// Stable counting sort of `idx` by int column `ci` when all non-null values lie in `[0, span)`
+/// with `span <= 4 * n` (avoids huge buckets on sparse keys). Returns `[]` to signal fallback.
++fr_count_sort_int(f: Frame, ci: i64, idx: _, desc: bool) {
+    n = host.sys_arr_len(idx)
+    slot = f.slots[ci]
+    c: IntCol = f.ints[slot]
+    mx = -1
+    i = 0
+    while i < n {
+        row = idx[i]
+        if c.nulls[row] == 1 { return [] }
+        v = c.vals[row]
+        if v < 0 { return [] }
+        if v > mx { mx = v }
+        i += 1
+    }
+    span = mx + 1
+    // Refuse sparse/huge key domains (fall back to merge-sort).
+    if span > n * 4 + 16 { return [] }
+    counts = host.sys_arr_new(span, 0)
+    i = 0
+    while i < n {
+        v = c.vals[idx[i]]
+        counts = host.sys_arr_set(counts, v, counts[v] + 1)
+        i += 1
+    }
+    starts = host.sys_arr_new(span + 1, 0)
+    g = 0
+    while g < span {
+        starts = host.sys_arr_set(starts, g + 1, starts[g] + counts[g])
+        g += 1
+    }
+    out = host.sys_arr_new(n, 0)
+    fill = host.sys_arr_new(span, 0)
+    g = 0
+    while g < span {
+        fill = host.sys_arr_set(fill, g, starts[g])
+        g += 1
+    }
+    i = 0
+    while i < n {
+        row = idx[i]
+        v = c.vals[row]
+        out = host.sys_arr_set(out, fill[v], row)
+        fill = host.sys_arr_set(fill, v, fill[v] + 1)
+        i += 1
+    }
+    if desc {
+        rev = host.sys_arr_new(n, 0)
+        i = 0
+        while i < n {
+            rev = host.sys_arr_set(rev, i, out[n - 1 - i])
+            i += 1
+        }
+        return rev
+    }
+    out
+}
+
+/// True when an int column holds a value beyond +-2^53, where float sort keys stop being exact.
++fr_int_wide(f: Frame, ci: i64) : bool {
+    c: IntCol = f.ints[f.slots[ci]]
+    i = 0
+    n = c.size()
+    while i < n {
+        if !c.is_null(i) && (c.vals[i] > 9007199254740992 || c.vals[i] < -9007199254740992) { return true }
+        i += 1
+    }
+    false
+}
+
+/// Sort keys (`[nulls, floats, strings]`) for one 31-bit digit of an int column: the low digit, or the high digit
+/// (`value` floor-divided by 2^31). Two stable passes (low, then high) sort any `i64` exactly.
++fr_int_digit(f: Frame, ci: i64, high: bool) {
+    c: IntCol = f.ints[f.slots[ci]]
+    kf = []
+    ks = []
+    i = 0
+    n = c.size()
+    while i < n {
+        v = c.vals[i]
+        hi = fr_floor_div(v, 2147483648)
+        d = v - hi * 2147483648
+        if high { d = hi }
+        kf = host.sys_arr_push(kf, host.sys_to_float(d))
+        ks = host.sys_arr_push(ks, "")
+        i += 1
+    }
+    return [c.nulls, kf, ks]
+}
+
+/// Row order sorted by the columns `ocis` (first is the primary key); `desc[k]` pairs with `ocis[k]`. Stable, nulls
+/// last. Int columns sort exactly even beyond 2^53 (e.g. nanosecond timestamps).
++fr_sorted_rows(f: Frame, ocis: _, desc: _) {
+    idx = host.sys_arr_new(f.nrows, 0)
+    row = 0
+    while row < f.nrows {
+        idx = host.sys_arr_set(idx, row, row)
+        row += 1
+    }
+    k = host.sys_arr_len(ocis) - 1
+    while k >= 0 {
+        ci = ocis[k]
+        d = false
+        if k < host.sys_arr_len(desc) { d = desc[k] }
+        if f.kinds[ci] == DT_INT {
+            // Counting sort when every non-null value is in [0, nrows) (common for ids).
+            counted = fr_count_sort_int(f, ci, idx, d)
+            if host.sys_arr_len(counted) == f.nrows {
+                idx = counted
+            } else {
+                if fr_int_wide(f, ci) {
+                    lo = fr_int_digit(f, ci, false)
+                    idx = fr_msort_num(idx, lo[1], lo[0], d)
+                    hi = fr_int_digit(f, ci, true)
+                    idx = fr_msort_num(idx, hi[1], hi[0], d)
+                } else {
+                    keys = fr_sort_keys(f, ci)
+                    idx = fr_msort_num(idx, keys[1], keys[0], d)
+                }
+            }
+        } else {
+            keys = fr_sort_keys(f, ci)
+            if f.kinds[ci] == DT_STR {
+                idx = fr_msort(idx, keys[1], keys[2], keys[0], true, d)
+            } else {
+                idx = fr_msort_num(idx, keys[1], keys[0], d)
+            }
+        }
+        k -= 1
+    }
+    idx
+}
+
+/// Row order that sorts column `ci` (stable, nulls last).
++fr_order(f: Frame, ci: i64, desc: bool) => fr_sorted_rows(f, [ci], [desc])
+
+// --- windows, as-of joins, dynamic groups, batching -------------------------------------------------
+
+/// Partition `f` by the columns `pcis` and sort inside each partition by `ocis` (`desc` flags, stable, nulls last).
+/// Returns `[order, starts, gids, firsts]`: rows grouped by partition in first-seen order (`order[starts[g]..starts[g + 1])`
+/// is partition `g` in sorted order), the partition id of every original row, and each partition's first original row.
++fr_partitions(f: Frame, pcis: _, ocis: _, desc: _) {
+    // Single int partition key: HashMap on i64 (no fr_row_key strings).
+    if host.sys_arr_len(pcis) == 1 && f.kinds[pcis[0]] == DT_INT {
+        return fr_partitions_int1(f, pcis[0], ocis, desc)
+    }
+    ki = KeyIndex.new()
+    gids = host.sys_arr_new(f.nrows, 0)
+    firsts = []
+    sizes = []
+    row = 0
+    while row < f.nrows {
+        before = ki.size()
+        g = @ki.find_or_add(fr_row_key(f, pcis, row))
+        if ki.size() > before {
+            firsts = host.sys_arr_push(firsts, row)
+            sizes = host.sys_arr_push(sizes, 0)
+        }
+        sizes = host.sys_arr_set(sizes, g, sizes[g] + 1)
+        gids = host.sys_arr_set(gids, row, g)
+        row += 1
+    }
+    ng = ki.size()
+    sorted = fr_sorted_rows(f, ocis, desc)
+    starts = host.sys_arr_new(ng + 1, 0)
+    fill = host.sys_arr_new(ng, 0)
+    g = 0
+    while g < ng {
+        starts = host.sys_arr_set(starts, g + 1, starts[g] + sizes[g])
+        fill = host.sys_arr_set(fill, g, starts[g])
+        g += 1
+    }
+    order = host.sys_arr_new(f.nrows, 0)
+    p = 0
+    while p < f.nrows {
+        r = sorted[p]
+        gid = gids[r]
+        order = host.sys_arr_set(order, fill[gid], r)
+        fill = host.sys_arr_set(fill, gid, fill[gid] + 1)
+        p += 1
+    }
+    return [order, starts, gids, firsts]
+}
+
+/// Partition by one int column + sort within partitions (see `fr_partitions`).
++fr_partitions_int1(f: Frame, pci: i64, ocis: _, desc: _) {
+    m = HashMap.with_capacity(64)
+    gids = host.sys_arr_new(f.nrows, 0)
+    firsts = []
+    sizes = []
+    pcol: IntCol = f.ints[f.slots[pci]]
+    row = 0
+    while row < f.nrows {
+        // Null partition keys share group id via a dedicated probe key.
+        key = -9223372036854775807
+        if pcol.nulls[row] != 1 { key = pcol.vals[row] }
+        g = m.get(key) or -1
+        if g < 0 {
+            g = host.sys_arr_len(firsts)
+            @m.put(key, g)
+            firsts = host.sys_arr_push(firsts, row)
+            sizes = host.sys_arr_push(sizes, 0)
+        }
+        sizes = host.sys_arr_set(sizes, g, sizes[g] + 1)
+        gids = host.sys_arr_set(gids, row, g)
+        row += 1
+    }
+    ng = host.sys_arr_len(firsts)
+    sorted = fr_sorted_rows(f, ocis, desc)
+    starts = host.sys_arr_new(ng + 1, 0)
+    fill = host.sys_arr_new(ng, 0)
+    g = 0
+    while g < ng {
+        starts = host.sys_arr_set(starts, g + 1, starts[g] + sizes[g])
+        fill = host.sys_arr_set(fill, g, starts[g])
+        g += 1
+    }
+    order = host.sys_arr_new(f.nrows, 0)
+    p = 0
+    while p < f.nrows {
+        r = sorted[p]
+        gid = gids[r]
+        order = host.sys_arr_set(order, fill[gid], r)
+        fill = host.sys_arr_set(fill, gid, fill[gid] + 1)
+        p += 1
+    }
+    return [order, starts, gids, firsts]
+}
+
+/// Column indices of `names` in `f`, or `[-1]` when any is unknown.
++fr_col_indices(f: Frame, names: _) {
+    cis = []
+    for names {
+        ci = f.col_index(it)
+        if ci < 0 { return [-1] }
+        cis = host.sys_arr_push(cis, ci)
+    }
+    return cis
+}
+
+/// True when `cis` is the `[-1]` failure marker of `fr_col_indices`.
++fr_cols_bad(cis: _) : bool => host.sys_arr_len(cis) == 1 && cis[0] < 0
+
+/// Evaluate one window op over the sorted partition `order[lo..hi)`, writing results into `cells_in` (indexed by
+/// original row) and returning the updated array.
++fr_window_part(f: Frame, spec: WinSpec, ci: i64, ocis: _, order: _, lo: i64, hi: i64, cells_in: _) {
+    op = spec.op
+    n = spec.n
+    // Sliding O(partition) path for sum/mean (avoids O(n×window) fr_aggregate rescans).
+    if (op == WN_ROLL_SUM || op == WN_ROLL_MEAN) && ci >= 0 {
+        return fr_window_roll_sum_mean(f, spec, ci, order, lo, hi, cells_in)
+    }
+    cells = cells_in
+    prev_key = ""
+    rank = 0
+    dense = 0
+    run_si = 0
+    run_sf = 0.0
+    run_n = 0
+    best = cell_null()
+    p = lo
+    while p < hi {
+        row = order[p]
+        out = cell_null()
+        if op == WN_ROW_NUMBER { out = cell_int(p - lo + 1) }
+        if op == WN_RANK || op == WN_DENSE_RANK {
+            key = fr_row_key(f, ocis, row)
+            if p == lo || key != prev_key {
+                rank = p - lo + 1
+                dense += 1
+                prev_key = key
+            }
+            if op == WN_RANK { out = cell_int(rank) } else { out = cell_int(dense) }
+        }
+        if (op == WN_LAG || op == WN_LEAD) && ci >= 0 {
+            src = p - n
+            if op == WN_LEAD { src = p + n }
+            if src >= lo && src < hi { out = f.cell(order[src], ci) }
+        }
+        if op >= WN_CUM_SUM && op <= WN_CUM_COUNT && ci >= 0 {
+            x = f.cell(row, ci)
+            if !x.null && x.kind == DT_BOOL {
+                if x.b { x = cell_int(1) } else { x = cell_int(0) }
+            }
+            if op == WN_CUM_COUNT {
+                if !x.null { run_n += 1 }
+                out = cell_int(run_n)
+            } else {
+                if !x.null {
+                    run_n += 1
+                    if op == WN_CUM_SUM && x.is_num() {
+                        if x.kind == DT_INT { run_si += x.i }
+                        run_sf += x.num()
+                        if x.kind == DT_INT { out = cell_int(run_si) } else { out = cell_float(run_sf) }
+                    }
+                    if op == WN_CUM_MIN || op == WN_CUM_MAX {
+                        if run_n == 1 {
+                            best = x
+                        } else {
+                            if op == WN_CUM_MIN && cell_compare(EX_LT, x, best).b { best = x }
+                            if op == WN_CUM_MAX && cell_compare(EX_GT, x, best).b { best = x }
+                        }
+                        out = best
+                    }
+                }
+            }
+        }
+        if op >= WN_ROLL_SUM && op <= WN_ROLL_MAX && ci >= 0 {
+            wlo = p - n + 1
+            if wlo < lo { wlo = lo }
+            have = fr_aggregate(f, ci, AG_COUNT, order, wlo, p + 1).i
+            if have > 0 && have >= spec.min_periods {
+                agg = AG_SUM
+                if op == WN_ROLL_MEAN { agg = AG_MEAN }
+                if op == WN_ROLL_STD { agg = AG_STD }
+                if op == WN_ROLL_MIN { agg = AG_MIN }
+                if op == WN_ROLL_MAX { agg = AG_MAX }
+                out = fr_aggregate(f, ci, agg, order, wlo, p + 1)
+            }
+        }
+        cells = host.sys_arr_set(cells, row, out)
+        p += 1
+    }
+    return cells
+}
+
+/// Sliding rolling sum/mean into parallel float `vals` / `nulls` arrays (indexed by original row).
++fr_window_roll_float_col(f: Frame, spec: WinSpec, ci: i64, order: _, starts: _, ng: i64) {
+    vals = host.sys_arr_new(f.nrows, 0.0)
+    nulls = host.sys_arr_new(f.nrows, 1)
+    n = spec.n
+    mean = spec.op == WN_ROLL_MEAN
+    slot = f.slots[ci]
+    col: FloatCol = f.floats[slot]
+    // Reuse scratch across partitions (size = largest partition).
+    maxp = 0
+    g = 0
+    while g < ng {
+        plen = starts[g + 1] - starts[g]
+        if plen > maxp { maxp = plen }
+        g += 1
+    }
+    ok = host.sys_arr_new(maxp, 0)
+    fvals = host.sys_arr_new(maxp, 0.0)
+    g = 0
+    while g < ng {
+        lo = starts[g]
+        hi = starts[g + 1]
+        plen = hi - lo
+        i = 0
+        while i < plen {
+            row = order[lo + i]
+            if col.nulls[row] != 1 {
+                ok = host.sys_arr_set(ok, i, 1)
+                fvals = host.sys_arr_set(fvals, i, col.vals[row])
+            } else {
+                ok = host.sys_arr_set(ok, i, 0)
+            }
+            i += 1
+        }
+        sum = 0.0
+        have = 0
+        i = 0
+        while i < plen {
+            if ok[i] == 1 {
+                sum += fvals[i]
+                have += 1
+            }
+            leave = i - n
+            if leave >= 0 && ok[leave] == 1 {
+                sum -= fvals[leave]
+                have -= 1
+            }
+            row = order[lo + i]
+            if have > 0 && have >= spec.min_periods {
+                if mean {
+                    vals = host.sys_arr_set(vals, row, sum / host.sys_to_float(have))
+                } else {
+                    vals = host.sys_arr_set(vals, row, sum)
+                }
+                nulls = host.sys_arr_set(nulls, row, 0)
+            }
+            i += 1
+        }
+        g += 1
+    }
+    return [vals, nulls]
+}
+
+/// O(length) sliding rolling sum/mean for a numeric column (nulls skipped in the window).
++fr_window_roll_sum_mean(f: Frame, spec: WinSpec, ci: i64, order: _, lo: i64, hi: i64, cells_in: _) {
+    cells = cells_in
+    n = spec.n
+    mean = spec.op == WN_ROLL_MEAN
+    as_int = !mean && f.kinds[ci] == DT_INT
+    plen = hi - lo
+    ok = host.sys_arr_new(plen, 0)
+    if as_int {
+        ivals = host.sys_arr_new(plen, 0)
+        i = 0
+        while lo + i < hi {
+            row = order[lo + i]
+            if !f.is_null_at(row, ci) {
+                ok = host.sys_arr_set(ok, i, 1)
+                ivals = host.sys_arr_set(ivals, i, fr_int_at(f, row, ci))
+            }
+            i += 1
+        }
+        sumi = 0
+        have = 0
+        i = 0
+        while lo + i < hi {
+            if ok[i] == 1 {
+                sumi += ivals[i]
+                have += 1
+            }
+            leave = i - n
+            if leave >= 0 && ok[leave] == 1 {
+                sumi -= ivals[leave]
+                have -= 1
+            }
+            row = order[lo + i]
+            out = cell_null()
+            if have > 0 && have >= spec.min_periods {
+                out = cell_int(sumi)
+            }
+            cells = host.sys_arr_set(cells, row, out)
+            i += 1
+        }
+        return cells
+    }
+    vals = host.sys_arr_new(plen, 0.0)
+    i = 0
+    while lo + i < hi {
+        row = order[lo + i]
+        if !f.is_null_at(row, ci) {
+            ok = host.sys_arr_set(ok, i, 1)
+            vals = host.sys_arr_set(vals, i, fr_num_at(f, row, ci))
+        }
+        i += 1
+    }
+    sum = 0.0
+    have = 0
+    i = 0
+    while lo + i < hi {
+        if ok[i] == 1 {
+            sum += vals[i]
+            have += 1
+        }
+        leave = i - n
+        if leave >= 0 && ok[leave] == 1 {
+            sum -= vals[leave]
+            have -= 1
+        }
+        row = order[lo + i]
+        out = cell_null()
+        if have > 0 && have >= spec.min_periods {
+            if mean {
+                out = cell_float(sum / host.sys_to_float(have))
+            } else {
+                out = cell_float(sum)
+            }
+        }
+        cells = host.sys_arr_set(cells, row, out)
+        i += 1
+    }
+    return cells
+}
+
+/// `f` plus one column per `WinSpec` in `wins` (see `Frame.over`). Unknown columns give an empty frame.
++fr_over(f: Frame, parts: _, order_by: _, desc: _, wins: _) : Frame {
+    pcis = fr_col_indices(f, parts)
+    ocis = fr_col_indices(f, order_by)
+    if fr_cols_bad(pcis) || fr_cols_bad(ocis) { return Frame.new() }
+    pt = fr_partitions(f, pcis, ocis, desc)
+    order = pt[0]
+    starts = pt[1]
+    ng = host.sys_arr_len(pt[3])
+    out = fr_share(f)
+    for wins {
+        item = it
+        spec: WinSpec = item
+        ci = f.col_index(spec.col)
+        // Float rolling sum/mean: write a FloatCol directly (no Cell array).
+        if (spec.op == WN_ROLL_SUM || spec.op == WN_ROLL_MEAN) && ci >= 0 && f.kinds[ci] == DT_FLOAT {
+            filled = fr_window_roll_float_col(f, spec, ci, order, starts, ng)
+            @out.add_float(FloatCol.{name: spec.out, vals: filled[0], nulls: filled[1]})
+        } else {
+            cells = host.sys_arr_new(f.nrows, cell_null())
+            g = 0
+            while g < ng {
+                lo = starts[g]
+                hi = starts[g + 1]
+                if spec.op <= AG_NUNIQUE {
+                    c = fr_aggregate(f, ci, spec.op, order, lo, hi)
+                    p = lo
+                    while p < hi {
+                        cells = host.sys_arr_set(cells, order[p], c)
+                        p += 1
+                    }
+                } else {
+                    cells = fr_window_part(f, spec, ci, ocis, order, lo, hi, cells)
+                }
+                g += 1
+            }
+            @out.add_cells(spec.out, cells)
+        }
+    }
+    out
+}
+
+/// `[ints, floats]` of the numeric column `ci`, indexed by row (zero for nulls; the int array is zero for float columns).
++fr_num_keys(f: Frame, ci: i64) {
+    ints = []
+    floats = []
+    row = 0
+    while row < f.nrows {
+        x = f.cell(row, ci)
+        iv = 0
+        fv = 0.0
+        if !x.null {
+            if x.kind == DT_INT { iv = x.i }
+            fv = x.num()
+        }
+        ints = host.sys_arr_push(ints, iv)
+        floats = host.sys_arr_push(floats, fv)
+        row += 1
+    }
+    return [ints, floats]
+}
+
+/// Three-way comparison of key `a` against key `b` (ints when `use_int`, else floats).
++fr_key_cmp(use_int: bool, ai: i64, af: f64, bi: i64, bf: f64) : i64 {
+    if use_int {
+        if ai < bi { return -1 }
+        if ai > bi { return 1 }
+        return 0
+    }
+    if af < bf { return -1 }
+    if af > bf { return 1 }
+    0
+}
+
+/// Distance between two keys as a float.
++fr_key_dist(use_int: bool, ai: i64, af: f64, bi: i64, bf: f64) : f64 {
+    if use_int { return dt_abs(host.sys_to_float(ai - bi)) }
+    dt_abs(af - bf)
+}
+
+/// First position in `[lo, hi)` of `rows` whose key is above the target (`strict`) or at least the target.
++fr_key_bound(rows: _, ki: _, kf: _, lo: i64, hi: i64, use_int: bool, ti: i64, tf: f64, strict: bool) : i64 {
+    a = lo
+    b = hi
+    while a < b {
+        mid = a + (b - a) / 2
+        r = rows[mid]
+        c = fr_key_cmp(use_int, ki[r], kf[r], ti, tf)
+        right = c < 0
+        if strict { right = c <= 0 }
+        if right { a = mid + 1 } else { b = mid }
+    }
+    a
+}
+
+/// Gather an int join-key column from left/right row indices (`-1` = take from the other side).
++fr_join_gather_int_key(lc: IntCol, rc: IntCol, lidx: _, ridx: _, n: i64, name: str) : IntCol {
+    kvals = host.sys_arr_new(n, 0)
+    knulls = host.sys_arr_new(n, 0)
+    i = 0
+    while i < n {
+        if lidx[i] >= 0 {
+            li = lidx[i]
+            if lc.nulls[li] == 1 {
+                knulls = host.sys_arr_set(knulls, i, 1)
+            } else {
+                kvals = host.sys_arr_set(kvals, i, lc.vals[li])
+            }
+        } else {
+            ri = ridx[i]
+            if rc.nulls[ri] == 1 {
+                knulls = host.sys_arr_set(knulls, i, 1)
+            } else {
+                kvals = host.sys_arr_set(kvals, i, rc.vals[ri])
+            }
+        }
+        i += 1
+    }
+    IntCol.{name, vals: kvals, nulls: knulls}
+}
+
+/// Gather non-key columns of `f` by `idx` into `out` (skips column indices in `skip`).
+/// When `dense`, every index is in-range (inner join) and numeric cols use `take_dense`.
++fr_join_take_rest(f: Frame, idx: _, skip: _, @out: Frame, suffix_clash: bool, dense: bool) : i64 {
+    ci = 0
+    w = f.width()
+    while ci < w {
+        iskey = false
+        for skip { if it == ci { iskey = true } }
+        k = f.kinds[ci]
+        s = f.slots[ci]
+        nm = f.names[ci]
+        if suffix_clash && !iskey && out.has_col(nm) { nm = "{nm}_right" }
+        if !iskey {
+            if (k == DT_INT) {
+                ic: IntCol = f.ints[s]
+                if dense {
+                    @out.add_int(ic.take_dense(idx).named(nm))
+                } else {
+                    @out.add_int(ic.take(idx).named(nm))
+                }
+            }
+            if (k == DT_FLOAT) {
+                fc: FloatCol = f.floats[s]
+                if dense {
+                    @out.add_float(fc.take_dense(idx).named(nm))
+                } else {
+                    @out.add_float(fc.take(idx).named(nm))
+                }
+            }
+            if (k == DT_BOOL) {
+                bc: BoolCol = f.bools[s]
+                @out.add_bool(bc.take(idx).named(nm))
+            }
+            if (k == DT_STR) {
+                sc: StrCol = f.strs[s]
+                @out.add_str(sc.take(idx).named(nm))
+            }
+        }
+        ci += 1
+    }
+    out.width()
+}
+
+/// Assemble join output from left/right row index lists (`-1` = missing side).
++fr_join_assemble(l: Frame, r: Frame, lcis: _, rcis: _, lidx: _, ridx: _) : Frame {
+    out = Frame.new()
+    n = host.sys_arr_len(lidx)
+    k = 0
+    while k < host.sys_arr_len(lcis) {
+        // Typed gather for int keys; Cell path for mixed/string keys.
+        if l.kinds[lcis[k]] == DT_INT && r.kinds[rcis[k]] == DT_INT {
+            @out.add_int(fr_join_gather_int_key(l.ints[l.slots[lcis[k]]], r.ints[r.slots[rcis[k]]], lidx, ridx, n, l.names[lcis[k]]))
+        } else {
+            cells = host.sys_arr_new(n, cell_null())
+            i = 0
+            while i < n {
+                if lidx[i] >= 0 {
+                    cells = host.sys_arr_set(cells, i, l.cell(lidx[i], lcis[k]))
+                } else {
+                    cells = host.sys_arr_set(cells, i, r.cell(ridx[i], rcis[k]))
+                }
+                i += 1
+            }
+            @out.add_cells(l.names[lcis[k]], cells)
+        }
+        k += 1
+    }
+    // Gather only non-key columns (avoid full-frame take that recopies keys).
+    // Inner joins never emit -1 indices → dense gather.
+    dense = true
+    i = 0
+    while i < n {
+        if lidx[i] < 0 || ridx[i] < 0 { dense = false }
+        i += 1
+    }
+    fr_join_take_rest(l, lidx, lcis, @out, false, dense)
+    fr_join_take_rest(r, ridx, rcis, @out, true, dense)
+    out
+}
+
+/// Inner/outer join when right keys are non-negative and `max_key` is small (direct array probe).
++fr_join_int1_dense(l: Frame, r: Frame, lci: i64, rci: i64, lkey: IntCol, rkey: IntCol, max_key: i64, keep_left: bool, keep_right: bool) : Frame {
+    span = max_key + 1
+    head = host.sys_arr_new(span, -1)
+    tailp = host.sys_arr_new(span, -1)
+    nxt = host.sys_arr_new(r.nrows, -1)
+    rrow = 0
+    while rrow < r.nrows {
+        if rkey.nulls[rrow] != 1 {
+            key = rkey.vals[rrow]
+            if head[key] < 0 {
+                head = host.sys_arr_set(head, key, rrow)
+                tailp = host.sys_arr_set(tailp, key, rrow)
+            } else {
+                nxt = host.sys_arr_set(nxt, tailp[key], rrow)
+                tailp = host.sys_arr_set(tailp, key, rrow)
+            }
+        }
+        rrow += 1
+    }
+    n_out = 0
+    lrow = 0
+    while lrow < l.nrows {
+        if lkey.nulls[lrow] != 1 {
+            key = lkey.vals[lrow]
+            if key >= 0 && key <= max_key && head[key] >= 0 {
+                rr = head[key]
+                while rr >= 0 {
+                    n_out += 1
+                    rr = nxt[rr]
+                }
+            } else {
+                if keep_left { n_out += 1 }
+            }
+        } else {
+            if keep_left { n_out += 1 }
+        }
+        lrow += 1
+    }
+    matched = host.sys_arr_new(r.nrows, 0)
+    lidx = host.sys_arr_new(n_out, -1)
+    ridx = host.sys_arr_new(n_out, -1)
+    at = 0
+    lrow = 0
+    while lrow < l.nrows {
+        if lkey.nulls[lrow] != 1 {
+            key = lkey.vals[lrow]
+            if key >= 0 && key <= max_key && head[key] >= 0 {
+                rr = head[key]
+                while rr >= 0 {
+                    lidx = host.sys_arr_set(lidx, at, lrow)
+                    ridx = host.sys_arr_set(ridx, at, rr)
+                    matched = host.sys_arr_set(matched, rr, 1)
+                    at += 1
+                    rr = nxt[rr]
+                }
+            } else {
+                if keep_left {
+                    lidx = host.sys_arr_set(lidx, at, lrow)
+                    ridx = host.sys_arr_set(ridx, at, -1)
+                    at += 1
+                }
+            }
+        } else {
+            if keep_left {
+                lidx = host.sys_arr_set(lidx, at, lrow)
+                ridx = host.sys_arr_set(ridx, at, -1)
+                at += 1
+            }
+        }
+        lrow += 1
+    }
+    if keep_right {
+        rrow = 0
+        while rrow < r.nrows {
+            if matched[rrow] == 0 {
+                lidx = host.sys_arr_push(lidx, -1)
+                ridx = host.sys_arr_push(ridx, rrow)
+            }
+            rrow += 1
+        }
+    }
+    fr_join_assemble(l, r, [lci], [rci], lidx, ridx)
+}
+
+/// Inner/outer join on a single int key column (HashMap on i64; no string keys).
++fr_join_int1(l: Frame, r: Frame, lci: i64, rci: i64, keep_left: bool, keep_right: bool) : Frame {
+    rkey: IntCol = r.ints[r.slots[rci]]
+    lkey: IntCol = l.ints[l.slots[lci]]
+    // Dense probe when keys are non-neg and span is O(nrows) — typical dimension tables.
+    max_key = -1
+    has_neg = false
+    rrow = 0
+    while rrow < r.nrows {
+        if rkey.nulls[rrow] != 1 {
+            v = rkey.vals[rrow]
+            if v < 0 { has_neg = true }
+            if v > max_key { max_key = v }
+        }
+        rrow += 1
+    }
+    if !has_neg && max_key >= 0 && max_key < 10000000 && max_key + 1 <= r.nrows * 4 + 64 {
+        return fr_join_int1_dense(l, r, lci, rci, lkey, rkey, max_key, keep_left, keep_right)
+    }
+    m = HashMap.with_capacity(r.nrows + 16)
+    head = []
+    tailp = []
+    nxt = host.sys_arr_new(r.nrows, -1)
+    rrow = 0
+    while rrow < r.nrows {
+        if rkey.nulls[rrow] != 1 {
+            key = rkey.vals[rrow]
+            g = m.get(key) or -1
+            if g < 0 {
+                g = host.sys_arr_len(head)
+                @m.put(key, g)
+                head = host.sys_arr_push(head, rrow)
+                tailp = host.sys_arr_push(tailp, rrow)
+            } else {
+                nxt = host.sys_arr_set(nxt, tailp[g], rrow)
+                tailp = host.sys_arr_set(tailp, g, rrow)
+            }
+        }
+        rrow += 1
+    }
+    // Count output rows, then pre-size index arrays.
+    n_out = 0
+    lrow = 0
+    while lrow < l.nrows {
+        if lkey.nulls[lrow] != 1 {
+            g = m.get(lkey.vals[lrow]) or -1
+            if g >= 0 {
+                rr = head[g]
+                while rr >= 0 {
+                    n_out += 1
+                    rr = nxt[rr]
+                }
+            } else {
+                if keep_left { n_out += 1 }
+            }
+        } else {
+            if keep_left { n_out += 1 }
+        }
+        lrow += 1
+    }
+    matched = host.sys_arr_new(r.nrows, 0)
+    // Pre-sized for left/inner matches; right-only rows append when keep_right.
+    lidx = host.sys_arr_new(n_out, -1)
+    ridx = host.sys_arr_new(n_out, -1)
+    at = 0
+    lrow = 0
+    while lrow < l.nrows {
+        if lkey.nulls[lrow] != 1 {
+            g = m.get(lkey.vals[lrow]) or -1
+            if g >= 0 {
+                rr = head[g]
+                while rr >= 0 {
+                    lidx = host.sys_arr_set(lidx, at, lrow)
+                    ridx = host.sys_arr_set(ridx, at, rr)
+                    matched = host.sys_arr_set(matched, rr, 1)
+                    at += 1
+                    rr = nxt[rr]
+                }
+            } else {
+                if keep_left {
+                    lidx = host.sys_arr_set(lidx, at, lrow)
+                    ridx = host.sys_arr_set(ridx, at, -1)
+                    at += 1
+                }
+            }
+        } else {
+            if keep_left {
+                lidx = host.sys_arr_set(lidx, at, lrow)
+                ridx = host.sys_arr_set(ridx, at, -1)
+                at += 1
+            }
+        }
+        lrow += 1
+    }
+    if keep_right {
+        rrow = 0
+        while rrow < r.nrows {
+            if matched[rrow] == 0 {
+                lidx = host.sys_arr_push(lidx, -1)
+                ridx = host.sys_arr_push(ridx, rrow)
+            }
+            rrow += 1
+        }
+    }
+    fr_join_assemble(l, r, [lci], [rci], lidx, ridx)
+}
+
+/// As-of join of `l` with `r` on numeric key `on`, grouped by `by` (see `Frame.join_asof`).
++fr_join_asof(l: Frame, r: Frame, on: str, by: _, strategy: str, tol: f64) : Frame {
+    lci = l.col_index(on)
+    rci = r.col_index(on)
+    if lci < 0 || rci < 0 { return Frame.new() }
+    lk = l.kinds[lci]
+    rk = r.kinds[rci]
+    if (lk != DT_INT && lk != DT_FLOAT) || (rk != DT_INT && rk != DT_FLOAT) { return Frame.new() }
+    if strategy != "backward" && strategy != "forward" && strategy != "nearest" { return Frame.new() }
+    lbs = fr_col_indices(l, by)
+    rbs = fr_col_indices(r, by)
+    if fr_cols_bad(lbs) || fr_cols_bad(rbs) { return Frame.new() }
+    use_int = lk == DT_INT && rk == DT_INT
+    lkeys = fr_num_keys(l, lci)
+    rkeys = fr_num_keys(r, rci)
+    lki = lkeys[0]
+    lkf = lkeys[1]
+    rki = rkeys[0]
+    rkf = rkeys[1]
+    // right rows sorted by key, then bucketed by `by` (counting sort keeps each bucket sorted); null keys never match
+    rorder = fr_order(r, rci, false)
+    ki = KeyIndex.new()
+    bucket = []
+    sizes = []
+    p = 0
+    while p < r.nrows {
+        row = rorder[p]
+        g = -1
+        if !r.is_null_at(row, rci) && !fr_key_has_null(r, rbs, row) {
+            before = ki.size()
+            g = @ki.find_or_add(fr_row_key(r, rbs, row))
+            if ki.size() > before { sizes = host.sys_arr_push(sizes, 0) }
+            sizes = host.sys_arr_set(sizes, g, sizes[g] + 1)
+        }
+        bucket = host.sys_arr_push(bucket, g)
+        p += 1
+    }
+    ng = ki.size()
+    starts = host.sys_arr_new(ng + 1, 0)
+    fill = []
+    g = 0
+    while g < ng {
+        starts = host.sys_arr_set(starts, g + 1, starts[g] + sizes[g])
+        fill = host.sys_arr_push(fill, starts[g])
+        g += 1
+    }
+    grouped = host.sys_arr_new(starts[ng], 0)
+    p = 0
+    while p < r.nrows {
+        g = bucket[p]
+        if g >= 0 {
+            grouped = host.sys_arr_set(grouped, fill[g], rorder[p])
+            fill = host.sys_arr_set(fill, g, fill[g] + 1)
+        }
+        p += 1
+    }
+    ridx = []
+    row = 0
+    while row < l.nrows {
+        pick = -1
+        if !l.is_null_at(row, lci) && !fr_key_has_null(l, lbs, row) {
+            g = ki.find(fr_row_key(l, lbs, row))
+            if g >= 0 {
+                lo = starts[g]
+                hi = starts[g + 1]
+                back = -1
+                fwd = -1
+                if strategy != "forward" {
+                    pos = fr_key_bound(grouped, rki, rkf, lo, hi, use_int, lki[row], lkf[row], true)
+                    if pos > lo { back = grouped[pos - 1] }
+                }
+                if strategy != "backward" {
+                    pos = fr_key_bound(grouped, rki, rkf, lo, hi, use_int, lki[row], lkf[row], false)
+                    if pos < hi { fwd = grouped[pos] }
+                }
+                pick = back
+                if back < 0 { pick = fwd }
+                if back >= 0 && fwd >= 0 && strategy == "nearest" {
+                    db = fr_key_dist(use_int, lki[row], lkf[row], rki[back], rkf[back])
+                    df = fr_key_dist(use_int, lki[row], lkf[row], rki[fwd], rkf[fwd])
+                    if df < db { pick = fwd }
+                }
+                if strategy == "forward" { pick = fwd }
+                if pick >= 0 && tol >= 0.0 {
+                    d = fr_key_dist(use_int, lki[row], lkf[row], rki[pick], rkf[pick])
+                    if d > tol { pick = -1 }
+                }
+            }
+        }
+        ridx = host.sys_arr_push(ridx, pick)
+        row += 1
+    }
+    out = fr_copy(l)
+    rt = r.take(ridx)
+    ci = 0
+    while ci < rt.width() {
+        nm = rt.names[ci]
+        skip = nm == on
+        for by { if it == nm { skip = true } }
+        if !skip {
+            if out.has_col(nm) { nm = "{nm}_right" }
+            fr_copy_col(rt, ci, @out, nm)
+        }
+        ci += 1
+    }
+    out
+}
+
+/// Floor division (`a / b` rounded toward negative infinity); `b` must be non-zero.
++fr_floor_div(a: i64, b: i64) : i64 {
+    q = a / b
+    if a % b != 0 && ((a < 0) != (b < 0)) { q -= 1 }
+    q
+}
+
+/// Duration text such as `"500ms"`, `"30s"`, `"5m"`, `"1h"`, `"2d"`, `"1w"` (units `ns us ms s m h d w`) in index units,
+/// where `per_second` is how many index units make one second (`1` for epoch seconds, `1000` for milliseconds).
+/// Returns `-1` for text that is not a positive whole duration.
++fr_duration(text: str, per_second: i64) : i64 {
+    t = trim(text)
+    n = char_count(t)
+    i = 0
+    while i < n && is_digit(t[i]) { i += 1 }
+    ensure i > 0 && i < n else { return -1 }
+    v = to_i64(t[0..i]) or -1
+    unit = t[i..n]
+    ensure v > 0 else { return -1 }
+    if unit == "ns" { return v * per_second / 1000000000 }
+    if unit == "us" { return v * per_second / 1000000 }
+    if unit == "ms" { return v * per_second / 1000 }
+    if unit == "s" { return v * per_second }
+    if unit == "m" { return v * 60 * per_second }
+    if unit == "h" { return v * 3600 * per_second }
+    if unit == "d" { return v * 86400 * per_second }
+    if unit == "w" { return v * 604800 * per_second }
+    -1
+}
+
+/// Dynamic (time) windows; see `Frame.group_by_dynamic_with`. An unknown / non-int `ts_col`, an unknown `by`, or a
+/// non-positive `every` / `period` give an empty frame.
++fr_group_dynamic(f: Frame, ts_col: str, every: i64, period: i64, offset: i64, by: _, aggs: _) : Frame {
+    ici = f.col_index(ts_col)
+    if ici < 0 || f.kinds[ici] != DT_INT || every <= 0 || period <= 0 { return Frame.new() }
+    bcis = fr_col_indices(f, by)
+    if fr_cols_bad(bcis) { return Frame.new() }
+    pt = fr_partitions(f, bcis, [ici], [false])
+    order = pt[0]
+    starts = pt[1]
+    firsts = pt[3]
+    keys = fr_num_keys(f, ici)[0]
+    ng = host.sys_arr_len(firsts)
+    labels = []
+    krows = []
+    acells = []
+    for aggs { acells = host.sys_arr_push(acells, []) }
+    g = 0
+    while g < ng {
+        lo = starts[g]
+        end = starts[g + 1]
+        while end > lo && f.is_null_at(order[end - 1], ici) { end -= 1 }
+        if end > lo {
+            k = fr_floor_div(keys[order[lo]] - offset - period, every) + 1
+            a = lo
+            b = lo
+            while a < end {
+                ws = offset + k * every
+                we = ws + period
+                while a < end && keys[order[a]] < ws { a += 1 }
+                if a >= end { break }
+                if b < a { b = a }
+                while b < end && keys[order[b]] < we { b += 1 }
+                if b > a {
+                    labels = host.sys_arr_push(labels, ws)
+                    krows = host.sys_arr_push(krows, firsts[g])
+                    ai = 0
+                    for aggs {
+                        item = it
+                        spec: AggSpec = item
+                        c = fr_aggregate(f, f.col_index(spec.col), spec.op, order, a, b)
+                        acells = host.sys_arr_set(acells, ai, host.sys_arr_push(acells[ai], c))
+                        ai += 1
+                    }
+                    k += 1
+                } else {
+                    k2 = fr_floor_div(keys[order[a]] - offset - period, every) + 1
+                    if k2 > k { k = k2 } else { k += 1 }
+                }
+            }
+        }
+        g += 1
+    }
+    out = f.select(by).take(krows)
+    @out.add_int(IntCol.{name: ts_col, vals: labels, nulls: dt_repeat(host.sys_arr_len(labels), 0)})
+    ai = 0
+    for aggs {
+        item = it
+        spec: AggSpec = item
+        @out.add_cells(spec.out, acells[ai])
+        ai += 1
+    }
+    out
+}
+
+/// Rows `start .. start + rows` of `f` (clamped to the frame).
++fr_slice(f: Frame, start: i64, rows: i64) : Frame {
+    idx = []
+    i = start
+    stop = start + rows
+    if stop > f.nrows { stop = f.nrows }
+    while i < stop {
+        idx = host.sys_arr_push(idx, i)
+        i += 1
+    }
+    f.take(idx)
+}
+
+/// Rows of every frame in `frames` stacked in order (all must have the same column names; `Frame.new()` otherwise).
+/// A column keeps its dtype when all frames agree on it, else it is re-inferred like `Frame.vstack`; when no frame
+/// has any row the first (typed, empty) frame is returned.
++fr_concat(frames: _) : Frame {
+    nf = host.sys_arr_len(frames)
+    ensure nf > 0 else { return Frame.new() }
+    first: Frame = frames[0]
+    total = 0
+    k = 0
+    while k < nf {
+        fitem = frames[k]
+        fk: Frame = fitem
+        if fk.width() != first.width() { return Frame.new() }
+        total += fk.nrows
+        k += 1
+    }
+    if total == 0 || nf == 1 { return first }
+    out = Frame.new()
+    ci = 0
+    while ci < first.width() {
+        name = first.names[ci]
+        kind = first.kinds[ci]
+        same = true
+        cols = []
+        k = 0
+        while k < nf {
+            fitem = frames[k]
+            fk: Frame = fitem
+            oc = fk.col_index(name)
+            if oc < 0 { return Frame.new() }
+            if fk.kinds[oc] != kind { same = false }
+            cols = host.sys_arr_push(cols, oc)
+            k += 1
+        }
+        if same && kind == DT_INT {
+            c = IntCol.new(name)
+            k = 0
+            while k < nf {
+                fitem = frames[k]
+                fk: Frame = fitem
+                src: IntCol = fk.ints[fk.slots[cols[k]]]
+                r = 0
+                while r < src.size() {
+                    if src.is_null(r) { @c.push_null() } else { @c.push(src.get(r)) }
+                    r += 1
+                }
+                k += 1
+            }
+            @out.add_int(c)
+        }
+        if same && kind == DT_FLOAT {
+            c = FloatCol.new(name)
+            k = 0
+            while k < nf {
+                fitem = frames[k]
+                fk: Frame = fitem
+                src: FloatCol = fk.floats[fk.slots[cols[k]]]
+                r = 0
+                while r < src.size() {
+                    if src.is_null(r) { @c.push_null() } else { @c.push(src.get(r)) }
+                    r += 1
+                }
+                k += 1
+            }
+            @out.add_float(c)
+        }
+        if same && kind == DT_BOOL {
+            c = BoolCol.new(name)
+            k = 0
+            while k < nf {
+                fitem = frames[k]
+                fk: Frame = fitem
+                src: BoolCol = fk.bools[fk.slots[cols[k]]]
+                r = 0
+                while r < src.size() {
+                    if src.is_null(r) { @c.push_null() } else { @c.push(src.get(r)) }
+                    r += 1
+                }
+                k += 1
+            }
+            @out.add_bool(c)
+        }
+        if same && kind == DT_STR {
+            c = StrCol.new(name)
+            k = 0
+            while k < nf {
+                fitem = frames[k]
+                fk: Frame = fitem
+                src: StrCol = fk.strs[fk.slots[cols[k]]]
+                r = 0
+                while r < src.size() {
+                    if src.is_null(r) { @c.push_null() } else { @c.push(src.get(r)) }
+                    r += 1
+                }
+                k += 1
+            }
+            @out.add_str(c)
+        }
+        if !same {
+            cells = []
+            k = 0
+            while k < nf {
+                fitem = frames[k]
+                fk: Frame = fitem
+                r = 0
+                while r < fk.nrows {
+                    cells = host.sys_arr_push(cells, fk.cell(r, cols[k]))
+                    r += 1
+                }
+                k += 1
+            }
+            @out.add_cells(name, cells)
+        }
+        ci += 1
+    }
+    out
+}
+
+// --- rows <-> frames --------------------------------------------------------------------------------
+
+/// True when `s` is an optionally signed run of digits.
++fr_is_int(s: str) : bool {
+    t = trim(s)
+    n = char_count(t)
+    ensure n > 0 else { return false }
+    from = 0
+    if t[0] == "-" || t[0] == "+" { from = 1 }
+    ensure from < n else { return false }
+    i = from
+    while i < n {
+        if !is_digit(t[i]) { return false }
+        i += 1
+    }
+    true
+}
+
+/// True when `s` is an optionally signed decimal number (`12`, `-3.5`, `.5`, `7.`).
++fr_is_float(s: str) : bool {
+    t = trim(s)
+    n = char_count(t)
+    ensure n > 0 else { return false }
+    from = 0
+    if t[0] == "-" || t[0] == "+" { from = 1 }
+    ensure from < n else { return false }
+    digits = 0
+    dots = 0
+    i = from
+    while i < n {
+        if is_digit(t[i]) {
+            digits += 1
+        } else {
+            if t[i] == "." { dots += 1 } else { return false }
+        }
+        i += 1
+    }
+    digits > 0 && dots <= 1
+}
+
+/// True when `s` is `true` or `false` in any case.
++fr_is_bool(s: str) : bool {
+    t = to_lower(trim(s))
+    t == "true" || t == "false"
+}
+
+/// Typed frame from text rows (arrays of strings, as produced by `csv_parse`). With `has_header` the first row names
+/// the columns (duplicates get `_2`, `_3` ... suffixes), otherwise columns are `c0`, `c1`, .... Each column becomes
+/// `int` when every non-empty cell is an integer, else `float` when all are numbers, else `bool` when all are
+/// `true`/`false`, else `str`; empty cells are nulls. Short rows are padded with nulls.
++frame_from_rows(rows: _, has_header: bool) : Frame {
+    out = Frame.new()
+    nrows = host.sys_arr_len(rows)
+    ensure nrows > 0 else { return out }
+    width = 0
+    for rows { if host.sys_arr_len(it) > width { width = host.sys_arr_len(it) } }
+    first = 0
+    if has_header {
+        first = 1
+        width = host.sys_arr_len(rows[0])
+    }
+    ci = 0
+    while ci < width {
+        name = "c{ci}"
+        if has_header {
+            name = rows[0][ci]
+            if name == "" { name = "c{ci}" }
+        }
+        base = name
+        dup = 2
+        while out.has_col(name) {
+            name = "{base}_{dup}"
+            dup += 1
+        }
+        all_int = true
+        all_num = true
+        all_bool = true
+        seen = 0
+        r = first
+        while r < nrows {
+            cell = ""
+            if ci < host.sys_arr_len(rows[r]) { cell = rows[r][ci] }
+            if trim(cell) != "" {
+                seen += 1
+                if !fr_is_int(cell) { all_int = false }
+                if !fr_is_float(cell) { all_num = false }
+                if !fr_is_bool(cell) { all_bool = false }
+            }
+            r += 1
+        }
+        if seen == 0 {
+            all_int = false
+            all_num = false
+            all_bool = false
+        }
+        if all_int {
+            c = IntCol.new(name)
+            r = first
+            while r < nrows {
+                cell = ""
+                if ci < host.sys_arr_len(rows[r]) { cell = rows[r][ci] }
+                if trim(cell) == "" { @c.push_null() } else { @c.push(to_i64(cell) or 0) }
+                r += 1
+            }
+            @out.add_int(c)
+        } else {
+            if all_num {
+                c = FloatCol.new(name)
+                r = first
+                while r < nrows {
+                    cell = ""
+                    if ci < host.sys_arr_len(rows[r]) { cell = rows[r][ci] }
+                    if trim(cell) == "" { @c.push_null() } else { @c.push(to_f64(cell) or 0.0) }
+                    r += 1
+                }
+                @out.add_float(c)
+            } else {
+                if all_bool {
+                    c = BoolCol.new(name)
+                    r = first
+                    while r < nrows {
+                        cell = ""
+                        if ci < host.sys_arr_len(rows[r]) { cell = rows[r][ci] }
+                        if trim(cell) == "" { @c.push_null() } else { @c.push(to_lower(trim(cell)) == "true") }
+                        r += 1
+                    }
+                    @out.add_bool(c)
+                } else {
+                    c = StrCol.new(name)
+                    r = first
+                    while r < nrows {
+                        cell = ""
+                        if ci < host.sys_arr_len(rows[r]) { cell = rows[r][ci] }
+                        if cell == "" { @c.push_null() } else { @c.push(cell) }
+                        r += 1
+                    }
+                    @out.add_str(c)
+                }
+            }
+        }
+        ci += 1
+    }
+    out
+}
+
+/// Text rows of a frame: the header row first when `with_header`, then one row per data row (nulls become `""`).
++frame_to_rows(f: Frame, with_header: bool) {
+    rows = []
+    if with_header { rows = host.sys_arr_push(rows, f.names) }
+    row = 0
+    while row < f.nrows {
+        cells = []
+        ci = 0
+        while ci < f.width() {
+            cells = host.sys_arr_push(cells, f.text_at(row, ci))
+            ci += 1
+        }
+        rows = host.sys_arr_push(rows, cells)
+        row += 1
+    }
+    rows
+}
+
+// --- tests ----------------------------------------------------------------------------------------
+
+/// Sales fixture used by the tests: 6 rows, mixed dtypes, one null.
+fr_sales() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("region", ["EU", "US", "EU", "APAC", "US", "EU"]))
+    @f.add_float(float_col("price", [10.0, 20.0, 30.0, 5.0, 8.0, 4.0]))
+    q = int_col("qty", [3, 1, 2, 10, 4, 5])
+    @f.add_int(q)
+    @f.add_bool(bool_col("rush", [true, false, false, true, false, true]))
+    f
+}
+
+test "frame construction and accessors" {
+    f = fr_sales()
+    assert_eq(f.width(), 4)
+    assert_eq(f.height(), 6)
+    assert_eq(f.col_index("price"), 1)
+    assert_eq(f.col_index("nope"), -1)
+    #assert(f.has_col("qty"))
+    #assert(!(f.has_col("zzz")))
+    assert_eq(f.kind_of("region"), DT_STR)
+    assert_eq(f.kind_of("price"), DT_FLOAT)
+    assert_eq(f.kind_of("qty"), DT_INT)
+    assert_eq(f.kind_of("rush"), DT_BOOL)
+    assert_eq(f.kind_of("x"), -1)
+    assert_eq(f.get_int("qty").total(), 25)
+    assert_eq(f.get_float("price").total(), 77.0)
+    assert_eq(f.get_str("region").n_unique(), 3)
+    assert_eq(f.get_bool("rush").count_true(), 3)
+    // wrong dtype or name gives an empty column
+    assert_eq(f.get_int("price").size(), 0)
+    assert_eq(f.get_str("nope").size(), 0)
+    assert_eq(f.cell(0, 0).s, "EU")
+    assert_eq(f.cell(3, 1).f, 5.0)
+    assert_eq(f.cell(5, 2).i, 5)
+    #assert(!(f.cell(4, 3).b))
+    assert_eq(f.text_at(1, 0), "US")
+    assert_eq(f.text_at(2, 2), "2")
+    #assert(!(f.is_null_at(0, 0)))
+    // a column of the wrong length is rejected
+    g = fr_copy(f)
+    assert_eq(@g.add_int(int_col("bad", [1, 2])), -1)
+    assert_eq(g.width(), 4)
+    // replacing a column keeps the width
+    assert_eq(g.height(), 6)
+    @g.add_int(int_col("qty", [9, 9, 9, 9, 9, 9]))
+    assert_eq(g.width(), 4)
+    assert_eq(g.get_int("qty").total(), 54)
+    assert_eq(f.get_int("qty").total(), 25)
+    // empty frame
+    e = Frame.new()
+    assert_eq(e.width(), 0)
+    assert_eq(e.height(), 0)
+    assert_eq(e.to_text(5), "(empty frame)")
+    @e.add_int(int_col("a", [1, 2, 3]))
+    assert_eq(e.height(), 3)
+}
+
+test "select drop rename take head tail" {
+    f = fr_sales()
+    s = f.select(["qty", "region", "ghost"])
+    assert_eq(s.width(), 2)
+    assert_eq(s.names[0], "qty")
+    assert_eq(s.names[1], "region")
+    assert_eq(s.height(), 6)
+    d = f.drop(["price", "rush"])
+    assert_eq(d.width(), 2)
+    #assert(!(d.has_col("price")))
+    #assert(d.has_col("region"))
+    r = f.rename("qty", "units")
+    #assert(r.has_col("units"))
+    #assert(!(r.has_col("qty")))
+    assert_eq(r.get_int("units").total(), 25)
+    assert_eq(r.names[2], "units")
+    assert_eq(f.rename("nope", "x").width(), 4)
+    t = f.take([5, 0, -1])
+    assert_eq(t.height(), 3)
+    assert_eq(t.cell(0, 2).i, 5)
+    assert_eq(t.cell(1, 0).s, "EU")
+    #assert(t.cell(2, 0).null)
+    #assert(t.cell(2, 1).null)
+    assert_eq(f.take([]).height(), 0)
+    assert_eq(f.take([]).width(), 4)
+    h = f.head(2)
+    assert_eq(h.height(), 2)
+    assert_eq(h.cell(1, 0).s, "US")
+    assert_eq(f.head(100).height(), 6)
+    assert_eq(f.head(0).height(), 0)
+    tl = f.tail(2)
+    assert_eq(tl.height(), 2)
+    assert_eq(tl.cell(0, 2).i, 4)
+    assert_eq(tl.cell(1, 2).i, 5)
+    assert_eq(f.tail(100).height(), 6)
+}
+
+test "filter with expressions" {
+    f = fr_sales()
+    big = f.filter(expr("price * qty >= 50") or fail_expr())
+    // 30, 20, 60 (EU 30*2), 50 (APAC 5*10), 32, 20 -> rows 2 and 3
+    assert_eq(big.height(), 2)
+    assert_eq(big.cell(0, 0).s, "EU")
+    assert_eq(big.cell(0, 2).i, 2)
+    assert_eq(big.cell(1, 0).s, "APAC")
+    eu = f.filter(expr("region == 'EU' and rush") or fail_expr())
+    assert_eq(eu.height(), 2)
+    assert_eq(eu.get_int("qty").total(), 8)
+    none_match = f.filter(expr("qty > 100") or fail_expr())
+    assert_eq(none_match.height(), 0)
+    assert_eq(none_match.width(), 4)
+    all_match = f.filter(expr("qty > 0") or fail_expr())
+    assert_eq(all_match.height(), 6)
+    either = f.filter(expr("region == 'APAC' or price > 25") or fail_expr())
+    assert_eq(either.height(), 2)
+    notrush = f.filter(expr("not rush") or fail_expr())
+    assert_eq(notrush.height(), 3)
+    // unknown column evaluates to null, so no rows pass
+    assert_eq(f.filter(expr("ghost > 1") or fail_expr()).height(), 0)
+    assert_eq(f.filter(expr("ghost is null") or fail_expr()).height(), 6)
+    // string functions and the empty expression
+    assert_eq(f.filter(expr("starts_with(region, 'E')") or fail_expr()).height(), 3)
+    assert_eq(f.filter(expr("contains(region, 'S')") or fail_expr()).height(), 2)
+    assert_eq(f.filter(Expr.new()).height(), 0)
+    // nulls are never truthy
+    g = fr_copy(f)
+    c = IntCol.new("score")
+    @c.push(10)
+    @c.push_null()
+    @c.push(30)
+    @c.push_null()
+    @c.push(50)
+    @c.push(60)
+    @g.add_int(c)
+    assert_eq(g.filter(expr("score > 20") or fail_expr()).height(), 3)
+    assert_eq(g.filter(expr("score is null") or fail_expr()).height(), 2)
+    assert_eq(g.filter(expr("score is not null and score < 55") or fail_expr()).height(), 3)
+    assert_eq(g.filter(expr("not (score > 20)") or fail_expr()).height(), 1)
+}
+
+test "with_column derives typed columns" {
+    f = fr_sales()
+    r = f.with_column("revenue", expr("price * qty") or fail_expr())
+    assert_eq(r.width(), 5)
+    assert_eq(r.kind_of("revenue"), DT_FLOAT)
+    assert_eq(r.get_float("revenue").total(), 30.0 + 20.0 + 60.0 + 50.0 + 32.0 + 20.0)
+    assert_eq(f.width(), 4)
+    q2 = f.with_column("double", expr("qty * 2") or fail_expr())
+    assert_eq(q2.kind_of("double"), DT_INT)
+    assert_eq(q2.get_int("double").total(), 50)
+    ratio = f.with_column("half", expr("qty / 2") or fail_expr())
+    assert_eq(ratio.kind_of("half"), DT_FLOAT)
+    assert_eq(ratio.get_float("half").total(), 12.5)
+    flag = f.with_column("big", expr("qty >= 4") or fail_expr())
+    assert_eq(flag.kind_of("big"), DT_BOOL)
+    assert_eq(flag.get_bool("big").count_true(), 3)
+    label = f.with_column("tag", expr("region + '-' + 'x'") or fail_expr())
+    assert_eq(label.kind_of("tag"), DT_STR)
+    assert_eq(label.cell(1, 4).s, "US-x")
+    // replaces an existing column in place of adding
+    rep = f.with_column("qty", expr("qty + 1") or fail_expr())
+    assert_eq(rep.width(), 4)
+    assert_eq(rep.get_int("qty").total(), 31)
+    // division by zero and unknown columns give null
+    z = f.with_column("z", expr("qty / 0") or fail_expr())
+    assert_eq(z.get_float("z").null_count(), 6)
+    u = f.with_column("u", expr("ghost + 1") or fail_expr())
+    assert_eq(u.get_float("u").null_count(), 6)
+    // chained
+    chain = f.with_column("rev", expr("price * qty") or fail_expr()).filter(expr("rev > 25") or fail_expr())
+    assert_eq(chain.height(), 4)
+    assert_eq(f.with_column("n", Expr.new()).width(), 4)
+}
+
+test "sorting is stable and puts nulls last" {
+    f = fr_sales()
+    a = f.sort_by("price", false)
+    assert_eq(a.cell(0, 1).f, 4.0)
+    assert_eq(a.cell(5, 1).f, 30.0)
+    d = f.sort_by("price", true)
+    assert_eq(d.cell(0, 1).f, 30.0)
+    assert_eq(d.cell(5, 1).f, 4.0)
+    r = f.sort_by("region", false)
+    assert_eq(r.cell(0, 0).s, "APAC")
+    assert_eq(r.cell(1, 0).s, "EU")
+    // stability inside equal regions keeps the original order: EU rows were qty 3, 2, 5
+    assert_eq(r.cell(1, 2).i, 3)
+    assert_eq(r.cell(2, 2).i, 2)
+    assert_eq(r.cell(3, 2).i, 5)
+    assert_eq(r.cell(5, 0).s, "US")
+    // booleans sort false before true
+    b = f.sort_by("rush", false)
+    #assert(!(b.cell(0, 3).b))
+    #assert(b.cell(5, 3).b)
+    // many keys: region ascending, qty descending
+    m = f.sort_by_many(["region", "qty"], [false, true])
+    assert_eq(m.cell(0, 0).s, "APAC")
+    assert_eq(m.cell(1, 2).i, 5)
+    assert_eq(m.cell(2, 2).i, 3)
+    assert_eq(m.cell(3, 2).i, 2)
+    assert_eq(m.cell(4, 0).s, "US")
+    assert_eq(m.cell(4, 2).i, 4)
+    // nulls last for both directions
+    g = Frame.new()
+    c = IntCol.new("v")
+    @c.push(3)
+    @c.push_null()
+    @c.push(1)
+    @c.push(2)
+    @g.add_int(c)
+    up = g.sort_by("v", false)
+    assert_eq(up.cell(0, 0).i, 1)
+    assert_eq(up.cell(2, 0).i, 3)
+    #assert(up.cell(3, 0).null)
+    down = g.sort_by("v", true)
+    assert_eq(down.cell(0, 0).i, 3)
+    assert_eq(down.cell(2, 0).i, 1)
+    #assert(down.cell(3, 0).null)
+    assert_eq(f.sort_by("ghost", false).height(), 6)
+    // larger input exercises every merge width
+    big = Frame.new()
+    vals = []
+    i = 0
+    while i < 200 {
+        vals = host.sys_arr_push(vals, (i * 37 + 11) % 101)
+        i += 1
+    }
+    @big.add_int(int_col("v", vals))
+    sorted = big.sort_by("v", false)
+    ok = true
+    k = 1
+    while k < 200 {
+        if sorted.cell(k - 1, 0).i > sorted.cell(k, 0).i { ok = false }
+        k += 1
+    }
+    #assert(ok)
+    assert_eq(sorted.get_int("v").total(), big.get_int("v").total())
+}
+
+test "group_by aggregates" {
+    f = fr_sales()
+    g = f.group_by(["region"], [agg_sum("qty", "units"), agg_mean("price", "avg_price"), agg_rows("n"), agg_max("price", "top"), agg_min("qty", "low")])
+    assert_eq(g.height(), 3)
+    assert_eq(g.names[0], "region")
+    assert_eq(g.cell(0, 0).s, "EU")
+    assert_eq(g.cell(1, 0).s, "US")
+    assert_eq(g.cell(2, 0).s, "APAC")
+    units = g.get_int("units")
+    assert_eq(units.get(0), 10)
+    assert_eq(units.get(1), 5)
+    assert_eq(units.get(2), 10)
+    avg = g.get_float("avg_price")
+    #assert(dt_abs(avg.get(0) - 44.0 / 3.0) < 1.0e-12)
+    assert_eq(avg.get(1), 14.0)
+    assert_eq(avg.get(2), 5.0)
+    n = g.get_int("n")
+    assert_eq(n.get(0), 3)
+    assert_eq(n.get(1), 2)
+    assert_eq(n.get(2), 1)
+    assert_eq(g.get_float("top").get(0), 30.0)
+    assert_eq(g.get_int("low").get(1), 1)
+    // total across groups equals the column total (conservation)
+    assert_eq(units.total(), f.get_int("qty").total())
+    // two keys and count / first / last / nunique / std
+    h = f.group_by(["region", "rush"], [agg_count("qty", "c")])
+    assert_eq(h.height(), 4)
+    assert_eq(h.get_int("c").total(), 6)
+    k = f.group_by(["region"], [agg_first("qty", "f"), agg_last("qty", "l"), agg_nunique("rush", "u"), agg_std("price", "sd")])
+    assert_eq(k.get_int("f").get(0), 3)
+    assert_eq(k.get_int("l").get(0), 5)
+    assert_eq(k.get_int("u").get(0), 2)
+    assert_eq(k.get_int("u").get(2), 1)
+    #assert(dt_abs(k.get_float("sd").get(0) - host.sys_sqrt(556.0 / 3.0)) < 1.0e-9)
+    #assert(k.get_float("sd").is_null(2))
+    // no aggregates: distinct keys
+    d = f.group_by(["region"], [])
+    assert_eq(d.height(), 3)
+    assert_eq(d.width(), 1)
+    // strings and bools aggregate by order
+    s = f.group_by(["rush"], [agg_min("region", "lo"), agg_max("region", "hi")])
+    assert_eq(s.height(), 2)
+    #assert(s.cell(0, 0).b)
+    assert_eq(s.get_str("lo").get(0), "APAC")
+    assert_eq(s.get_str("hi").get(0), "EU")
+    bsum = f.group_by(["region"], [agg_sum("rush", "rs"), agg_max("rush", "rmax"), agg_min("rush", "rmin")])
+    assert_eq(bsum.get_int("rs").get(0), 2)
+    #assert(bsum.get_bool("rmax").get(0))
+    #assert(!(bsum.get_bool("rmin").get(0)))
+    // sum over strings is null, unknown column gives null column, unknown key gives empty frame
+    z = f.group_by(["region"], [agg_sum("region", "bad"), agg_sum("ghost", "g")])
+    assert_eq(z.get_float("bad").null_count(), 3)
+    assert_eq(z.get_float("g").null_count(), 3)
+    assert_eq(f.group_by(["ghost"], [agg_rows("n")]).width(), 0)
+    // grouping an empty frame
+    assert_eq(f.filter(expr("qty > 100") or fail_expr()).group_by(["region"], [agg_rows("n")]).height(), 0)
+}
+
+test "group_by treats nulls as one group" {
+    f = Frame.new()
+    k = StrCol.new("k")
+    v = FloatCol.new("v")
+    @k.push("a")
+    @v.push(1.0)
+    @k.push_null()
+    @v.push(2.0)
+    @k.push("a")
+    @v.push_null()
+    @k.push_null()
+    @v.push(4.0)
+    @f.add_str(k)
+    @f.add_float(v)
+    g = f.group_by(["k"], [agg_sum("v", "s"), agg_count("v", "c"), agg_rows("n")])
+    assert_eq(g.height(), 2)
+    assert_eq(g.cell(0, 0).s, "a")
+    #assert(g.cell(1, 0).null)
+    assert_eq(g.get_float("s").get(0), 1.0)
+    assert_eq(g.get_float("s").get(1), 6.0)
+    assert_eq(g.get_int("c").get(0), 1)
+    assert_eq(g.get_int("n").get(0), 2)
+    assert_eq(g.get_int("n").get(1), 2)
+    allnull = Frame.new()
+    kk = StrCol.new("k")
+    vv = FloatCol.new("v")
+    @kk.push("x")
+    @vv.push_null()
+    @allnull.add_str(kk)
+    @allnull.add_float(vv)
+    r = allnull.group_by(["k"], [agg_sum("v", "s"), agg_mean("v", "m"), agg_min("v", "lo")])
+    assert_eq(r.height(), 1)
+    #assert(r.get_float("s").is_null(0))
+    #assert(r.get_float("m").is_null(0))
+}
+
+test "joins" {
+    f = fr_sales()
+    rates = Frame.new()
+    @rates.add_str(str_col("region", ["EU", "US", "LATAM"]))
+    @rates.add_float(float_col("tax", [0.2, 0.1, 0.3]))
+    @rates.add_str(str_col("price", ["x", "y", "z"]))
+    inner = f.join(rates, ["region"], "inner")
+    assert_eq(inner.height(), 5)
+    assert_eq(inner.width(), 6)
+    assert_eq(inner.names[0], "region")
+    // name clash on `price`
+    #assert(inner.has_col("price"))
+    #assert(inner.has_col("price_right"))
+    #assert(inner.has_col("tax"))
+    assert_eq(inner.cell(0, 0).s, "EU")
+    #assert(inner.get_float("tax").total() > 0.0)
+    left = f.join(rates, ["region"], "left")
+    assert_eq(left.height(), 6)
+    apac = left.filter(expr("region == 'APAC'") or fail_expr())
+    assert_eq(apac.height(), 1)
+    #assert(apac.get_float("tax").is_null(0))
+    right = f.join(rates, ["region"], "right")
+    assert_eq(right.height(), 6)
+    latam = right.filter(expr("region == 'LATAM'") or fail_expr())
+    assert_eq(latam.height(), 1)
+    assert_eq(latam.get_float("tax").get(0), 0.3)
+    #assert(latam.get_int("qty").is_null(0))
+    outer = f.join(rates, ["region"], "outer")
+    assert_eq(outer.height(), 7)
+    assert_eq(outer.filter(expr("qty is null") or fail_expr()).height(), 1)
+    assert_eq(outer.filter(expr("tax is null") or fail_expr()).height(), 1)
+    // one-to-many expands rows: duplicate right keys
+    dup = Frame.new()
+    @dup.add_str(str_col("region", ["EU", "EU", "US"]))
+    @dup.add_int(int_col("code", [1, 2, 3]))
+    many = f.join(dup, ["region"], "inner")
+    // EU appears 3 times on the left x 2 right + US twice x 1
+    assert_eq(many.height(), 3 * 2 + 2)
+    assert_eq(many.get_int("code").total(), 3 * 3 + 2 * 3)
+    // multi-column keys
+    a = Frame.new()
+    @a.add_str(str_col("k1", ["x", "x", "y"]))
+    @a.add_int(int_col("k2", [1, 2, 1]))
+    @a.add_int(int_col("va", [10, 20, 30]))
+    b = Frame.new()
+    @b.add_str(str_col("k1", ["x", "y", "y"]))
+    @b.add_int(int_col("k2", [2, 1, 2]))
+    @b.add_int(int_col("vb", [100, 200, 300]))
+    j = a.join(b, ["k1", "k2"], "inner")
+    assert_eq(j.height(), 2)
+    assert_eq(j.get_int("va").total(), 50)
+    assert_eq(j.get_int("vb").total(), 300)
+    // null keys never match; unknown key gives an empty frame
+    n1 = Frame.new()
+    kn = StrCol.new("k")
+    @kn.push_null()
+    @kn.push("a")
+    @n1.add_str(kn)
+    n2 = fr_copy(n1)
+    assert_eq(n1.join(n2, ["k"], "inner").height(), 1)
+    assert_eq(n1.join(n2, ["k"], "left").height(), 2)
+    assert_eq(f.join(rates, ["ghost"], "inner").width(), 0)
+    // a join keeps every left row when the right side is empty
+    empty_right = rates.filter(expr("tax > 5") or fail_expr())
+    assert_eq(f.join(empty_right, ["region"], "left").height(), 6)
+    assert_eq(f.join(empty_right, ["region"], "inner").height(), 0)
+}
+
+test "unique, vstack, same_as and to_text" {
+    f = Frame.new()
+    @f.add_str(str_col("a", ["x", "y", "x", "y", "x"]))
+    @f.add_int(int_col("b", [1, 2, 1, 3, 1]))
+    u = f.unique()
+    assert_eq(u.height(), 3)
+    assert_eq(u.cell(2, 1).i, 3)
+    s = fr_sales()
+    stacked = s.vstack(s)
+    assert_eq(stacked.height(), 12)
+    assert_eq(stacked.get_int("qty").total(), 50)
+    assert_eq(s.vstack(s.drop(["rush"])).width(), 0)
+    // reordered columns still stack by name
+    flipped = s.select(["rush", "qty", "price", "region"])
+    assert_eq(s.vstack(flipped).height(), 12)
+    // promotion int + float
+    ia = Frame.new()
+    @ia.add_int(int_col("v", [1, 2]))
+    fb = Frame.new()
+    @fb.add_float(float_col("v", [0.5]))
+    mixed = ia.vstack(fb)
+    assert_eq(mixed.kind_of("v"), DT_FLOAT)
+    assert_eq(mixed.get_float("v").total(), 3.5)
+    #assert(s.same_as(fr_copy(s)))
+    #assert(!(s.same_as(s.head(3))))
+    #assert(!(s.same_as(s.rename("qty", "q"))))
+    #assert(!(s.same_as(s.sort_by("price", false))))
+    #assert(!(s.same_as(s.sort_by("price", false).sort_by("region", false))))
+    text = s.head(2).to_text(10)
+    #assert(contains(text, "region"))
+    #assert(contains(text, "EU"))
+    #assert(!(contains(text, "more rows")))
+    short = s.to_text(2)
+    #assert(contains(short, "... 4 more rows"))
+    withnull = s.take([0, -1]).to_text(5)
+    #assert(contains(withnull, "null"))
+}
+
+test "KeyIndex handles many keys" {
+    ki = KeyIndex.new()
+    i = 0
+    while i < 500 {
+        id = @ki.find_or_add("key-{i % 123}")
+        assert_eq(id, i % 123)
+        i += 1
+    }
+    assert_eq(ki.size(), 123)
+    #assert(ki.find("key-7") >= 0)
+    assert_eq(ki.find("key-999"), -1)
+    assert_eq(ki.find("key-122"), 122)
+}
+
+test "frame_from_rows infers dtypes and nulls" {
+    rows = [["id", "price", "ok", "name", "empty", "id"], ["1", "2.5", "true", "ann", "", "x"], ["2", "", "false", "bob", "", "y"], ["-3", "7", "TRUE", "", "", ""]]
+    f = frame_from_rows(rows, true)
+    assert_eq(f.width(), 6)
+    assert_eq(f.height(), 3)
+    assert_eq(f.kind_of("id"), DT_INT)
+    assert_eq(f.get_int("id").total(), 0)
+    assert_eq(f.kind_of("price"), DT_FLOAT)
+    assert_eq(f.get_float("price").null_count(), 1)
+    assert_eq(f.get_float("price").total(), 9.5)
+    assert_eq(f.kind_of("ok"), DT_BOOL)
+    assert_eq(f.get_bool("ok").count_true(), 2)
+    assert_eq(f.kind_of("name"), DT_STR)
+    assert_eq(f.get_str("name").null_count(), 1)
+    assert_eq(f.kind_of("empty"), DT_STR)
+    assert_eq(f.get_str("empty").null_count(), 3)
+    // duplicate header
+    assert_eq(f.names[5], "id_2")
+    assert_eq(f.kind_of("id_2"), DT_STR)
+    // no header: generated names, short rows padded
+    g = frame_from_rows([["1", "2"], ["3"], ["5", "6", "7"]], false)
+    assert_eq(g.width(), 3)
+    assert_eq(g.names[0], "c0")
+    assert_eq(g.height(), 3)
+    assert_eq(g.get_int("c0").total(), 9)
+    assert_eq(g.get_int("c1").null_count(), 1)
+    assert_eq(g.get_int("c2").valid(), 1)
+    // header only, empty input
+    h = frame_from_rows([["a", "b"]], true)
+    assert_eq(h.width(), 2)
+    assert_eq(h.height(), 0)
+    assert_eq(frame_from_rows([], true).width(), 0)
+    // text round trip
+    back = frame_to_rows(f, true)
+    assert_eq(host.sys_arr_len(back), 4)
+    assert_eq(back[0][1], "price")
+    assert_eq(back[1][1], "2.5")
+    assert_eq(back[2][1], "")
+    assert_eq(back[3][3], "")
+    assert_eq(host.sys_arr_len(frame_to_rows(f, false)), 3)
+}
+
+test "numeric text detection" {
+    #assert(fr_is_int("42"))
+    #assert(fr_is_int("-7"))
+    #assert(fr_is_int(" +7 "))
+    #assert(!(fr_is_int("4.2")))
+    #assert(!(fr_is_int("")))
+    #assert(!(fr_is_int("-")))
+    #assert(!(fr_is_int("12a")))
+    #assert(fr_is_float("4.2"))
+    #assert(fr_is_float(".5"))
+    #assert(fr_is_float("7."))
+    #assert(fr_is_float("-3"))
+    #assert(!(fr_is_float("1.2.3")))
+    #assert(!(fr_is_float(".")))
+    #assert(!(fr_is_float("abc")))
+    #assert(fr_is_bool("True"))
+    #assert(fr_is_bool(" false "))
+    #assert(!(fr_is_bool("yes")))
+}
+
+fr_events() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("grp", ["a", "a", "a", "b", "b", "a"]))
+    @f.add_int(int_col("t", [3, 1, 2, 2, 1, 4]))
+    @f.add_float(float_col("v", [10.0, 20.0, 30.0, 5.0, 7.0, 40.0]))
+    f
+}
+
+test "over: row_number, cumulative and shifted windows keep row order" {
+    f = fr_events()
+    r = f.over(["grp"], ["t"], [win_row_number("rn"), win_cum_sum("v", "cs"), win_lag("v", "prev", 1), win_lead("v", "next", 1)])
+    assert_eq(r.height(), 6)
+    assert_eq(r.width(), 7)
+    // original columns and order are untouched
+    assert_eq(r.get_int("t").get(0), 3)
+    assert_eq(r.get_str("grp").get(3), "b")
+    rn = r.get_int("rn")
+    assert_eq(rn.get(0), 3)
+    assert_eq(rn.get(1), 1)
+    assert_eq(rn.get(2), 2)
+    assert_eq(rn.get(3), 2)
+    assert_eq(rn.get(4), 1)
+    assert_eq(rn.get(5), 4)
+    cs = r.get_float("cs")
+    assert_eq(cs.get(1), 20.0)
+    assert_eq(cs.get(2), 50.0)
+    assert_eq(cs.get(0), 60.0)
+    assert_eq(cs.get(5), 100.0)
+    assert_eq(cs.get(4), 7.0)
+    assert_eq(cs.get(3), 12.0)
+    prev = r.get_float("prev")
+    #assert(prev.is_null(1))
+    assert_eq(prev.get(2), 20.0)
+    assert_eq(prev.get(0), 30.0)
+    assert_eq(prev.get(5), 10.0)
+    #assert(prev.is_null(4))
+    assert_eq(prev.get(3), 7.0)
+    next = r.get_float("next")
+    assert_eq(next.get(1), 30.0)
+    assert_eq(next.get(0), 40.0)
+    #assert(next.is_null(5))
+    assert_eq(next.get(4), 5.0)
+    #assert(next.is_null(3))
+    // the input frame is not touched
+    assert_eq(f.width(), 3)
+}
+
+test "over: partition aggregates broadcast to every row" {
+    f = fr_events()
+    r = f.over(["grp"], [], [win_sum("v", "s"), win_mean("v", "m"), win_min("v", "lo"), win_max("v", "hi"), win_count("v", "c"), win_rows("n"), win_std("v", "sd"), win_first("v", "f"), win_last("v", "l"), win_nunique("t", "u")])
+    s = r.get_float("s")
+    assert_eq(s.get(0), 100.0)
+    assert_eq(s.get(1), 100.0)
+    assert_eq(s.get(3), 12.0)
+    assert_eq(r.get_float("m").get(2), 25.0)
+    assert_eq(r.get_float("m").get(4), 6.0)
+    assert_eq(r.get_float("lo").get(5), 10.0)
+    assert_eq(r.get_float("hi").get(0), 40.0)
+    assert_eq(r.get_int("c").get(3), 2)
+    assert_eq(r.get_int("n").get(0), 4)
+    #assert(dt_abs(r.get_float("sd").get(3) - host.sys_sqrt(2.0)) < 1.0e-12)
+    // no order keys: first/last follow the original row order
+    assert_eq(r.get_float("f").get(0), 10.0)
+    assert_eq(r.get_float("l").get(0), 40.0)
+    assert_eq(r.get_int("u").get(0), 4)
+    assert_eq(r.get_int("u").get(3), 2)
+    // with an order, first/last follow it
+    o = f.over(["grp"], ["t"], [win_first("v", "f"), win_last("v", "l")])
+    assert_eq(o.get_float("f").get(0), 20.0)
+    assert_eq(o.get_float("l").get(0), 40.0)
+    // no partition: one global window
+    g = f.over([], [], [win_sum("v", "s")])
+    assert_eq(g.get_float("s").get(2), 112.0)
+    assert_eq(g.get_float("s").get(5), 112.0)
+}
+
+test "over: rank, dense_rank and descending order" {
+    f = Frame.new()
+    @f.add_int(int_col("k", [1, 1, 2, 3, 3, 3]))
+    @f.add_str(str_col("who", ["a", "b", "c", "d", "e", "f"]))
+    r = f.over([], ["k"], [win_rank("r"), win_dense_rank("d"), win_row_number("n")])
+    rk = r.get_int("r")
+    assert_eq(rk.get(0), 1)
+    assert_eq(rk.get(1), 1)
+    assert_eq(rk.get(2), 3)
+    assert_eq(rk.get(3), 4)
+    assert_eq(rk.get(5), 4)
+    dn = r.get_int("d")
+    assert_eq(dn.get(1), 1)
+    assert_eq(dn.get(2), 2)
+    assert_eq(dn.get(4), 3)
+    assert_eq(r.get_int("n").get(5), 6)
+    // descending keys and two order columns
+    d = f.over_desc([], ["k"], [true], [win_rank("r")])
+    assert_eq(d.get_int("r").get(3), 1)
+    assert_eq(d.get_int("r").get(5), 1)
+    assert_eq(d.get_int("r").get(2), 4)
+    assert_eq(d.get_int("r").get(0), 5)
+    two = f.over_desc([], ["k", "who"], [false, true], [win_row_number("n")])
+    assert_eq(two.get_int("n").get(0), 2)
+    assert_eq(two.get_int("n").get(1), 1)
+    assert_eq(two.get_int("n").get(5), 4)
+    // without order keys everything ties
+    assert_eq(f.over([], [], [win_rank("r")]).get_int("r").get(4), 1)
+    // partitioned ranks restart
+    p = fr_events().over(["grp"], ["v"], [win_rank("r")])
+    assert_eq(p.get_int("r").get(0), 1)
+    assert_eq(p.get_int("r").get(5), 4)
+    assert_eq(p.get_int("r").get(3), 1)
+    assert_eq(p.get_int("r").get(4), 2)
+}
+
+test "over: rolling windows respect min_periods and nulls" {
+    f = fr_events()
+    r = f.over(["grp"], ["t"], [win_rolling_mean("v", "m2", 2), win_rolling_sum("v", "s3", 3), win_rolling_min("v", "lo3", 3), win_rolling_max("v", "hi3", 3), win_rolling_std("v", "sd2", 2)])
+    m2 = r.get_float("m2")
+    #assert(m2.is_null(1))
+    assert_eq(m2.get(2), 25.0)
+    assert_eq(m2.get(0), 20.0)
+    assert_eq(m2.get(5), 25.0)
+    #assert(m2.is_null(4))
+    assert_eq(m2.get(3), 6.0)
+    s3 = r.get_float("s3")
+    #assert(s3.is_null(1))
+    #assert(s3.is_null(2))
+    assert_eq(s3.get(0), 60.0)
+    assert_eq(s3.get(5), 80.0)
+    assert_eq(r.get_float("lo3").get(5), 10.0)
+    assert_eq(r.get_float("hi3").get(5), 40.0)
+    assert_eq(r.get_float("hi3").get(0), 30.0)
+    #assert(dt_abs(r.get_float("sd2").get(2) - host.sys_sqrt(50.0)) < 1.0e-12)
+    #assert(r.get_float("sd2").is_null(1))
+    // lowering min_periods lets the first rows report partial windows
+    p = f.over(["grp"], ["t"], [win_min_periods(win_rolling_mean("v", "m", 2), 1), win_min_periods(win_rolling_sum("v", "s", 3), 2)])
+    assert_eq(p.get_float("m").get(1), 20.0)
+    assert_eq(p.get_float("m").get(2), 25.0)
+    #assert(p.get_float("s").is_null(1))
+    assert_eq(p.get_float("s").get(2), 50.0)
+    // int columns keep int sums, nulls inside a window reduce the valid count
+    n = Frame.new()
+    c = IntCol.new("x")
+    @c.push(1)
+    @c.push_null()
+    @c.push(3)
+    @c.push(4)
+    @n.add_int(c)
+    ni = n.over([], [], [win_rolling_sum("x", "s", 2), win_min_periods(win_rolling_sum("x", "s1", 2), 1), win_cum_sum("x", "cs"), win_cum_count("x", "cc"), win_cum_max("x", "cx"), win_cum_min("x", "cn")])
+    assert_eq(ni.kind_of("s"), DT_INT)
+    #assert(ni.get_int("s").is_null(1))
+    #assert(ni.get_int("s").is_null(2))
+    assert_eq(ni.get_int("s").get(3), 7)
+    assert_eq(ni.get_int("s1").get(1), 1)
+    assert_eq(ni.get_int("s1").get(2), 3)
+    assert_eq(ni.get_int("cs").get(0), 1)
+    #assert(ni.get_int("cs").is_null(1))
+    assert_eq(ni.get_int("cs").get(2), 4)
+    assert_eq(ni.get_int("cs").get(3), 8)
+    assert_eq(ni.get_int("cc").get(1), 1)
+    assert_eq(ni.get_int("cc").get(3), 3)
+    assert_eq(ni.get_int("cx").get(3), 4)
+    assert_eq(ni.get_int("cn").get(3), 1)
+    // string cumulative min / max, and lag keeps the dtype
+    s = frame_from_rows([["b"], ["a"], ["c"]], false)
+    sr = s.over([], [], [win_cum_min("c0", "lo"), win_cum_max("c0", "hi"), win_lag("c0", "p", 1), win_cum_sum("c0", "bad")])
+    assert_eq(sr.get_str("lo").get(2), "a")
+    assert_eq(sr.get_str("hi").get(2), "c")
+    assert_eq(sr.get_str("p").get(1), "b")
+    #assert(sr.get_str("p").is_null(0))
+    assert_eq(sr.get_float("bad").null_count(), 3)
+}
+
+test "over: edge cases" {
+    f = fr_events()
+    assert_eq(f.over(["ghost"], [], [win_sum("v", "s")]).width(), 0)
+    assert_eq(f.over([], ["ghost"], [win_sum("v", "s")]).width(), 0)
+    assert_eq(f.over([], [], []).width(), 3)
+    // an unknown value column gives a null column
+    u = f.over(["grp"], [], [win_sum("ghost", "s"), win_lag("ghost", "p", 1), win_rolling_sum("ghost", "r", 2), win_cum_sum("ghost", "c")])
+    assert_eq(u.get_float("s").null_count(), 6)
+    assert_eq(u.width(), 7)
+    // lag / lead with larger and negative offsets
+    far = f.over(["grp"], ["t"], [win_lag("v", "p", 3), win_lag("v", "n", -1), win_lead("v", "q", 9)])
+    assert_eq(far.get_float("p").get(5), 20.0)
+    assert_eq(far.get_float("p").null_count(), 5)
+    assert_eq(far.get_float("n").get(1), 30.0)
+    assert_eq(far.get_float("q").null_count(), 6)
+    // an empty frame stays empty
+    e = f.filter(expr("v > 1000") or fail_expr()).over(["grp"], ["t"], [win_row_number("rn"), win_cum_sum("v", "cs")])
+    assert_eq(e.height(), 0)
+    assert_eq(e.width(), 5)
+    // null partition keys form their own partition, null order keys sort last
+    k = Frame.new()
+    pk = StrCol.new("k")
+    @pk.push("x")
+    @pk.push_null()
+    @pk.push("x")
+    @pk.push_null()
+    @k.add_str(pk)
+    ok = IntCol.new("o")
+    @ok.push_null()
+    @ok.push(2)
+    @ok.push(1)
+    @ok.push(1)
+    @k.add_int(ok)
+    kr = k.over(["k"], ["o"], [win_row_number("n")])
+    assert_eq(kr.get_int("n").get(0), 2)
+    assert_eq(kr.get_int("n").get(2), 1)
+    assert_eq(kr.get_int("n").get(3), 1)
+    assert_eq(kr.get_int("n").get(1), 2)
+    // window columns can feed expressions
+    d = f.over(["grp"], [], [win_mean("v", "m")]).with_column("dev", expr("v - m") or fail_expr())
+    assert_eq(d.get_float("dev").total(), 0.0)
+}
+
+test "over: conformance with eager group_by and sorting" {
+    f = fr_events()
+    w = f.over(["grp"], [], [win_sum("v", "s"), win_rows("n")])
+    g = f.group_by(["grp"], [agg_sum("v", "s"), agg_rows("n")])
+    row = 0
+    while row < f.height() {
+        gi = 0
+        if f.get_str("grp").get(row) == "b" { gi = 1 }
+        assert_eq(w.get_float("s").get(row), g.get_float("s").get(gi))
+        assert_eq(w.get_int("n").get(row), g.get_int("n").get(gi))
+        row += 1
+    }
+    // cum_sum on the last row of every partition is the partition total
+    c = f.over(["grp"], ["t"], [win_cum_sum("v", "cs"), win_row_number("rn"), win_sum("v", "tot")])
+    row = 0
+    while row < f.height() {
+        if c.get_int("rn").get(row) == w.get_int("n").get(row) { assert_eq(c.get_float("cs").get(row), c.get_float("tot").get(row)) }
+        row += 1
+    }
+    // row_number over a total order is a permutation of 1..n
+    r = f.over([], ["v"], [win_row_number("rn")])
+    assert_eq(r.get_int("rn").total(), 21)
+    // many rows exercise every merge width of the order-key sorts
+    big = Frame.new()
+    ks = []
+    vs = []
+    i = 0
+    while i < 150 {
+        ks = host.sys_arr_push(ks, i % 4)
+        vs = host.sys_arr_push(vs, (i * 37 + 11) % 101)
+        i += 1
+    }
+    @big.add_int(int_col("k", ks))
+    @big.add_int(int_col("v", vs))
+    bw = big.over(["k"], ["v"], [win_row_number("rn"), win_rows("n"), win_cum_sum("v", "cs"), win_sum("v", "tot")])
+    ok = true
+    i = 0
+    while i < 150 {
+        if bw.get_int("rn").get(i) == bw.get_int("n").get(i) && bw.get_int("cs").get(i) != bw.get_int("tot").get(i) { ok = false }
+        i += 1
+    }
+    #assert(ok)
+    assert_eq(bw.get_int("rn").total(), 38 * 39 / 2 * 2 + 37 * 38 / 2 * 2)
+}
+
+fr_quotes() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("sym", ["A", "A", "A", "B"]))
+    @f.add_int(int_col("t", [1, 5, 10, 2]))
+    @f.add_float(float_col("bid", [100.0, 101.0, 102.0, 50.0]))
+    f
+}
+
+fr_trades() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("sym", ["A", "A", "B", "A", "C"]))
+    @f.add_int(int_col("t", [2, 5, 3, 12, 1]))
+    @f.add_int(int_col("qty", [1, 2, 3, 4, 5]))
+    f
+}
+
+test "join_asof strategies, grouping and tolerance" {
+    q = fr_quotes()
+    t = fr_trades()
+    back = t.join_asof(q, "t", ["sym"], "backward", -1.0)
+    assert_eq(back.height(), 5)
+    assert_eq(back.width(), 4)
+    assert_eq(back.names[3], "bid")
+    bb = back.get_float("bid")
+    assert_eq(bb.get(0), 100.0)
+    assert_eq(bb.get(1), 101.0)
+    assert_eq(bb.get(2), 50.0)
+    assert_eq(bb.get(3), 102.0)
+    #assert(bb.is_null(4))
+    // left order and columns are preserved
+    assert_eq(back.get_int("qty").get(3), 4)
+    fwd = t.join_asof(q, "t", ["sym"], "forward", -1.0).get_float("bid")
+    assert_eq(fwd.get(0), 101.0)
+    assert_eq(fwd.get(1), 101.0)
+    #assert(fwd.is_null(2))
+    #assert(fwd.is_null(3))
+    #assert(fwd.is_null(4))
+    near = t.join_asof(q, "t", ["sym"], "nearest", -1.0).get_float("bid")
+    assert_eq(near.get(0), 100.0)
+    assert_eq(near.get(1), 101.0)
+    assert_eq(near.get(2), 50.0)
+    assert_eq(near.get(3), 102.0)
+    // tolerance
+    tol = t.join_asof(q, "t", ["sym"], "backward", 1.0).get_float("bid")
+    assert_eq(tol.get(0), 100.0)
+    #assert(tol.is_null(3))
+    assert_eq(tol.get(2), 50.0)
+    // no by: a single timeline
+    flat = t.join_asof(q.drop(["sym"]), "t", [], "backward", -1.0)
+    assert_eq(flat.width(), 4)
+    fb = flat.get_float("bid")
+    assert_eq(fb.get(0), 50.0)
+    assert_eq(fb.get(1), 101.0)
+    assert_eq(fb.get(2), 50.0)
+    assert_eq(fb.get(3), 102.0)
+    assert_eq(fb.get(4), 100.0)
+    // the inputs are unchanged
+    assert_eq(t.width(), 3)
+    assert_eq(q.height(), 4)
+}
+
+test "join_asof edge cases: exact int keys, clashes, nulls, errors" {
+    big = 1700000000000000000
+    l = Frame.new()
+    @l.add_int(int_col("t", [big + 3, big + 1, big]))
+    r = Frame.new()
+    @r.add_int(int_col("t", [big + 2, big + 1]))
+    @r.add_int(int_col("x", [20, 10]))
+    j = l.join_asof(r, "t", [], "backward", -1.0)
+    assert_eq(j.get_int("x").get(0), 20)
+    assert_eq(j.get_int("x").get(1), 10)
+    #assert(j.get_int("x").is_null(2))
+    // exact ties on the key match backward and forward alike
+    assert_eq(l.join_asof(r, "t", [], "forward", -1.0).get_int("x").get(1), 10)
+    // nearest tie goes backward
+    tie = Frame.new()
+    @tie.add_int(int_col("t", [5]))
+    pair = Frame.new()
+    @pair.add_int(int_col("t", [3, 7]))
+    @pair.add_str(str_col("tag", ["lo", "hi"]))
+    assert_eq(tie.join_asof(pair, "t", [], "nearest", -1.0).get_str("tag").get(0), "lo")
+    // float keys and a mixed int / float pair
+    fl = Frame.new()
+    @fl.add_float(float_col("t", [1.5, 2.5]))
+    fr = Frame.new()
+    @fr.add_float(float_col("t", [1.0, 2.0]))
+    @fr.add_int(int_col("v", [7, 8]))
+    assert_eq(fl.join_asof(fr, "t", [], "backward", -1.0).get_int("v").get(1), 8)
+    assert_eq(l.join_asof(fr, "t", [], "backward", -1.0).get_int("v").get(0), 8)
+    // column name clash gets a suffix
+    c = Frame.new()
+    @c.add_int(int_col("t", [10]))
+    @c.add_int(int_col("v", [1]))
+    d = Frame.new()
+    @d.add_int(int_col("t", [9]))
+    @d.add_int(int_col("v", [2]))
+    cj = c.join_asof(d, "t", [], "backward", -1.0)
+    assert_eq(cj.get_int("v").get(0), 1)
+    assert_eq(cj.get_int("v_right").get(0), 2)
+    // null keys never match, on either side
+    ln = IntCol.new("t")
+    @ln.push(4)
+    @ln.push_null()
+    lf = Frame.new()
+    @lf.add_int(ln)
+    rn = IntCol.new("t")
+    @rn.push_null()
+    @rn.push(3)
+    rf = Frame.new()
+    @rf.add_int(rn)
+    @rf.add_int(int_col("w", [1, 2]))
+    nj = lf.join_asof(rf, "t", [], "backward", -1.0)
+    assert_eq(nj.get_int("w").get(0), 2)
+    #assert(nj.get_int("w").is_null(1))
+    // failures give an empty frame
+    assert_eq(l.join_asof(r, "ghost", [], "backward", -1.0).width(), 0)
+    assert_eq(l.join_asof(r, "t", ["ghost"], "backward", -1.0).width(), 0)
+    assert_eq(l.join_asof(r, "t", [], "sideways", -1.0).width(), 0)
+    assert_eq(fr_events().join_asof(fr_events(), "grp", [], "backward", -1.0).width(), 0)
+    // empty sides
+    assert_eq(l.join_asof(r.filter(expr("x > 100") or fail_expr()), "t", [], "backward", -1.0).get_int("x").null_count(), 3)
+    assert_eq(l.filter(expr("t < 0") or fail_expr()).join_asof(r, "t", [], "backward", -1.0).height(), 0)
+}
+
+fr_ticks() : Frame {
+    f = Frame.new()
+    @f.add_int(int_col("ts", [0, 1, 2, 5, 6, 11, 12]))
+    @f.add_int(int_col("v", [1, 2, 3, 4, 5, 6, 7]))
+    @f.add_str(str_col("k", ["x", "x", "y", "x", "y", "x", "x"]))
+    f
+}
+
+test "group_by_dynamic tumbling, keyed and sparse windows" {
+    g = fr_ticks().group_by_dynamic("ts", 5, [], [agg_sum("v", "s"), agg_rows("n")])
+    assert_eq(g.height(), 3)
+    assert_eq(g.names[0], "ts")
+    assert_eq(g.get_int("ts").get(0), 0)
+    assert_eq(g.get_int("ts").get(1), 5)
+    assert_eq(g.get_int("ts").get(2), 10)
+    assert_eq(g.get_int("s").get(0), 6)
+    assert_eq(g.get_int("s").get(1), 9)
+    assert_eq(g.get_int("s").get(2), 13)
+    assert_eq(g.get_int("n").total(), 7)
+    keyed = fr_ticks().group_by_dynamic("ts", 5, ["k"], [agg_sum("v", "s")])
+    assert_eq(keyed.height(), 5)
+    assert_eq(keyed.names[0], "k")
+    assert_eq(keyed.names[1], "ts")
+    assert_eq(keyed.get_str("k").get(0), "x")
+    assert_eq(keyed.get_int("ts").get(2), 10)
+    assert_eq(keyed.get_int("s").get(2), 13)
+    assert_eq(keyed.get_str("k").get(3), "y")
+    assert_eq(keyed.get_int("s").get(3), 3)
+    assert_eq(keyed.get_int("s").get(4), 5)
+    assert_eq(keyed.get_int("s").total(), 28)
+    // empty windows are skipped even across a huge gap
+    sparse = Frame.new()
+    @sparse.add_int(int_col("ts", [0, 1000000000000]))
+    @sparse.add_int(int_col("v", [1, 2]))
+    sg = sparse.group_by_dynamic("ts", 5, [], [agg_sum("v", "s")])
+    assert_eq(sg.height(), 2)
+    assert_eq(sg.get_int("ts").get(1), 1000000000000)
+    // unsorted input gives the same windows
+    shuffled = fr_ticks().take([6, 3, 0, 5, 2, 1, 4]).group_by_dynamic("ts", 5, [], [agg_sum("v", "s"), agg_first("v", "f"), agg_max("v", "hi")])
+    assert_eq(shuffled.get_int("s").get(0), 6)
+    assert_eq(shuffled.get_int("f").get(0), 1)
+    assert_eq(shuffled.get_int("hi").get(2), 7)
+    // mean / min over windows, and a conservation check
+    m = fr_ticks().group_by_dynamic("ts", 5, [], [agg_mean("v", "m"), agg_min("v", "lo")])
+    assert_eq(m.get_float("m").get(0), 2.0)
+    assert_eq(m.get_int("lo").get(2), 6)
+}
+
+test "group_by_dynamic overlapping windows, offsets and negatives" {
+    ov = fr_ticks().group_by_dynamic_with("ts", 5, 10, 0, [], [agg_sum("v", "s")])
+    assert_eq(ov.height(), 4)
+    assert_eq(ov.get_int("ts").get(0), -5)
+    assert_eq(ov.get_int("ts").get(3), 10)
+    assert_eq(ov.get_int("s").get(0), 6)
+    assert_eq(ov.get_int("s").get(1), 15)
+    assert_eq(ov.get_int("s").get(2), 22)
+    assert_eq(ov.get_int("s").get(3), 13)
+    off = fr_ticks().group_by_dynamic_with("ts", 5, 5, 2, [], [agg_sum("v", "s")])
+    assert_eq(off.get_int("ts").get(0), -3)
+    assert_eq(off.get_int("s").get(0), 3)
+    assert_eq(off.get_int("s").get(1), 12)
+    assert_eq(off.get_int("s").get(2), 6)
+    assert_eq(off.get_int("s").get(3), 7)
+    neg = Frame.new()
+    @neg.add_int(int_col("ts", [-7, -1, 0]))
+    @neg.add_int(int_col("v", [1, 1, 1]))
+    ng = neg.group_by_dynamic("ts", 5, [], [agg_rows("n")])
+    assert_eq(ng.get_int("ts").get(0), -10)
+    assert_eq(ng.get_int("ts").get(1), -5)
+    assert_eq(ng.get_int("ts").get(2), 0)
+    // a period shorter than `every` leaves gaps
+    gap = fr_ticks().group_by_dynamic_with("ts", 5, 2, 0, [], [agg_rows("n")])
+    assert_eq(gap.get_int("n").total(), 2 + 0 + 1 + 1 + 1)
+    // null index rows are ignored; bad arguments give an empty frame
+    ix = IntCol.new("ts")
+    @ix.push(1)
+    @ix.push_null()
+    @ix.push(2)
+    nf = Frame.new()
+    @nf.add_int(ix)
+    @nf.add_int(int_col("v", [1, 2, 3]))
+    assert_eq(nf.group_by_dynamic("ts", 5, [], [agg_sum("v", "s")]).get_int("s").get(0), 4)
+    assert_eq(fr_ticks().group_by_dynamic("ghost", 5, [], []).width(), 0)
+    assert_eq(fr_ticks().group_by_dynamic("ts", 0, [], []).width(), 0)
+    assert_eq(fr_ticks().group_by_dynamic("ts", 5, ["ghost"], []).width(), 0)
+    assert_eq(fr_ticks().group_by_dynamic("k", 5, [], []).width(), 0)
+    assert_eq(fr_ticks().group_by_dynamic_with("ts", 5, 0, 0, [], []).width(), 0)
+    assert_eq(fr_ticks().filter(expr("v > 100") or fail_expr()).group_by_dynamic("ts", 5, [], [agg_sum("v", "s")]).height(), 0)
+}
+
+test "durations and floor division" {
+    assert_eq(fr_duration("500ms", 1000), 500)
+    assert_eq(fr_duration("30s", 1000), 30000)
+    assert_eq(fr_duration("5m", 1), 300)
+    assert_eq(fr_duration("2h", 1000), 7200000)
+    assert_eq(fr_duration("1d", 1), 86400)
+    assert_eq(fr_duration("1w", 1), 604800)
+    assert_eq(fr_duration("250us", 1000000), 250)
+    assert_eq(fr_duration("7ns", 1000000000), 7)
+    assert_eq(fr_duration(" 3s ", 1), 3)
+    assert_eq(fr_duration("5", 1), -1)
+    assert_eq(fr_duration("ms", 1), -1)
+    assert_eq(fr_duration("0s", 1), -1)
+    assert_eq(fr_duration("5x", 1), -1)
+    assert_eq(fr_duration("", 1), -1)
+    assert_eq(fr_floor_div(7, 5), 1)
+    assert_eq(fr_floor_div(-7, 5), -2)
+    assert_eq(fr_floor_div(-10, 5), -2)
+    assert_eq(fr_floor_div(0, 5), 0)
+    assert_eq(fr_floor_div(7, -5), -2)
+    // group by an hourly window via a parsed duration
+    hourly = Frame.new()
+    @hourly.add_int(int_col("ts", [10, 3600, 3601, 7300]))
+    @hourly.add_int(int_col("v", [1, 1, 1, 1]))
+    h = hourly.group_by_dynamic("ts", fr_duration("1h", 1), [], [agg_rows("n")])
+    assert_eq(h.get_int("ts").get(1), 3600)
+    assert_eq(h.get_int("n").get(1), 2)
+    assert_eq(h.get_int("n").get(2), 1)
+}
+
+test "selectors: exclude, dtype_cols, numeric_cols" {
+    f = fr_sales()
+    assert_eq(f.exclude(["price", "rush"])[0], "region")
+    assert_eq(host.sys_arr_len(f.exclude(["price", "rush"])), 2)
+    assert_eq(host.sys_arr_len(f.exclude([])), 4)
+    assert_eq(host.sys_arr_len(f.exclude(["ghost"])), 4)
+    assert_eq(f.select(f.exclude(["region"])).width(), 3)
+    assert_eq(f.dtype_cols(DT_FLOAT)[0], "price")
+    assert_eq(host.sys_arr_len(f.dtype_cols(DT_BOOL)), 1)
+    assert_eq(host.sys_arr_len(f.dtype_cols(DT_STR)), 1)
+    num = f.numeric_cols()
+    assert_eq(host.sys_arr_len(num), 2)
+    assert_eq(num[0], "price")
+    assert_eq(num[1], "qty")
+    assert_eq(f.select_dtype(DT_INT).names[0], "qty")
+    assert_eq(f.select_dtype(DT_INT).height(), 6)
+    assert_eq(f.select(f.numeric_cols()).get_int("qty").total(), 25)
+    #assert(!(Frame.new().numeric_cols()[0] == "x"))
+    assert_eq(host.sys_arr_len(Frame.new().dtype_cols(DT_INT)), 0)
+}
+
+test "when / then / otherwise and coalesce drive derived columns" {
+    f = fr_sales()
+    size = f.with_column("size", when_expr(expr("qty > 3") or fail_expr()).then(str_expr("big")).otherwise(str_expr("small")))
+    assert_eq(size.kind_of("size"), DT_STR)
+    assert_eq(size.get_str("size").get(0), "small")
+    assert_eq(size.get_str("size").get(3), "big")
+    assert_eq(size.get_str("size").get(5), "big")
+    tiers = f.with_column("tier", when_expr(expr("qty >= 10") or fail_expr()).then(int_expr(3)).and_when(expr("qty >= 4") or fail_expr()).then(int_expr(2)).otherwise(int_expr(1)))
+    assert_eq(tiers.kind_of("tier"), DT_INT)
+    assert_eq(tiers.get_int("tier").total(), 1 + 1 + 1 + 3 + 2 + 2)
+    text = f.with_column("size", expr("if(qty > 3, 'big', 'small')") or fail_expr())
+    #assert(text.same_as(size))
+    // a null condition falls through to the next arm
+    n = Frame.new()
+    c = IntCol.new("x")
+    @c.push(5)
+    @c.push_null()
+    @c.push(-1)
+    @n.add_int(c)
+    sign = n.with_column("s", expr("if(x > 0, 'pos', if(x < 0, 'neg', 'unknown'))") or fail_expr())
+    assert_eq(sign.get_str("s").get(0), "pos")
+    assert_eq(sign.get_str("s").get(1), "unknown")
+    assert_eq(sign.get_str("s").get(2), "neg")
+    // branches may read different columns
+    mixed = f.with_column("m", expr("if(rush, qty * 2, price)") or fail_expr())
+    assert_eq(mixed.kind_of("m"), DT_FLOAT)
+    assert_eq(mixed.get_float("m").get(0), 6.0)
+    assert_eq(mixed.get_float("m").get(1), 20.0)
+    // filters may use when too
+    assert_eq(f.filter(expr("if(rush, qty > 4, qty < 3)") or fail_expr()).height(), 4)
+    // variadic coalesce picks the first non-null
+    k = Frame.new()
+    a = IntCol.new("a")
+    @a.push_null()
+    @a.push_null()
+    @a.push(1)
+    @k.add_int(a)
+    b = IntCol.new("b")
+    @b.push_null()
+    @b.push(2)
+    @b.push(3)
+    @k.add_int(b)
+    co = k.with_column("c", expr("coalesce(a, b, 99)") or fail_expr())
+    assert_eq(co.get_int("c").get(0), 99)
+    assert_eq(co.get_int("c").get(1), 2)
+    assert_eq(co.get_int("c").get(2), 1)
+    co2 = k.with_column("c", coalesce_expr([col_expr("a"), col_expr("b")]))
+    assert_eq(co2.get_int("c").get(0) , 0)
+    #assert(co2.get_int("c").is_null(0))
+    assert_eq(co2.get_int("c").get(1), 2)
+}
+
+test "concat_str builds text columns" {
+    f = Frame.new()
+    @f.add_str(str_col("first", ["Ada", "Alan", "Grace"]))
+    last = StrCol.new("last")
+    @last.push("Lovelace")
+    @last.push_null()
+    @last.push("Hopper")
+    @f.add_str(last)
+    @f.add_int(int_col("age", [36, 41, 85]))
+    r = f.concat_str(["first", "last"], " ", "full", false)
+    assert_eq(r.get_str("full").get(0), "Ada Lovelace")
+    #assert(r.get_str("full").is_null(1))
+    assert_eq(r.get_str("full").get(2), "Grace Hopper")
+    k = f.concat_str(["first", "last", "age"], "-", "full", true)
+    assert_eq(k.get_str("full").get(1), "Alan-41")
+    assert_eq(k.get_str("full").get(0), "Ada-Lovelace-36")
+    assert_eq(f.concat_str(["first"], ",", "x", false).get_str("x").get(2), "Grace")
+    assert_eq(f.concat_str(["first", "ghost"], ",", "x", false).width(), 3)
+    assert_eq(f.concat_str([], ",", "x", true).get_str("x").get(0), "")
+    // the expression form matches
+    e = f.with_column("full", expr("concat_str(first, ' ', last)") or fail_expr())
+    assert_eq(e.get_str("full").get(0), "Ada Lovelace")
+    #assert(e.get_str("full").is_null(1))
+    n = f.with_column("tag", expr("concat_str(first, ':', age)") or fail_expr())
+    assert_eq(n.get_str("tag").get(1), "Alan:41")
+    assert_eq(f.with_column("j", concat_str_expr([col_expr("first"), col_expr("age")], "/")).get_str("j").get(2), "Grace/85")
+}
+
+test "fr_concat stacks many frames and keeps dtypes" {
+    f = fr_sales()
+    parts = [fr_slice(f, 0, 2), fr_slice(f, 2, 3), fr_slice(f, 5, 10)]
+    c = fr_concat(parts)
+    #assert(c.same_as(f))
+    assert_eq(fr_slice(f, 4, 100).height(), 2)
+    assert_eq(fr_slice(f, 6, 3).height(), 0)
+    assert_eq(fr_concat([]).width(), 0)
+    #assert(fr_concat([f]).same_as(f))
+    // all-empty keeps the typed schema
+    empty = f.take([])
+    e2 = fr_concat([empty, empty])
+    assert_eq(e2.height(), 0)
+    assert_eq(e2.kind_of("qty"), DT_INT)
+    // an all-null batch does not change the dtype of the column
+    n = Frame.new()
+    c1 = StrCol.new("s")
+    @c1.push_null()
+    @c1.push_null()
+    @n.add_str(c1)
+    m = Frame.new()
+    @m.add_str(str_col("s", ["z"]))
+    nm = fr_concat([n, m])
+    assert_eq(nm.kind_of("s"), DT_STR)
+    assert_eq(nm.get_str("s").null_count(), 2)
+    // a dtype mismatch is re-inferred
+    ia = Frame.new()
+    @ia.add_int(int_col("v", [1, 2]))
+    fb = Frame.new()
+    @fb.add_float(float_col("v", [0.5]))
+    assert_eq(fr_concat([ia, fb, ia]).kind_of("v"), DT_FLOAT)
+    assert_eq(fr_concat([ia, fb]).get_float("v").total(), 3.5)
+    // schema mismatches give an empty frame
+    assert_eq(fr_concat([f, f.drop(["rush"])]).width(), 0)
+    assert_eq(fr_concat([f, f.rename("qty", "q")]).width(), 0)
+}
+
+test "sorting, windows and dynamic groups are exact beyond 2^53" {
+    big = 1700000000000000000
+    f = Frame.new()
+    @f.add_int(int_col("t", [big + 3, big + 1, big + 2, big, big + 1]))
+    @f.add_int(int_col("id", [0, 1, 2, 3, 4]))
+    up = f.sort_by("t", false)
+    assert_eq(up.get_int("id").get(0), 3)
+    assert_eq(up.get_int("id").get(1), 1)
+    assert_eq(up.get_int("id").get(2), 4)
+    assert_eq(up.get_int("id").get(3), 2)
+    assert_eq(up.get_int("id").get(4), 0)
+    down = f.sort_by("t", true)
+    assert_eq(down.get_int("id").get(0), 0)
+    assert_eq(down.get_int("id").get(4), 3)
+    neg = Frame.new()
+    @neg.add_int(int_col("t", [0 - big, big, 0 - big - 1, 5, 0 - 5]))
+    @neg.add_int(int_col("id", [0, 1, 2, 3, 4]))
+    n = neg.sort_by("t", false)
+    assert_eq(n.get_int("id").get(0), 2)
+    assert_eq(n.get_int("id").get(1), 0)
+    assert_eq(n.get_int("id").get(2), 4)
+    assert_eq(n.get_int("id").get(3), 3)
+    assert_eq(n.get_int("id").get(4), 1)
+    r = f.over([], ["t"], [win_row_number("rn")])
+    assert_eq(r.get_int("rn").get(3), 1)
+    assert_eq(r.get_int("rn").get(0), 5)
+    w = f.group_by_dynamic("t", 2, [], [agg_rows("n")])
+    assert_eq(w.get_int("n").total(), 5)
+    assert_eq(w.get_int("t").get(0), big)
+}

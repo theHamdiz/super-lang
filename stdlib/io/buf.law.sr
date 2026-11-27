@@ -1,0 +1,17 @@
+//! Laws for std.io.buf — ring buffer helpers (pure tag model).
+//! Implementation: `RingWriter` / `RingReader` in `buf.sr`.
+
+law_ring_writer_tag() : i64 => 1
+
+law_ring_reader_tag() : i64 => 2
+
+#law("ring writer model tag is stable")
+buf_ring_writer_new() {
+    #assert(law_ring_writer_tag() == 1)
+}
+
+#law("ring reader model tag is distinct")
+buf_ring_reader_empty() {
+    #assert(law_ring_reader_tag() == 2)
+    #assert(law_ring_reader_tag() != law_ring_writer_tag())
+}

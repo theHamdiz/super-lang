@@ -1,0 +1,21 @@
+//! Laws for std.net.url — real-body (`url_index_of`, `url_last_index_of`, `url_hex_byte`).
+//! `url_starts_with` / `url_encode` byte walks remain SMT-limited (docs/LAWS_STATUS.md).
+
+#law("url_index_of finds first colon")
+url_index_of_colon() {
+    #assert(url_index_of("a:b:c", ":") == 1)
+    #assert(url_index_of("none", ":") == -1)
+}
+
+#law("url_last_index_of finds final slash")
+url_last_index_of_slash() {
+    #assert(url_last_index_of("/a/b/", "/") == 4)
+    #assert(url_last_index_of("ab", "/") == -1)
+}
+
+#law("url_hex_byte encodes nibbles")
+url_hex_byte_nibbles() {
+    assert_eq(url_hex_byte(0), "00")
+    assert_eq(url_hex_byte(255), "FF")
+    assert_eq(url_hex_byte(16), "10")
+}

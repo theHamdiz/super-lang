@@ -1,0 +1,105 @@
+// 05_parallel_mapreduce - 64 KiB corpus; full-scan checksum (parity with C)
+use std.core.str
+
++CORPUS = 65_536
++BUCKETS = 65_536
++U32 = 0x1_0000_0000
++WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
++LCG_MOD = 0x8000_0000
++COFFEE = 0xC0FFEE
+
++lcg(@rng) : i64 {
+    v = (rng[0] * 1103515245 + 12345) % LCG_MOD
+    rng[0] = v
+    v
+}
+
++bump(@keys, @counts, key: i64, add: i64) : i64 {
+    i = key % BUCKETS
+    for probe in 0..BUCKETS {
+        j = (i + probe) % BUCKETS
+        if counts[j] == 0 {
+            keys[j] = key
+            counts[j] = add
+            return add
+        }
+        if keys[j] == key {
+            n = counts[j] + add
+            counts[j] = n
+            return n
+        }
+    }
+    0
+}
+
++fnv(bytes, start: i64, nbytes: i64) : i64 {
+    h = 2166136261
+    for k in 0..nbytes {
+        h = (h ^ (bytes[start + k] % 256)) % U32
+        h = (h * 16777619) % U32
+    }
+    h
+}
+
++main() {
+    rng = [370945]
+    bytes = [120; CORPUS]
+    pos = 0
+    while pos + 16 < CORPUS {
+        s2 = lcg(@rng)
+        w = WORDS[s2 % 10]
+        wl = byte_len(w)
+        for wi in 0..wl {
+            if pos < CORPUS {
+                bytes[pos] = ord(w[wi])
+                pos += 1
+            }
+        }
+        if pos < CORPUS {
+            bytes[pos] = 32
+            pos += 1
+        }
+    }
+    while pos < CORPUS {
+        bytes[pos] = 120
+        pos += 1
+    }
+
+    keys = [0; BUCKETS]
+    counts = [0; BUCKETS]
+    i = 0
+    while i < CORPUS {
+        while i < CORPUS && (bytes[i] < 97 || bytes[i] > 122) {
+            i += 1
+        }
+        start = i
+        while i < CORPUS && bytes[i] >= 97 && bytes[i] <= 122 {
+            i += 1
+        }
+        if i > start {
+            h = fnv(bytes, start, i - start)
+            bump(@keys, @counts, h, 1)
+            if i - start >= 3 {
+                bump(@keys, @counts, fnv(bytes, start, 3) ^ COFFEE, 1)
+            }
+        }
+    }
+    total, best, best_key = 0, 0, 0
+    for bi in 0..BUCKETS {
+        c = counts[bi]
+        if c > 0 {
+            total += c
+            // Strictly higher count wins; equal count keeps the smaller key.
+            when (c > best, c == best && keys[bi] < best_key) {
+                (true, _) => {
+                    best = c
+                    best_key = keys[bi]
+                }
+                (false, true) => { best_key = keys[bi] }
+                else => { best = best } // lower count: keep current best
+            }
+        }
+    }
+    cs = total ^ (best * 1315423911) ^ best_key
+    print("CHECKSUM={cs}")
+}

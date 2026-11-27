@@ -1,0 +1,35 @@
+// 06_mergesort — 50_000 ints, LCG fill, mergesort, checksum
+use std.core.collections
+
++N = 50_000
+
++lcg(@rng): i64 {
+    v = (rng[0] * 1103515245 + 12345) % 2147483648
+    rng[0] = v
+    v
+}
+
++merge(a, tmp, lo: i64, mid: i64, hi: i64) => merge_sorted(a, tmp, lo, mid, hi)
+
++mergesort(a, tmp, lo: i64, hi: i64) {
+    if hi - lo <= 1 { return a }
+    mid = lo + (hi - lo) / 2
+    a = mergesort(a, tmp, lo, mid)
+    a = mergesort(a, tmp, mid, hi)
+    merge(a, tmp, lo, mid, hi)
+}
+
++main() {
+    rng = [395799]
+    a = [0; 50_000]
+    tmp = [0; 50_000]
+    for 0..N { a[it] = lcg(@rng) }
+    a = mergesort(a, tmp, 0, N)
+    cs = 0
+    ok = 1
+    for 0..N {
+        cs = (cs ^ (a[it] % 4294967296)) * 131 + a[it] / 4294967296
+        if it > 0 && a[it] < a[it - 1] { ok = 0 }
+    }
+    print("CHECKSUM={cs ^ ok}")
+}

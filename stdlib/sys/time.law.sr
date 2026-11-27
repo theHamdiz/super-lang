@@ -1,0 +1,14 @@
+//! Laws for std.sys.time — real-body (`time_days_from_civil`).
+//! `Duration` constructors and `time_pad2` / sleep need host clocks (docs/LAWS_STATUS.md).
+
+#law("time_days_from_civil epoch anchor")
+time_days_from_civil_epoch() {
+    #assert(time_days_from_civil(1970, 1, 1) == 0)
+    #assert(time_days_from_civil(1970, 3, 1) == 59)
+    #assert(time_days_from_civil(1970, 2, 1) == 31)
+}
+
+#law("time_days_from_civil month branch")
+time_days_from_civil_march() {
+    #assert(time_days_from_civil(1971, 1, 1) == 365)
+}

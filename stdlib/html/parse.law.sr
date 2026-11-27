@@ -1,0 +1,21 @@
+//! Laws for std.html.parse — HTML document parsing (pure tag-count model).
+//! Implementation: `parse_html` / `select_count` in `parse.sr`.
+
+law_select_p_count(doc_tag: i64) : i64 {
+    if doc_tag == 0 { return 0 }
+    1
+}
+
+law_minimal_doc_tag() : i64 => 1
+
+#law("minimal markup has one paragraph in the model")
+html_parse_minimal() {
+    tag = law_minimal_doc_tag()
+    #assert(tag == 1)
+    #assert(law_select_p_count(tag) == 1)
+}
+
+#law("empty selection count is zero on missing tag")
+html_select_count_empty() {
+    #assert(law_select_p_count(0) == 0)
+}

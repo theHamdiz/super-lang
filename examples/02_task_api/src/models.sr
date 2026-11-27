@@ -1,0 +1,42 @@
+#assert_size(User, 24)
++User = {
+    id: i64
+    name: str
+    -password_hash: str = ""
+}
+
+#USER_SZ = User.size
+#USER_JSON_GOAL = #goal_type
+
++Task = {
+    id: i64
+    title: str
+    done: bool = false
+    owner_id: i64
+}
+
++CreateTask = {
+    title: str
+    owner_id: i64
+}
+
++AuthToken = {
+    user_id: i64
+    token: str
+}
+
+#USER_FIELD_LABELS = User.fields.join(", ")
+
++user_fields_json(id: i64, name: str) : str {
+    head = "{ \"id\": "
+    tail = ", \"name\": \"" + name + "\" }"
+    head + id + tail + " /* " + #USER_FIELD_LABELS + " */"
+}
+
+test "user C-ABI size via reflection" {
+    assert_eq(#USER_SZ, 24)
+}
+
+test "goal_type stub for JSON builders" {
+    assert_eq(#USER_JSON_GOAL, "goal")
+}

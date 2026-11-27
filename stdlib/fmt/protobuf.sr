@@ -1,0 +1,257 @@
+//! std.fmt.protobuf -- Protobuf wire-format encode/decode
+//!
+//! Import: use std.fmt.protobuf
+//!
+//! Minimal codec for gRPC and hand-written messages: varints, zigzag, tags,
+//! length-delimited fields, fixed32/64, unknown-field preservation via parse.
+//! Codegen from `.proto` is out of scope for this module; pair with `std.net.grpc`.
+
+/// Wire type: varint.
++WT_VARINT = 0
+/// Wire type: 64-bit.
++WT_I64 = 1
+/// Wire type: length-delimited.
++WT_LEN = 2
+/// Wire type: 32-bit.
++WT_I32 = 5
+
+/// Protobuf varint of `n` (int64 two's complement for negatives).
++pb_varint(n: i64) : _ {
+    out = []
+    v = n
+    while (v & -128) != 0 {
+        out = host.sys_arr_push(out, (v & 127) | 128)
+        v = v >>> 7
+    }
+    host.sys_arr_push(out, v)
+}
+
++PbVar = {
+    value: i64 = 0
+    next: i64 = 0
+}
+
++pb_read_varint(data: _, pos: i64) : PbVar! {
+    n = host.sys_arr_len(data)
+    value = 0
+    shift = 0
+    p = pos
+    going = true
+    problem = ""
+    while going {
+        if p >= n {
+            problem = "protobuf: truncated varint"
+            going = false
+        } else {
+            if shift > 63 {
+                problem = "protobuf: varint longer than 10 bytes"
+                going = false
+            } else {
+                b = data[p]
+                value = value | ((b & 127) << shift)
+                shift = shift + 7
+                p = p + 1
+                if (b & 128) == 0 { going = false }
+            }
+        }
+    }
+    ensure problem == "" else {
+        fail problem
+        return
+    }
+    PbVar.{value, next: p}
+}
+
++pb_zigzag(n: i64) : i64 {
+    if n >= 0 { n * 2 } else { (0 - n) * 2 - 1 }
+}
+
++pb_unzigzag(n: i64) : i64 {
+    if (n & 1) == 0 { n >>> 1 } else { 0 - ((n >>> 1) + 1) }
+}
+
++pb_tag(number: i64, wire: i64) : _! {
+    ensure number >= 1 else {
+        fail "protobuf: field numbers start at 1"
+        return
+    }
+    ensure number < 536870912 else {
+        fail "protobuf: field number too large"
+        return
+    }
+    ensure !(number >= 19000 && number <= 19999) else {
+        fail "protobuf: field numbers 19000-19999 are reserved"
+        return
+    }
+    pb_varint((number << 3) | wire)
+}
+
++pb_cat(a: _, b: _) : _ {
+    out = a
+    n = host.sys_arr_len(b)
+    for 0..n { out = host.sys_arr_push(out, b[it]) }
+    out
+}
+
++pb_varint_field(number: i64, value: i64) : _! {
+    tag = pb_tag(number, WT_VARINT) or err {
+        fail err
+        return
+    }
+    pb_cat(tag, pb_varint(value))
+}
+
++pb_bytes_field(number: i64, bytes: _) : _! {
+    tag = pb_tag(number, WT_LEN) or err {
+        fail err
+        return
+    }
+    head = pb_cat(tag, pb_varint(host.sys_arr_len(bytes)))
+    pb_cat(head, bytes)
+}
+
++pb_string_field(number: i64, s: str) : _! {
+    bytes = host.sys_str_to_bytes(s)
+    pb_bytes_field(number, bytes)
+}
+
++PbField = {
+    number: i64 = 0
+    wire: i64 = 0
+    value: i64 = 0
+    bytes: _ = []
+}
+
++pb_parse(data: _) : _! {
+    fields = []
+    pos = 0
+    n = host.sys_arr_len(data)
+    while pos < n {
+        key = pb_read_varint(data, pos) or err {
+            fail err
+            return
+        }
+        number = key.value >>> 3
+        wire = key.value & 7
+        pos = key.next
+        ensure number >= 1 else {
+            fail "protobuf: field number 0"
+            return
+        }
+        when wire {
+            0 => {
+                v = pb_read_varint(data, pos) or err {
+                    fail err
+                    return
+                }
+                fields = host.sys_arr_push(fields, PbField.{number, wire, value: v.value, bytes: []})
+                pos = v.next
+            }
+            2 => {
+                ln = pb_read_varint(data, pos) or err {
+                    fail err
+                    return
+                }
+                pos = ln.next
+                ensure ln.value >= 0 else {
+                    fail "protobuf: negative length"
+                    return
+                }
+                end = pos + ln.value
+                ensure end <= n else {
+                    fail "protobuf: length-delimited field overruns"
+                    return
+                }
+                chunk = []
+                for pos..end { chunk = host.sys_arr_push(chunk, data[it]) }
+                fields = host.sys_arr_push(fields, PbField.{number, wire, value: 0, bytes: chunk})
+                pos = end
+            }
+            5 => {
+                ensure pos + 4 <= n else {
+                    fail "protobuf: truncated fixed32"
+                    return
+                }
+                v = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16) | (data[pos + 3] << 24)
+                fields = host.sys_arr_push(fields, PbField.{number, wire, value: v, bytes: []})
+                pos = pos + 4
+            }
+            1 => {
+                ensure pos + 8 <= n else {
+                    fail "protobuf: truncated fixed64"
+                    return
+                }
+                v = 0
+                shift = 1
+                for 0..8 {
+                    v = v + data[pos + it] * shift
+                    shift = shift * 256
+                }
+                fields = host.sys_arr_push(fields, PbField.{number, wire, value: v, bytes: []})
+                pos = pos + 8
+            }
+            else => {
+                fail "protobuf: unsupported wire type {wire}"
+                return
+            }
+        }
+    }
+    fields
+}
+
++pb_get_varint(fields: _, number: i64, fallback: i64) : i64 {
+    n = host.sys_arr_len(fields)
+    out = fallback
+    for 0..n {
+        f = fields[it]
+        if f.number == number && f.wire == WT_VARINT { out = f.value }
+    }
+    out
+}
+
++pb_get_bytes(fields: _, number: i64) : _ {
+    n = host.sys_arr_len(fields)
+    out = []
+    for 0..n {
+        f = fields[it]
+        if f.number == number && f.wire == WT_LEN { out = f.bytes }
+    }
+    out
+}
+
+test "protobuf varint round-trip" {
+    for [0, 1, 127, 128, 300, 0 - 1, 0 - 128] {
+        enc = pb_varint(it)
+        dec = pb_read_varint(enc, 0) or PbVar.{}
+        assert_eq(dec.value, it)
+        assert_eq(dec.next, host.sys_arr_len(enc))
+    }
+}
+
+test "protobuf zigzag identities" {
+    for [0, 1, 0 - 1, 2, 0 - 2, 2147483647, 0 - 2147483648] {
+        assert_eq(pb_unzigzag(pb_zigzag(it)), it)
+    }
+}
+
+test "protobuf message encode/decode with unknown field" {
+    // field 1 = 42, field 2 = "hi", field 99 = 7 (unknown to reader that only looks at 1/2)
+    m = pb_varint_field(1, 42) or []
+    m = pb_cat(m, pb_string_field(2, "hi") or [])
+    m = pb_cat(m, pb_varint_field(99, 7) or [])
+    fields = pb_parse(m) or []
+    assert_eq(pb_get_varint(fields, 1, 0), 42)
+    b = pb_get_bytes(fields, 2)
+    assert_eq(host.sys_bytes_to_str(b), "hi")
+    assert_eq(pb_get_varint(fields, 99, 0), 7)
+    assert_eq(host.sys_arr_len(fields), 3)
+}
+
+test "protobuf rejects reserved field numbers" {
+    bad = false
+    _ = pb_tag(19000, WT_VARINT) or err {
+        bad = true
+        ""
+    }
+    #assert(bad)
+}

@@ -1,0 +1,2090 @@
+{
+  "seed": "0xa1c0b26",
+  "mutants": [
+    {
+      "module": "stdlib/core/str.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 384 (fn=starts_with)",
+      "line": 384,
+      "original": "+starts_with(s: str, prefix: str) : bool => host.sys_str_match_at(s, prefix, 0)",
+      "mutated": "-starts_with(s: str, prefix: str) : bool => host.sys_str_match_at(s, prefix, 0)"
+    },
+    {
+      "module": "stdlib/core/str.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 25 (fn=byte_len)",
+      "line": 25,
+      "original": "+byte_len(s: str) : i64 => host.sys_byte_len(s)",
+      "mutated": "-byte_len(s: str) : i64 => host.sys_byte_len(s)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 347 (fn=bytes_last_index)",
+      "line": 347,
+      "original": "    for 0..(hn - nn + 1) {",
+      "mutated": "    for 0..(hn + nn + 1) {"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 347 (fn=bytes_last_index)",
+      "line": 347,
+      "original": "    for 0..(hn - nn + 1) {",
+      "mutated": "    for 0..(hn - nn - 1) {"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 345 (fn=bytes_last_index)",
+      "line": 345,
+      "original": "    ensure nn > 0 else { return -1 }",
+      "mutated": "    ensure nn > 0 else { return +1 }"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 342 (fn=bytes_last_index)",
+      "line": 342,
+      "original": "+bytes_last_index(hay: _, needle: _) : i64 {",
+      "mutated": "-bytes_last_index(hay: _, needle: _) : i64 {"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 345 (fn=bytes_last_index)",
+      "line": 345,
+      "original": "    ensure nn > 0 else { return -1 }",
+      "mutated": "    ensure nn < 0 else { return -1 }"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 274 (fn=bytes_equal)",
+      "line": 274,
+      "original": "+bytes_equal(a: _, b: _) : bool {",
+      "mutated": "-bytes_equal(a: _, b: _) : bool {"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_ne",
+      "description": "flip_ne on line 279 (fn=bytes_equal)",
+      "line": 279,
+      "original": "        if a[it] != b[it] { return false }",
+      "mutated": "        if a[it] == b[it] { return false }"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 277 (fn=bytes_equal)",
+      "line": 277,
+      "original": "    ensure na == nb else { return false }",
+      "mutated": "    ensure na != nb else { return false }"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 203 (fn=m_smoothstep)",
+      "line": 203,
+      "original": "    t * t * (3.0 - 2.0 * t)",
+      "mutated": "    t * t * (3.0 + 2.0 * t)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 202 (fn=m_smoothstep)",
+      "line": 202,
+      "original": "    t = m_clamp((x - e0) / (e1 - e0), 0.0, 1.0)",
+      "mutated": "    t = m_clamp((x + e0) / (e1 - e0), 0.0, 1.0)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 41 (fn=m_min)",
+      "line": 41,
+      "original": "    if a < b { return a }",
+      "mutated": "    if a > b { return a }"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 201 (fn=m_smoothstep)",
+      "line": 201,
+      "original": "+m_smoothstep(e0: f64, e1: f64, x: f64) : f64 {",
+      "mutated": "-m_smoothstep(e0: f64, e1: f64, x: f64) : f64 {"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 207 (fn=m_smootherstep)",
+      "line": 207,
+      "original": "    t = m_clamp((x - e0) / (e1 - e0), 0.0, 1.0)",
+      "mutated": "    t = m_clamp((x + e0) / (e1 - e0), 0.0, 1.0)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 50 (fn=m_clamp)",
+      "line": 50,
+      "original": "+m_clamp(x: f64, lo: f64, hi: f64) : f64 => m_min(m_max(x, lo), hi)",
+      "mutated": "-m_clamp(x: f64, lo: f64, hi: f64) : f64 => m_min(m_max(x, lo), hi)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 40 (fn=m_min)",
+      "line": 40,
+      "original": "+m_min(a: f64, b: f64) : f64 {",
+      "mutated": "-m_min(a: f64, b: f64) : f64 {"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 208 (fn=m_smootherstep)",
+      "line": 208,
+      "original": "    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)",
+      "mutated": "    t * t * t * (t * (t * 6.0 - 15.0) - 10.0)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 51 (fn=i_sdiv)",
+      "line": 51,
+      "original": "    0 - ((0 - a) / d)",
+      "mutated": "    0 + ((0 - a) / d)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 635 (fn=popcount32)",
+      "line": 635,
+      "original": "    x = (x + (x >> 4)) & 252645135",
+      "mutated": "    x = (x - (x >> 4)) & 252645135"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 622 (fn=word_has)",
+      "line": 622,
+      "original": "+word_has(w: i64, bit: i64) : bool => (w & (1 << bit)) != 0",
+      "mutated": "-word_has(w: i64, bit: i64) : bool => (w & (1 << bit)) != 0"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 637 (fn=popcount32)",
+      "line": 637,
+      "original": "    x = x + (x >> 16)",
+      "mutated": "    x = x + (x <> 16)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 634 (fn=popcount32)",
+      "line": 634,
+      "original": "    x = (x & 858993459) + ((x >> 2) & 858993459)",
+      "mutated": "    x = (x & 858993459) - ((x >> 2) & 858993459)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 636 (fn=popcount32)",
+      "line": 636,
+      "original": "    x = x + (x >> 8)",
+      "mutated": "    x = x + (x <> 8)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 631 (fn=popcount32)",
+      "line": 631,
+      "original": "+popcount32(w: i64) : i64 {",
+      "mutated": "-popcount32(w: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 637 (fn=popcount32)",
+      "line": 637,
+      "original": "    x = x + (x >> 16)",
+      "mutated": "    x = x - (x >> 16)"
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 162 (fn=json_is_ws)",
+      "line": 162,
+      "original": "+json_is_ws(c: str) : bool => c == \" \" || c == \"\\n\" || c == \"\\t\" || c == \"\\r\"",
+      "mutated": "-json_is_ws(c: str) : bool => c == \" \" || c == \"\\n\" || c == \"\\t\" || c == \"\\r\""
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 165 (fn=json_is_ws_b)",
+      "line": 165,
+      "original": "+json_is_ws_b(b: i64) : bool => b == 32 || b == 10 || b == 9 || b == 13",
+      "mutated": "-json_is_ws_b(b: i64) : bool => b == 32 || b == 10 || b == 9 || b == 13"
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 162 (fn=json_is_ws)",
+      "line": 162,
+      "original": "+json_is_ws(c: str) : bool => c == \" \" || c == \"\\n\" || c == \"\\t\" || c == \"\\r\"",
+      "mutated": "+json_is_ws(c: str) : bool => c != \" \" || c == \"\\n\" || c == \"\\t\" || c == \"\\r\""
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 165 (fn=json_is_ws_b)",
+      "line": 165,
+      "original": "+json_is_ws_b(b: i64) : bool => b == 32 || b == 10 || b == 9 || b == 13",
+      "mutated": "+json_is_ws_b(b: i64) : bool => b != 32 || b == 10 || b == 9 || b == 13"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 240 (fn=enc_hex_value)",
+      "line": 240,
+      "original": "            if found < 0 && low[it] == c { found = it + 10 }",
+      "mutated": "            if found > 0 && low[it] == c { found = it + 10 }"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 233 (fn=enc_hex_value)",
+      "line": 233,
+      "original": "    found = -1",
+      "mutated": "    found = +1"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 235 (fn=enc_hex_value)",
+      "line": 235,
+      "original": "        if found < 0 && ENC_HEX[it] == c { found = it }",
+      "mutated": "        if found < 0 && ENC_HEX[it] != c { found = it }"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 240 (fn=enc_hex_value)",
+      "line": 240,
+      "original": "            if found < 0 && low[it] == c { found = it + 10 }",
+      "mutated": "            if found < 0 && low[it] != c { found = it + 10 }"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 235 (fn=enc_hex_value)",
+      "line": 235,
+      "original": "        if found < 0 && ENC_HEX[it] == c { found = it }",
+      "mutated": "        if found > 0 && ENC_HEX[it] == c { found = it }"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 240 (fn=enc_hex_value)",
+      "line": 240,
+      "original": "            if found < 0 && low[it] == c { found = it + 10 }",
+      "mutated": "            if found < 0 && low[it] == c { found = it - 10 }"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 232 (fn=enc_hex_value)",
+      "line": 232,
+      "original": "+enc_hex_value(c: str) : i64 {",
+      "mutated": "-enc_hex_value(c: str) : i64 {"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 237 (fn=enc_hex_value)",
+      "line": 237,
+      "original": "    if found < 0 {",
+      "mutated": "    if found > 0 {"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 14 (fn=days_from_civil)",
+      "line": 14,
+      "original": "+days_from_civil(y: i64, m: i64, d: i64) : i64 {",
+      "mutated": "-days_from_civil(y: i64, m: i64, d: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 45 (fn=is_leap_year)",
+      "line": 45,
+      "original": "+is_leap_year(y: i64) : bool {",
+      "mutated": "-is_leap_year(y: i64) : bool {"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 21 (fn=days_from_civil)",
+      "line": 21,
+      "original": "    if m > 2 { mm = m - 3 } else { mm = m + 9 }",
+      "mutated": "    if m > 2 { mm = m + 3 } else { mm = m + 9 }"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 21 (fn=days_from_civil)",
+      "line": 21,
+      "original": "    if m > 2 { mm = m - 3 } else { mm = m + 9 }",
+      "mutated": "    if m > 2 { mm = m - 3 } else { mm = m - 9 }"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 19 (fn=days_from_civil)",
+      "line": 19,
+      "original": "    yoe = yy - era * 400",
+      "mutated": "    yoe = yy + era * 400"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 21 (fn=days_from_civil)",
+      "line": 21,
+      "original": "    if m > 2 { mm = m - 3 } else { mm = m + 9 }",
+      "mutated": "    if m < 2 { mm = m - 3 } else { mm = m + 9 }"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 16 (fn=days_from_civil)",
+      "line": 16,
+      "original": "    if m <= 2 { yy = y - 1 }",
+      "mutated": "    if m <= 2 { yy = y + 1 }"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 18 (fn=days_from_civil)",
+      "line": 18,
+      "original": "    if yy >= 0 { era = yy / 400 } else { era = (yy - 399) / 400 }",
+      "mutated": "    if yy >= 0 { era = yy / 400 } else { era = (yy + 399) / 400 }"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 51 (fn=hash_u32)",
+      "line": 51,
+      "original": "    if v < 0 { v = v + 4294967296 }",
+      "mutated": "    if v > 0 { v = v + 4294967296 }"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 51 (fn=hash_u32)",
+      "line": 51,
+      "original": "    if v < 0 { v = v + 4294967296 }",
+      "mutated": "    if v < 0 { v = v - 4294967296 }"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 56 (fn=hash_xor32)",
+      "line": 56,
+      "original": "+hash_xor32(a: i64, b: i64) : i64 {",
+      "mutated": "-hash_xor32(a: i64, b: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 49 (fn=hash_u32)",
+      "line": 49,
+      "original": "+hash_u32(x: i64) : i64 {",
+      "mutated": "-hash_u32(x: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/core/decimal.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 30 (fn=dec_abs)",
+      "line": 30,
+      "original": "+dec_abs(v: i64) : i64 {",
+      "mutated": "-dec_abs(v: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/core/decimal.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 31 (fn=dec_abs)",
+      "line": 31,
+      "original": "    if v < 0 { return -v }",
+      "mutated": "    if v < 0 { return +v }"
+    },
+    {
+      "module": "stdlib/core/decimal.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 31 (fn=dec_abs)",
+      "line": 31,
+      "original": "    if v < 0 { return -v }",
+      "mutated": "    if v > 0 { return -v }"
+    },
+    {
+      "module": "stdlib/core/int.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 35 (fn=is_u32)",
+      "line": 35,
+      "original": "+is_u32(n: i64) : bool => n >= 0 && n <= U32_MAX",
+      "mutated": "-is_u32(n: i64) : bool => n >= 0 && n <= U32_MAX"
+    },
+    {
+      "module": "stdlib/core/unicode.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 89 (fn=utf8_is_cont)",
+      "line": 89,
+      "original": "+utf8_is_cont(b: i64) : bool => (b & 192) == 128",
+      "mutated": "-utf8_is_cont(b: i64) : bool => (b & 192) == 128"
+    },
+    {
+      "module": "stdlib/core/unicode.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 89 (fn=utf8_is_cont)",
+      "line": 89,
+      "original": "+utf8_is_cont(b: i64) : bool => (b & 192) == 128",
+      "mutated": "+utf8_is_cont(b: i64) : bool => (b & 192) != 128"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 65 (fn=dt_same)",
+      "line": 65,
+      "original": "+dt_same(a: f64, b: f64) : bool => !(a < b) && !(a > b)",
+      "mutated": "-dt_same(a: f64, b: f64) : bool => !(a < b) && !(a > b)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 60 (fn=dt_abs)",
+      "line": 60,
+      "original": "    if x < 0.0 { return -x }",
+      "mutated": "    if x < 0.0 { return +x }"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 65 (fn=dt_same)",
+      "line": 65,
+      "original": "+dt_same(a: f64, b: f64) : bool => !(a < b) && !(a > b)",
+      "mutated": "+dt_same(a: f64, b: f64) : bool => !(a > b) && !(a > b)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 60 (fn=dt_abs)",
+      "line": 60,
+      "original": "    if x < 0.0 { return -x }",
+      "mutated": "    if x > 0.0 { return -x }"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 65 (fn=dt_same)",
+      "line": 65,
+      "original": "+dt_same(a: f64, b: f64) : bool => !(a < b) && !(a > b)",
+      "mutated": "+dt_same(a: f64, b: f64) : bool => !(a < b) && !(a < b)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 59 (fn=dt_abs)",
+      "line": 59,
+      "original": "+dt_abs(x: f64) : f64 {",
+      "mutated": "-dt_abs(x: f64) : f64 {"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 138 (fn=cron_match)",
+      "line": 138,
+      "original": "    if field == \"*\" { return true }",
+      "mutated": "    if field != \"*\" { return true }"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 132 (fn=cron_digit_acc)",
+      "line": 132,
+      "original": "+cron_digit_acc(v: i64, cp: i64) : i64 {",
+      "mutated": "-cron_digit_acc(v: i64, cp: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 147 (fn=cron_match)",
+      "line": 147,
+      "original": "    v == value",
+      "mutated": "    v != value"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 133 (fn=cron_digit_acc)",
+      "line": 133,
+      "original": "    if cp < 48 || cp > 57 { return -1 }",
+      "mutated": "    if cp < 48 || cp < 57 { return -1 }"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 133 (fn=cron_digit_acc)",
+      "line": 133,
+      "original": "    if cp < 48 || cp > 57 { return -1 }",
+      "mutated": "    if cp > 48 || cp > 57 { return -1 }"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 137 (fn=cron_match)",
+      "line": 137,
+      "original": "+cron_match(field: str, value: i64) : bool {",
+      "mutated": "-cron_match(field: str, value: i64) : bool {"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 134 (fn=cron_digit_acc)",
+      "line": 134,
+      "original": "    v * 10 + (cp - 48)",
+      "mutated": "    v * 10 - (cp - 48)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 133 (fn=cron_digit_acc)",
+      "line": 133,
+      "original": "    if cp < 48 || cp > 57 { return -1 }",
+      "mutated": "    if cp < 48 || cp > 57 { return +1 }"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 272 (fn=sql_digit)",
+      "line": 272,
+      "original": "        if found < 0 && SQL_DIGITS[it] == c { found = it }",
+      "mutated": "        if found < 0 && SQL_DIGITS[it] != c { found = it }"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 269 (fn=sql_digit)",
+      "line": 269,
+      "original": "+sql_digit(c: str) : i64 {",
+      "mutated": "-sql_digit(c: str) : i64 {"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 270 (fn=sql_digit)",
+      "line": 270,
+      "original": "    found = -1",
+      "mutated": "    found = +1"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 326 (fn=sql_bool)",
+      "line": 326,
+      "original": "+sql_bool(b: bool) : str {",
+      "mutated": "-sql_bool(b: bool) : str {"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 272 (fn=sql_digit)",
+      "line": 272,
+      "original": "        if found < 0 && SQL_DIGITS[it] == c { found = it }",
+      "mutated": "        if found > 0 && SQL_DIGITS[it] == c { found = it }"
+    },
+    {
+      "module": "stdlib/diag/log.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 313 (fn=field)",
+      "line": 313,
+      "original": "+field(k: str, v: str) : LogField => LogField.{k, v, raw: false}",
+      "mutated": "-field(k: str, v: str) : LogField => LogField.{k, v, raw: false}"
+    },
+    {
+      "module": "stdlib/diag/log.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 315 (fn=field_int)",
+      "line": 315,
+      "original": "+field_int(k: str, n: i64) : LogField => LogField.{k, v: \"\" + n, raw: true}",
+      "mutated": "-field_int(k: str, n: i64) : LogField => LogField.{k, v: \"\" + n, raw: true}"
+    },
+    {
+      "module": "stdlib/fmt/bin.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 177 (fn=be32_get)",
+      "line": 177,
+      "original": "+be32_get(bytes: _, at: i64) : i64 => (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]",
+      "mutated": "+be32_get(bytes: _, at: i64) : i64 => (bytes[at] >< 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]"
+    },
+    {
+      "module": "stdlib/fmt/bin.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 177 (fn=be32_get)",
+      "line": 177,
+      "original": "+be32_get(bytes: _, at: i64) : i64 => (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]",
+      "mutated": "-be32_get(bytes: _, at: i64) : i64 => (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 35 (fn=compress_xor32)",
+      "line": 35,
+      "original": "+compress_xor32(a: i64, b: i64) : i64 {",
+      "mutated": "-compress_xor32(a: i64, b: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 30 (fn=compress_u32)",
+      "line": 30,
+      "original": "    if v < 0 { v = v + 4294967296 }",
+      "mutated": "    if v > 0 { v = v + 4294967296 }"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 30 (fn=compress_u32)",
+      "line": 30,
+      "original": "    if v < 0 { v = v + 4294967296 }",
+      "mutated": "    if v < 0 { v = v - 4294967296 }"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 40 (fn=compress_xor32)",
+      "line": 40,
+      "original": "        out = out + ((x % 2 + y % 2) % 2) * COMPRESS_POW2[it]",
+      "mutated": "        out = out - ((x % 2 + y % 2) % 2) * COMPRESS_POW2[it]"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 28 (fn=compress_u32)",
+      "line": 28,
+      "original": "+compress_u32(x: i64) : i64 {",
+      "mutated": "-compress_u32(x: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 46 (fn=csv_is_lf)",
+      "line": 46,
+      "original": "+csv_is_lf(c: str) : bool => c == \"\\n\"",
+      "mutated": "+csv_is_lf(c: str) : bool => c != \"\\n\""
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_ne",
+      "description": "flip_ne on line 47 (fn=csv_should_keep_char)",
+      "line": 47,
+      "original": "+csv_should_keep_char(c: str) : bool => c != \"\\r\"",
+      "mutated": "+csv_should_keep_char(c: str) : bool => c == \"\\r\""
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 50 (fn=csv_is_quote)",
+      "line": 50,
+      "original": "+csv_is_quote(c: str) : bool => c == CSV_QUOTE",
+      "mutated": "+csv_is_quote(c: str) : bool => c != CSV_QUOTE"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 46 (fn=csv_is_lf)",
+      "line": 46,
+      "original": "+csv_is_lf(c: str) : bool => c == \"\\n\"",
+      "mutated": "-csv_is_lf(c: str) : bool => c == \"\\n\""
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 58 (fn=csv_parse)",
+      "line": 58,
+      "original": "+csv_parse(text: str) {",
+      "mutated": "-csv_parse(text: str) {"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 47 (fn=csv_should_keep_char)",
+      "line": 47,
+      "original": "+csv_should_keep_char(c: str) : bool => c != \"\\r\"",
+      "mutated": "-csv_should_keep_char(c: str) : bool => c != \"\\r\""
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 51 (fn=csv_skip_after_doubled)",
+      "line": 51,
+      "original": "+csv_skip_after_doubled(it: i64) : i64 => it + 2",
+      "mutated": "-csv_skip_after_doubled(it: i64) : i64 => it + 2"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 50 (fn=csv_is_quote)",
+      "line": 50,
+      "original": "+csv_is_quote(c: str) : bool => c == CSV_QUOTE",
+      "mutated": "-csv_is_quote(c: str) : bool => c == CSV_QUOTE"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 198 (fn=mp_payload)",
+      "line": 198,
+      "original": "    if h.kind == 8 { return h.n }",
+      "mutated": "    if h.kind != 8 { return h.n }"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 197 (fn=mp_payload)",
+      "line": 197,
+      "original": "    if h.kind == 4 { return h.n }",
+      "mutated": "    if h.kind != 4 { return h.n }"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 196 (fn=mp_payload)",
+      "line": 196,
+      "original": "    if h.kind == 3 { return h.n }",
+      "mutated": "    if h.kind != 3 { return h.n }"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 195 (fn=mp_payload)",
+      "line": 195,
+      "original": "+mp_payload(h: MpHead) : i64 {",
+      "mutated": "-mp_payload(h: MpHead) : i64 {"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 66 (fn=pb_zigzag)",
+      "line": 66,
+      "original": "    if n >= 0 { n * 2 } else { (0 - n) * 2 - 1 }",
+      "mutated": "    if n >= 0 { n * 2 } else { (0 + n) * 2 - 1 }"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 70 (fn=pb_unzigzag)",
+      "line": 70,
+      "original": "    if (n & 1) == 0 { n >>> 1 } else { 0 - ((n >>> 1) + 1) }",
+      "mutated": "    if (n & 1) == 0 { n >>> 1 } else { 0 - ((n >>> 1) - 1) }"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 65 (fn=pb_zigzag)",
+      "line": 65,
+      "original": "+pb_zigzag(n: i64) : i64 {",
+      "mutated": "-pb_zigzag(n: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 70 (fn=pb_unzigzag)",
+      "line": 70,
+      "original": "    if (n & 1) == 0 { n >>> 1 } else { 0 - ((n >>> 1) + 1) }",
+      "mutated": "    if (n & 1) == 0 { n <>> 1 } else { 0 - ((n >>> 1) + 1) }"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 70 (fn=pb_unzigzag)",
+      "line": 70,
+      "original": "    if (n & 1) == 0 { n >>> 1 } else { 0 - ((n >>> 1) + 1) }",
+      "mutated": "    if (n & 1) == 0 { n >>> 1 } else { 0 + ((n >>> 1) + 1) }"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 70 (fn=pb_unzigzag)",
+      "line": 70,
+      "original": "    if (n & 1) == 0 { n >>> 1 } else { 0 - ((n >>> 1) + 1) }",
+      "mutated": "    if (n & 1) != 0 { n >>> 1 } else { 0 - ((n >>> 1) + 1) }"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 69 (fn=pb_unzigzag)",
+      "line": 69,
+      "original": "+pb_unzigzag(n: i64) : i64 {",
+      "mutated": "-pb_unzigzag(n: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 277 (fn=toml_digit)",
+      "line": 277,
+      "original": "        if digits[it] == c { pos = it }",
+      "mutated": "        if digits[it] != c { pos = it }"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 273 (fn=toml_digit)",
+      "line": 273,
+      "original": "+toml_digit(c: str) : i64 {",
+      "mutated": "-toml_digit(c: str) : i64 {"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 141 (fn=toml_is_space)",
+      "line": 141,
+      "original": "+toml_is_space(c: str) : bool => c == \" \" || c == \"\\t\" || c == \"\\r\"",
+      "mutated": "+toml_is_space(c: str) : bool => c != \" \" || c == \"\\t\" || c == \"\\r\""
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 275 (fn=toml_digit)",
+      "line": 275,
+      "original": "    pos = -1",
+      "mutated": "    pos = +1"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 141 (fn=toml_is_space)",
+      "line": 141,
+      "original": "+toml_is_space(c: str) : bool => c == \" \" || c == \"\\t\" || c == \"\\r\"",
+      "mutated": "-toml_is_space(c: str) : bool => c == \" \" || c == \"\\t\" || c == \"\\r\""
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 215 (fn=xml_char_ok)",
+      "line": 215,
+      "original": "    if v == 65535 { return false }",
+      "mutated": "    if v != 65535 { return false }"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 276 (fn=xml_is_ws)",
+      "line": 276,
+      "original": "    if c == \" \" { return true }",
+      "mutated": "    if c != \" \" { return true }"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 207 (fn=xml_char_ok)",
+      "line": 207,
+      "original": "    if v == 9 { return true }",
+      "mutated": "    if v != 9 { return true }"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 214 (fn=xml_char_ok)",
+      "line": 214,
+      "original": "    if v == 65534 { return false }",
+      "mutated": "    if v != 65534 { return false }"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 279 (fn=xml_is_ws)",
+      "line": 279,
+      "original": "    c == \"\\r\"",
+      "mutated": "    c != \"\\r\""
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 275 (fn=xml_is_ws)",
+      "line": 275,
+      "original": "+xml_is_ws(c: str) : bool {",
+      "mutated": "-xml_is_ws(c: str) : bool {"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 210 (fn=xml_char_ok)",
+      "line": 210,
+      "original": "    if v < 32 { return false }",
+      "mutated": "    if v > 32 { return false }"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 278 (fn=xml_is_ws)",
+      "line": 278,
+      "original": "    if c == \"\\t\" { return true }",
+      "mutated": "    if c != \"\\t\" { return true }"
+    },
+    {
+      "module": "stdlib/fmt/yaml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 46 (fn=yaml_is_ws)",
+      "line": 46,
+      "original": "    if c == \" \" { return true }",
+      "mutated": "    if c != \" \" { return true }"
+    },
+    {
+      "module": "stdlib/fmt/yaml.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 47 (fn=yaml_is_ws)",
+      "line": 47,
+      "original": "    c == \"\\t\"",
+      "mutated": "    c != \"\\t\""
+    },
+    {
+      "module": "stdlib/fmt/yaml.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 45 (fn=yaml_is_ws)",
+      "line": 45,
+      "original": "+yaml_is_ws(c: str) : bool {",
+      "mutated": "-yaml_is_ws(c: str) : bool {"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 22 (fn=escape_text_entity)",
+      "line": 22,
+      "original": "    if c == \">\" { return escape_text_entity_gt() }",
+      "mutated": "    if c != \">\" { return escape_text_entity_gt() }"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 23 (fn=escape_text_entity)",
+      "line": 23,
+      "original": "    if c == \"\\\"\" { return escape_text_entity_quot() }",
+      "mutated": "    if c != \"\\\"\" { return escape_text_entity_quot() }"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 19 (fn=escape_text_entity)",
+      "line": 19,
+      "original": "+escape_text_entity(c: str) : str {",
+      "mutated": "-escape_text_entity(c: str) : str {"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 15 (fn=escape_text_entity_quot)",
+      "line": 15,
+      "original": "+escape_text_entity_quot() : str => \"&quot;\"",
+      "mutated": "-escape_text_entity_quot() : str => \"&quot;\""
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 22 (fn=escape_text_entity)",
+      "line": 22,
+      "original": "    if c == \">\" { return escape_text_entity_gt() }",
+      "mutated": "    if c == \"<\" { return escape_text_entity_gt() }"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 16 (fn=escape_text_entity_apos)",
+      "line": 16,
+      "original": "+escape_text_entity_apos() : str => \"&#39;\"",
+      "mutated": "-escape_text_entity_apos() : str => \"&#39;\""
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 21 (fn=escape_text_entity)",
+      "line": 21,
+      "original": "    if c == \"<\" { return escape_text_entity_lt() }",
+      "mutated": "    if c == \">\" { return escape_text_entity_lt() }"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 20 (fn=escape_text_entity)",
+      "line": 20,
+      "original": "    if c == \"&\" { return escape_text_entity_amp() }",
+      "mutated": "    if c != \"&\" { return escape_text_entity_amp() }"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 360 (fn=http_is_space_tab)",
+      "line": 360,
+      "original": "+http_is_space_tab(c: str) : bool => c == \" \" || c == \"\\t\"",
+      "mutated": "-http_is_space_tab(c: str) : bool => c == \" \" || c == \"\\t\""
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 363 (fn=http_trim_advance_lo)",
+      "line": 363,
+      "original": "+http_trim_advance_lo(s: str, lo: i64, hi: i64) : i64 {",
+      "mutated": "-http_trim_advance_lo(s: str, lo: i64, hi: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 266 (fn=http_is_token)",
+      "line": 266,
+      "original": "    if n == 0 { return false }",
+      "mutated": "    if n != 0 { return false }"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 264 (fn=http_is_token)",
+      "line": 264,
+      "original": "+http_is_token(s: str) : bool {",
+      "mutated": "-http_is_token(s: str) : bool {"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 364 (fn=http_trim_advance_lo)",
+      "line": 364,
+      "original": "    if lo < hi && http_is_space_tab(s[lo]) { return lo + 1 }",
+      "mutated": "    if lo > hi && http_is_space_tab(s[lo]) { return lo + 1 }"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 370 (fn=http_trim_rewind_hi)",
+      "line": 370,
+      "original": "    if hi > lo && http_is_space_tab(s[hi - 1]) { return hi - 1 }",
+      "mutated": "    if hi < lo && http_is_space_tab(s[hi - 1]) { return hi - 1 }"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 260 (fn=http_is_token_char)",
+      "line": 260,
+      "original": "    o == 33 || o == 35 || o == 36 || o == 37 || o == 38 || o == 39 || o == 42 || o == 43 || o == 45 || o == 46 || o == 94 || o == 95 || o == 96 || o == 124 || o == 126",
+      "mutated": "    o != 33 || o == 35 || o == 36 || o == 37 || o == 38 || o == 39 || o == 42 || o == 43 || o == 45 || o == 46 || o == 94 || o == 95 || o == 96 || o == 124 || o == 126"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 370 (fn=http_trim_rewind_hi)",
+      "line": 370,
+      "original": "    if hi > lo && http_is_space_tab(s[hi - 1]) { return hi - 1 }",
+      "mutated": "    if hi > lo && http_is_space_tab(s[hi + 1]) { return hi - 1 }"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 272 (fn=url_hex_byte)",
+      "line": 272,
+      "original": "    digits[hi] + digits[lo]",
+      "mutated": "    digits[hi] - digits[lo]"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 222 (fn=url_last_index_of)",
+      "line": 222,
+      "original": "    pos = -1",
+      "mutated": "    pos = +1"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_lt",
+      "description": "flip_lt on line 214 (fn=url_index_of)",
+      "line": 214,
+      "original": "        if pos < 0 && s[it] == ch { pos = it }",
+      "mutated": "        if pos > 0 && s[it] == ch { pos = it }"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 220 (fn=url_last_index_of)",
+      "line": 220,
+      "original": "+url_last_index_of(s: str, ch: str) : i64 {",
+      "mutated": "-url_last_index_of(s: str, ch: str) : i64 {"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 212 (fn=url_index_of)",
+      "line": 212,
+      "original": "    pos = -1",
+      "mutated": "    pos = +1"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 214 (fn=url_index_of)",
+      "line": 214,
+      "original": "        if pos < 0 && s[it] == ch { pos = it }",
+      "mutated": "        if pos < 0 && s[it] != ch { pos = it }"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 224 (fn=url_last_index_of)",
+      "line": 224,
+      "original": "        if s[it] == ch { pos = it }",
+      "mutated": "        if s[it] != ch { pos = it }"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 268 (fn=url_hex_byte)",
+      "line": 268,
+      "original": "+url_hex_byte(v: i64) : str {",
+      "mutated": "-url_hex_byte(v: i64) : str {"
+    },
+    {
+      "module": "stdlib/sys/path.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 24 (fn=path_is_abs)",
+      "line": 24,
+      "original": "+path_is_abs(p: str) : bool => p != \"\" && p[0] == \"/\"",
+      "mutated": "-path_is_abs(p: str) : bool => p != \"\" && p[0] == \"/\""
+    },
+    {
+      "module": "stdlib/sys/path.sr",
+      "kind": "flip_eq",
+      "description": "flip_eq on line 24 (fn=path_is_abs)",
+      "line": 24,
+      "original": "+path_is_abs(p: str) : bool => p != \"\" && p[0] == \"/\"",
+      "mutated": "+path_is_abs(p: str) : bool => p != \"\" && p[0] != \"/\""
+    },
+    {
+      "module": "stdlib/sys/path.sr",
+      "kind": "flip_ne",
+      "description": "flip_ne on line 24 (fn=path_is_abs)",
+      "line": 24,
+      "original": "+path_is_abs(p: str) : bool => p != \"\" && p[0] == \"/\"",
+      "mutated": "+path_is_abs(p: str) : bool => p == \"\" && p[0] == \"/\""
+    },
+    {
+      "module": "stdlib/sys/platform.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 15 (fn=readiness_backend)",
+      "line": 15,
+      "original": "+readiness_backend() : str => READINESS_BACKEND",
+      "mutated": "-readiness_backend() : str => READINESS_BACKEND"
+    },
+    {
+      "module": "stdlib/sys/platform.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 16 (fn=has_io_uring)",
+      "line": 16,
+      "original": "+has_io_uring() : bool => HAS_IO_URING",
+      "mutated": "-has_io_uring() : bool => HAS_IO_URING"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_gt",
+      "description": "flip_gt on line 352 (fn=time_days_from_civil)",
+      "line": 352,
+      "original": "    if m > 2 { mp = m - 3 }",
+      "mutated": "    if m < 2 { mp = m - 3 }"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 355 (fn=time_days_from_civil)",
+      "line": 355,
+      "original": "    era * 146097 + doe - 719468",
+      "mutated": "    era * 146097 + doe + 719468"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 350 (fn=time_days_from_civil)",
+      "line": 350,
+      "original": "    yoe = yy - era * 400",
+      "mutated": "    yoe = yy + era * 400"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 345 (fn=time_days_from_civil)",
+      "line": 345,
+      "original": "+time_days_from_civil(y: i64, m: i64, d: i64) : i64 {",
+      "mutated": "-time_days_from_civil(y: i64, m: i64, d: i64) : i64 {"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 353 (fn=time_days_from_civil)",
+      "line": 353,
+      "original": "    doy = (153 * mp + 2) / 5 + d - 1",
+      "mutated": "    doy = (153 * mp - 2) / 5 + d - 1"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 347 (fn=time_days_from_civil)",
+      "line": 347,
+      "original": "    if m <= 2 { yy = yy - 1 }",
+      "mutated": "    if m <= 2 { yy = yy + 1 }"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_sub",
+      "description": "flip_sub on line 352 (fn=time_days_from_civil)",
+      "line": 352,
+      "original": "    if m > 2 { mp = m - 3 }",
+      "mutated": "    if m > 2 { mp = m + 3 }"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "kind": "flip_add",
+      "description": "flip_add on line 351 (fn=time_days_from_civil)",
+      "line": 351,
+      "original": "    mp = m + 9",
+      "mutated": "    mp = m - 9"
+    }
+  ],
+  "results": [
+    {
+      "module": "stdlib/core/reduce.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/core/str.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 384 (fn=starts_with)"
+    },
+    {
+      "module": "stdlib/core/str.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 25 (fn=byte_len)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "survived",
+      "detail": "flip_sub on line 347 (fn=bytes_last_index)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 347 (fn=bytes_last_index)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 345 (fn=bytes_last_index)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 342 (fn=bytes_last_index)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 345 (fn=bytes_last_index)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 274 (fn=bytes_equal)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "killed",
+      "detail": "flip_ne on line 279 (fn=bytes_equal)"
+    },
+    {
+      "module": "stdlib/core/bytes.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 277 (fn=bytes_equal)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 203 (fn=m_smoothstep)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 202 (fn=m_smoothstep)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 41 (fn=m_min)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 201 (fn=m_smoothstep)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 207 (fn=m_smootherstep)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 50 (fn=m_clamp)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 40 (fn=m_min)"
+    },
+    {
+      "module": "stdlib/math/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 208 (fn=m_smootherstep)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 51 (fn=i_sdiv)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 635 (fn=popcount32)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 622 (fn=word_has)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 637 (fn=popcount32)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 634 (fn=popcount32)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 636 (fn=popcount32)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 631 (fn=popcount32)"
+    },
+    {
+      "module": "stdlib/core/collections.sr",
+      "outcome": "survived",
+      "detail": "flip_add on line 637 (fn=popcount32)"
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 162 (fn=json_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 165 (fn=json_is_ws_b)"
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 162 (fn=json_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/json.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 165 (fn=json_is_ws_b)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 240 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 233 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 235 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 240 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 235 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 240 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 232 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/sec/encoding.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 237 (fn=enc_hex_value)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 14 (fn=days_from_civil)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 45 (fn=is_leap_year)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 21 (fn=days_from_civil)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 21 (fn=days_from_civil)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 19 (fn=days_from_civil)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 21 (fn=days_from_civil)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 16 (fn=days_from_civil)"
+    },
+    {
+      "module": "stdlib/datetime/core.sr",
+      "outcome": "survived",
+      "detail": "flip_sub on line 18 (fn=days_from_civil)"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 51 (fn=hash_u32)"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 51 (fn=hash_u32)"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 56 (fn=hash_xor32)"
+    },
+    {
+      "module": "stdlib/sec/hash.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 49 (fn=hash_u32)"
+    },
+    {
+      "module": "stdlib/core/decimal.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 30 (fn=dec_abs)"
+    },
+    {
+      "module": "stdlib/core/decimal.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 31 (fn=dec_abs)"
+    },
+    {
+      "module": "stdlib/core/decimal.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 31 (fn=dec_abs)"
+    },
+    {
+      "module": "stdlib/core/int.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 35 (fn=is_u32)"
+    },
+    {
+      "module": "stdlib/core/unicode.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 89 (fn=utf8_is_cont)"
+    },
+    {
+      "module": "stdlib/core/unicode.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 89 (fn=utf8_is_cont)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 65 (fn=dt_same)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 60 (fn=dt_abs)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 65 (fn=dt_same)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 60 (fn=dt_abs)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "outcome": "survived",
+      "detail": "flip_gt on line 65 (fn=dt_same)"
+    },
+    {
+      "module": "stdlib/data/column.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 59 (fn=dt_abs)"
+    },
+    {
+      "module": "stdlib/data/expr.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/data/plan.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 138 (fn=cron_match)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 132 (fn=cron_digit_acc)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "survived",
+      "detail": "flip_eq on line 147 (fn=cron_match)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 133 (fn=cron_digit_acc)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 133 (fn=cron_digit_acc)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 137 (fn=cron_match)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 134 (fn=cron_digit_acc)"
+    },
+    {
+      "module": "stdlib/datetime/cron.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 133 (fn=cron_digit_acc)"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 272 (fn=sql_digit)"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 269 (fn=sql_digit)"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 270 (fn=sql_digit)"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 326 (fn=sql_bool)"
+    },
+    {
+      "module": "stdlib/db/sql.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 272 (fn=sql_digit)"
+    },
+    {
+      "module": "stdlib/diag/log.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 313 (fn=field)"
+    },
+    {
+      "module": "stdlib/diag/log.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 315 (fn=field_int)"
+    },
+    {
+      "module": "stdlib/fmt/bin.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 177 (fn=be32_get)"
+    },
+    {
+      "module": "stdlib/fmt/bin.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 177 (fn=be32_get)"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 35 (fn=compress_xor32)"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 30 (fn=compress_u32)"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "outcome": "survived",
+      "detail": "flip_add on line 30 (fn=compress_u32)"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 40 (fn=compress_xor32)"
+    },
+    {
+      "module": "stdlib/fmt/compress.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 28 (fn=compress_u32)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 46 (fn=csv_is_lf)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_ne on line 47 (fn=csv_should_keep_char)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 50 (fn=csv_is_quote)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 46 (fn=csv_is_lf)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 58 (fn=csv_parse)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 47 (fn=csv_should_keep_char)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 51 (fn=csv_skip_after_doubled)"
+    },
+    {
+      "module": "stdlib/fmt/csv.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 50 (fn=csv_is_quote)"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 198 (fn=mp_payload)"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 197 (fn=mp_payload)"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 196 (fn=mp_payload)"
+    },
+    {
+      "module": "stdlib/fmt/msgpack.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 195 (fn=mp_payload)"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 66 (fn=pb_zigzag)"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 70 (fn=pb_unzigzag)"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 65 (fn=pb_zigzag)"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 70 (fn=pb_unzigzag)"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 70 (fn=pb_unzigzag)"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 70 (fn=pb_unzigzag)"
+    },
+    {
+      "module": "stdlib/fmt/protobuf.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 69 (fn=pb_unzigzag)"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 277 (fn=toml_digit)"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 273 (fn=toml_digit)"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 141 (fn=toml_is_space)"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 275 (fn=toml_digit)"
+    },
+    {
+      "module": "stdlib/fmt/toml.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 141 (fn=toml_is_space)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "survived",
+      "detail": "flip_eq on line 215 (fn=xml_char_ok)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 276 (fn=xml_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 207 (fn=xml_char_ok)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "survived",
+      "detail": "flip_eq on line 214 (fn=xml_char_ok)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "survived",
+      "detail": "flip_eq on line 279 (fn=xml_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 275 (fn=xml_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 210 (fn=xml_char_ok)"
+    },
+    {
+      "module": "stdlib/fmt/xml.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 278 (fn=xml_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/yaml.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 46 (fn=yaml_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/yaml.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 47 (fn=yaml_is_ws)"
+    },
+    {
+      "module": "stdlib/fmt/yaml.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 45 (fn=yaml_is_ws)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 22 (fn=escape_text_entity)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "survived",
+      "detail": "flip_eq on line 23 (fn=escape_text_entity)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 19 (fn=escape_text_entity)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 15 (fn=escape_text_entity_quot)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 22 (fn=escape_text_entity)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 16 (fn=escape_text_entity_apos)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 21 (fn=escape_text_entity)"
+    },
+    {
+      "module": "stdlib/html/core.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 20 (fn=escape_text_entity)"
+    },
+    {
+      "module": "stdlib/html/parse.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/html/template.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/io/buf.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/net/dns.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 360 (fn=http_is_space_tab)"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 363 (fn=http_trim_advance_lo)"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 266 (fn=http_is_token)"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 264 (fn=http_is_token)"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 364 (fn=http_trim_advance_lo)"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 370 (fn=http_trim_rewind_hi)"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 260 (fn=http_is_token_char)"
+    },
+    {
+      "module": "stdlib/net/http.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 370 (fn=http_trim_rewind_hi)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "survived",
+      "detail": "flip_add on line 272 (fn=url_hex_byte)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 222 (fn=url_last_index_of)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "killed",
+      "detail": "flip_lt on line 214 (fn=url_index_of)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 220 (fn=url_last_index_of)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 212 (fn=url_index_of)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 214 (fn=url_index_of)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 224 (fn=url_last_index_of)"
+    },
+    {
+      "module": "stdlib/net/url.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 268 (fn=url_hex_byte)"
+    },
+    {
+      "module": "stdlib/sec/argon2.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/sec/csprng.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/sec/secret.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/sec/sha2.sr",
+      "outcome": "skipped",
+      "detail": "no safe mutation site"
+    },
+    {
+      "module": "stdlib/sys/path.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 24 (fn=path_is_abs)"
+    },
+    {
+      "module": "stdlib/sys/path.sr",
+      "outcome": "killed",
+      "detail": "flip_eq on line 24 (fn=path_is_abs)"
+    },
+    {
+      "module": "stdlib/sys/path.sr",
+      "outcome": "killed",
+      "detail": "flip_ne on line 24 (fn=path_is_abs)"
+    },
+    {
+      "module": "stdlib/sys/platform.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 15 (fn=readiness_backend)"
+    },
+    {
+      "module": "stdlib/sys/platform.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 16 (fn=has_io_uring)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_gt on line 352 (fn=time_days_from_civil)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 355 (fn=time_days_from_civil)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 350 (fn=time_days_from_civil)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 345 (fn=time_days_from_civil)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 353 (fn=time_days_from_civil)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 347 (fn=time_days_from_civil)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_sub on line 352 (fn=time_days_from_civil)"
+    },
+    {
+      "module": "stdlib/sys/time.sr",
+      "outcome": "killed",
+      "detail": "flip_add on line 351 (fn=time_days_from_civil)"
+    }
+  ]
+}

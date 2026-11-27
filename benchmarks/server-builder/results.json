@@ -1,0 +1,95 @@
+{
+  "stress_probe": {
+  "status": "partial",
+  "reason": "The ergonomic server completed the load runs without request errors, but process RSS grew between runs. The verbose comparison was stopped; these measurements are not suitable for a release performance claim.",
+  "date": "2026-11-26",
+  "host": {
+    "os": "Linux 7.3.5-2-cachyos-bore x86_64",
+    "cpu": "AMD Ryzen 9 9950X 16-Core Processor",
+    "logical_cpus": 32,
+    "memory_gib": 91
+  },
+  "configuration": {
+    "variant": "new",
+    "duration_seconds": 5,
+    "concurrency": 32,
+    "path": "/ping",
+    "connection": "close"
+  },
+  "runs": [
+    {
+      "requests": 74044,
+      "errors": 0,
+      "requests_per_second": 14750.783,
+      "p50_ms": 2.128,
+      "p99_ms": 2.511,
+      "peak_rss_kib": 2104708
+    },
+    {
+      "requests": 75000,
+      "errors": 0,
+      "requests_per_second": 14993.649,
+      "p50_ms": 2.112,
+      "p99_ms": 2.462,
+      "peak_rss_kib": 4224328
+    },
+    {
+      "requests": 75726,
+      "errors": 0,
+      "requests_per_second": 15138.470,
+      "p50_ms": 2.094,
+      "p99_ms": 2.518,
+      "peak_rss_kib": 6372592
+    }
+  ],
+  "median": {
+    "requests_per_second": 14993.65,
+    "p50_ms": 2.112,
+    "p99_ms": 2.511
+  },
+  "concurrency_probe": {
+    "highest_zero_error_concurrency_tested": 128,
+    "duration_seconds": 5,
+    "requests": 78342,
+    "errors": 0,
+    "requests_per_second": 15623.62,
+    "p50_ms": 8.019,
+    "p99_ms": 10.402
+  }
+  },
+  "comparison_probe": {
+    "environment": {
+    "os": "Linux",
+    "arch": "x86_64",
+    "profile": "release AOT C23",
+    "concurrency": 16,
+    "window_seconds": 2,
+    "load_runs": 3,
+    "startup_runs": 10
+  },
+  "verbose": {
+    "startup_median_ms": 0.401,
+    "startup_spread_ms": 0.706,
+    "rps_runs": [14984.204, 15174.164, 14938.363],
+    "rps_median": 14984.20,
+    "p50_ms_median": 1.037,
+    "p99_ms_median": 1.338,
+    "peak_rss_kib": 7672,
+    "errors": 0
+  },
+  "app_serve": {
+    "startup_median_ms": 0.387,
+    "startup_spread_ms": 0.093,
+    "rps_runs": [15228.482, 15381.676, 15335.119],
+    "rps_median": 15335.12,
+    "p50_ms_median": 1.022,
+    "p99_ms_median": 1.214,
+    "peak_rss_kib": 7632,
+    "errors": 0
+  },
+  "allocation_count": {
+    "status": "unverified",
+    "reason": "The dependency-free probe measures process RSS; no counting allocator is exposed to Super AOT programs."
+    }
+  }
+}

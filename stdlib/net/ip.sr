@@ -1,0 +1,283 @@
+//! std.net.ip — IPv4 / IPv6 helpers (parse, format, private/loopback, CIDR)
+//!
+//! Import with:
+//!   use std.net.ip
+//!
+//!   a = Ipv4.parse("10.0.0.1") or err { return }
+//!   #assert(a.is_private())
+//!   #assert(cidr_contains_v4("10.0.0.0/8", a))
+
+use std.core.collections
+use std.core.str
+use std.math.core
+
+/// `Ipv4` is a 32-bit IPv4 address.
++Ipv4 = {
+    /// Packed network-order 32-bit value as i64 (high bits unused).
+    bits: i64 = 0
+
+    /// Create a fresh `Ipv4`.
+    new(a: i64, b: i64, c: i64, d: i64) : Ipv4 {
+        Ipv4.{bits: ((a % 256) * 16777216) + ((b % 256) * 65536) + ((c % 256) * 256) + (d % 256)}
+    }
+
+    /// Parse `s` into a `Ipv4`, or fail.
+    parse(s: str) : Ipv4! {
+        parts = ip_split_dots(s)
+        ensure len(parts) == 4 else { fail "need 4 octets" }
+        a = ip_octet(parts[0]) or err { fail "bad octet" }
+        b = ip_octet(parts[1]) or err { fail "bad octet" }
+        c = ip_octet(parts[2]) or err { fail "bad octet" }
+        d = ip_octet(parts[3]) or err { fail "bad octet" }
+        Ipv4.new(a, b, c, d)
+    }
+
+    /// From bits on this `Ipv4` (`bits`). Returns `Ipv4`.
+    from_bits(bits: i64) : Ipv4 => Ipv4.{bits: bits % 4294967296}
+
+    /// Octet on this `Ipv4` (`i`). Returns `i64`.
+    octet(self, i: i64) : i64 {
+        if i == 0 { return (self.bits / 16777216) % 256 }
+        if i == 1 { return (self.bits / 65536) % 256 }
+        if i == 2 { return (self.bits / 256) % 256 }
+        self.bits % 256
+    }
+
+    /// True when this address is a loopback address.
+    is_loopback(self) : bool {
+        if self.octet(0) == 127 { return true }
+        false
+    }
+    /// True when this address is in a private range.
+    is_private(self) : bool {
+        a = self.octet(0)
+        b = self.octet(1)
+        if a == 10 { return true }
+        if a == 172 {
+            if b >= 16 {
+                if b <= 31 { return true }
+            }
+        }
+        if a == 192 {
+            if b == 168 { return true }
+        }
+        false
+    }
+    /// True when this address is link-local.
+    is_link_local(self) : bool {
+        if self.octet(0) != 169 { return false }
+        if self.octet(1) == 254 { return true }
+        false
+    }
+    /// True when this address is multicast.
+    is_multicast(self) : bool {
+        a = self.octet(0)
+        if a < 224 { return false }
+        if a <= 239 { return true }
+        false
+    }
+}
+
+/// `Ipv6` is an IPv6 address.
++Ipv6 = {
+    /// Eight 16-bit hextets.
+    h0: i64 = 0
+    /// H1 on `Ipv6` (`i64`). Defaults to `0`.
+    h1: i64 = 0
+    /// H2 on `Ipv6` (`i64`). Defaults to `0`.
+    h2: i64 = 0
+    /// H3 on `Ipv6` (`i64`). Defaults to `0`.
+    h3: i64 = 0
+    /// H4 on `Ipv6` (`i64`). Defaults to `0`.
+    h4: i64 = 0
+    /// H5 on `Ipv6` (`i64`). Defaults to `0`.
+    h5: i64 = 0
+    /// H6 on `Ipv6` (`i64`). Defaults to `0`.
+    h6: i64 = 0
+    /// H7 on `Ipv6` (`i64`). Defaults to `0`.
+    h7: i64 = 0
+
+    /// Loopback on this `Ipv6`. Returns `Ipv6`.
+    loopback() : Ipv6 => Ipv6.{h0: 0, h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0, h7: 1}
+    /// Unspecified on this `Ipv6`. Returns `Ipv6`.
+    unspecified() : Ipv6 => Ipv6.{h0: 0, h1: 0, h2: 0, h3: 0, h4: 0, h5: 0, h6: 0, h7: 0}
+
+    /// Full form only (8 hextets); `::` compression not required for enterprise smoke.
+    parse_full(s: str) : Ipv6! {
+        parts = ip_split_colons(s)
+        ensure len(parts) == 8 else { fail "need 8 hextets" }
+        Ipv6.{
+            h0: ip_hextet(parts[0]) or err { fail "bad" },
+            h1: ip_hextet(parts[1]) or err { fail "bad" },
+            h2: ip_hextet(parts[2]) or err { fail "bad" },
+            h3: ip_hextet(parts[3]) or err { fail "bad" },
+            h4: ip_hextet(parts[4]) or err { fail "bad" },
+            h5: ip_hextet(parts[5]) or err { fail "bad" },
+            h6: ip_hextet(parts[6]) or err { fail "bad" },
+            h7: ip_hextet(parts[7]) or err { fail "bad" },
+        }
+    }
+
+    /// True when this address is a loopback address.
+    is_loopback(self) : bool {
+        if self.h0 != 0 { return false }
+        if self.h1 != 0 { return false }
+        if self.h2 != 0 { return false }
+        if self.h3 != 0 { return false }
+        if self.h4 != 0 { return false }
+        if self.h5 != 0 { return false }
+        if self.h6 != 0 { return false }
+        if self.h7 == 1 { return true }
+        false
+    }
+}
+
+/// Ipv4 text (`a`). Returns `str`.
++ipv4_text(a: Ipv4) : str {
+    o0 = a.octet(0)
+    o1 = a.octet(1)
+    o2 = a.octet(2)
+    o3 = a.octet(3)
+    "{o0}.{o1}.{o2}.{o3}"
+}
+
+/// Ipv6 text (`a`). Returns `str`.
++ipv6_text(a: Ipv6) : str {
+    ip_hex4(a.h0) + ":" + ip_hex4(a.h1) + ":" + ip_hex4(a.h2) + ":" + ip_hex4(a.h3) + ":" + ip_hex4(a.h4) + ":" + ip_hex4(a.h5) + ":" + ip_hex4(a.h6) + ":" + ip_hex4(a.h7)
+}
+
+/// Ip split dots (`s`).
++ip_split_dots(s: str) {
+    out = []
+    start = 0
+    n = byte_len(s)
+    for 0..(n + 1) {
+        if it == n || s[it] == "." {
+            out = arr_push(out, s[start..it])
+            start = it + 1
+        }
+    }
+    out
+}
+
+/// Ip split colons (`s`).
++ip_split_colons(s: str) {
+    out = []
+    start = 0
+    n = byte_len(s)
+    for 0..(n + 1) {
+        if it == n || s[it] == ":" {
+            out = arr_push(out, s[start..it])
+            start = it + 1
+        }
+    }
+    out
+}
+
+/// Ip octet (`s`). Returns `i64`, or fails.
++ip_octet(s: str) : i64! {
+    n = byte_len(s)
+    ensure n > 0 && n <= 3 else { fail "octet" }
+    acc = 0
+    for 0..n {
+        d = ord(s[it]) - 48
+        ensure d >= 0 && d <= 9 else { fail "digit" }
+        acc = acc * 10 + d
+    }
+    ensure acc >= 0 && acc <= 255 else { fail "range" }
+    acc
+}
+
+/// Ip hextet (`s`). Returns `i64`, or fails.
++ip_hextet(s: str) : i64! {
+    n = byte_len(s)
+    ensure n > 0 && n <= 4 else { fail "hextet" }
+    acc = 0
+    for 0..n {
+        c = s[it]
+        o = ord(c)
+        v = -1
+        if o >= 48 && o <= 57 { v = o - 48 }
+        if o >= 65 && o <= 70 { v = o - 55 }
+        if o >= 97 && o <= 102 { v = o - 87 }
+        ensure v >= 0 else { fail "hex" }
+        acc = acc * 16 + v
+    }
+    acc
+}
+
+/// Ip hex4 (`v`). Returns `str`.
++ip_hex4(v: i64) : str {
+    digits = "0123456789abcdef"
+    x = v % 65536
+    digits[(x / 4096) % 16] + digits[(x / 256) % 16] + digits[(x / 16) % 16] + digits[x % 16]
+}
+
+/// Cidr parse prefix (`cidr`). Returns `i64`, or fails.
++cidr_parse_prefix(cidr: str) : i64! {
+    slash = -1
+    n = byte_len(cidr)
+    for 0..n {
+        if cidr[it] == "/" { slash = it }
+    }
+    ensure slash > 0 else { fail "no prefix" }
+    acc = 0
+    for (slash + 1)..n {
+        d = ord(cidr[it]) - 48
+        ensure d >= 0 && d <= 9 else { fail "bad prefix" }
+        acc = acc * 10 + d
+    }
+    ensure acc >= 0 && acc <= 32 else { fail "prefix range" }
+    acc
+}
+
+/// Cidr network v4 (`cidr`). Returns `Ipv4`, or fails.
++cidr_network_v4(cidr: str) : Ipv4! {
+    slash = -1
+    n = byte_len(cidr)
+    for 0..n {
+        if cidr[it] == "/" { slash = it }
+    }
+    ensure slash > 0 else { fail "bad cidr" }
+    Ipv4.parse(cidr[0..slash])
+}
+
+/// Cidr contains v4 (`cidr`, `addr`).
++cidr_contains_v4(cidr: str, addr: Ipv4) : bool {
+    net = cidr_network_v4(cidr) or err { return false }
+    pref = cidr_parse_prefix(cidr) or err { return false }
+    // Clear the low (32 - prefix) bits via integer division.
+    shift = 32 - pref
+    step = 1
+    if shift > 0 {
+        step = to_int(pow(2.0, to_float(shift)))
+        if step <= 0 { step = 1 }
+    }
+    net_aligned = (net.bits / step) * step
+    addr_aligned = (addr.bits / step) * step
+    net_aligned == addr_aligned
+}
+
+/// Test that ipv4 private loopback stringify.
+test "ipv4 private loopback stringify" {
+    a = Ipv4.parse("10.0.0.1") or err { assert_eq(0, 1)
+        return }
+    assert_eq(ipv4_text(a), "10.0.0.1")
+    #assert(a.is_private())
+    lo = Ipv4.parse("127.0.0.1") or err { return }
+    #assert(lo.is_loopback())
+    pub = Ipv4.parse("8.8.8.8") or err { return }
+    #assert(!(pub.is_private()))
+    ll = Ipv4.parse("169.254.1.1") or err { return }
+    #assert(ll.is_link_local())
+}
+
+/// Test that cidr and ipv6.
+test "cidr and ipv6" {
+    a = Ipv4.parse("10.1.2.3") or err { return }
+    #assert(cidr_contains_v4("10.0.0.0/8", a))
+    #assert(!(cidr_contains_v4("192.168.0.0/16", a)))
+    v6 = Ipv6.parse_full("0000:0000:0000:0000:0000:0000:0000:0001") or err { return }
+    #assert(v6.is_loopback())
+    assert_eq(ipv6_text(Ipv6.loopback()), "0000:0000:0000:0000:0000:0000:0000:0001")
+}

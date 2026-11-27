@@ -1,0 +1,636 @@
+//! std.core.bytes — byte buffers and binary readers
+//!
+//! Import with:
+//!   use std.core.bytes
+//!
+//! Bytes are plain `i64` values in 0..255 stored in an array. `ByteBuf` is the
+//! append-only writer, `ByteReader` the cursor-based reader over any byte array
+//! (including host-bound zero-copy slices).
+//!
+//! Array growth uses the host intrinsic `sys_arr_push(arr, v)` (returns the
+//! grown array); reads are plain `data[i]` indexing.
+
+//! Printable ASCII 32..126, indexed by `code - 32`. The four characters that
+//! need escaping inside a Super string literal (34 `"`, 92 `\`, 123 `{`, 125 `}`)
+//! hold the placeholder `¤` and are produced by the host intrinsic `sys_chr`.
++ASCII_SAFE = " !¤#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[¤]^_`abcdefghijklmnopqrstuvwxyz¤|¤~"
+
+/// `ByteBuf` is a growable little-endian byte buffer.
++ByteBuf = {
+    /// Data on `ByteBuf`. Defaults to `[]`.
+    data: _ = []
+    /// Count on `ByteBuf` (`i64`). Defaults to `0`.
+    count: i64 = 0
+
+    /// Empty buffer.
+    new() : ByteBuf => ByteBuf.{data: [], count: 0}
+
+    /// Size on this `ByteBuf`. Returns `i64`.
+    size(self) : i64 => self.count
+
+    /// Append `v` as one byte.
+    put_u8(@self, v: i64) : i64 {
+        self.data = host.sys_arr_push(self.data, v % 256)
+        self.count += 1
+        self.count
+    }
+
+    /// Append `v` as a little-endian unsigned 16-bit integer.
+    put_u16_le(@self, v: i64) : i64 {
+        @self.put_u8(byte_n(v, 0))
+        @self.put_u8(byte_n(v, 1))
+    }
+
+    /// Append `v` as a big-endian unsigned 16-bit integer.
+    put_u16_be(@self, v: i64) : i64 {
+        @self.put_u8(byte_n(v, 1))
+        @self.put_u8(byte_n(v, 0))
+    }
+
+    /// Append `v` as a little-endian unsigned 32-bit integer.
+    put_u32_le(@self, v: i64) : i64 {
+        for 0..4 { @self.put_u8(byte_n(v, it)) }
+        self.count
+    }
+
+    /// Append `v` as a big-endian unsigned 32-bit integer.
+    put_u32_be(@self, v: i64) : i64 {
+        for 0..4 { @self.put_u8(byte_n(v, 3 - it)) }
+        self.count
+    }
+
+    /// Append `v` as a little-endian unsigned 64-bit integer.
+    put_u64_le(@self, v: i64) : i64 {
+        for 0..8 { @self.put_u8(byte_n(v, it)) }
+        self.count
+    }
+
+    /// Append `v` as a big-endian unsigned 64-bit integer.
+    put_u64_be(@self, v: i64) : i64 {
+        for 0..8 { @self.put_u8(byte_n(v, 7 - it)) }
+        self.count
+    }
+
+    /// Append the bytes `data`.
+    put_bytes(@self, data: _) : i64 {
+        for 0..len(data) { @self.put_u8(data[it]) }
+        self.count
+    }
+
+    /// Reset on this `ByteBuf`.
+    reset(@self) {
+        self.data = []
+        self.count = 0
+    }
+
+    /// The bytes written so far.
+    to_bytes(self) : _ => bytes_clone(self.data)
+
+    /// Append the bytes of `s`.
+    put_str(@self, s: str) : i64 {
+        n = host.sys_str_len(s)
+        for 0..n { @self.put_u8(byte_of(s[it])) }
+        self.count
+    }
+
+    /// Byte at index `i`.
+    at(self, i: i64) : i64 => self.data[i]
+
+    /// A `ByteReader` over the bytes written so far.
+    reader(self) : ByteReader => ByteReader.{data: self.data, pos: 0, size: self.count}
+}
+
+/// `ByteReader` walks a byte buffer from a cursor.
++ByteReader: From = {
+    /// Data on `ByteReader`. Defaults to `[]`.
+    data: _ = []
+    /// Pos on `ByteReader` (`i64`). Defaults to `0`.
+    pos: i64 = 0
+    /// Size on `ByteReader` (`i64`). Defaults to `0`.
+    size: i64 = 0
+
+    /// Reader over `data`, starting at the beginning.
+    from(data: _) : ByteReader {
+        n = 0
+        for data { n += 1 }
+        ByteReader.{data, pos: 0, size: n}
+    }
+
+    /// How many bytes are left after the cursor.
+    remaining(self) : i64 => self.size - self.pos
+
+    /// Next byte without advancing, or fail.
+    peek(self) : i64! {
+        ensure self.pos < self.size else {
+            fail "unexpected end of bytes"
+            return
+        }
+        self.data[self.pos]
+    }
+
+    /// Next byte, advancing the cursor, or fail.
+    read_u8(@self) : i64! {
+        ensure self.pos < self.size else {
+            fail "unexpected end of bytes"
+            return
+        }
+        v = self.data[self.pos]
+        self.pos += 1
+        v
+    }
+
+    /// Advance the cursor by `n` bytes, or fail.
+    skip(@self, n: i64) : i64! {
+        ensure self.pos + n <= self.size else {
+            fail "skip past end of bytes"
+            return
+        }
+        self.pos += n
+        self.pos
+    }
+
+    /// Read a little-endian unsigned 16-bit integer, advancing the cursor, or fail.
+    read_u16_le(@self) : i64! {
+        ensure self.pos + 2 <= self.size else {
+            fail "need 2 bytes"
+            return
+        }
+        v = u16_le(self.data[self.pos], self.data[self.pos + 1])
+        self.pos += 2
+        v
+    }
+
+    /// Read a big-endian unsigned 16-bit integer, advancing the cursor, or fail.
+    read_u16_be(@self) : i64! {
+        ensure self.pos + 2 <= self.size else {
+            fail "need 2 bytes"
+            return
+        }
+        v = u16_be(self.data[self.pos], self.data[self.pos + 1])
+        self.pos += 2
+        v
+    }
+
+    /// Read a little-endian unsigned 32-bit integer, advancing the cursor, or fail.
+    read_u32_le(@self) : i64! {
+        ensure self.pos + 4 <= self.size else {
+            fail "need 4 bytes"
+            return
+        }
+        p = self.pos
+        v = u32_le(self.data[p], self.data[p + 1], self.data[p + 2], self.data[p + 3])
+        self.pos += 4
+        v
+    }
+
+    /// Read a big-endian unsigned 32-bit integer, advancing the cursor, or fail.
+    read_u32_be(@self) : i64! {
+        ensure self.pos + 4 <= self.size else {
+            fail "need 4 bytes"
+            return
+        }
+        p = self.pos
+        v = u32_be(self.data[p], self.data[p + 1], self.data[p + 2], self.data[p + 3])
+        self.pos += 4
+        v
+    }
+
+    /// The next `n` bytes, advancing the cursor, or fail.
+    read_n(@self, n: i64) : _! {
+        ensure n >= 0 else {
+            fail "negative read"
+            return
+        }
+        ensure self.pos + n <= self.size else {
+            fail "need {n} bytes"
+            return
+        }
+        if n == 0 { return [] }
+        out = []
+        for self.pos..(self.pos + n) {
+            out = host.sys_arr_push(out, self.data[it])
+        }
+        self.pos += n
+        out
+    }
+
+    /// Read a little-endian unsigned 64-bit integer, advancing the cursor, or fail.
+    read_u64_le(@self) : i64! {
+        ensure self.pos + 8 <= self.size else {
+            fail "need 8 bytes"
+            return
+        }
+        v = 0
+        for 0..8 {
+            v = v + self.data[self.pos + it] * pow256(it)
+        }
+        self.pos += 8
+        v
+    }
+
+    /// Read a big-endian unsigned 64-bit integer, advancing the cursor, or fail.
+    read_u64_be(@self) : i64! {
+        ensure self.pos + 8 <= self.size else {
+            fail "need 8 bytes"
+            return
+        }
+        v = 0
+        for 0..8 {
+            v = v * 256 + self.data[self.pos + it]
+        }
+        self.pos += 8
+        v
+    }
+
+    /// Rewind the cursor by `n` bytes (clamped at 0).
+    unread(@self, n: i64) {
+        new_pos = self.pos - n
+        if new_pos < 0 {
+            new_pos = 0
+        }
+        self.pos = new_pos
+    }
+}
+
+// --- slice helpers (Go bytes.*) ----------------------------------------
+
+/// Dense zeroed byte buffer of length `n` (bench WAL / packet scratch).
++bytes_fixed(n: i64) => host.sys_bytes_new(n)
+
+/// Copy `n` byte-lanes from `src[src_off..]` into `dst[dst_off..]`.
++bytes_copy_range(@dst, dst_off: i64, src, src_off: i64, n: i64) {
+    for i in 0..n {
+        dst[dst_off + i] = src[src_off + i]
+    }
+}
+
+/// Number of bytes in `data`.
++bytes_len(data: _) : i64 => host.sys_arr_len(data)
+
+/// Byte of `data` at index `i`.
++bytes_get(data: _, i: i64) : i64 => data[i]
+
+/// True when `a` and `b` are the same bytes.
++bytes_equal(a: _, b: _) : bool {
+    na = bytes_len(a)
+    nb = len(b)
+    ensure na == nb else { return false }
+    for 0..na {
+        if a[it] != b[it] { return false }
+    }
+    true
+}
+
+/// Lexicographic compare: -1 if a<b, 0 if equal, +1 if a>b.
++bytes_compare(a: _, b: _) : i64 {
+    na = bytes_len(a)
+    nb = len(b)
+    n = na
+    if nb < n { n = nb }
+    for 0..n {
+        if a[it] < b[it] { return -1 }
+        if a[it] > b[it] { return 1 }
+    }
+    if na < nb { return -1 }
+    if na > nb { return 1 }
+    0
+}
+
+/// True when `at` occurs in `data` at index `prefix`.
++bytes_prefix_at(data: _, at: i64, prefix: _) : bool {
+    n = bytes_len(prefix)
+    dn = len(data)
+    ensure at + n <= dn else { return false }
+    for 0..n {
+        if data[at + it] != prefix[it] { return false }
+    }
+    true
+}
+
+/// True when `data` begins with `prefix`.
++bytes_has_prefix(data: _, prefix: _) : bool => bytes_prefix_at(data, 0, prefix)
+
+/// True when `data` ends with `suffix`.
++bytes_has_suffix(data: _, suffix: _) : bool {
+    ns = len(data)
+    n = bytes_len(suffix)
+    ensure ns >= n else { return false }
+    off = ns - n
+    for 0..n {
+        if data[off + it] != suffix[it] { return false }
+    }
+    true
+}
+
+/// First index of needle byte-sequence in haystack, or -1.
++bytes_index(hay: _, needle: _, from: i64) : i64 {
+    hn = bytes_len(hay)
+    nn = bytes_len(needle)
+    ensure nn > 0 else { return from }
+    ensure from >= 0 else { return -1 }
+    pos = -1
+    for from..(hn - nn + 1) {
+        if pos < 0 && bytes_prefix_at(hay, it, needle) { pos = it }
+    }
+    pos
+}
+
+/// Index of `needle` in `hay` at or after `from`, or -1.
++bytes_index_from(hay: _, needle: _, from: i64) : i64 => bytes_index(hay, needle, from)
+
+/// Last index of `needle` in `hay`, or -1.
++bytes_last_index(hay: _, needle: _) : i64 {
+    hn = bytes_len(hay)
+    nn = bytes_len(needle)
+    ensure nn > 0 else { return -1 }
+    pos = -1
+    for 0..(hn - nn + 1) {
+        if bytes_prefix_at(hay, it, needle) { pos = it }
+    }
+    pos
+}
+
+/// Copy of `data`.
++bytes_clone(data: _) : _ {
+    out = []
+    for 0..len(data) {
+        out = host.sys_arr_push(out, data[it])
+    }
+    out
+}
+
+/// `b` repeated `count` times.
++bytes_repeat(b: i64, count: i64) : _ {
+    out = []
+    v = b % 256
+    for 0..count {
+        out = host.sys_arr_push(out, v)
+    }
+    out
+}
+
+/// `parts` followed by the value.
++bytes_concat(parts: _) : _ {
+    out = []
+    for parts {
+        chunk = it
+        for 0..bytes_len(chunk) {
+            out = host.sys_arr_push(out, chunk[it])
+        }
+    }
+    out
+}
+
+/// Trim leading/trailing bytes equal to `cut` (default space: 32).
++bytes_trim(data: _, cut: i64) : _ {
+    n = len(data)
+    if n == 0 { return [] }
+    c = cut % 256
+    lo = 0
+    while lo < n && data[lo] == c {
+        lo += 1
+    }
+    hi = n
+    while hi > lo && data[hi - 1] == c {
+        hi -= 1
+    }
+    if lo >= hi { return [] }
+    bytes_slice(data, lo, hi)
+}
+
+/// Bytes of `data` from `lo` inclusive to `hi` exclusive.
++bytes_slice(data: _, lo: i64, hi: i64) : _ {
+    out = []
+    for lo..hi {
+        out = host.sys_arr_push(out, data[it])
+    }
+    out
+}
+
+// --- pure integer helpers ----------------------------------------------
+
+/// `256` raised to `n`, used when shifting a byte into an integer.
++pow256(n: i64) : i64 {
+    acc = 1
+    for 0..n { acc = acc * 256 }
+    acc
+}
+
+/// n-th little-endian byte of `v` (n = 0 is the least significant byte).
++byte_n(v: i64, n: i64) : i64 => (v / pow256(n)) % 256
+
+/// Little-endian unsigned 16-bit integer at `hi` in `lo`.
++u16_le(lo: i64, hi: i64) : i64 => hi * 256 + lo
+/// Big-endian unsigned 16-bit integer at `lo` in `hi`.
++u16_be(hi: i64, lo: i64) : i64 => hi * 256 + lo
+/// Little-endian unsigned 32-bit integer at `b1` in `b0`.
++u32_le(b0: i64, b1: i64, b2: i64, b3: i64) : i64 => ((b3 * 256 + b2) * 256 + b1) * 256 + b0
+/// Big-endian unsigned 32-bit integer at `b1` in `b0`.
++u32_be(b0: i64, b1: i64, b2: i64, b3: i64) : i64 => ((b0 * 256 + b1) * 256 + b2) * 256 + b3
+
+/// Index of ASCII byte `c` in the alphabet, or -1.
++ascii_index(c: str) : i64 {
+    pos = -1
+    for 0..95 {
+        if pos < 0 && ASCII_SAFE[it] == c { pos = it }
+    }
+    pos
+}
+
+/// Character -> byte value (ASCII). Unknown characters map to 63 ('?').
++byte_of(c: str) : i64 {
+    if c == "¤" { return 63 }
+    k = ascii_index(c)
+    if k >= 0 { return k + 32 }
+    if c == "\"" { return 34 }
+    if c == "\\" { return 92 }
+    if c == "\n" { return 10 }
+    if c == "\t" { return 9 }
+    if c == "\r" { return 13 }
+    63
+}
+
+/// Byte value -> one-character string (ASCII).
++char_of(b: i64) : str {
+    if b >= 32 && b <= 126 && b != 34 && b != 92 && b != 123 && b != 125 {
+        ASCII_SAFE[b - 32]
+    } else {
+        host.sys_chr(b)
+    }
+}
+
+/// UTF-8 bytes of `s` as a dense i64 array (host-native, O(n)).
++str_to_bytes(s: str) => host.sys_str_to_bytes(s)
+
+/// Decode a byte array (values 0..255) as UTF-8 text; invalid sequences become U+FFFD.
++bytes_to_str(data: _) : str => host.sys_bytes_to_str(data)
+
+/// Free constructor kept for array→reader sugar (not a type method on a value).
++reader(data: _) : ByteReader => ByteReader.from(data)
+
+// --- tests --------------------------------------------------------------
+
+/// Test that pow256 and byte_n extract bytes.
+test "pow256 and byte_n extract bytes" {
+    assert_eq(pow256(0), 1)
+    assert_eq(pow256(2), 65536)
+    assert_eq(byte_n(258, 0), 2)
+    assert_eq(byte_n(258, 1), 1)
+    assert_eq(byte_n(16909060, 3), 1)
+}
+
+/// Test that u16 / u32 pack both endiannesses.
+test "u16 / u32 pack both endiannesses" {
+    assert_eq(u16_le(1, 2), 513)
+    assert_eq(u16_be(1, 2), 258)
+    assert_eq(u32_le(4, 3, 2, 1), 16909060)
+    assert_eq(u32_be(1, 2, 3, 4), 16909060)
+}
+
+/// Test that ascii byte_of / char_of round trip.
+test "ascii byte_of / char_of round trip" {
+    assert_eq(byte_of("A"), 65)
+    assert_eq(byte_of("a"), 97)
+    assert_eq(byte_of("0"), 48)
+    assert_eq(byte_of(" "), 32)
+    assert_eq(byte_of("~"), 126)
+    assert_eq(byte_of("\""), 34)
+    assert_eq(char_of(65), "A")
+    assert_eq(char_of(48), "0")
+    assert_eq(char_of(126), "~")
+}
+
+/// Test that reader decodes little and big endian ints.
+test "reader decodes little and big endian ints" {
+    r = reader([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    assert_eq(r.remaining(), 9)
+    assert_eq(@r.read_u8() or -1, 1)
+    assert_eq(@r.read_u16_le() or -1, 770)
+    assert_eq(@r.read_u16_be() or -1, 1029)
+    assert_eq(r.pos, 5)
+    assert_eq(@r.read_u32_be() or -1, 101124105)
+    assert_eq(r.remaining(), 0)
+}
+
+/// Test that reader u32_le and skip.
+test "reader u32_le and skip" {
+    r = reader([0, 0, 1, 2, 3, 4])
+    assert_eq(@r.skip(2) or -1, 2)
+    assert_eq(@r.read_u32_le() or -1, 67305985)
+}
+
+/// Test that reader reports truncation.
+test "reader reports truncation" {
+    r = reader([7])
+    assert_eq(r.peek() or -1, 7)
+    assert_eq(@r.read_u8() or -1, 7)
+    assert_eq(@r.read_u8() or -1, -1)
+    assert_eq(@r.read_u16_le() or -1, -1)
+    assert_eq(@r.skip(1) or -1, -1)
+}
+
+/// Test that reader over empty data.
+test "reader over empty data" {
+    r = reader([])
+    assert_eq(r.size, 0)
+    assert_eq(r.remaining(), 0)
+    assert_eq(@r.read_u32_be() or -1, -1)
+}
+
+/// Test that str_to_bytes and bytes_to_str round trip.
+test "str_to_bytes and bytes_to_str round trip" {
+    b = str_to_bytes("Hi!")
+    assert_eq(host.sys_arr_len(b), 3)
+    assert_eq(b[0], 72)
+    assert_eq(b[1], 105)
+    assert_eq(b[2], 33)
+    assert_eq(bytes_to_str(b), "Hi!")
+    assert_eq(bytes_to_str([104, 101, 108, 108, 111]), "hello")
+    assert_eq(host.sys_arr_len(str_to_bytes("")), 0)
+    assert_eq(bytes_to_str([]), "")
+    // multi-byte UTF-8: "é" is 0xC3 0xA9
+    e = str_to_bytes("é")
+    assert_eq(host.sys_arr_len(e), 2)
+    assert_eq(e[0], 195)
+    assert_eq(e[1], 169)
+    assert_eq(bytes_to_str(e), "é")
+}
+
+/// Test that ByteBuf writes little/big endian (host arrays).
+test "ByteBuf writes little/big endian (host arrays)" {
+    b = ByteBuf.new()
+    @b.put_u8(255)
+    @b.put_u16_le(258)
+    @b.put_u16_be(258)
+    @b.put_u32_be(16909060)
+    assert_eq(b.size(), 9)
+    assert_eq(b.at(0), 255)
+    assert_eq(b.at(1), 2)
+    assert_eq(b.at(2), 1)
+    assert_eq(b.at(3), 1)
+    assert_eq(b.at(4), 2)
+    assert_eq(b.at(5), 1)
+    assert_eq(b.at(8), 4)
+}
+
+/// Test that ByteBuf -> reader round trip (host arrays).
+test "ByteBuf -> reader round trip (host arrays)" {
+    b = ByteBuf.new()
+    @b.put_u32_le(305419896)
+    @b.put_u16_be(4660)
+    r = b.reader()
+    assert_eq(@r.read_u32_le() or -1, 305419896)
+    assert_eq(@r.read_u16_be() or -1, 4660)
+    assert_eq(r.remaining(), 0)
+}
+
+/// Test that bytes compare equal index.
+test "bytes compare equal index" {
+    a = [1, 2, 3, 4]
+    b = [1, 2, 3, 5]
+    #assert(bytes_equal(a, a))
+    #assert(!(bytes_equal(a, b)))
+    assert_eq(bytes_compare(a, b), -1)
+    assert_eq(bytes_compare(b, a), 1)
+    assert_eq(bytes_compare(a, [1, 2, 3]), 1)
+    #assert(bytes_has_prefix(a, [1, 2]))
+    #assert(!(bytes_has_prefix(a, [2, 3])))
+    #assert(bytes_has_suffix(a, [3, 4]))
+    assert_eq(bytes_index(a, [2, 3], 0), 1)
+    assert_eq(bytes_index(a, [2, 3], 2), -1)
+    assert_eq(bytes_last_index(a, [2, 3]), 1)
+    assert_eq(bytes_last_index([1, 2, 1, 2], [1, 2]), 2)
+}
+
+/// Test that bytes clone repeat concat trim.
+test "bytes clone repeat concat trim" {
+    src = [9, 9, 9]
+    c = bytes_clone(src)
+    #assert(bytes_equal(c, src))
+    assert_eq(bytes_len(bytes_repeat(65, 4)), 4)
+    assert_eq(bytes_repeat(65, 2)[0], 65)
+    m = bytes_concat([[1, 2], [3]])
+    assert_eq(bytes_len(m), 3)
+    assert_eq(m[0], 1)
+    assert_eq(m[2], 3)
+    t = bytes_trim([32, 32, 65, 66, 32], 32)
+    assert_eq(bytes_len(t), 2)
+    assert_eq(t[0], 65)
+}
+
+/// Test that ByteBuf u64 and read_n.
+test "ByteBuf u64 and read_n" {
+    b = ByteBuf.new()
+    @b.put_u64_le(258)
+    @b.put_bytes([7, 8, 9])
+    r = b.reader()
+    assert_eq(@r.read_u64_le() or -1, 258)
+    got = @r.read_n(2) or [-1]
+    assert_eq(got[0], 7)
+    assert_eq(got[1], 8)
+    assert_eq(@r.read_u8() or -1, 9)
+    @r.unread(1)
+    assert_eq(@r.read_u8() or -1, 9)
+    @b.reset()
+    assert_eq(b.size(), 0)
+}

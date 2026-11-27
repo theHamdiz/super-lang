@@ -1,0 +1,119 @@
+//! std.math.complex — complex numbers (Cartesian)
+//!
+//! Import with:
+//!   use std.math.complex
+//!
+//!   z = Complex.new(1.0, 2.0)
+//!   w = z.add(Complex.i()).mul(Complex.new(0.5, 0.0))
+//!   #assert(!(w.re_close(0.5)))  // prefer abs/arg helpers
+
+/// `CX_EPS` is `0.000001`.
++CX_EPS = 0.000001
+
+/// `Complex` is a complex number with real and imaginary parts.
++Complex: Display, Add, Sub, Neg, Mul, Div = {
+    /// Real part. Defaults to `0.0`.
+    re: f64 = 0.0
+
+    /// Display witness. Whole floats print as integers.
+    display(self) : str => "{self.re}+{self.im}i"
+    /// Imaginary part. Defaults to `0.0`.
+    im: f64 = 0.0
+
+    /// Create a fresh `Complex`.
+    new(re: f64, im: f64) : Complex => Complex.{re, im}
+    /// Complex zero.
+    zero() : Complex => Complex.{re: 0.0, im: 0.0}
+    /// Complex one.
+    one() : Complex => Complex.{re: 1.0, im: 0.0}
+    /// The imaginary unit.
+    i() : Complex => Complex.{re: 0.0, im: 1.0}
+    /// Complex number with magnitude `r` and argument `theta` radians.
+    from_polar(r: f64, theta: f64) : Complex => Complex.{re: r * host.sys_cos(theta), im: r * host.sys_sin(theta)}
+
+    /// Sum with `o`.
+    add(self, o: Complex) : Complex => Complex.{re: self.re + o.re, im: self.im + o.im}
+    /// Difference from `o`.
+    sub(self, o: Complex) : Complex => Complex.{re: self.re - o.re, im: self.im - o.im}
+    /// Negation of this `Complex`.
+    neg(self) : Complex => Complex.{re: 0.0 - self.re, im: 0.0 - self.im}
+    /// Scaled by `k`.
+    scale(self, k: f64) : Complex => Complex.{re: self.re * k, im: self.im * k}
+
+    /// Product with `o`.
+    mul(self, o: Complex) : Complex => Complex.{
+        re: self.re * o.re - self.im * o.im,
+        im: self.re * o.im + self.im * o.re,
+    }
+
+    /// Division; returns zero when |o| is tiny.
+    div(self, o: Complex) : Complex {
+        d = o.re * o.re + o.im * o.im
+        ensure d > CX_EPS else { return Complex.zero() }
+        Complex.{
+            re: (self.re * o.re + self.im * o.im) / d,
+            im: (self.im * o.re - self.re * o.im) / d,
+        }
+    }
+
+    /// Conjugate of this `Complex`.
+    conj(self) : Complex => Complex.{re: self.re, im: 0.0 - self.im}
+    /// Absolute value of the value.
+    abs(self) : f64 => host.sys_hypot(self.re, self.im)
+    /// Squared magnitude.
+    abs2(self) : f64 => self.re * self.re + self.im * self.im
+    /// Argument (phase) in radians.
+    arg(self) : f64 => host.sys_atan2(self.im, self.re)
+
+    /// `e` raised to the value.
+    exp(self) : Complex {
+        er = host.sys_exp(self.re)
+        Complex.{re: er * host.sys_cos(self.im), im: er * host.sys_sin(self.im)}
+    }
+
+    /// Natural logarithm of the value.
+    ln(self) : Complex => Complex.{re: host.sys_ln(self.abs()), im: self.arg()}
+
+    /// `n` raised to the power the value.
+    pow(self, n: f64) : Complex {
+        // z^n = exp(n * ln z)
+        self.ln().scale(n).exp()
+    }
+
+    /// Square root of the value.
+    sqrt(self) : Complex {
+        r = self.abs()
+        ensure r > CX_EPS else { return Complex.zero() }
+        Complex.from_polar(host.sys_sqrt(r), self.arg() * 0.5)
+    }
+
+    /// Close this `Complex` and release the underlying resource.
+    close(self, o: Complex) : bool {
+        host.sys_abs(self.re - o.re) < CX_EPS && host.sys_abs(self.im - o.im) < CX_EPS
+    }
+}
+
+/// Test that arithmetic and polar.
+test "arithmetic and polar" {
+    z = Complex.new(3.0, 4.0)
+    assert_eq(z.abs(), 5.0)
+    assert_eq(z.abs2(), 25.0)
+    w = z.mul(Complex.i())
+    #assert(w.close(Complex.new(0.0 - 4.0, 3.0)))
+    q = z.div(Complex.new(1.0, 0.0))
+    #assert(q.close(z))
+    p = Complex.from_polar(2.0, 0.0)
+    #assert(p.close(Complex.new(2.0, 0.0)))
+}
+
+/// Test that exp ln sqrt.
+test "exp ln sqrt" {
+    z = Complex.new(0.0, 3.141592653589793)
+    // e^{iπ} ≈ -1
+    #assert(z.exp().close(Complex.new(0.0 - 1.0, 0.0)))
+    a = Complex.new(4.0, 0.0).sqrt()
+    #assert(a.close(Complex.new(2.0, 0.0)))
+    b = Complex.new(0.0, 1.0).ln()
+    #assert(host.sys_abs(b.re) < CX_EPS)
+    #assert(host.sys_abs(b.im - 1.5707963267948966) < 0.0001)
+}

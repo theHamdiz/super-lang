@@ -1,0 +1,8 @@
+[pod]
+name = "doc_pod"
+version = "0.1.0"
+
+[build]
+profile = "dev"
+backend = "c23"
+mode = "aot"

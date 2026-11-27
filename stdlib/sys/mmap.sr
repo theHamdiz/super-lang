@@ -1,0 +1,426 @@
+//! std.sys.mmap — memory-mapped regions over files or anonymous buffers, plus shm names
+//!
+//! Import with:
+//!   use std.sys.mmap
+//!
+//!   r = mm_map_file("data.bin", MM_PROT_READ + MM_PROT_WRITE, true) or err { return }
+//!   v = r.read_u32_le(0) or 0
+//!   @r.write_u8(4, 255) or false
+//!   @r.sync() or false          // shared writable maps write back to the file
+//!   @r.unmap()
+//!
+//!   shm = mm_shm_name("ring.v1") or "/fallback"   // "/ring.v1" — a valid POSIX shm name
+//!
+//! `MmapRegion` is a bounds-checked view over a byte array. File maps read the file with
+//! `host.sys_read_bytes` and, for shared writable maps, write it back on `sync`; anonymous
+//! maps are zero-filled buffers. The 0.1.0 host kernel has no raw `mmap(2)` primitive, so the
+//! region is a simulation with the real permission and bounds rules (read/write/exec bits,
+//! shared vs private, unmapped = every access fails), which keeps tests and sandboxed
+//! embeds deterministic. Shared-memory helpers only build and validate names and paths.
+//! Public helpers are prefixed `mm_` because modules merge flat.
+
+/// `MM_PROT_READ` is the readable permission bit (`1`).
++MM_PROT_READ = 1
+/// `MM_PROT_WRITE` is the writable permission bit (`2`).
++MM_PROT_WRITE = 2
+/// `MM_PROT_EXEC` is the executable permission bit (`4`).
++MM_PROT_EXEC = 4
+/// `MM_PAGE` is the page size in bytes (`4096`).
++MM_PAGE = 4096
+/// `MM_SHM_MAX` is the longest accepted shm name, slash included (`255`).
++MM_SHM_MAX = 255
+/// `MM_SHM_DIR` is where POSIX shared memory objects live on Linux.
++MM_SHM_DIR = "/dev/shm"
+
+/// Page size in bytes.
++mm_page_size() : i64 => MM_PAGE
+
+/// `n` rounded up to a whole number of pages (0 stays 0, negatives clamp to 0).
++mm_round_up(n: i64) : i64 {
+    ensure n > 0 else { return 0 }
+    ((n + MM_PAGE - 1) / MM_PAGE) * MM_PAGE
+}
+
+/// How many pages `n` bytes occupy.
++mm_page_count(n: i64) : i64 => mm_round_up(n) / MM_PAGE
+
+/// `rwx`-style text for a protection mask, e.g. `rw-`.
++mm_prot_str(prot: i64) : str {
+    r = "-"
+    w = "-"
+    x = "-"
+    if (prot / MM_PROT_READ) % 2 == 1 { r = "r" }
+    if (prot / MM_PROT_WRITE) % 2 == 1 { w = "w" }
+    if (prot / MM_PROT_EXEC) % 2 == 1 { x = "x" }
+    r + w + x
+}
+
+/// `MmapRegion` is a mapped byte range with permissions.
++MmapRegion = {
+    /// Backing file path, or "" for anonymous and shared-memory maps. Defaults to `""`.
+    path: str = ""
+    /// Mapped length in bytes. Defaults to `0`.
+    size: i64 = 0
+    /// Protection mask built from `MM_PROT_*`. Defaults to `0`.
+    prot: i64 = 0
+    /// True for MAP_SHARED, false for MAP_PRIVATE. Defaults to `false`.
+    is_shared: bool = false
+    /// False once `unmap` has run. Defaults to `false`.
+    mapped: bool = false
+    /// True when bytes changed since the last `sync`. Defaults to `false`.
+    dirty: bool = false
+    /// The mapped bytes (values 0..255). Defaults to `[]`.
+    data: _ = []
+
+    /// Zero-filled anonymous region of `size` bytes.
+    anon(size: i64, prot: i64, is_shared: bool) : MmapRegion {
+        n = size
+        if n < 0 { n = 0 }
+        bytes = []
+        for 0..n { bytes = host.sys_arr_push(bytes, 0) }
+        MmapRegion.{path: "", size: n, prot, is_shared, mapped: true, dirty: false, data: bytes}
+    }
+
+    /// Region over a copy of `bytes` (a stand-in for a file mapping held in memory).
+    over(bytes: _, prot: i64, is_shared: bool) : MmapRegion {
+        copy = []
+        for bytes { copy = host.sys_arr_push(copy, it % 256) }
+        MmapRegion.{path: "", size: host.sys_arr_len(copy), prot, is_shared, mapped: true, dirty: false, data: copy}
+    }
+
+    /// True when the region allows reads.
+    can_read(self) : bool => self.mapped && (self.prot / MM_PROT_READ) % 2 == 1
+
+    /// True when the region allows writes.
+    can_write(self) : bool => self.mapped && (self.prot / MM_PROT_WRITE) % 2 == 1
+
+    /// True when the region allows execution.
+    can_exec(self) : bool => self.mapped && (self.prot / MM_PROT_EXEC) % 2 == 1
+
+    /// True when `[off, off + n)` lies inside the region.
+    in_bounds(self, off: i64, n: i64) : bool {
+        ensure n >= 0 else { return false }
+        ensure off >= 0 else { return false }
+        off + n <= self.size
+    }
+
+    /// Byte at `off`, or fail on a bad range or missing read permission.
+    read_u8(self, off: i64) : i64! {
+        ensure self.can_read() else {
+            fail "mmap: region is not readable"
+            return
+        }
+        ensure self.in_bounds(off, 1) else {
+            fail "mmap: read out of range"
+            return
+        }
+        self.data[off]
+    }
+
+    /// Little-endian 32-bit value at `off`, or fail.
+    read_u32_le(self, off: i64) : i64! {
+        ensure self.can_read() else {
+            fail "mmap: region is not readable"
+            return
+        }
+        ensure self.in_bounds(off, 4) else {
+            fail "mmap: read out of range"
+            return
+        }
+        ((self.data[off + 3] * 256 + self.data[off + 2]) * 256 + self.data[off + 1]) * 256 + self.data[off]
+    }
+
+    /// `n` bytes starting at `off`, or fail.
+    read_bytes(self, off: i64, n: i64) : _! {
+        ensure self.can_read() else {
+            fail "mmap: region is not readable"
+            return
+        }
+        ensure self.in_bounds(off, n) else {
+            fail "mmap: read out of range"
+            return
+        }
+        out = []
+        for off..(off + n) { out = host.sys_arr_push(out, self.data[it]) }
+        out
+    }
+
+    /// Store `v` (mod 256) at `off`, or fail. Returns true.
+    write_u8(@self, off: i64, v: i64) : bool! {
+        ensure self.can_write() else {
+            fail "mmap: region is not writable"
+            return
+        }
+        ensure self.in_bounds(off, 1) else {
+            fail "mmap: write out of range"
+            return
+        }
+        self.data = host.sys_arr_set(self.data, off, v % 256)
+        self.dirty = true
+        true
+    }
+
+    /// Store a little-endian 32-bit value at `off`, or fail. Returns true.
+    write_u32_le(@self, off: i64, v: i64) : bool! {
+        ensure self.can_write() else {
+            fail "mmap: region is not writable"
+            return
+        }
+        ensure self.in_bounds(off, 4) else {
+            fail "mmap: write out of range"
+            return
+        }
+        rest = v
+        for 0..4 {
+            self.data = host.sys_arr_set(self.data, off + it, rest % 256)
+            rest = rest / 256
+        }
+        self.dirty = true
+        true
+    }
+
+    /// Store `bytes` starting at `off`, or fail. Returns the number of bytes written.
+    write_bytes(@self, off: i64, bytes: _) : i64! {
+        n = host.sys_arr_len(bytes)
+        ensure self.can_write() else {
+            fail "mmap: region is not writable"
+            return
+        }
+        ensure self.in_bounds(off, n) else {
+            fail "mmap: write out of range"
+            return
+        }
+        for 0..n { self.data = host.sys_arr_set(self.data, off + it, bytes[it] % 256) }
+        if n > 0 { self.dirty = true }
+        n
+    }
+
+    /// Set every byte to `v` (mod 256), or fail.
+    fill(@self, v: i64) : bool! {
+        ensure self.can_write() else {
+            fail "mmap: region is not writable"
+            return
+        }
+        for 0..self.size { self.data = host.sys_arr_set(self.data, it, v % 256) }
+        self.dirty = true
+        true
+    }
+
+    /// Write a shared, writable file map back to its file and clear `dirty`. Private and
+    /// anonymous maps have nothing to flush and return false.
+    sync(@self) : bool! {
+        ensure self.mapped else {
+            fail "mmap: region is unmapped"
+            return
+        }
+        ensure self.is_shared && self.path != "" && self.can_write() else { return false }
+        host.sys_write_bytes(self.path, self.data) or err {
+            fail "mmap: sync failed: {err}"
+            return
+        }
+        self.dirty = false
+        true
+    }
+
+    /// Release the mapping; every later access fails. Returns false when already unmapped.
+    unmap(@self) : bool {
+        ensure self.mapped else { return false }
+        self.mapped = false
+        self.data = []
+        self.size = 0
+        true
+    }
+}
+
+/// Map the whole file at `path`. A shared writable map writes back on `sync`.
++mm_map_file(path: str, prot: i64, is_shared: bool) : MmapRegion! {
+    raw = host.sys_read_bytes(path) or err {
+        fail "mmap: cannot map {path}: {err}"
+        return
+    }
+    base = MmapRegion.over(host.sys_io_bytes_to_array(raw), prot, is_shared)
+    MmapRegion.{path, size: base.size, prot, is_shared, mapped: true, dirty: false, data: base.data}
+}
+
+/// Zero-filled anonymous map of `size` bytes.
++mm_map_anon(size: i64, prot: i64, is_shared: bool) : MmapRegion => MmapRegion.anon(size, prot, is_shared)
+
+/// Unmap `r` in place (free-function form of `MmapRegion.unmap`).
++mm_unmap(@r: MmapRegion) : bool => @r.unmap()
+
+// --- shared memory names ----------------------------------------------------------------
+
+/// True for a POSIX shm name: a leading `/`, then 1+ characters with no further `/` or NUL, under 256 bytes.
++mm_shm_valid(name: str) : bool {
+    n = host.sys_str_len(name)
+    ensure n >= 2 else { return false }
+    ensure n <= MM_SHM_MAX else { return false }
+    ensure name[0] == "/" else { return false }
+    ok = true
+    for 1..n {
+        if name[it] == "/" { ok = false }
+        if host.sys_ord(name[it]) == 0 { ok = false }
+    }
+    ok
+}
+
+/// Normalise `base` to a shm name: prefix `/` when missing; fails when the result is invalid.
++mm_shm_name(base: str) : str! {
+    full = base
+    if host.sys_str_len(base) == 0 || base[0] != "/" { full = "/" + base }
+    ensure mm_shm_valid(full) else {
+        fail "mmap: invalid shm name: {base}"
+        return
+    }
+    full
+}
+
+/// Filesystem path of the shm object `name` (`/dev/shm/<name>`), or fail on an invalid name.
++mm_shm_path(name: str) : str! {
+    ensure mm_shm_valid(name) else {
+        fail "mmap: invalid shm name: {name}"
+        return
+    }
+    MM_SHM_DIR + name
+}
+
+/// Unique-ish shm name from a prefix, a process id and a sequence number.
++mm_shm_unique(prefix: str, pid: i64, seq: i64) : str! => mm_shm_name("{prefix}-{pid}-{seq}")
+
+// --- tests ----------------------------------------------------------------------------------
+
+/// Test that page math rounds up.
+test "page math rounds up" {
+    assert_eq(mm_page_size(), 4096)
+    assert_eq(mm_round_up(0), 0)
+    assert_eq(mm_round_up(-5), 0)
+    assert_eq(mm_round_up(1), 4096)
+    assert_eq(mm_round_up(4096), 4096)
+    assert_eq(mm_round_up(4097), 8192)
+    assert_eq(mm_page_count(10000), 3)
+    assert_eq(mm_page_count(0), 0)
+}
+
+/// Test that protection masks render as rwx text.
+test "protection masks render as rwx text" {
+    assert_eq(mm_prot_str(0), "---")
+    assert_eq(mm_prot_str(MM_PROT_READ), "r--")
+    assert_eq(mm_prot_str(MM_PROT_READ + MM_PROT_WRITE), "rw-")
+    assert_eq(mm_prot_str(MM_PROT_READ + MM_PROT_EXEC), "r-x")
+    assert_eq(mm_prot_str(7), "rwx")
+}
+
+/// Test that anonymous maps are zeroed and read-write.
+test "anonymous maps are zeroed and read-write" {
+    r = mm_map_anon(16, MM_PROT_READ + MM_PROT_WRITE, false)
+    assert_eq(r.size, 16)
+    #assert(r.mapped)
+    assert_eq(r.read_u8(0) or -1, 0)
+    #assert(@r.write_u8(3, 300) or false)
+    assert_eq(r.read_u8(3) or -1, 44)
+    #assert(r.dirty)
+    #assert(@r.write_u32_le(4, 305419896) or false)
+    assert_eq(r.read_u8(4) or -1, 120)
+    assert_eq(r.read_u8(7) or -1, 18)
+    assert_eq(r.read_u32_le(4) or -1, 305419896)
+    assert_eq(@r.write_bytes(8, [1, 2, 3]) or -1, 3)
+    got = r.read_bytes(8, 3) or []
+    assert_eq(host.sys_arr_len(got), 3)
+    assert_eq(got[2], 3)
+    #assert(@r.fill(9) or false)
+    assert_eq(r.read_u8(15) or -1, 9)
+    #assert(!(r.can_exec()))
+    assert_eq(mm_map_anon(-4, 1, false).size, 0)
+}
+
+/// Test that permissions and bounds are enforced.
+test "permissions and bounds are enforced" {
+    ro = MmapRegion.over([10, 20, 30, 40], MM_PROT_READ, false)
+    assert_eq(ro.read_u8(2) or -1, 30)
+    assert_eq(ro.read_u8(4) or -1, -1)
+    assert_eq(ro.read_u8(-1) or -1, -1)
+    assert_eq(ro.read_u32_le(1) or -1, -1)
+    assert_eq(ro.read_u32_le(0) or -1, 673059850)
+    assert_eq(host.sys_arr_len(ro.read_bytes(2, 3) or []), 0)
+    #assert(!(@ro.write_u8(0, 1) or false))
+    #assert(!(@ro.write_u32_le(0, 1) or false))
+    assert_eq(@ro.write_bytes(0, [1]) or -1, -1)
+    #assert(!(@ro.fill(1) or false))
+    wo = MmapRegion.over([0, 0], MM_PROT_WRITE, false)
+    assert_eq(wo.read_u8(0) or -1, -1)
+    #assert(@wo.write_u8(1, 5) or false)
+    #assert(!(@wo.write_u8(2, 5) or false))
+    assert_eq(@wo.write_bytes(1, [1, 2]) or -1, -1)
+    msg = ro.read_u8(9) or err { "{err}" }
+    #assert(host.sys_str_len(msg) > 0)
+    #assert(ro.in_bounds(0, 4))
+    #assert(!(ro.in_bounds(1, 4)))
+    #assert(!(ro.in_bounds(0, -1)))
+}
+
+/// Test that unmapping invalidates the region.
+test "unmapping invalidates the region" {
+    r = MmapRegion.over([1, 2, 3], MM_PROT_READ + MM_PROT_WRITE, true)
+    #assert(r.can_read())
+    #assert(@r.unmap())
+    #assert(!(r.mapped))
+    assert_eq(r.size, 0)
+    assert_eq(r.read_u8(0) or -1, -1)
+    #assert(!(@r.write_u8(0, 1) or false))
+    #assert(!(@r.unmap()))
+    #assert(!(@r.sync() or false))
+    again = mm_map_anon(4, 3, true)
+    #assert(@again.mm_unmap())
+}
+
+/// Test that shared file maps write back on sync and private maps do not.
+test "shared file maps write back on sync and private maps do not" {
+    path = host.sys_temp_dir() + "/super_mmap_test_" + host.sys_unix_ns() + ".bin"
+    #assert(host.sys_write_bytes(path, [1, 2, 3, 4, 5]) or false)
+    share = mm_map_file(path, MM_PROT_READ + MM_PROT_WRITE, true) or MmapRegion.anon(0, 0, false)
+    assert_eq(share.size, 5)
+    assert_eq(share.path, path)
+    #assert(@share.write_u8(0, 99) or false)
+    #assert(share.dirty)
+    #assert(@share.sync() or false)
+    #assert(!(share.dirty))
+    disk = host.sys_io_bytes_to_array(host.sys_read_bytes(path) or [])
+    assert_eq(disk[0], 99)
+    assert_eq(disk[4], 5)
+    snap = mm_map_file(path, MM_PROT_READ + MM_PROT_WRITE, false) or MmapRegion.anon(0, 0, false)
+    #assert(@snap.write_u8(1, 77) or false)
+    #assert(!(@snap.sync() or true))
+    again = host.sys_io_bytes_to_array(host.sys_read_bytes(path) or [])
+    assert_eq(again[1], 2)
+    #assert(host.sys_remove(path) or false)
+}
+
+/// Test that mapping a missing file fails.
+test "mapping a missing file fails" {
+    missing = host.sys_temp_dir() + "/super_mmap_missing_file_does_not_exist.bin"
+    r = mm_map_file(missing, MM_PROT_READ, false) or MmapRegion.anon(0, 0, false)
+    assert_eq(r.size, 0)
+    assert_eq(r.path, "")
+    msg = mm_map_file(missing, MM_PROT_READ, false) or err { "{err}" }
+    #assert(host.sys_str_len(msg) > 0)
+}
+
+/// Test that shm names follow POSIX rules.
+test "shm names follow POSIX rules" {
+    #assert(mm_shm_valid("/ring"))
+    #assert(mm_shm_valid("/a.b-c_d"))
+    #assert(!(mm_shm_valid("ring")))
+    #assert(!(mm_shm_valid("/")))
+    #assert(!(mm_shm_valid("")))
+    #assert(!(mm_shm_valid("/a/b")))
+    assert_eq(mm_shm_name("ring.v1") or "bad", "/ring.v1")
+    assert_eq(mm_shm_name("/ring") or "bad", "/ring")
+    assert_eq(mm_shm_name("a/b") or "bad", "bad")
+    assert_eq(mm_shm_name("") or "bad", "bad")
+    assert_eq(mm_shm_path("/ring") or "bad", "/dev/shm/ring")
+    assert_eq(mm_shm_path("ring") or "bad", "bad")
+    assert_eq(mm_shm_unique("game", 42, 7) or "bad", "/game-42-7")
+    long = "/"
+    for 0..300 { long = long + "x" }
+    #assert(!(mm_shm_valid(long)))
+}

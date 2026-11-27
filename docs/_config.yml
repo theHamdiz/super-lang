@@ -1,0 +1,56 @@
+# Super language — GitHub Pages (docs/) site
+title: Super
+description: >-
+  Ultra-fast embeddable language for high-throughput APIs and data-oriented
+  game engines — benchmarks, book, spec, and install.
+url: "https://thehamdiz.github.io"
+baseurl: "/super-lang"
+
+# Custom product layouts in _layouts; Primer remote_theme for Pages defaults
+# and SEO helpers. Brand chrome (orange / Bricolage) lives in site.css + includes.
+# Pin to a published pages-themes/primer release.
+remote_theme: pages-themes/primer@v0.2.1
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+
+# Product pages use directory indexes (language/index.html → /language/).
+permalink: pretty
+sass:
+  style: compressed
+  sass_dir: _sass
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+  - FIX_LOG.md
+  - results.json
+  - vendor/
+  - node_modules/
+  - "*.py"
+  - test_*.py
+
+# Markdown pages (guide.md) use _layouts/default. Generator HTML has no
+# front matter and is copied through as static files.
+defaults:
+  - scope:
+      path: ""
+      type: pages
+    values:
+      layout: default
+
+collections: {}
+
+super:
+  book_pdf: /downloads/SUPER_BOOK.pdf
+  accent: "#ff7a1f"
+  ink: "#050f16"
+  version: "0.1.0"
+  install_home: "~/.super"

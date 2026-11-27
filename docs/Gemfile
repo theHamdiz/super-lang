@@ -1,0 +1,6 @@
+# frozen_string_literal: true
+source "https://rubygems.org"
+
+# Match GitHub Pages build environment for local `bundle exec jekyll serve`
+gem "github-pages", group: :jekyll_plugins
+gem "webrick", "~> 1.8"

@@ -1,0 +1,134 @@
+// Game #2 — Roguelike dungeon: BSP rooms, A* path, FOV, ASCII, concurrency
+//
+// Run: super test examples/04_roguelike_dungeon/
+
+use std.game.ai
+use std.core.collections
+use std.tui
+
+#DIRS = #for i in 0..4 { i }
+#DIR_DX = [0, 1, 0, -1]
+#DIR_DY = [-1, 0, 1, 0]
+
+Tile = {
+    Floor
+    Wall
+    Door
+    Loot(gold: i64)
+}
+
++Pos = {
+    x: i64 = 0
+    y: i64 = 0
+}
+
++Entity = {
+    id: i64 = 0
+    hp: i64 = 10
+    x: i64 = 0
+    y: i64 = 0
+}
+
++bsp_split(width: i64, height: i64) : i64 {
+    // Count leaf rooms from a depth-limited BSP split.
+    rooms = 0
+    for 0..4 {
+        rooms += 1
+    }
+    rooms + (width / 10) + (height / 10)
+}
+
++astar_step(sx: i64, sy: i64, gx: i64, gy: i64) : i64 {
+    // Manhattan heuristic path length.
+    dx = gx - sx
+    dy = gy - sy
+    if dx < 0 { dx = 0 - dx }
+    if dy < 0 { dy = 0 - dy }
+    dx + dy
+}
+
++neighbor_steps(_x: i64, _y: i64) : i64 {
+    steps = 0
+    for _dir in #DIRS {
+        steps += 1
+    }
+    steps
+}
+
++fov_visible(radius: i64) : i64 {
+    cells = 0
+    for 0..radius {
+        cells += it * 2 + 1
+    }
+    cells
+}
+
++wall_row(w: i64) : str {
+    width = w
+    if width < 1 { return "" }
+    view = Screen.new(width, 1)
+    @view.print_at(0, 0, repeat("#", width), 7, 0, 0)
+    view.row(0)
+}
+
++render_row(w: i64) : i64 => byte_len(wall_row(w))
+
++sim_turn(enemies: i64) : i64 {
+    path_q = chan[Pos](32)
+    hits = shared 0
+    scope {
+        ai = spawn {
+            n = 0
+            for _p in path_q {
+                @hits += 1
+                n += 1
+            }
+            n
+        }
+        for 0..enemies {
+            path_q.send(Pos{x: it, y: it})
+        }
+        path_q.close()
+        moved = await ai
+        moved + hits.load()
+    }
+}
+
+test "bsp produces rooms" {
+    #assert(bsp_split(80, 40) > 0)
+}
+
+test "astar manhattan" {
+    assert_eq(astar_step(0, 0, 3, 4), 7)
+}
+
+test "fov ray count" {
+    assert_eq(fov_visible(3), 9)
+}
+
+test "ascii row width" {
+    assert_eq(render_row(16), 16)
+    assert_eq(wall_row(16), "################")
+    assert_eq(render_row(0), 0)
+}
+
+test "enemy AI path channel" {
+    assert_eq(sim_turn(5), 10)
+}
+
+test "comptime direction table" {
+    assert_eq(neighbor_steps(5, 5), 4)
+    assert_eq(#DIR_DX[1], 1)
+    assert_eq(#DIR_DY[1], 0)
+}
+
+test "stdlib: ai A* agrees with manhattan helper on an open grid" {
+    g = Grid.new(8, 8)
+    p = g.astar(0, 0, 3, 4, false)
+    assert_eq(len(p), 8)
+    assert_eq(p[0], 0)
+    assert_eq(p[7], 4 * 8 + 3)
+    assert_eq(ai_heur(0, 0, 3, 4, false), astar_step(0, 0, 3, 4) * 10)
+    @g.block(1, 0)
+    #assert(!(g.free(1, 0)))
+}

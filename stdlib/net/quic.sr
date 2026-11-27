@@ -1,0 +1,2493 @@
+//! std.net.quic — QUIC v1 (RFC 9000) wire format: varints, packet headers, frames, streams
+//!
+//! Import with:
+//!   use std.net.quic
+//!
+//! Byte buffers are arrays of `i64` in 0..255. This module builds and parses the *unprotected*
+//! wire image of packets (RFC 9001 header and payload protection is applied by the TLS layer on
+//! top, see `std.net.tls`), which is exactly what packet captures after decryption, interop
+//! tooling and offline tests work with.
+//!
+//!   dcid = quic_new_cid("seed", 8)
+//!   hello = quic_crypto(0, client_hello_bytes) or []
+//!   pkt = quic_initial_padded(QUIC_V1, dcid, [], [], 0, 2, hello, 1200) or []     // 1200 byte datagram
+//!   hdr = quic_parse_packet(pkt, 0, 0) or none                                    // server side
+//!   frames = quic_parse_frames(hdr.payload) or []
+//!
+//! Contents:
+//!   * variable-length integers (RFC 9000 16), packet number encode/decode (Appendix A)
+//!   * long headers (Initial, 0-RTT, Handshake, Retry), Version Negotiation, short headers,
+//!     coalesced datagram splitting, connection id parse and derivation
+//!   * every v1 frame builder and a strict frame parser, ACK range construction and expansion
+//!   * stream id helpers and `StreamAssembler` for out-of-order, overlapping STREAM data
+//!   * transport parameter encode/decode, transport error names
+
+use std.sec.hash
+
+use std.sec.hash
+
+/// QUIC version 1 (RFC 9000).
++QUIC_V1 = 1
+/// QUIC version 2 (RFC 9369).
++QUIC_V2 = 1805313023
+
+/// Long header packet type Initial.
++QUIC_INITIAL = 0
+/// Long header packet type 0-RTT.
++QUIC_ZERO_RTT = 1
+/// Long header packet type Handshake.
++QUIC_HANDSHAKE = 2
+/// Long header packet type Retry.
++QUIC_RETRY = 3
+/// Pseudo packet type of Version Negotiation packets.
++QUIC_VERSION_NEGOTIATION = -1
+/// Pseudo packet type of short header (1-RTT) packets.
++QUIC_ONE_RTT = -2
+
+/// Longest connection id of QUIC v1.
++QUIC_MAX_CID = 20
+/// Largest value a variable-length integer can carry.
++QUIC_MAX_VARINT = 4611686018427387903
+/// Smallest datagram that carries a client Initial.
++QUIC_MIN_INITIAL = 1200
+
+/// Frame kind: PADDING (a run of zero bytes).
++QF_PADDING = 0
+/// Frame kind: PING.
++QF_PING = 1
+/// Frame kind: ACK (with or without ECN counts).
++QF_ACK = 2
+/// Frame kind: RESET_STREAM.
++QF_RESET_STREAM = 4
+/// Frame kind: STOP_SENDING.
++QF_STOP_SENDING = 5
+/// Frame kind: CRYPTO.
++QF_CRYPTO = 6
+/// Frame kind: NEW_TOKEN.
++QF_NEW_TOKEN = 7
+/// Frame kind: STREAM (all eight type bytes).
++QF_STREAM = 8
+/// Frame kind: MAX_DATA.
++QF_MAX_DATA = 16
+/// Frame kind: MAX_STREAM_DATA.
++QF_MAX_STREAM_DATA = 17
+/// Frame kind: MAX_STREAMS (bidirectional and unidirectional).
++QF_MAX_STREAMS = 18
+/// Frame kind: DATA_BLOCKED.
++QF_DATA_BLOCKED = 20
+/// Frame kind: STREAM_DATA_BLOCKED.
++QF_STREAM_DATA_BLOCKED = 21
+/// Frame kind: STREAMS_BLOCKED (bidirectional and unidirectional).
++QF_STREAMS_BLOCKED = 22
+/// Frame kind: NEW_CONNECTION_ID.
++QF_NEW_CONNECTION_ID = 24
+/// Frame kind: RETIRE_CONNECTION_ID.
++QF_RETIRE_CONNECTION_ID = 25
+/// Frame kind: PATH_CHALLENGE.
++QF_PATH_CHALLENGE = 26
+/// Frame kind: PATH_RESPONSE.
++QF_PATH_RESPONSE = 27
+/// Frame kind: CONNECTION_CLOSE (transport 0x1c and application 0x1d).
++QF_CONNECTION_CLOSE = 28
+/// Frame kind: HANDSHAKE_DONE.
++QF_HANDSHAKE_DONE = 30
+
+/// Transport error NO_ERROR.
++QUIC_NO_ERROR = 0
+/// Transport error INTERNAL_ERROR.
++QUIC_INTERNAL_ERROR = 1
+/// Transport error CONNECTION_REFUSED.
++QUIC_CONNECTION_REFUSED = 2
+/// Transport error FLOW_CONTROL_ERROR.
++QUIC_FLOW_CONTROL_ERROR = 3
+/// Transport error STREAM_LIMIT_ERROR.
++QUIC_STREAM_LIMIT_ERROR = 4
+/// Transport error STREAM_STATE_ERROR.
++QUIC_STREAM_STATE_ERROR = 5
+/// Transport error FINAL_SIZE_ERROR.
++QUIC_FINAL_SIZE_ERROR = 6
+/// Transport error FRAME_ENCODING_ERROR.
++QUIC_FRAME_ENCODING_ERROR = 7
+/// Transport error TRANSPORT_PARAMETER_ERROR.
++QUIC_TRANSPORT_PARAMETER_ERROR = 8
+/// Transport error CONNECTION_ID_LIMIT_ERROR.
++QUIC_CONNECTION_ID_LIMIT_ERROR = 9
+/// Transport error PROTOCOL_VIOLATION.
++QUIC_PROTOCOL_VIOLATION = 10
+/// Transport error INVALID_TOKEN.
++QUIC_INVALID_TOKEN = 11
+/// Transport error APPLICATION_ERROR.
++QUIC_APPLICATION_ERROR = 12
+/// Transport error CRYPTO_BUFFER_EXCEEDED.
++QUIC_CRYPTO_BUFFER_EXCEEDED = 13
+
+/// Transport parameter max_idle_timeout (milliseconds).
++QTP_MAX_IDLE_TIMEOUT = 1
+/// Transport parameter max_udp_payload_size.
++QTP_MAX_UDP_PAYLOAD = 3
+/// Transport parameter initial_max_data.
++QTP_INITIAL_MAX_DATA = 4
+/// Transport parameter initial_max_stream_data_bidi_local.
++QTP_MAX_STREAM_DATA_BIDI_LOCAL = 5
+/// Transport parameter initial_max_stream_data_bidi_remote.
++QTP_MAX_STREAM_DATA_BIDI_REMOTE = 6
+/// Transport parameter initial_max_stream_data_uni.
++QTP_MAX_STREAM_DATA_UNI = 7
+/// Transport parameter initial_max_streams_bidi.
++QTP_MAX_STREAMS_BIDI = 8
+/// Transport parameter initial_max_streams_uni.
++QTP_MAX_STREAMS_UNI = 9
+/// Transport parameter ack_delay_exponent.
++QTP_ACK_DELAY_EXPONENT = 10
+/// Transport parameter max_ack_delay (milliseconds).
++QTP_MAX_ACK_DELAY = 11
+/// Transport parameter active_connection_id_limit.
++QTP_ACTIVE_CID_LIMIT = 14
+
+// --- byte helpers ---------------------------------------------------------------------------
+
+q_slice(a: _, from: i64, to: i64) : _ {
+    out = []
+    i = from
+    while i < to {
+        out = host.sys_arr_push(out, a[i])
+        i = i + 1
+    }
+    out
+}
+
+q_cat(a: _, b: _) : _ {
+    out = a
+    i = 0
+    n = host.sys_arr_len(b)
+    while i < n {
+        out = host.sys_arr_push(out, b[i])
+        i = i + 1
+    }
+    out
+}
+
+q_be(value: i64, width: i64) : _ {
+    out = []
+    i = width - 1
+    while i >= 0 {
+        out = host.sys_arr_push(out, (value >>> (i * 8)) & 255)
+        i = i - 1
+    }
+    out
+}
+
+q_read_be(data: _, pos: i64, width: i64) : i64 {
+    v = 0
+    i = 0
+    while i < width {
+        v = (v << 8) | data[pos + i]
+        i = i + 1
+    }
+    v
+}
+
+/// True when two byte arrays are identical.
++quic_same(a: _, b: _) : bool {
+    n = host.sys_arr_len(a)
+    if n != host.sys_arr_len(b) { return false }
+    same = true
+    i = 0
+    while i < n {
+        if a[i] != b[i] { same = false }
+        i = i + 1
+    }
+    same
+}
+
+q_is_bytes(bytes: _) : bool {
+    ok = true
+    i = 0
+    n = host.sys_arr_len(bytes)
+    while i < n {
+        b = bytes[i]
+        if b < 0 { ok = false }
+        if b > 255 { ok = false }
+        i = i + 1
+    }
+    ok
+}
+
+q_hex_val(c: str) : i64 {
+    code = host.sys_ord(c)
+    if code >= 48 {
+        if code <= 57 { return code - 48 }
+    }
+    if code >= 97 {
+        if code <= 102 { return code - 87 }
+    }
+    -1
+}
+
+q_unhex(hex: str) : _ {
+    out = []
+    n = host.sys_str_len(hex) / 2
+    i = 0
+    while i < n {
+        hi = q_hex_val(hex[i * 2])
+        lo = q_hex_val(hex[i * 2 + 1])
+        out = host.sys_arr_push(out, hi * 16 + lo)
+        i = i + 1
+    }
+    out
+}
+
+q_hex(data: _) : str {
+    digits = "0123456789abcdef"
+    out = ""
+    i = 0
+    n = host.sys_arr_len(data)
+    while i < n {
+        b = data[i]
+        out = "{out}{digits[b / 16]}{digits[b % 16]}"
+        i = i + 1
+    }
+    out
+}
+
+/// Sequential reader over a byte array that records the first problem instead of failing, so
+/// parsers can read a whole structure and check once.
++QReader = {
+    /// Bytes being read. Defaults to `[]`.
+    data: _ = []
+    /// Next offset. Defaults to `0`.
+    pos: i64 = 0
+    /// First error, empty while healthy. Defaults to `""`.
+    problem: str = ""
+
+    /// Bytes left to read.
+    rd_left(self) : i64 => host.sys_arr_len(self.data) - self.pos
+
+    /// Read one byte.
+    rd_byte(@self) : i64 {
+        if self.problem != "" { return 0 }
+        if self.pos >= host.sys_arr_len(self.data) {
+            self.problem = "quic: truncated input"
+            return 0
+        }
+        b = self.data[self.pos]
+        self.pos = self.pos + 1
+        b
+    }
+
+    /// Read `n` bytes.
+    rd_bytes(@self, n: i64) : _ {
+        if self.problem != "" { return [] }
+        if n < 0 {
+            self.problem = "quic: negative length"
+            return []
+        }
+        if self.pos + n > host.sys_arr_len(self.data) {
+            self.problem = "quic: truncated input"
+            return []
+        }
+        out = q_slice(self.data, self.pos, self.pos + n)
+        self.pos = self.pos + n
+        out
+    }
+
+    /// Read a big-endian integer of `width` bytes.
+    rd_uint(@self, width: i64) : i64 {
+        if self.problem != "" { return 0 }
+        if self.pos + width > host.sys_arr_len(self.data) {
+            self.problem = "quic: truncated input"
+            return 0
+        }
+        v = q_read_be(self.data, self.pos, width)
+        self.pos = self.pos + width
+        v
+    }
+
+    /// Read a variable-length integer.
+    rd_varint(@self) : i64 {
+        if self.problem != "" { return 0 }
+        n = host.sys_arr_len(self.data)
+        if self.pos >= n {
+            self.problem = "quic: truncated varint"
+            return 0
+        }
+        first = self.data[self.pos]
+        size = 1 << (first >> 6)
+        if self.pos + size > n {
+            self.problem = "quic: truncated varint"
+            return 0
+        }
+        v = first & 63
+        i = 1
+        while i < size {
+            v = (v << 8) | self.data[self.pos + i]
+            i = i + 1
+        }
+        self.pos = self.pos + size
+        v
+    }
+
+    /// Read the body of an ACK frame (`ecn` for type 0x03).
+    rd_ack(@self, ecn: bool) : QFrame {
+        largest = @self.rd_varint()
+        delay = @self.rd_varint()
+        count = @self.rd_varint()
+        first = @self.rd_varint()
+        if self.problem == "" {
+            if count * 2 > host.sys_arr_len(self.data) - self.pos {
+                self.problem = "quic: ACK range count exceeds the frame"
+            }
+        }
+        if self.problem == "" {
+            if first > largest { self.problem = "quic: first ACK range exceeds the largest acknowledged" }
+        }
+        ranges = []
+        low = largest - first
+        i = 0
+        while i < count {
+            if self.problem != "" { break }
+            gap = @self.rd_varint()
+            ln = @self.rd_varint()
+            nh = low - gap - 2
+            if self.problem == "" {
+                if nh < 0 { self.problem = "quic: ACK ranges descend below packet number 0" }
+            }
+            if self.problem == "" {
+                if nh - ln < 0 { self.problem = "quic: ACK ranges descend below packet number 0" }
+            }
+            low = nh - ln
+            ranges = host.sys_arr_push(ranges, gap)
+            ranges = host.sys_arr_push(ranges, ln)
+            i = i + 1
+        }
+        counts = []
+        if ecn {
+            counts = host.sys_arr_push(counts, @self.rd_varint())
+            counts = host.sys_arr_push(counts, @self.rd_varint())
+            counts = host.sys_arr_push(counts, @self.rd_varint())
+        }
+        QFrame.{kind: 2, largest, ack_delay: delay, first_range: first, ranges, ecn: counts}
+    }
+
+    /// Read the body of every frame except PADDING, PING and ACK.
+    rd_frame(@self, ftype: i64) : QFrame {
+        if ftype == 4 {
+            sid = @self.rd_varint()
+            code = @self.rd_varint()
+            final = @self.rd_varint()
+            return QFrame.{kind: 4, stream_id: sid, error_code: code, value: final}
+        }
+        if ftype == 5 {
+            sid = @self.rd_varint()
+            code = @self.rd_varint()
+            return QFrame.{kind: 5, stream_id: sid, error_code: code}
+        }
+        if ftype == 6 {
+            off = @self.rd_varint()
+            len = @self.rd_varint()
+            body = @self.rd_bytes(len)
+            return QFrame.{kind: 6, offset: off, data: body}
+        }
+        if ftype == 7 {
+            len = @self.rd_varint()
+            body = @self.rd_bytes(len)
+            if self.problem == "" {
+                if len == 0 { self.problem = "quic: NEW_TOKEN with an empty token" }
+            }
+            return QFrame.{kind: 7, data: body}
+        }
+        if ftype >= 8 {
+            if ftype <= 15 {
+                sid = @self.rd_varint()
+                off = 0
+                if (ftype & 4) != 0 { off = @self.rd_varint() }
+                body = []
+                if (ftype & 2) != 0 {
+                    len = @self.rd_varint()
+                    body = @self.rd_bytes(len)
+                } else {
+                    body = @self.rd_bytes(self.rd_left())
+                }
+                return QFrame.{kind: 8, stream_id: sid, offset: off, fin: (ftype & 1) != 0, data: body}
+            }
+        }
+        if ftype == 16 {
+            v = @self.rd_varint()
+            return QFrame.{kind: 16, value: v}
+        }
+        if ftype == 17 {
+            sid = @self.rd_varint()
+            v = @self.rd_varint()
+            return QFrame.{kind: 17, stream_id: sid, value: v}
+        }
+        if ftype == 18 {
+            v = @self.rd_varint()
+            return QFrame.{kind: 18, value: v, bidi: true}
+        }
+        if ftype == 19 {
+            v = @self.rd_varint()
+            return QFrame.{kind: 18, value: v, bidi: false}
+        }
+        if ftype == 20 {
+            v = @self.rd_varint()
+            return QFrame.{kind: 20, value: v}
+        }
+        if ftype == 21 {
+            sid = @self.rd_varint()
+            v = @self.rd_varint()
+            return QFrame.{kind: 21, stream_id: sid, value: v}
+        }
+        if ftype == 22 {
+            v = @self.rd_varint()
+            return QFrame.{kind: 22, value: v, bidi: true}
+        }
+        if ftype == 23 {
+            v = @self.rd_varint()
+            return QFrame.{kind: 22, value: v, bidi: false}
+        }
+        if ftype == 24 {
+            seq = @self.rd_varint()
+            retire = @self.rd_varint()
+            clen = @self.rd_byte()
+            if self.problem == "" {
+                if clen < 1 { self.problem = "quic: NEW_CONNECTION_ID with an empty connection id" }
+            }
+            if self.problem == "" {
+                if clen > 20 { self.problem = "quic: NEW_CONNECTION_ID with a connection id longer than 20 bytes" }
+            }
+            if self.problem == "" {
+                if retire > seq { self.problem = "quic: Retire Prior To exceeds the sequence number" }
+            }
+            id = @self.rd_bytes(clen)
+            token = @self.rd_bytes(16)
+            return QFrame.{kind: 24, seq, retire_prior: retire, cid: id, data: token}
+        }
+        if ftype == 25 {
+            seq = @self.rd_varint()
+            return QFrame.{kind: 25, seq}
+        }
+        if ftype == 26 {
+            body = @self.rd_bytes(8)
+            return QFrame.{kind: 26, data: body}
+        }
+        if ftype == 27 {
+            body = @self.rd_bytes(8)
+            return QFrame.{kind: 27, data: body}
+        }
+        if ftype == 28 {
+            code = @self.rd_varint()
+            offending = @self.rd_varint()
+            len = @self.rd_varint()
+            raw = @self.rd_bytes(len)
+            return QFrame.{kind: 28, error_code: code, frame_type: offending, reason: host.sys_bytes_to_str(raw)}
+        }
+        if ftype == 29 {
+            code = @self.rd_varint()
+            len = @self.rd_varint()
+            raw = @self.rd_bytes(len)
+            return QFrame.{kind: 28, error_code: code, reason: host.sys_bytes_to_str(raw), app: true}
+        }
+        if ftype == 30 { return QFrame.{kind: 30} }
+        if self.problem == "" { self.problem = "quic: unknown frame type {ftype}" }
+        QFrame.{kind: -1}
+    }
+}
+
+// --- variable-length integers ---------------------------------------------------------------
+
+/// Encoded size of `n` in bytes (1, 2, 4 or 8), or 0 when `n` is outside 0..2^62-1.
++quic_varint_size(n: i64) : i64 {
+    if n < 0 { return 0 }
+    if n < 64 { return 1 }
+    if n < 16384 { return 2 }
+    if n < 1073741824 { return 4 }
+    if n <= QUIC_MAX_VARINT { return 8 }
+    0
+}
+
+/// Shortest variable-length integer encoding of `n`.
++quic_varint(n: i64) : _! {
+    size = quic_varint_size(n)
+    ensure size > 0 else {
+        fail "quic: varint {n} is outside 0..2^62-1"
+        return
+    }
+    out = q_be(n, size)
+    if size == 2 { out = host.sys_arr_set(out, 0, out[0] | 64) }
+    if size == 4 { out = host.sys_arr_set(out, 0, out[0] | 128) }
+    if size == 8 { out = host.sys_arr_set(out, 0, out[0] | 192) }
+    out
+}
+
+/// A decoded varint and the offset after it.
++QVar = {
+    /// The decoded value. Defaults to `0`.
+    value: i64 = 0
+    /// Offset after the varint. Defaults to `0`.
+    next: i64 = 0
+}
+
+/// Read the varint at `pos`.
++quic_read_varint(data: _, pos: i64) : QVar! {
+    ensure pos >= 0 else {
+        fail "quic: negative offset"
+        return
+    }
+    r = QReader.{data, pos}
+    v = @r.rd_varint()
+    ensure r.problem == "" else {
+        fail "{r.problem}"
+        return
+    }
+    QVar.{value: v, next: r.pos}
+}
+
+/// Bytes a varint starting with `first` occupies.
++quic_varint_len(first: i64) : i64 => 1 << ((first >> 6) & 3)
+
+/// Varint with its length forced to `size` bytes (valid but non-minimal; used for length fields
+/// that are patched later).
++quic_varint_sized(n: i64, size: i64) : _! {
+    valid = false
+    if size == 1 { valid = true }
+    if size == 2 { valid = true }
+    if size == 4 { valid = true }
+    if size == 8 { valid = true }
+    ensure valid else {
+        fail "quic: varint size must be 1, 2, 4 or 8"
+        return
+    }
+    ensure n >= 0 else {
+        fail "quic: negative varint"
+        return
+    }
+    ensure quic_varint_size(n) <= size else {
+        fail "quic: {n} does not fit in a {size} byte varint"
+        return
+    }
+    out = q_be(n, size)
+    if size == 2 { out = host.sys_arr_set(out, 0, out[0] | 64) }
+    if size == 4 { out = host.sys_arr_set(out, 0, out[0] | 128) }
+    if size == 8 { out = host.sys_arr_set(out, 0, out[0] | 192) }
+    out
+}
+
+// --- packet numbers -------------------------------------------------------------------------
+
+/// Bytes (1..4) needed to send packet number `full` when `largest_acked` (-1 for none) is the
+/// highest acknowledged one: the range must cover twice the gap (RFC 9000 A.2).
++quic_pn_len(full: i64, largest_acked: i64) : i64 {
+    gap = (full - largest_acked) * 2
+    if gap < 256 { return 1 }
+    if gap < 65536 { return 2 }
+    if gap < 16777216 { return 3 }
+    4
+}
+
+/// Low `len` bytes of `full`.
++quic_pn_truncate(full: i64, len: i64) : i64 => full & ((1 << (len * 8)) - 1)
+
+/// Reconstruct a full packet number from its `len`-byte truncation (RFC 9000 A.3).
++quic_pn_decode(largest: i64, truncated: i64, len: i64) : i64 {
+    nbits = len * 8
+    expected = largest + 1
+    win = 1 << nbits
+    half = win / 2
+    mask = win - 1
+    candidate = (expected & ~mask) | truncated
+    if candidate <= expected - half {
+        if candidate < QUIC_MAX_VARINT + 1 - win { return candidate + win }
+    }
+    if candidate > expected + half {
+        if candidate >= win { return candidate - win }
+    }
+    candidate
+}
+
+// --- connection ids -------------------------------------------------------------------------
+
+/// A deterministic connection id of `len` (0..20) bytes derived from `seed` (offline tests and
+/// reproducible captures; production code should draw from a CSPRNG).
++quic_new_cid(seed: str, len: i64) : _ {
+    take = len
+    if take > QUIC_MAX_CID { take = QUIC_MAX_CID }
+    if take < 0 { take = 0 }
+    q_slice(q_unhex(sha256_hex("quic-cid|{seed}")), 0, take)
+}
+
+/// Stateless reset token (16 bytes) for `cid` under `key` (RFC 9000 10.3.2).
++quic_reset_token(key: str, cid: _) : _ {
+    q_slice(q_unhex(hmac_sha256_hex(key, q_hex(cid))), 0, 16)
+}
+
+/// Stream id of the `index`th stream opened by the given side; `uni` selects unidirectional.
++quic_stream_id(index: i64, server: bool, uni: bool) : i64 {
+    id = index * 4
+    if server { id = id + 1 }
+    if uni { id = id + 2 }
+    id
+}
+
+/// True when the stream was opened by the server.
++quic_stream_is_server(id: i64) : bool => (id & 1) == 1
+
+/// True when the stream is unidirectional.
++quic_stream_is_uni(id: i64) : bool => (id & 2) == 2
+
+/// Ordinal of the stream among those opened by the same side with the same directionality.
++quic_stream_index(id: i64) : i64 => id >>> 2
+
+// --- packet headers -------------------------------------------------------------------------
+
+/// A parsed packet. Long and short headers share the type; `ptype` tells them apart.
++QHeader = {
+    /// True for long header packets (including Version Negotiation). Defaults to `false`.
+    long: bool = false
+    /// `QUIC_INITIAL`..`QUIC_RETRY`, `QUIC_VERSION_NEGOTIATION` or `QUIC_ONE_RTT`. Defaults to `-2`.
+    ptype: i64 = -2
+    /// Version (0 for Version Negotiation, 0 for short headers). Defaults to `0`.
+    version: i64 = 0
+    /// Destination connection id. Defaults to `[]`.
+    dcid: _ = []
+    /// Source connection id (long headers only). Defaults to `[]`.
+    scid: _ = []
+    /// Initial token or Retry token. Defaults to `[]`.
+    token: _ = []
+    /// Value of the Length field (packet number plus payload). Defaults to `0`.
+    length: i64 = 0
+    /// Packet number length in bytes. Defaults to `0`.
+    pn_len: i64 = 0
+    /// Truncated packet number as sent. Defaults to `0`.
+    pn: i64 = 0
+    /// Bytes before the payload (first byte through packet number). Defaults to `0`.
+    header_len: i64 = 0
+    /// Payload bytes after the packet number. Defaults to `[]`.
+    payload: _ = []
+    /// Bytes this packet occupies in the datagram. Defaults to `0`.
+    total: i64 = 0
+    /// Latency spin bit of short headers. Defaults to `false`.
+    spin: bool = false
+    /// Key phase bit of short headers. Defaults to `false`.
+    key_phase: bool = false
+    /// Versions offered by a Version Negotiation packet. Defaults to `[]`.
+    versions: _ = []
+    /// Retry integrity tag (16 bytes). Defaults to `[]`.
+    tag: _ = []
+}
+
+/// Two-bit long header type field for `ptype` under `version` (v2 permutes the values).
++quic_type_bits(version: i64, ptype: i64) : i64 {
+    if version == QUIC_V2 {
+        if ptype == 0 { return 1 }
+        if ptype == 1 { return 2 }
+        if ptype == 2 { return 3 }
+        return 0
+    }
+    ptype
+}
+
+/// Inverse of `quic_type_bits`.
++quic_type_from_bits(version: i64, bits: i64) : i64 {
+    if version == QUIC_V2 {
+        if bits == 1 { return 0 }
+        if bits == 2 { return 1 }
+        if bits == 3 { return 2 }
+        return 3
+    }
+    bits
+}
+
+/// True for versions this module can build and parse (v1 and v2).
++quic_known_version(version: i64) : bool {
+    if version == QUIC_V1 { return true }
+    version == QUIC_V2
+}
+
+/// Connection id prefix: length byte then the id.
+q_cid_field(cid: _) : _ {
+    out = host.sys_arr_push([], host.sys_arr_len(cid))
+    q_cat(out, cid)
+}
+
+/// Common checks for packets built here.
+q_check_cids(dcid: _, scid: _) : str {
+    if host.sys_arr_len(dcid) > QUIC_MAX_CID { return "quic: destination connection id longer than 20 bytes" }
+    if host.sys_arr_len(scid) > QUIC_MAX_CID { return "quic: source connection id longer than 20 bytes" }
+    if !q_is_bytes(dcid) { return "quic: destination connection id is not a byte array" }
+    if !q_is_bytes(scid) { return "quic: source connection id is not a byte array" }
+    ""
+}
+
+/// Initial, 0-RTT or Handshake packet in unprotected form: `ptype` is `QUIC_INITIAL`,
+/// `QUIC_ZERO_RTT` or `QUIC_HANDSHAKE`; `token` must be empty except for Initial.
++quic_long_packet(ptype: i64, version: i64, dcid: _, scid: _, token: _, pn: i64, pn_len: i64, payload: _) : _! {
+    ensure quic_known_version(version) else {
+        fail "quic: unsupported version {version}"
+        return
+    }
+    ensure ptype >= 0 else {
+        fail "quic: use quic_version_negotiation for version negotiation"
+        return
+    }
+    ensure ptype <= 2 else {
+        fail "quic: use quic_retry_packet for Retry"
+        return
+    }
+    problem = q_check_cids(dcid, scid)
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    ensure pn_len >= 1 else {
+        fail "quic: packet number length must be 1..4"
+        return
+    }
+    ensure pn_len <= 4 else {
+        fail "quic: packet number length must be 1..4"
+        return
+    }
+    ensure pn >= 0 else {
+        fail "quic: negative packet number"
+        return
+    }
+    ensure pn < (1 << (pn_len * 8)) else {
+        fail "quic: packet number {pn} does not fit in {pn_len} bytes"
+        return
+    }
+    if ptype != 0 {
+        ensure host.sys_arr_len(token) == 0 else {
+            fail "quic: only Initial packets carry a token"
+            return
+        }
+    }
+    ensure q_is_bytes(payload) else {
+        fail "quic: payload is not a byte array"
+        return
+    }
+    first = 192 | (quic_type_bits(version, ptype) << 4) | (pn_len - 1)
+    out = host.sys_arr_push([], first)
+    out = q_cat(out, q_be(version, 4))
+    out = q_cat(out, q_cid_field(dcid))
+    out = q_cat(out, q_cid_field(scid))
+    if ptype == 0 {
+        tlen = quic_varint(host.sys_arr_len(token)) or err { fail "{err}" }
+        out = q_cat(out, tlen)
+        out = q_cat(out, token)
+    }
+    length = quic_varint(pn_len + host.sys_arr_len(payload)) or err { fail "{err}" }
+    out = q_cat(out, length)
+    out = q_cat(out, q_be(pn, pn_len))
+    q_cat(out, payload)
+}
+
+/// Initial packet (see `quic_long_packet`).
++quic_initial(version: i64, dcid: _, scid: _, token: _, pn: i64, pn_len: i64, payload: _) : _! {
+    quic_long_packet(QUIC_INITIAL, version, dcid, scid, token, pn, pn_len, payload) or err { fail "{err}" }
+}
+
+/// Handshake packet (see `quic_long_packet`).
++quic_handshake(version: i64, dcid: _, scid: _, pn: i64, pn_len: i64, payload: _) : _! {
+    quic_long_packet(QUIC_HANDSHAKE, version, dcid, scid, [], pn, pn_len, payload) or err { fail "{err}" }
+}
+
+/// Initial packet padded with PADDING frames until the datagram is at least `min_size` bytes
+/// (clients must send 1200, `QUIC_MIN_INITIAL`).
++quic_initial_padded(version: i64, dcid: _, scid: _, token: _, pn: i64, pn_len: i64, payload: _, min_size: i64) : _! {
+    first = quic_initial(version, dcid, scid, token, pn, pn_len, payload) or err { fail "{err}" }
+    size = host.sys_arr_len(first)
+    if size >= min_size { return first }
+    pad = min_size - size
+    second = quic_initial(version, dcid, scid, token, pn, pn_len, q_cat(payload, quic_padding(pad))) or err { fail "{err}" }
+    size2 = host.sys_arr_len(second)
+    if size2 >= min_size {
+        if size2 == min_size { return second }
+        // The Length field grew by a byte; give one back.
+        pad = pad - (size2 - min_size)
+    }
+    third = quic_initial(version, dcid, scid, token, pn, pn_len, q_cat(payload, quic_padding(pad))) or err { fail "{err}" }
+    third
+}
+
+/// Retry packet: `token` plus the 16-byte integrity `tag` computed by the caller (RFC 9001 5.8).
++quic_retry_packet(version: i64, dcid: _, scid: _, token: _, tag: _) : _! {
+    ensure quic_known_version(version) else {
+        fail "quic: unsupported version {version}"
+        return
+    }
+    problem = q_check_cids(dcid, scid)
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    ensure host.sys_arr_len(tag) == 16 else {
+        fail "quic: Retry integrity tag must be 16 bytes"
+        return
+    }
+    ensure host.sys_arr_len(token) > 0 else {
+        fail "quic: Retry token must not be empty"
+        return
+    }
+    first = 192 | (quic_type_bits(version, QUIC_RETRY) << 4)
+    out = host.sys_arr_push([], first)
+    out = q_cat(out, q_be(version, 4))
+    out = q_cat(out, q_cid_field(dcid))
+    out = q_cat(out, q_cid_field(scid))
+    out = q_cat(out, token)
+    q_cat(out, tag)
+}
+
+/// Version Negotiation packet (RFC 9000 17.2.1). `dcid` and `scid` are the client's source and
+/// destination ids swapped by the caller; `unused` supplies the 7 free bits of the first byte.
++quic_version_negotiation(dcid: _, scid: _, versions: _, unused: i64) : _! {
+    ensure host.sys_arr_len(dcid) <= 255 else {
+        fail "quic: connection id longer than 255 bytes"
+        return
+    }
+    ensure host.sys_arr_len(scid) <= 255 else {
+        fail "quic: connection id longer than 255 bytes"
+        return
+    }
+    ensure host.sys_arr_len(versions) > 0 else {
+        fail "quic: Version Negotiation must list at least one version"
+        return
+    }
+    out = host.sys_arr_push([], 128 | (unused & 127))
+    out = q_cat(out, q_be(0, 4))
+    out = q_cat(out, q_cid_field(dcid))
+    out = q_cat(out, q_cid_field(scid))
+    i = 0
+    n = host.sys_arr_len(versions)
+    while i < n {
+        out = q_cat(out, q_be(versions[i], 4))
+        i = i + 1
+    }
+    out
+}
+
+/// Short header (1-RTT) packet in unprotected form.
++quic_short_packet(dcid: _, pn: i64, pn_len: i64, spin: bool, key_phase: bool, payload: _) : _! {
+    ensure host.sys_arr_len(dcid) <= QUIC_MAX_CID else {
+        fail "quic: destination connection id longer than 20 bytes"
+        return
+    }
+    ensure pn_len >= 1 else {
+        fail "quic: packet number length must be 1..4"
+        return
+    }
+    ensure pn_len <= 4 else {
+        fail "quic: packet number length must be 1..4"
+        return
+    }
+    ensure pn >= 0 else {
+        fail "quic: negative packet number"
+        return
+    }
+    ensure pn < (1 << (pn_len * 8)) else {
+        fail "quic: packet number {pn} does not fit in {pn_len} bytes"
+        return
+    }
+    first = 64 | (pn_len - 1)
+    if spin { first = first | 32 }
+    if key_phase { first = first | 4 }
+    out = host.sys_arr_push([], first)
+    out = q_cat(out, dcid)
+    out = q_cat(out, q_be(pn, pn_len))
+    q_cat(out, payload)
+}
+
+/// Version, destination and source connection ids of any long header, whatever the version
+/// (what a server needs to decide between answering and Version Negotiation).
++quic_peek_long(data: _) : QHeader! {
+    ensure host.sys_arr_len(data) >= 7 else {
+        fail "quic: long header shorter than 7 bytes"
+        return
+    }
+    ensure (data[0] & 128) != 0 else {
+        fail "quic: not a long header"
+        return
+    }
+    r = QReader.{data, pos: 1}
+    version = @r.rd_uint(4)
+    dlen = @r.rd_byte()
+    dcid = @r.rd_bytes(dlen)
+    slen = @r.rd_byte()
+    scid = @r.rd_bytes(slen)
+    ensure r.problem == "" else {
+        fail "{r.problem}"
+        return
+    }
+    QHeader.{long: true, version, dcid, scid, header_len: r.pos}
+}
+
+/// Parse the packet at `pos`. `short_dcid_len` is the length of connection ids this endpoint
+/// issues (short headers do not carry it). Header protection must already be removed.
++quic_parse_packet(data: _, pos: i64, short_dcid_len: i64) : QHeader! {
+    n = host.sys_arr_len(data)
+    ensure pos >= 0 else {
+        fail "quic: negative offset"
+        return
+    }
+    ensure pos < n else {
+        fail "quic: empty packet"
+        return
+    }
+    first = data[pos]
+    if (first & 128) == 0 {
+        ensure (first & 64) != 0 else {
+            fail "quic: fixed bit is not set"
+            return
+        }
+        ensure short_dcid_len >= 0 else {
+            fail "quic: negative connection id length"
+            return
+        }
+        pn_len = (first & 3) + 1
+        r = QReader.{data, pos: pos + 1}
+        dcid = @r.rd_bytes(short_dcid_len)
+        pn = @r.rd_uint(pn_len)
+        ensure r.problem == "" else {
+            fail "{r.problem}"
+            return
+        }
+        payload = q_slice(data, r.pos, n)
+        return QHeader.{long: false, ptype: QUIC_ONE_RTT, dcid, pn_len, pn, header_len: r.pos - pos, payload, total: n - pos, spin: (first & 32) != 0, key_phase: (first & 4) != 0}
+    }
+    r = QReader.{data, pos: pos + 1}
+    version = @r.rd_uint(4)
+    dlen = @r.rd_byte()
+    dcid = @r.rd_bytes(dlen)
+    slen = @r.rd_byte()
+    scid = @r.rd_bytes(slen)
+    ensure r.problem == "" else {
+        fail "{r.problem}"
+        return
+    }
+    if version == 0 {
+        left = r.rd_left()
+        hdr_end = r.pos
+        ensure left > 0 else {
+            fail "quic: Version Negotiation lists no versions"
+            return
+        }
+        ensure left % 4 == 0 else {
+            fail "quic: Version Negotiation list is not a multiple of 4 bytes"
+            return
+        }
+        versions = []
+        while r.rd_left() > 0 {
+            versions = host.sys_arr_push(versions, @r.rd_uint(4))
+        }
+        return QHeader.{long: true, ptype: QUIC_VERSION_NEGOTIATION, version: 0, dcid, scid, header_len: hdr_end - pos, total: n - pos, versions}
+    }
+    ensure (first & 64) != 0 else {
+        fail "quic: fixed bit is not set"
+        return
+    }
+    ensure quic_known_version(version) else {
+        fail "quic: unsupported version {version}"
+        return
+    }
+    ensure dlen <= QUIC_MAX_CID else {
+        fail "quic: destination connection id of {dlen} bytes exceeds 20"
+        return
+    }
+    ensure slen <= QUIC_MAX_CID else {
+        fail "quic: source connection id of {slen} bytes exceeds 20"
+        return
+    }
+    ptype = quic_type_from_bits(version, (first >> 4) & 3)
+    if ptype == QUIC_RETRY {
+        rest = r.rd_left()
+        ensure rest >= 17 else {
+            fail "quic: Retry packet lacks a token and integrity tag"
+            return
+        }
+        retry_hdr = r.pos - pos
+        token = @r.rd_bytes(rest - 16)
+        tag = @r.rd_bytes(16)
+        return QHeader.{long: true, ptype, version, dcid, scid, token, header_len: retry_hdr, total: n - pos, tag}
+    }
+    token = []
+    if ptype == QUIC_INITIAL {
+        tlen = @r.rd_varint()
+        token = @r.rd_bytes(tlen)
+    }
+    length = @r.rd_varint()
+    pn_len = (first & 3) + 1
+    pn = @r.rd_uint(pn_len)
+    ensure r.problem == "" else {
+        fail "{r.problem}"
+        return
+    }
+    ensure length >= pn_len else {
+        fail "quic: Length {length} is shorter than the packet number"
+        return
+    }
+    payload_len = length - pn_len
+    ensure r.pos + payload_len <= n else {
+        fail "quic: packet payload overruns the datagram"
+        return
+    }
+    payload = q_slice(data, r.pos, r.pos + payload_len)
+    QHeader.{long: true, ptype, version, dcid, scid, token, length, pn_len, pn, header_len: r.pos - pos, payload, total: r.pos + payload_len - pos}
+}
+
+/// Split a datagram into its coalesced packets (RFC 9000 12.2). A short header, Retry or
+/// Version Negotiation packet consumes the rest of the datagram.
++quic_split_datagram(data: _, short_dcid_len: i64) : _! {
+    n = host.sys_arr_len(data)
+    out = []
+    pos = 0
+    problem = ""
+    while pos < n {
+        h = quic_parse_packet(data, pos, short_dcid_len) or err {
+            problem = "{err}"
+            QHeader.{total: n}
+        }
+        if problem == "" { out = host.sys_arr_push(out, h) }
+        pos = pos + h.total
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+// --- frame builders -------------------------------------------------------------------------
+
+/// A run of `n` PADDING bytes.
++quic_padding(n: i64) : _ => host.sys_arr_new(n, 0)
+
+/// PING frame.
++quic_ping() : _ => [1]
+
+/// HANDSHAKE_DONE frame (server only).
++quic_handshake_done() : _ => [30]
+
+/// Frame type byte followed by the varints in `values`.
+q_varint_frame(ftype: i64, values: _) : _! {
+    out = host.sys_arr_push([], ftype)
+    nothing = []
+    i = 0
+    n = host.sys_arr_len(values)
+    bad = ""
+    while i < n {
+        v = quic_varint(values[i]) or err {
+            bad = "{err}"
+            nothing
+        }
+        out = q_cat(out, v)
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "{bad}"
+        return
+    }
+    out
+}
+
+/// ACK frame (type 0x02). `gaps[i]`/`lens[i]` follow the first range (RFC 9000 19.3.1).
++quic_ack(largest: i64, delay: i64, first_range: i64, gaps: _, lens: _) : _! {
+    ensure host.sys_arr_len(gaps) == host.sys_arr_len(lens) else {
+        fail "quic: ACK gap and length lists differ in size"
+        return
+    }
+    ensure first_range >= 0 else {
+        fail "quic: negative first ACK range"
+        return
+    }
+    ensure first_range <= largest else {
+        fail "quic: first ACK range {first_range} exceeds the largest acknowledged {largest}"
+        return
+    }
+    out = q_varint_frame(2, [largest, delay, host.sys_arr_len(gaps), first_range]) or err { fail "{err}" }
+    low = largest - first_range
+    i = 0
+    n = host.sys_arr_len(gaps)
+    bad = ""
+    while i < n {
+        gap = gaps[i]
+        ln = lens[i]
+        next_high = low - gap - 2
+        if gap < 0 {
+            if bad == "" { bad = "quic: negative ACK gap" }
+        }
+        if ln < 0 {
+            if bad == "" { bad = "quic: negative ACK range length" }
+        }
+        if next_high < 0 {
+            if bad == "" { bad = "quic: ACK ranges descend below packet number 0" }
+        }
+        if next_high - ln < 0 {
+            if bad == "" { bad = "quic: ACK ranges descend below packet number 0" }
+        }
+        low = next_high - ln
+        part = q_varint_frame(0, [gap, ln]) or []
+        out = q_cat(out, q_slice(part, 1, host.sys_arr_len(part)))
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "{bad}"
+        return
+    }
+    out
+}
+
+/// ACK frame covering the received packet numbers `pns` (any order, duplicates allowed).
++quic_ack_from_pns(pns: _, delay: i64) : _! {
+    n = host.sys_arr_len(pns)
+    ensure n > 0 else {
+        fail "quic: nothing to acknowledge"
+        return
+    }
+    sorted = []
+    i = 0
+    while i < n {
+        v = pns[i]
+        at = host.sys_arr_len(sorted)
+        j = 0
+        dup = false
+        while j < at {
+            if sorted[j] == v { dup = true }
+            j = j + 1
+        }
+        if !dup {
+            // insertion keeping the list descending
+            head = []
+            tail = []
+            k = 0
+            while k < at {
+                if sorted[k] > v { head = host.sys_arr_push(head, sorted[k]) } else { tail = host.sys_arr_push(tail, sorted[k]) }
+                k = k + 1
+            }
+            head = host.sys_arr_push(head, v)
+            sorted = q_cat(head, tail)
+        }
+        i = i + 1
+    }
+    count = host.sys_arr_len(sorted)
+    ensure sorted[count - 1] >= 0 else {
+        fail "quic: negative packet number"
+        return
+    }
+    largest = sorted[0]
+    run_low = largest
+    first_range = -1
+    gaps = []
+    lens = []
+    prev_low = largest
+    i = 1
+    while i < count {
+        v = sorted[i]
+        if v == run_low - 1 {
+            run_low = v
+        } else {
+            if first_range < 0 {
+                first_range = largest - run_low
+            } else {
+                lens = host.sys_arr_push(lens, prev_low - run_low)
+            }
+            gaps = host.sys_arr_push(gaps, run_low - v - 2)
+            prev_low = v
+            run_low = v
+        }
+        i = i + 1
+    }
+    if first_range < 0 {
+        first_range = largest - run_low
+    } else {
+        lens = host.sys_arr_push(lens, prev_low - run_low)
+    }
+    quic_ack(largest, delay, first_range, gaps, lens) or err { fail "{err}" }
+}
+
+/// RESET_STREAM frame.
++quic_reset_stream(stream: i64, error: i64, final_size: i64) : _! {
+    q_varint_frame(4, [stream, error, final_size]) or err { fail "{err}" }
+}
+
+/// STOP_SENDING frame.
++quic_stop_sending(stream: i64, error: i64) : _! {
+    q_varint_frame(5, [stream, error]) or err { fail "{err}" }
+}
+
+/// CRYPTO frame carrying `data` at `offset` of the handshake stream.
++quic_crypto(offset: i64, data: _) : _! {
+    head = q_varint_frame(6, [offset, host.sys_arr_len(data)]) or err { fail "{err}" }
+    q_cat(head, data)
+}
+
+/// NEW_TOKEN frame.
++quic_new_token(token: _) : _! {
+    ensure host.sys_arr_len(token) > 0 else {
+        fail "quic: NEW_TOKEN token must not be empty"
+        return
+    }
+    head = q_varint_frame(7, [host.sys_arr_len(token)]) or err { fail "{err}" }
+    q_cat(head, token)
+}
+
+/// STREAM frame. The offset field is included when `offset > 0`; the length field is included
+/// when `with_len` is true (it may only be dropped for the last frame of a packet).
++quic_stream(stream: i64, offset: i64, data: _, fin: bool, with_len: bool) : _! {
+    ftype = 8
+    if offset > 0 { ftype = ftype | 4 }
+    if with_len { ftype = ftype | 2 }
+    if fin { ftype = ftype | 1 }
+    values = [stream]
+    if offset > 0 { values = host.sys_arr_push(values, offset) }
+    if with_len { values = host.sys_arr_push(values, host.sys_arr_len(data)) }
+    head = q_varint_frame(ftype, values) or err { fail "{err}" }
+    q_cat(head, data)
+}
+
+/// MAX_DATA frame.
++quic_max_data(limit: i64) : _! {
+    q_varint_frame(16, [limit]) or err { fail "{err}" }
+}
+
+/// MAX_STREAM_DATA frame.
++quic_max_stream_data(stream: i64, limit: i64) : _! {
+    q_varint_frame(17, [stream, limit]) or err { fail "{err}" }
+}
+
+/// MAX_STREAMS frame for bidirectional or unidirectional streams (limit at most 2^60).
++quic_max_streams(bidi: bool, limit: i64) : _! {
+    ensure limit <= 1152921504606846976 else {
+        fail "quic: stream limit above 2^60"
+        return
+    }
+    ftype = 19
+    if bidi { ftype = 18 }
+    q_varint_frame(ftype, [limit]) or err { fail "{err}" }
+}
+
+/// DATA_BLOCKED frame.
++quic_data_blocked(limit: i64) : _! {
+    q_varint_frame(20, [limit]) or err { fail "{err}" }
+}
+
+/// STREAM_DATA_BLOCKED frame.
++quic_stream_data_blocked(stream: i64, limit: i64) : _! {
+    q_varint_frame(21, [stream, limit]) or err { fail "{err}" }
+}
+
+/// STREAMS_BLOCKED frame.
++quic_streams_blocked(bidi: bool, limit: i64) : _! {
+    ftype = 23
+    if bidi { ftype = 22 }
+    q_varint_frame(ftype, [limit]) or err { fail "{err}" }
+}
+
+/// NEW_CONNECTION_ID frame: sequence, retire-prior-to, a 1..20 byte id and a 16-byte reset token.
++quic_new_connection_id(seq: i64, retire_prior: i64, cid: _, token: _) : _! {
+    ensure host.sys_arr_len(cid) >= 1 else {
+        fail "quic: NEW_CONNECTION_ID needs a connection id of 1..20 bytes"
+        return
+    }
+    ensure host.sys_arr_len(cid) <= QUIC_MAX_CID else {
+        fail "quic: NEW_CONNECTION_ID needs a connection id of 1..20 bytes"
+        return
+    }
+    ensure host.sys_arr_len(token) == 16 else {
+        fail "quic: stateless reset token must be 16 bytes"
+        return
+    }
+    ensure retire_prior <= seq else {
+        fail "quic: Retire Prior To exceeds the sequence number"
+        return
+    }
+    head = q_varint_frame(24, [seq, retire_prior]) or err { fail "{err}" }
+    head = host.sys_arr_push(head, host.sys_arr_len(cid))
+    head = q_cat(head, cid)
+    q_cat(head, token)
+}
+
+/// RETIRE_CONNECTION_ID frame.
++quic_retire_connection_id(seq: i64) : _! {
+    q_varint_frame(25, [seq]) or err { fail "{err}" }
+}
+
+/// PATH_CHALLENGE frame (8 opaque bytes).
++quic_path_challenge(data: _) : _! {
+    ensure host.sys_arr_len(data) == 8 else {
+        fail "quic: PATH_CHALLENGE carries 8 bytes"
+        return
+    }
+    q_cat([26], data)
+}
+
+/// PATH_RESPONSE frame echoing a challenge.
++quic_path_response(data: _) : _! {
+    ensure host.sys_arr_len(data) == 8 else {
+        fail "quic: PATH_RESPONSE carries 8 bytes"
+        return
+    }
+    q_cat([27], data)
+}
+
+/// CONNECTION_CLOSE: transport variant (0x1c, carries the offending `frame_type`) or, with
+/// `app` true, the application variant (0x1d).
++quic_connection_close(error: i64, frame_type: i64, reason: str, app: bool) : _! {
+    raw = host.sys_str_to_bytes(reason)
+    ftype = 28
+    values = [error]
+    if app {
+        ftype = 29
+    } else {
+        values = host.sys_arr_push(values, frame_type)
+    }
+    values = host.sys_arr_push(values, host.sys_arr_len(raw))
+    head = q_varint_frame(ftype, values) or err { fail "{err}" }
+    q_cat(head, raw)
+}
+
+// --- frame parser ---------------------------------------------------------------------------
+
+/// A parsed frame; only the fields relevant to `kind` are set.
++QFrame = {
+    /// Normalized `QF_*` kind. Defaults to `0`.
+    kind: i64 = 0
+    /// Stream id (STREAM, RESET_STREAM, STOP_SENDING, MAX_STREAM_DATA, STREAM_DATA_BLOCKED). Defaults to `0`.
+    stream_id: i64 = 0
+    /// Offset (CRYPTO, STREAM). Defaults to `0`.
+    offset: i64 = 0
+    /// True when the STREAM frame carries FIN. Defaults to `false`.
+    fin: bool = false
+    /// Payload: CRYPTO/STREAM data, NEW_TOKEN token, PATH_*, reset token of NEW_CONNECTION_ID. Defaults to `[]`.
+    data: _ = []
+    /// Error code (RESET_STREAM, STOP_SENDING, CONNECTION_CLOSE). Defaults to `0`.
+    error_code: i64 = 0
+    /// Offending frame type of a transport CONNECTION_CLOSE. Defaults to `0`.
+    frame_type: i64 = 0
+    /// Reason phrase of CONNECTION_CLOSE. Defaults to `""`.
+    reason: str = ""
+    /// True for the application variant of CONNECTION_CLOSE. Defaults to `false`.
+    app: bool = false
+    /// Largest acknowledged packet number (ACK). Defaults to `0`.
+    largest: i64 = 0
+    /// Raw ACK delay field. Defaults to `0`.
+    ack_delay: i64 = 0
+    /// First ACK range length. Defaults to `0`.
+    first_range: i64 = 0
+    /// Flat `[gap, length, gap, length, ...]` ACK ranges. Defaults to `[]`.
+    ranges: _ = []
+    /// ECN counts `[ect0, ect1, ce]` when the ACK carried them. Defaults to `[]`.
+    ecn: _ = []
+    /// Sequence number (NEW_CONNECTION_ID, RETIRE_CONNECTION_ID). Defaults to `0`.
+    seq: i64 = 0
+    /// Retire Prior To of NEW_CONNECTION_ID. Defaults to `0`.
+    retire_prior: i64 = 0
+    /// Connection id of NEW_CONNECTION_ID. Defaults to `[]`.
+    cid: _ = []
+    /// Limit or final size carried by flow control frames and RESET_STREAM. Defaults to `0`.
+    value: i64 = 0
+    /// True for the bidirectional variant of MAX_STREAMS / STREAMS_BLOCKED. Defaults to `false`.
+    bidi: bool = false
+    /// Length of a PADDING run. Defaults to `0`.
+    pad: i64 = 0
+}
+
+/// Parse every frame of a packet payload. Fails on unknown frame types, truncation and invalid
+/// field values.
++quic_parse_frames(payload: _) : _! {
+    r = QReader.{data: payload}
+    out = []
+    while r.rd_left() > 0 {
+        if r.problem != "" { break }
+        ftype = @r.rd_varint()
+        f = QFrame.{kind: ftype}
+        if ftype == 0 {
+            run = 1
+            while r.rd_left() > 0 {
+                if payload[r.pos] != 0 { break }
+                r.pos = r.pos + 1
+                run = run + 1
+            }
+            f = QFrame.{kind: 0, pad: run}
+        }
+        if ftype == 1 { f = QFrame.{kind: 1} }
+        if ftype == 2 { f = @r.rd_ack(false) }
+        if ftype == 3 { f = @r.rd_ack(true) }
+        if ftype > 3 { f = @r.rd_frame(ftype) }
+        if r.problem == "" { out = host.sys_arr_push(out, f) }
+    }
+    ensure r.problem == "" else {
+        fail "{r.problem}"
+        return
+    }
+    out
+}
+
+/// ACK ranges of a parsed ACK frame as flat `[high, low, high, low, ...]`, newest first.
++quic_ack_intervals(frame: QFrame) : _ {
+    out = []
+    high = frame.largest
+    low = high - frame.first_range
+    out = host.sys_arr_push(out, high)
+    out = host.sys_arr_push(out, low)
+    i = 0
+    n = host.sys_arr_len(frame.ranges)
+    while i + 1 < n {
+        high = low - frame.ranges[i] - 2
+        low = high - frame.ranges[i + 1]
+        out = host.sys_arr_push(out, high)
+        out = host.sys_arr_push(out, low)
+        i = i + 2
+    }
+    out
+}
+
+/// True when the ACK frame acknowledges packet number `pn`.
++quic_ack_covers(frame: QFrame, pn: i64) : bool {
+    iv = quic_ack_intervals(frame)
+    hit = false
+    i = 0
+    n = host.sys_arr_len(iv)
+    while i < n {
+        if pn <= iv[i] {
+            if pn >= iv[i + 1] { hit = true }
+        }
+        i = i + 2
+    }
+    hit
+}
+
+/// Number of packets acknowledged by the ACK frame.
++quic_ack_count(frame: QFrame) : i64 {
+    iv = quic_ack_intervals(frame)
+    total = 0
+    i = 0
+    n = host.sys_arr_len(iv)
+    while i < n {
+        total = total + iv[i] - iv[i + 1] + 1
+        i = i + 2
+    }
+    total
+}
+
+// --- stream reassembly ----------------------------------------------------------------------
+
+/// Reassembles one stream (or the CRYPTO stream) from STREAM frames that may arrive out of
+/// order, overlap or repeat. All state is flat public fields so it survives `@` mutation.
++StreamAssembler = {
+    /// Offset of the next byte that has not been delivered yet. Defaults to `0`.
+    next_off: i64 = 0
+    /// Contiguous bytes delivered so far. Defaults to `[]`.
+    ready: _ = []
+    /// Offsets of buffered out-of-order segments. Defaults to `[]`.
+    seg_off: _ = []
+    /// Buffered out-of-order segments, parallel to `seg_off`. Defaults to `[]`.
+    seg_data: _ = []
+    /// Final size announced by FIN, or -1 while unknown. Defaults to `-1`.
+    final_size: i64 = -1
+    /// Maximum bytes that may be buffered out of order. Defaults to `1048576`.
+    window: i64 = 1048576
+
+    /// True once every byte up to the final size has been delivered.
+    sa_complete(self) : bool {
+        if self.final_size < 0 { return false }
+        self.next_off == self.final_size
+    }
+
+    /// Bytes currently buffered out of order.
+    sa_buffered(self) : i64 {
+        total = 0
+        i = 0
+        n = host.sys_arr_len(self.seg_data)
+        while i < n {
+            total = total + host.sys_arr_len(self.seg_data[i])
+            i = i + 1
+        }
+        total
+    }
+
+    /// Move buffered segments that became contiguous into `ready`.
+    sa_drain(@self) : i64 {
+        moved = 0
+        going = true
+        while going {
+            found = -1
+            i = 0
+            n = host.sys_arr_len(self.seg_off)
+            while i < n {
+                if found < 0 {
+                    if self.seg_off[i] <= self.next_off { found = i }
+                }
+                i = i + 1
+            }
+            if found < 0 {
+                going = false
+            } else {
+                off = self.seg_off[found]
+                seg = self.seg_data[found]
+                skip = self.next_off - off
+                len = host.sys_arr_len(seg)
+                if skip < len {
+                    self.ready = q_cat(self.ready, q_slice(seg, skip, len))
+                    moved = moved + len - skip
+                    self.next_off = self.next_off + len - skip
+                }
+                keep_off = []
+                keep_data = []
+                j = 0
+                while j < n {
+                    if j != found {
+                        keep_off = host.sys_arr_push(keep_off, self.seg_off[j])
+                        keep_data = host.sys_arr_push(keep_data, self.seg_data[j])
+                    }
+                    j = j + 1
+                }
+                self.seg_off = keep_off
+                self.seg_data = keep_data
+            }
+        }
+        moved
+    }
+
+    /// Feed a frame's `data` at `offset`; `fin` marks the end of the stream. Returns the number of
+    /// newly contiguous bytes. Fails on final size violations and window overflow.
+    sa_insert(@self, offset: i64, data: _, fin: bool) : i64! {
+        len = host.sys_arr_len(data)
+        end = offset + len
+        ensure offset >= 0 else {
+            fail "quic: negative stream offset"
+            return
+        }
+        ensure end <= QUIC_MAX_VARINT else {
+            fail "quic: stream offset beyond 2^62-1"
+            return
+        }
+        if fin {
+            if self.final_size >= 0 {
+                ensure self.final_size == end else {
+                    fail "quic: FIN changes the final size from {self.final_size} to {end}"
+                    return
+                }
+            }
+        }
+        if self.final_size >= 0 {
+            ensure end <= self.final_size else {
+                fail "quic: data beyond the final size {self.final_size}"
+                return
+            }
+        }
+        if fin {
+            ensure end >= self.next_off else {
+                fail "quic: final size {end} is below data already delivered"
+                return
+            }
+            ensure self.sa_known_end() <= end else {
+                fail "quic: final size {end} is below data already received"
+                return
+            }
+            self.final_size = end
+        }
+        if end <= self.next_off { return 0 }
+        ensure self.sa_buffered() + len <= self.window else {
+            fail "quic: stream reassembly window exceeded"
+            return
+        }
+        self.seg_off = host.sys_arr_push(self.seg_off, offset)
+        self.seg_data = host.sys_arr_push(self.seg_data, data)
+        moved = @self.sa_drain()
+        moved
+    }
+
+    /// Highest end offset of any received byte, delivered or buffered.
+    sa_known_end(self) : i64 {
+        top = self.next_off
+        i = 0
+        n = host.sys_arr_len(self.seg_off)
+        while i < n {
+            e = self.seg_off[i] + host.sys_arr_len(self.seg_data[i])
+            if e > top { top = e }
+            i = i + 1
+        }
+        top
+    }
+}
+
+// --- transport parameters and errors --------------------------------------------------------
+
+/// Encode integer-valued transport parameters (RFC 9000 18): `id`, length, varint value each.
++quic_params_encode(ids: _, values: _) : _! {
+    ensure host.sys_arr_len(ids) == host.sys_arr_len(values) else {
+        fail "quic: parameter ids and values differ in length"
+        return
+    }
+    out = []
+    nothing = []
+    bad = ""
+    i = 0
+    n = host.sys_arr_len(ids)
+    while i < n {
+        id = quic_varint(ids[i]) or err {
+            bad = "{err}"
+            nothing
+        }
+        val = quic_varint(values[i]) or err {
+            bad = "{err}"
+            nothing
+        }
+        len = quic_varint(host.sys_arr_len(val)) or err {
+            bad = "{err}"
+            nothing
+        }
+        out = q_cat(out, id)
+        out = q_cat(out, len)
+        out = q_cat(out, val)
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "{bad}"
+        return
+    }
+    out
+}
+
+/// Decoded transport parameters: ids with their raw value bytes.
++QParams = {
+    /// Parameter ids in wire order. Defaults to `[]`.
+    ids: _ = []
+    /// Raw value bytes, parallel to `ids`. Defaults to `[]`.
+    raws: _ = []
+}
+
+/// Decode a transport parameter block; rejects duplicates and truncated values.
++quic_params_decode(data: _) : QParams! {
+    r = QReader.{data}
+    ids = []
+    raws = []
+    dup = ""
+    while r.rd_left() > 0 {
+        if r.problem != "" { break }
+        id = @r.rd_varint()
+        len = @r.rd_varint()
+        raw = @r.rd_bytes(len)
+        k = 0
+        while k < host.sys_arr_len(ids) {
+            if ids[k] == id { dup = "quic: duplicate transport parameter {id}" }
+            k = k + 1
+        }
+        ids = host.sys_arr_push(ids, id)
+        raws = host.sys_arr_push(raws, raw)
+    }
+    ensure r.problem == "" else {
+        fail "{r.problem}"
+        return
+    }
+    ensure dup == "" else {
+        fail "{dup}"
+        return
+    }
+    QParams.{ids, raws}
+}
+
+/// Integer value of parameter `id` (a varint), or `fallback` when absent or malformed.
++quic_param_int(params: QParams, id: i64, fallback: i64) : i64 {
+    out = fallback
+    i = 0
+    n = host.sys_arr_len(params.ids)
+    while i < n {
+        if params.ids[i] == id {
+            raw = params.raws[i]
+            v = quic_read_varint(raw, 0) or QVar.{value: fallback, next: -1}
+            if v.next == host.sys_arr_len(raw) { out = v.value }
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// Name of a transport error code (`CRYPTO_ERROR(0xNN)` for the TLS alert range).
++quic_error_name(code: i64) : str {
+    names = ["NO_ERROR", "INTERNAL_ERROR", "CONNECTION_REFUSED", "FLOW_CONTROL_ERROR", "STREAM_LIMIT_ERROR", "STREAM_STATE_ERROR", "FINAL_SIZE_ERROR", "FRAME_ENCODING_ERROR", "TRANSPORT_PARAMETER_ERROR", "CONNECTION_ID_LIMIT_ERROR", "PROTOCOL_VIOLATION", "INVALID_TOKEN", "APPLICATION_ERROR", "CRYPTO_BUFFER_EXCEEDED", "KEY_UPDATE_ERROR", "AEAD_LIMIT_REACHED", "NO_VIABLE_PATH"]
+    if code >= 0 {
+        if code <= 16 { return names[code] }
+    }
+    if code >= 256 {
+        if code <= 511 { return "CRYPTO_ERROR({code - 256})" }
+    }
+    "UNKNOWN({code})"
+}
+
+test "quic varint and ping frame" {
+    enc = quic_varint(37) or []
+    assert_eq(host.sys_arr_len(enc), 1)
+    assert_eq(enc[0], 37)
+    ping = quic_ping()
+    assert_eq(ping[0], 1)
+    frames = quic_parse_frames(ping) or []
+    assert_eq(host.sys_arr_len(frames), 1)
+    assert_eq(frames[0].kind, 1)
+}
+
+test "quic stream id helpers" {
+    sid = quic_stream_id(0, false, false)
+    assert_eq(sid, 0)
+    #assert(!(quic_stream_is_server(sid)))
+    #assert(!(quic_stream_is_uni(sid)))
+}
+
+test "quic cid derivation length" {
+    cid = quic_new_cid("seed", 8)
+    assert_eq(host.sys_arr_len(cid), 8)
+}
+
+/// `a` without its last `n` bytes.
+q_trim(a: _, n: i64) : _ => q_slice(a, 0, host.sys_arr_len(a) - n)
+
+// --- tests ----------------------------------------------------------------------------------
+
+test "quic varints match rfc 9000 appendix a" {
+    assert_eq(quic_varint(151288809941952652) or [], [194, 25, 124, 94, 255, 20, 232, 140])
+    assert_eq(quic_varint(494878333) or [], [157, 127, 62, 125])
+    assert_eq(quic_varint(15293) or [], [123, 189])
+    assert_eq(quic_varint(37) or [], [37])
+    assert_eq(quic_varint(0) or [], [0])
+    assert_eq(quic_varint(63) or [], [63])
+    assert_eq(quic_varint(64) or [], [64, 64])
+    assert_eq(quic_varint(16383) or [], [127, 255])
+    assert_eq(quic_varint(16384) or [], [128, 0, 64, 0])
+    assert_eq(quic_varint(1073741823) or [], [191, 255, 255, 255])
+    assert_eq(quic_varint(1073741824) or [], [192, 0, 0, 0, 64, 0, 0, 0])
+    assert_eq(host.sys_arr_len(quic_varint(QUIC_MAX_VARINT) or []), 8)
+    assert_eq(host.sys_arr_len(quic_varint(QUIC_MAX_VARINT + 1) or []), 0)
+    assert_eq(host.sys_arr_len(quic_varint(-1) or []), 0)
+    assert_eq(quic_varint_size(63), 1)
+    assert_eq(quic_varint_size(64), 2)
+    assert_eq(quic_varint_size(16384), 4)
+    assert_eq(quic_varint_size(1073741824), 8)
+    assert_eq(quic_varint_size(-5), 0)
+    assert_eq(quic_varint_size(QUIC_MAX_VARINT + 1), 0)
+    assert_eq(quic_varint_len(194), 8)
+    assert_eq(quic_varint_len(157), 4)
+    assert_eq(quic_varint_len(123), 2)
+    assert_eq(quic_varint_len(37), 1)
+    a = quic_read_varint([194, 25, 124, 94, 255, 20, 232, 140], 0) or QVar.{value: -1}
+    assert_eq(a.value, 151288809941952652)
+    assert_eq(a.next, 8)
+    b = quic_read_varint([64, 37], 0) or QVar.{value: -1}
+    assert_eq(b.value, 37)
+    assert_eq(b.next, 2)
+    c = quic_read_varint([9, 125, 123, 189, 7], 2) or QVar.{value: -1}
+    assert_eq(c.value, 15293)
+    assert_eq(c.next, 4)
+    assert_eq(quic_read_varint([64], 0) or QVar.{value: -1}.value, -1)
+    assert_eq(quic_read_varint([], 0) or QVar.{value: -1}.value, -1)
+    assert_eq(quic_read_varint([1], 3) or QVar.{value: -1}.value, -1)
+    assert_eq(quic_read_varint([1], -1) or QVar.{value: -1}.value, -1)
+    for v in [0, 1, 62, 63, 64, 100, 16383, 16384, 1000000, 1073741823, 1073741824, 4611686018427387903] {
+        enc = quic_varint(v) or []
+        dec = quic_read_varint(enc, 0) or QVar.{value: -1}
+        assert_eq(dec.value, v)
+        assert_eq(dec.next, host.sys_arr_len(enc))
+    }
+}
+
+test "quic sized varints" {
+    assert_eq(quic_varint_sized(5, 2) or [], [64, 5])
+    assert_eq(quic_varint_sized(5, 4) or [], [128, 0, 0, 5])
+    assert_eq(quic_varint_sized(5, 8) or [], [192, 0, 0, 0, 0, 0, 0, 5])
+    assert_eq(quic_varint_sized(5, 1) or [], [5])
+    assert_eq(host.sys_arr_len(quic_varint_sized(64, 1) or []), 0)
+    assert_eq(host.sys_arr_len(quic_varint_sized(5, 3) or []), 0)
+    assert_eq(host.sys_arr_len(quic_varint_sized(-1, 2) or []), 0)
+    wide = quic_read_varint(quic_varint_sized(300, 4) or [], 0) or QVar.{value: -1}
+    assert_eq(wide.value, 300)
+    assert_eq(wide.next, 4)
+}
+
+test "quic packet number encoding matches rfc 9000 appendix a" {
+    assert_eq(quic_pn_len(11295746, 11266227), 2)
+    assert_eq(quic_pn_truncate(11295746, 2), 23554)
+    assert_eq(quic_pn_len(0, -1), 1)
+    assert_eq(quic_pn_len(126, -1), 1)
+    assert_eq(quic_pn_len(127, -1), 2)
+    assert_eq(quic_pn_len(128, -1), 2)
+    assert_eq(quic_pn_len(40000, 0), 3)
+    assert_eq(quic_pn_len(10000000, 0), 4)
+    assert_eq(quic_pn_decode(2821665002, 39730, 2), 2821692210)
+    assert_eq(quic_pn_decode(-1, 0, 1), 0)
+    assert_eq(quic_pn_decode(255, 0, 1), 256)
+    assert_eq(quic_pn_decode(256, 255, 1), 255)
+    assert_eq(quic_pn_decode(0, 1, 4), 1)
+    for full in [0, 1, 200, 255, 256, 1000, 65535, 65536, 5000000, 4294967295, 4294967296, 99999999999] {
+        acked = full - 100
+        if acked < 0 { acked = -1 }
+        len = quic_pn_len(full, acked)
+        trunc = quic_pn_truncate(full, len)
+        assert_eq(quic_pn_decode(acked, trunc, len), full)
+    }
+}
+
+test "quic connection ids and stream ids" {
+    a = quic_new_cid("seed", 8)
+    b = quic_new_cid("seed", 8)
+    c = quic_new_cid("other", 8)
+    assert_eq(host.sys_arr_len(a), 8)
+    #assert(quic_same(a, b))
+    #assert(!(quic_same(a, c)))
+    assert_eq(host.sys_arr_len(quic_new_cid("x", 0)), 0)
+    assert_eq(host.sys_arr_len(quic_new_cid("x", 20)), 20)
+    assert_eq(host.sys_arr_len(quic_new_cid("x", 99)), 20)
+    assert_eq(host.sys_arr_len(quic_new_cid("x", -3)), 0)
+    #assert(quic_same(q_slice(quic_new_cid("x", 20), 0, 8), quic_new_cid("x", 8)))
+    t1 = quic_reset_token("k", a)
+    t2 = quic_reset_token("k", a)
+    t3 = quic_reset_token("k2", a)
+    assert_eq(host.sys_arr_len(t1), 16)
+    #assert(quic_same(t1, t2))
+    #assert(!(quic_same(t1, t3)))
+    assert_eq(quic_stream_id(0, false, false), 0)
+    assert_eq(quic_stream_id(0, true, false), 1)
+    assert_eq(quic_stream_id(0, false, true), 2)
+    assert_eq(quic_stream_id(0, true, true), 3)
+    assert_eq(quic_stream_id(5, false, false), 20)
+    assert_eq(quic_stream_id(5, true, true), 23)
+    #assert(quic_stream_is_server(23))
+    #assert(!(quic_stream_is_server(20)))
+    #assert(quic_stream_is_uni(23))
+    #assert(!(quic_stream_is_uni(21)))
+    assert_eq(quic_stream_index(23), 5)
+    assert_eq(quic_stream_index(4), 1)
+}
+
+test "quic initial packet bytes" {
+    dcid = [1, 2, 3, 4, 5, 6, 7, 8]
+    scid = [9, 10, 11, 12]
+    crypto = quic_crypto(0, [1, 2, 3]) or []
+    assert_eq(crypto, [6, 0, 3, 1, 2, 3])
+    pkt = quic_initial(QUIC_V1, dcid, scid, [], 5, 1, crypto) or []
+    assert_eq(pkt, [192, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 4, 9, 10, 11, 12, 0, 7, 5, 6, 0, 3, 1, 2, 3])
+    h = quic_parse_packet(pkt, 0, 0) or QHeader.{ptype: -9}
+    #assert(h.long)
+    assert_eq(h.ptype, QUIC_INITIAL)
+    assert_eq(h.version, QUIC_V1)
+    assert_eq(h.dcid, dcid)
+    assert_eq(h.scid, scid)
+    assert_eq(host.sys_arr_len(h.token), 0)
+    assert_eq(h.length, 7)
+    assert_eq(h.pn_len, 1)
+    assert_eq(h.pn, 5)
+    assert_eq(h.header_len, 22)
+    assert_eq(h.payload, crypto)
+    assert_eq(h.total, host.sys_arr_len(pkt))
+    tok = quic_initial(QUIC_V1, dcid, [], [170, 187], 300, 2, [1]) or []
+    th = quic_parse_packet(tok, 0, 0) or QHeader.{ptype: -9}
+    assert_eq(th.token, [170, 187])
+    assert_eq(th.pn, 300)
+    assert_eq(th.pn_len, 2)
+    assert_eq(host.sys_arr_len(th.scid), 0)
+    assert_eq(th.payload, [1])
+    v2 = quic_initial(QUIC_V2, dcid, scid, [], 1, 1, [1]) or []
+    assert_eq(v2[0], 208)
+    v2h = quic_parse_packet(v2, 0, 0) or QHeader.{ptype: -9}
+    assert_eq(v2h.ptype, QUIC_INITIAL)
+    assert_eq(v2h.version, QUIC_V2)
+}
+
+test "quic long packet validation" {
+    cid = [1, 2]
+    assert_eq(host.sys_arr_len(quic_long_packet(QUIC_INITIAL, 7, cid, cid, [], 0, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(-1, 1, cid, cid, [], 0, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(3, 1, cid, cid, [], 0, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, host.sys_arr_new(21, 1), cid, [], 0, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, cid, host.sys_arr_new(21, 1), [], 0, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, [300], cid, [], 0, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, cid, cid, [], 0, 0, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, cid, cid, [], 0, 5, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, cid, cid, [], -1, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, cid, cid, [], 256, 1, []) or []), 0)
+    #assert(host.sys_arr_len(quic_long_packet(0, 1, cid, cid, [], 255, 1, []) or []) > 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(2, 1, cid, cid, [1], 0, 1, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_long_packet(0, 1, cid, cid, [], 0, 1, [999]) or []), 0)
+    #assert(host.sys_arr_len(quic_handshake(1, cid, cid, 0, 1, [1]) or []) > 0)
+}
+
+test "quic padded initial reaches exactly the minimum" {
+    dcid = quic_new_cid("d", 8)
+    scid = quic_new_cid("s", 8)
+    for body in [0, 1, 30, 100, 600, 1100, 1150, 1170] {
+        payload = host.sys_arr_new(body, 1)
+        pkt = quic_initial_padded(QUIC_V1, dcid, scid, [], 0, 2, payload, QUIC_MIN_INITIAL) or []
+        assert_eq(host.sys_arr_len(pkt), 1200)
+        h = quic_parse_packet(pkt, 0, 0) or QHeader.{ptype: -9}
+        assert_eq(h.total, 1200)
+        frames = quic_parse_frames(h.payload) or []
+        #assert(host.sys_arr_len(frames) >= 1)
+    }
+    big = host.sys_arr_new(1300, 1)
+    untouched = quic_initial_padded(QUIC_V1, dcid, scid, [], 0, 2, big, QUIC_MIN_INITIAL) or []
+    plain = quic_initial(QUIC_V1, dcid, scid, [], 0, 2, big) or []
+    #assert(quic_same(untouched, plain))
+    with_token = quic_initial_padded(QUIC_V1, dcid, scid, host.sys_arr_new(40, 9), 3, 1, quic_ping(), 1200) or []
+    assert_eq(host.sys_arr_len(with_token), 1200)
+    assert_eq(host.sys_arr_len(quic_initial_padded(QUIC_V1, dcid, scid, [], 0, 9, [], 1200) or []), 0)
+}
+
+test "quic short packets" {
+    pkt = quic_short_packet([1, 2, 3, 4], 4660, 2, true, true, [1]) or []
+    assert_eq(pkt, [101, 1, 2, 3, 4, 18, 52, 1])
+    h = quic_parse_packet(pkt, 0, 4) or QHeader.{ptype: -9}
+    #assert(!(h.long))
+    assert_eq(h.ptype, QUIC_ONE_RTT)
+    assert_eq(h.dcid, [1, 2, 3, 4])
+    assert_eq(h.pn, 4660)
+    assert_eq(h.pn_len, 2)
+    #assert(h.spin)
+    #assert(h.key_phase)
+    assert_eq(h.payload, [1])
+    assert_eq(h.header_len, 7)
+    assert_eq(h.total, 8)
+    plain = quic_short_packet([], 1, 1, false, false, [2, 3]) or []
+    assert_eq(plain, [64, 1, 2, 3])
+    ph = quic_parse_packet(plain, 0, 0) or QHeader.{ptype: -9}
+    #assert(!(ph.spin))
+    #assert(!(ph.key_phase))
+    assert_eq(ph.payload, [2, 3])
+    assert_eq(host.sys_arr_len(quic_short_packet(host.sys_arr_new(21, 1), 0, 1, false, false, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_short_packet([1], 0, 0, false, false, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_short_packet([1], 0, 5, false, false, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_short_packet([1], -1, 1, false, false, []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_short_packet([1], 256, 1, false, false, []) or []), 0)
+    assert_eq(quic_parse_packet([0, 1, 2], 0, 4) or QHeader.{ptype: -9}.ptype, -9)
+    assert_eq(quic_parse_packet([1, 1, 2], 0, 1) or QHeader.{ptype: -9}.ptype, -9)
+    assert_eq(quic_parse_packet(pkt, 0, -1) or QHeader.{ptype: -9}.ptype, -9)
+}
+
+test "quic version negotiation and retry" {
+    vn = quic_version_negotiation([1, 2], [3], [1, 4278190109], 5) or []
+    assert_eq(vn, [133, 0, 0, 0, 0, 2, 1, 2, 1, 3, 0, 0, 0, 1, 255, 0, 0, 29])
+    h = quic_parse_packet(vn, 0, 0) or QHeader.{ptype: -9}
+    assert_eq(h.ptype, QUIC_VERSION_NEGOTIATION)
+    assert_eq(h.version, 0)
+    assert_eq(h.dcid, [1, 2])
+    assert_eq(h.scid, [3])
+    assert_eq(h.versions, [1, 4278190109])
+    assert_eq(h.header_len, 10)
+    assert_eq(h.total, 18)
+    assert_eq(host.sys_arr_len(quic_version_negotiation([1], [2], [], 0) or []), 0)
+    assert_eq(host.sys_arr_len(quic_version_negotiation(host.sys_arr_new(256, 1), [2], [1], 0) or []), 0)
+    assert_eq(host.sys_arr_len(quic_version_negotiation([1], host.sys_arr_new(256, 1), [1], 0) or []), 0)
+    long_ids = quic_version_negotiation(host.sys_arr_new(30, 7), [], [1], 0) or []
+    peek = quic_peek_long(long_ids) or QHeader.{version: -1}
+    assert_eq(host.sys_arr_len(peek.dcid), 30)
+    assert_eq(quic_parse_packet([128, 0, 0, 0, 0, 0, 0], 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    assert_eq(quic_parse_packet([128, 0, 0, 0, 0, 0, 0, 1, 2, 3], 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    tag = host.sys_arr_new(16, 170)
+    retry = quic_retry_packet(QUIC_V1, [1, 2], [3, 4], [9, 9, 9], tag) or []
+    assert_eq(retry[0], 240)
+    rh = quic_parse_packet(retry, 0, 0) or QHeader.{ptype: -9}
+    assert_eq(rh.ptype, QUIC_RETRY)
+    assert_eq(rh.token, [9, 9, 9])
+    assert_eq(rh.tag, tag)
+    assert_eq(rh.dcid, [1, 2])
+    assert_eq(rh.scid, [3, 4])
+    assert_eq(rh.header_len, 11)
+    assert_eq(host.sys_arr_len(quic_retry_packet(QUIC_V1, [1], [2], [9], [1, 2]) or []), 0)
+    assert_eq(host.sys_arr_len(quic_retry_packet(QUIC_V1, [1], [2], [], tag) or []), 0)
+    assert_eq(host.sys_arr_len(quic_retry_packet(5, [1], [2], [9], tag) or []), 0)
+    assert_eq(quic_parse_packet(q_trim(retry, 20), 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+}
+
+test "quic parse rejects malformed headers" {
+    good = quic_initial(QUIC_V1, [1], [2], [], 0, 1, [1, 2, 3]) or []
+    gp = quic_parse_packet(good, 0, 0) or QHeader.{ptype: -9}
+    assert_eq(gp.ptype, 0)
+    assert_eq(quic_parse_packet(q_trim(good, 1), 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    nofixed = host.sys_arr_set(good, 0, 128 | 1)
+    assert_eq(quic_parse_packet(nofixed, 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    unknown = host.sys_arr_set(good, 4, 99)
+    assert_eq(quic_parse_packet(unknown, 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    assert_eq(quic_parse_packet([], 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    assert_eq(quic_parse_packet(good, -1, 0) or QHeader.{ptype: -9}.ptype, -9)
+    assert_eq(quic_parse_packet(good, 99, 0) or QHeader.{ptype: -9}.ptype, -9)
+    long_dcid = host.sys_arr_set(good, 5, 25)
+    assert_eq(quic_parse_packet(long_dcid, 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    short_len = [192, 0, 0, 0, 1, 1, 7, 1, 8, 0, 0, 0]
+    assert_eq(quic_parse_packet(short_len, 0, 0) or QHeader.{ptype: -9}.ptype, -9)
+    assert_eq(quic_peek_long([1, 2, 3]) or QHeader.{version: -1}.version, -1)
+    assert_eq(quic_peek_long([64, 0, 0, 0, 1, 0, 0, 0]) or QHeader.{version: -1}.version, -1)
+    peek = quic_peek_long(good) or QHeader.{version: -1}
+    assert_eq(peek.version, 1)
+    assert_eq(peek.dcid, [1])
+    assert_eq(peek.scid, [2])
+    unk = quic_peek_long([192, 255, 0, 0, 29, 1, 5, 2, 6, 7]) or QHeader.{version: -1}
+    assert_eq(unk.version, 4278190109)
+    assert_eq(unk.dcid, [5])
+    assert_eq(unk.scid, [6, 7])
+}
+
+test "quic coalesced datagrams" {
+    dcid = [1, 2, 3, 4]
+    initial = quic_initial(QUIC_V1, dcid, [9], [], 0, 1, quic_crypto(0, [1, 2]) or []) or []
+    hs = quic_handshake(QUIC_V1, dcid, [9], 0, 1, quic_crypto(0, [3, 4, 5]) or []) or []
+    short = quic_short_packet(dcid, 7, 1, false, false, quic_ping()) or []
+    datagram = q_cat(q_cat(initial, hs), short)
+    parts = quic_split_datagram(datagram, 4) or []
+    assert_eq(host.sys_arr_len(parts), 3)
+    p0 = parts[0]
+    p1 = parts[1]
+    p2 = parts[2]
+    assert_eq(p0.ptype, QUIC_INITIAL)
+    assert_eq(p1.ptype, QUIC_HANDSHAKE)
+    assert_eq(p2.ptype, QUIC_ONE_RTT)
+    assert_eq(p0.total, host.sys_arr_len(initial))
+    assert_eq(p1.total, host.sys_arr_len(hs))
+    assert_eq(p2.pn, 7)
+    assert_eq(p0.total + p1.total + p2.total, host.sys_arr_len(datagram))
+    single = quic_split_datagram(initial, 0) or []
+    assert_eq(host.sys_arr_len(single), 1)
+    assert_eq(host.sys_arr_len(quic_split_datagram([], 0) or [1]), 0)
+    broken = q_cat(initial, [192, 0])
+    assert_eq(host.sys_arr_len(quic_split_datagram(broken, 0) or []), 0)
+    second = quic_parse_packet(datagram, p0.total, 4) or QHeader.{ptype: -9}
+    assert_eq(second.ptype, QUIC_HANDSHAKE)
+    assert_eq(second.payload, quic_crypto(0, [3, 4, 5]) or [])
+}
+
+test "quic frame builders produce exact bytes" {
+    assert_eq(quic_ping(), [1])
+    assert_eq(quic_handshake_done(), [30])
+    assert_eq(quic_padding(3), [0, 0, 0])
+    assert_eq(quic_padding(0), [])
+    assert_eq(quic_crypto(0, [1, 2, 3]) or [], [6, 0, 3, 1, 2, 3])
+    assert_eq(quic_crypto(300, [9]) or [], [6, 65, 44, 1, 9])
+    assert_eq(quic_new_token([5, 6]) or [], [7, 2, 5, 6])
+    assert_eq(host.sys_arr_len(quic_new_token([]) or []), 0)
+    assert_eq(quic_stream(4, 0, [1, 2], true, true) or [], [11, 4, 2, 1, 2])
+    assert_eq(quic_stream(4, 300, [1, 2], false, true) or [], [14, 4, 65, 44, 2, 1, 2])
+    assert_eq(quic_stream(4, 0, [1, 2], false, false) or [], [8, 4, 1, 2])
+    assert_eq(quic_stream(4, 5, [1], true, false) or [], [13, 4, 5, 1])
+    assert_eq(quic_stream(0, 0, [], true, true) or [], [11, 0, 0])
+    assert_eq(quic_reset_stream(4, 7, 100) or [], [4, 4, 7, 64, 100])
+    assert_eq(quic_stop_sending(4, 7) or [], [5, 4, 7])
+    assert_eq(quic_max_data(1000) or [], [16, 67, 232])
+    assert_eq(quic_max_stream_data(8, 50) or [], [17, 8, 50])
+    assert_eq(quic_max_streams(true, 100) or [], [18, 64, 100])
+    assert_eq(quic_max_streams(false, 100) or [], [19, 64, 100])
+    assert_eq(host.sys_arr_len(quic_max_streams(true, 1152921504606846977) or []), 0)
+    assert_eq(quic_data_blocked(7) or [], [20, 7])
+    assert_eq(quic_stream_data_blocked(4, 7) or [], [21, 4, 7])
+    assert_eq(quic_streams_blocked(true, 3) or [], [22, 3])
+    assert_eq(quic_streams_blocked(false, 3) or [], [23, 3])
+    assert_eq(quic_retire_connection_id(2) or [], [25, 2])
+    assert_eq(host.sys_arr_len(quic_stream(-1, 0, [], false, true) or []), 0)
+    assert_eq(host.sys_arr_len(quic_max_data(QUIC_MAX_VARINT + 1) or []), 0)
+}
+
+test "quic connection management frames" {
+    token = host.sys_arr_new(16, 7)
+    ncid = quic_new_connection_id(1, 0, [9, 8, 7], token) or []
+    assert_eq(host.sys_arr_len(ncid), 1 + 1 + 1 + 1 + 3 + 16)
+    assert_eq(ncid[0], 24)
+    assert_eq(host.sys_arr_len(quic_new_connection_id(1, 0, [], token) or []), 0)
+    assert_eq(host.sys_arr_len(quic_new_connection_id(1, 0, host.sys_arr_new(21, 1), token) or []), 0)
+    assert_eq(host.sys_arr_len(quic_new_connection_id(1, 0, [1], [1]) or []), 0)
+    assert_eq(host.sys_arr_len(quic_new_connection_id(1, 2, [1], token) or []), 0)
+    assert_eq(quic_path_challenge([1, 2, 3, 4, 5, 6, 7, 8]) or [], [26, 1, 2, 3, 4, 5, 6, 7, 8])
+    assert_eq(quic_path_response([1, 2, 3, 4, 5, 6, 7, 8]) or [], [27, 1, 2, 3, 4, 5, 6, 7, 8])
+    assert_eq(host.sys_arr_len(quic_path_challenge([1]) or []), 0)
+    assert_eq(host.sys_arr_len(quic_path_response([]) or []), 0)
+    assert_eq(quic_connection_close(10, 6, "bad", false) or [], [28, 10, 6, 3, 98, 97, 100])
+    assert_eq(quic_connection_close(12, 0, "bye", true) or [], [29, 12, 3, 98, 121, 101])
+    assert_eq(quic_connection_close(0, 0, "", false) or [], [28, 0, 0, 0])
+}
+
+test "quic frames roundtrip through the parser" {
+    token = host.sys_arr_new(16, 3)
+    payload = quic_padding(2)
+    payload = q_cat(payload, quic_ping())
+    payload = q_cat(payload, quic_ack(10, 25, 2, [1], [3]) or [])
+    payload = q_cat(payload, quic_reset_stream(4, 7, 100) or [])
+    payload = q_cat(payload, quic_stop_sending(8, 9) or [])
+    payload = q_cat(payload, quic_crypto(300, [1, 2, 3]) or [])
+    payload = q_cat(payload, quic_new_token([5, 6]) or [])
+    payload = q_cat(payload, quic_stream(4, 300, [10, 11], true, true) or [])
+    payload = q_cat(payload, quic_max_data(1000) or [])
+    payload = q_cat(payload, quic_max_stream_data(8, 50) or [])
+    payload = q_cat(payload, quic_max_streams(true, 100) or [])
+    payload = q_cat(payload, quic_max_streams(false, 7) or [])
+    payload = q_cat(payload, quic_data_blocked(77) or [])
+    payload = q_cat(payload, quic_stream_data_blocked(4, 88) or [])
+    payload = q_cat(payload, quic_streams_blocked(true, 3) or [])
+    payload = q_cat(payload, quic_new_connection_id(5, 2, [9, 8, 7], token) or [])
+    payload = q_cat(payload, quic_retire_connection_id(2) or [])
+    payload = q_cat(payload, quic_path_challenge([1, 2, 3, 4, 5, 6, 7, 8]) or [])
+    payload = q_cat(payload, quic_path_response([8, 7, 6, 5, 4, 3, 2, 1]) or [])
+    payload = q_cat(payload, quic_connection_close(10, 6, "bad frame", false) or [])
+    payload = q_cat(payload, quic_connection_close(12, 0, "bye", true) or [])
+    payload = q_cat(payload, quic_handshake_done())
+    frames = quic_parse_frames(payload) or []
+    assert_eq(host.sys_arr_len(frames), 22)
+    f = frames[0]
+    assert_eq(f.kind, QF_PADDING)
+    assert_eq(f.pad, 2)
+    f = frames[1]
+    assert_eq(f.kind, QF_PING)
+    f = frames[2]
+    assert_eq(f.kind, QF_ACK)
+    assert_eq(f.largest, 10)
+    assert_eq(f.ack_delay, 25)
+    assert_eq(f.first_range, 2)
+    assert_eq(f.ranges, [1, 3])
+    assert_eq(host.sys_arr_len(f.ecn), 0)
+    f = frames[3]
+    assert_eq(f.kind, QF_RESET_STREAM)
+    assert_eq(f.stream_id, 4)
+    assert_eq(f.error_code, 7)
+    assert_eq(f.value, 100)
+    f = frames[4]
+    assert_eq(f.kind, QF_STOP_SENDING)
+    assert_eq(f.stream_id, 8)
+    assert_eq(f.error_code, 9)
+    f = frames[5]
+    assert_eq(f.kind, QF_CRYPTO)
+    assert_eq(f.offset, 300)
+    assert_eq(f.data, [1, 2, 3])
+    f = frames[6]
+    assert_eq(f.kind, QF_NEW_TOKEN)
+    assert_eq(f.data, [5, 6])
+    f = frames[7]
+    assert_eq(f.kind, QF_STREAM)
+    assert_eq(f.stream_id, 4)
+    assert_eq(f.offset, 300)
+    #assert(f.fin)
+    assert_eq(f.data, [10, 11])
+    f = frames[8]
+    assert_eq(f.kind, QF_MAX_DATA)
+    assert_eq(f.value, 1000)
+    f = frames[9]
+    assert_eq(f.kind, QF_MAX_STREAM_DATA)
+    assert_eq(f.stream_id, 8)
+    assert_eq(f.value, 50)
+    f = frames[10]
+    assert_eq(f.kind, QF_MAX_STREAMS)
+    #assert(f.bidi)
+    assert_eq(f.value, 100)
+    f = frames[11]
+    assert_eq(f.kind, QF_MAX_STREAMS)
+    #assert(!(f.bidi))
+    assert_eq(f.value, 7)
+    f = frames[12]
+    assert_eq(f.kind, QF_DATA_BLOCKED)
+    assert_eq(f.value, 77)
+    f = frames[13]
+    assert_eq(f.kind, QF_STREAM_DATA_BLOCKED)
+    assert_eq(f.stream_id, 4)
+    assert_eq(f.value, 88)
+    f = frames[14]
+    assert_eq(f.kind, QF_STREAMS_BLOCKED)
+    #assert(f.bidi)
+    assert_eq(f.value, 3)
+    f = frames[15]
+    assert_eq(f.kind, QF_NEW_CONNECTION_ID)
+    assert_eq(f.seq, 5)
+    assert_eq(f.retire_prior, 2)
+    assert_eq(f.cid, [9, 8, 7])
+    assert_eq(f.data, token)
+    f = frames[16]
+    assert_eq(f.kind, QF_RETIRE_CONNECTION_ID)
+    assert_eq(f.seq, 2)
+    f = frames[17]
+    assert_eq(f.kind, QF_PATH_CHALLENGE)
+    assert_eq(f.data, [1, 2, 3, 4, 5, 6, 7, 8])
+    f = frames[18]
+    assert_eq(f.kind, QF_PATH_RESPONSE)
+    assert_eq(f.data, [8, 7, 6, 5, 4, 3, 2, 1])
+    f = frames[19]
+    assert_eq(f.kind, QF_CONNECTION_CLOSE)
+    #assert(!(f.app))
+    assert_eq(f.error_code, 10)
+    assert_eq(f.frame_type, 6)
+    assert_eq(f.reason, "bad frame")
+    f = frames[20]
+    assert_eq(f.kind, QF_CONNECTION_CLOSE)
+    #assert(f.app)
+    assert_eq(f.error_code, 12)
+    assert_eq(f.reason, "bye")
+    f = frames[21]
+    assert_eq(f.kind, QF_HANDSHAKE_DONE)
+}
+
+test "quic stream frame length forms" {
+    open_ended = quic_parse_frames([8, 4, 1, 2, 3]) or []
+    assert_eq(host.sys_arr_len(open_ended), 1)
+    f = open_ended[0]
+    assert_eq(f.data, [1, 2, 3])
+    #assert(!(f.fin))
+    assert_eq(f.offset, 0)
+    with_off = quic_parse_frames([12, 4, 5, 1, 2]) or []
+    g = with_off[0]
+    assert_eq(g.offset, 5)
+    assert_eq(g.data, [1, 2])
+    for off in [0, 17] {
+        for last in [false, true] {
+            for with_len in [false, true] {
+                built = quic_stream(6, off, [1, 2, 3], last, with_len) or []
+                parsed = quic_parse_frames(built) or []
+                assert_eq(host.sys_arr_len(parsed), 1)
+                sf = parsed[0]
+                assert_eq(sf.kind, QF_STREAM)
+                assert_eq(sf.stream_id, 6)
+                assert_eq(sf.offset, off)
+                assert_eq(sf.fin, last)
+                assert_eq(sf.data, [1, 2, 3])
+            }
+        }
+    }
+    empty = quic_parse_frames([]) or [9]
+    assert_eq(host.sys_arr_len(empty), 0)
+}
+
+test "quic ack frames with ecn and ranges" {
+    ecn = quic_parse_frames([3, 20, 0, 0, 5, 1, 2, 3]) or []
+    f = ecn[0]
+    assert_eq(f.kind, QF_ACK)
+    assert_eq(f.largest, 20)
+    assert_eq(f.first_range, 5)
+    assert_eq(f.ecn, [1, 2, 3])
+    assert_eq(quic_ack_count(f), 6)
+    built = quic_ack(10, 0, 2, [1], [3]) or []
+    assert_eq(built, [2, 10, 0, 1, 2, 1, 3])
+    parsed = quic_parse_frames(built) or []
+    a = parsed[0]
+    assert_eq(quic_ack_intervals(a), [10, 8, 5, 2])
+    #assert(quic_ack_covers(a, 10))
+    #assert(quic_ack_covers(a, 9))
+    #assert(quic_ack_covers(a, 8))
+    #assert(!(quic_ack_covers(a, 7)))
+    #assert(!(quic_ack_covers(a, 6)))
+    #assert(quic_ack_covers(a, 5))
+    #assert(quic_ack_covers(a, 2))
+    #assert(!(quic_ack_covers(a, 1)))
+    #assert(!(quic_ack_covers(a, 11)))
+    assert_eq(quic_ack_count(a), 7)
+    assert_eq(host.sys_arr_len(quic_ack(5, 0, 6, [], []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_ack(5, 0, -1, [], []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_ack(5, 0, 0, [1], []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_ack(5, 0, 0, [-1], [0]) or []), 0)
+    assert_eq(host.sys_arr_len(quic_ack(5, 0, 0, [4], [0]) or []), 0)
+    assert_eq(host.sys_arr_len(quic_ack(5, 0, 0, [1], [9]) or []), 0)
+    assert_eq(host.sys_arr_len(quic_ack(5, 0, 0, [1], [-1]) or []), 0)
+    #assert(host.sys_arr_len(quic_ack(5, 0, 5, [], []) or []) > 0)
+}
+
+test "quic ack from received packet numbers" {
+    frame = quic_ack_from_pns([0, 1, 2, 5, 6, 9, 10], 3) or []
+    parsed = quic_parse_frames(frame) or []
+    a = parsed[0]
+    assert_eq(a.largest, 10)
+    assert_eq(a.ack_delay, 3)
+    assert_eq(a.first_range, 1)
+    assert_eq(a.ranges, [1, 1, 1, 2])
+    assert_eq(quic_ack_intervals(a), [10, 9, 6, 5, 2, 0])
+    for pn in [0, 1, 2, 5, 6, 9, 10] {
+        #assert(quic_ack_covers(a, pn))
+    }
+    for pn in [3, 4, 7, 8, 11] {
+        #assert(!(quic_ack_covers(a, pn)))
+    }
+    shuffled = quic_ack_from_pns([10, 0, 6, 9, 2, 5, 1, 6, 10], 3) or []
+    #assert(quic_same(frame, shuffled))
+    single = quic_ack_from_pns([7], 0) or []
+    assert_eq(single, [2, 7, 0, 0, 0])
+    contiguous = quic_ack_from_pns([3, 4, 5, 6], 0) or []
+    assert_eq(contiguous, [2, 6, 0, 0, 3])
+    assert_eq(host.sys_arr_len(quic_ack_from_pns([], 0) or []), 0)
+    assert_eq(host.sys_arr_len(quic_ack_from_pns([-1, 4], 0) or []), 0)
+    big = []
+    for i in 0..40 {
+        if i % 3 != 0 { big = host.sys_arr_push(big, i) }
+    }
+    bf = quic_parse_frames(quic_ack_from_pns(big, 0) or []) or []
+    ba = bf[0]
+    for i in 0..40 {
+        assert_eq(quic_ack_covers(ba, i), i % 3 != 0)
+    }
+}
+
+test "quic frame parser rejects malformed payloads" {
+    assert_eq(host.sys_arr_len(quic_parse_frames([31]) or [9]), 1)
+    assert_eq(quic_parse_frames([64, 31]) or [9], [9])
+    assert_eq(quic_parse_frames([6, 0, 5, 1]) or [9], [9])
+    assert_eq(quic_parse_frames([8]) or [9], [9])
+    assert_eq(quic_parse_frames([10, 4, 5, 1]) or [9], [9])
+    assert_eq(quic_parse_frames([7, 0]) or [9], [9])
+    assert_eq(quic_parse_frames([2, 5, 0, 0]) or [9], [9])
+    assert_eq(quic_parse_frames([2, 5, 0, 0, 9]) or [9], [9])
+    assert_eq(quic_parse_frames([2, 5, 0, 200, 0]) or [9], [9])
+    assert_eq(quic_parse_frames([2, 5, 0, 1, 0, 9, 0]) or [9], [9])
+    assert_eq(quic_parse_frames([3, 5, 0, 0, 0, 1, 2]) or [9], [9])
+    assert_eq(quic_parse_frames([24, 1, 0, 0, 1]) or [9], [9])
+    assert_eq(quic_parse_frames([24, 1, 2, 1, 7]) or [9], [9])
+    long_cid = q_cat([24, 1, 0, 21], host.sys_arr_new(37, 1))
+    assert_eq(quic_parse_frames(long_cid) or [9], [9])
+    assert_eq(quic_parse_frames([26, 1, 2, 3]) or [9], [9])
+    assert_eq(quic_parse_frames([28, 1, 2, 5, 97]) or [9], [9])
+    assert_eq(quic_parse_frames([29, 1]) or [9], [9])
+    assert_eq(quic_parse_frames([16]) or [9], [9])
+    assert_eq(quic_parse_frames([4, 1, 2]) or [9], [9])
+}
+
+test "stream assembler delivers in order" {
+    sa = StreamAssembler.{}
+    assert_eq(@sa.sa_insert(0, [1, 2, 3], false) or -1, 3)
+    assert_eq(@sa.sa_insert(3, [4, 5], false) or -1, 2)
+    assert_eq(sa.ready, [1, 2, 3, 4, 5])
+    assert_eq(sa.next_off, 5)
+    #assert(!(sa.sa_complete()))
+    assert_eq(@sa.sa_insert(5, [6], true) or -1, 1)
+    assert_eq(sa.ready, [1, 2, 3, 4, 5, 6])
+    assert_eq(sa.final_size, 6)
+    #assert(sa.sa_complete())
+    assert_eq(@sa.sa_insert(0, [1, 2, 3], false) or -1, 0)
+    assert_eq(@sa.sa_insert(5, [6], true) or -1, 0)
+}
+
+test "stream assembler handles gaps overlaps and duplicates" {
+    sa = StreamAssembler.{}
+    assert_eq(@sa.sa_insert(6, [7, 8], false) or -1, 0)
+    assert_eq(sa.sa_buffered(), 2)
+    assert_eq(@sa.sa_insert(3, [4, 5, 6], false) or -1, 0)
+    assert_eq(sa.sa_buffered(), 5)
+    assert_eq(@sa.sa_insert(0, [1, 2, 3, 4], false) or -1, 8)
+    assert_eq(sa.ready, [1, 2, 3, 4, 5, 6, 7, 8])
+    assert_eq(sa.sa_buffered(), 0)
+    assert_eq(sa.next_off, 8)
+    assert_eq(@sa.sa_insert(6, [7, 8, 9, 10], false) or -1, 2)
+    assert_eq(sa.ready, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    assert_eq(@sa.sa_insert(2, [3, 4], false) or -1, 0)
+    assert_eq(sa.next_off, 10)
+    sb = StreamAssembler.{}
+    assert_eq(@sb.sa_insert(2, [3], false) or -1, 0)
+    assert_eq(@sb.sa_insert(2, [3], false) or -1, 0)
+    assert_eq(@sb.sa_insert(0, [1, 2], false) or -1, 3)
+    assert_eq(sb.ready, [1, 2, 3])
+    assert_eq(sb.sa_known_end(), 3)
+}
+
+test "stream assembler enforces final size rules" {
+    sa = StreamAssembler.{}
+    assert_eq(@sa.sa_insert(0, [1, 2], true) or -1, 2)
+    #assert(sa.sa_complete())
+    assert_eq(@sa.sa_insert(0, [1, 2], true) or -1, 0)
+    assert_eq(@sa.sa_insert(0, [1, 2, 3], false) or -1, -1)
+    assert_eq(@sa.sa_insert(2, [3], true) or -1, -1)
+    sb = StreamAssembler.{}
+    assert_eq(@sb.sa_insert(4, [5], false) or -1, 0)
+    assert_eq(@sb.sa_insert(0, [1], true) or -1, -1)
+    sc = StreamAssembler.{}
+    assert_eq(@sc.sa_insert(0, [1, 2, 3], false) or -1, 3)
+    assert_eq(@sc.sa_insert(0, [1], true) or -1, -1)
+    sd = StreamAssembler.{}
+    assert_eq(@sd.sa_insert(-1, [1], false) or -9, -9)
+    assert_eq(@sd.sa_insert(QUIC_MAX_VARINT, [1, 2], false) or -9, -9)
+    se = StreamAssembler.{window: 4}
+    assert_eq(@se.sa_insert(10, [1, 2, 3], false) or -9, 0)
+    assert_eq(@se.sa_insert(20, [1, 2], false) or -9, -9)
+    sf = StreamAssembler.{}
+    assert_eq(@sf.sa_insert(0, [], true) or -1, 0)
+    #assert(sf.sa_complete())
+    sg = StreamAssembler.{}
+    assert_eq(@sg.sa_insert(5, [1], false) or -1, 0)
+    assert_eq(@sg.sa_insert(9, [], true) or -1, 0)
+    assert_eq(sg.final_size, 9)
+    #assert(!(sg.sa_complete()))
+}
+
+test "stream assembler reassembles shuffled frames from packets" {
+    message = []
+    for i in 0..50 {
+        message = host.sys_arr_push(message, i * 3 % 251)
+    }
+    pieces = [[30, 40], [0, 10], [10, 20], [40, 50], [20, 30], [5, 15]]
+    sa = StreamAssembler.{}
+    total = 0
+    for piece in pieces {
+        lo = piece[0]
+        hi = piece[1]
+        frame = quic_stream(4, lo, q_slice(message, lo, hi), hi == 50, true) or []
+        parsed = quic_parse_frames(frame) or []
+        f = parsed[0]
+        total = total + (@sa.sa_insert(f.offset, f.data, f.fin) or 0)
+    }
+    assert_eq(total, 50)
+    assert_eq(sa.ready, message)
+    #assert(sa.sa_complete())
+}
+
+test "quic transport parameters" {
+    block = quic_params_encode([QTP_MAX_IDLE_TIMEOUT, QTP_INITIAL_MAX_DATA, QTP_ACK_DELAY_EXPONENT], [30000, 1048576, 3]) or []
+    assert_eq(block[0], 1)
+    params = quic_params_decode(block) or QParams.{}
+    assert_eq(params.ids, [1, 4, 10])
+    assert_eq(quic_param_int(params, QTP_MAX_IDLE_TIMEOUT, -1), 30000)
+    assert_eq(quic_param_int(params, QTP_INITIAL_MAX_DATA, -1), 1048576)
+    assert_eq(quic_param_int(params, QTP_ACK_DELAY_EXPONENT, -1), 3)
+    assert_eq(quic_param_int(params, QTP_MAX_ACK_DELAY, 25), 25)
+    assert_eq(host.sys_arr_len(quic_params_encode([1], []) or []), 0)
+    assert_eq(host.sys_arr_len(quic_params_encode([-1], [1]) or []), 0)
+    assert_eq(host.sys_arr_len(quic_params_encode([1], [-1]) or []), 0)
+    empty = quic_params_decode([]) or QParams.{ids: [9]}
+    assert_eq(host.sys_arr_len(empty.ids), 0)
+    dup = q_cat(block, q_slice(block, 0, 4))
+    assert_eq(quic_params_decode(dup) or QParams.{ids: [9]}.ids, [9])
+    assert_eq(quic_params_decode([1, 5, 1]) or QParams.{ids: [9]}.ids, [9])
+    wide = QParams.{ids: [1], raws: [[1, 2, 3]]}
+    assert_eq(quic_param_int(wide, 1, 77), 77)
+    tail = QParams.{ids: [1], raws: [[64, 5, 9]]}
+    assert_eq(quic_param_int(tail, 1, 77), 77)
+}
+
+test "quic error names" {
+    assert_eq(quic_error_name(QUIC_NO_ERROR), "NO_ERROR")
+    assert_eq(quic_error_name(QUIC_PROTOCOL_VIOLATION), "PROTOCOL_VIOLATION")
+    assert_eq(quic_error_name(QUIC_FINAL_SIZE_ERROR), "FINAL_SIZE_ERROR")
+    assert_eq(quic_error_name(16), "NO_VIABLE_PATH")
+    assert_eq(quic_error_name(256 + 40), "CRYPTO_ERROR(40)")
+    assert_eq(quic_error_name(17), "UNKNOWN(17)")
+    assert_eq(quic_error_name(-1), "UNKNOWN(-1)")
+    assert_eq(quic_error_name(512), "UNKNOWN(512)")
+}
+
+test "quic handshake flight end to end" {
+    client_cid = quic_new_cid("client", 8)
+    server_cid = quic_new_cid("server", 8)
+    original = quic_new_cid("original-dcid", 8)
+    hello = host.sys_arr_new(300, 22)
+    crypto = quic_crypto(0, hello) or []
+    wire = quic_initial_padded(QUIC_V1, original, client_cid, [], 0, 1, crypto, QUIC_MIN_INITIAL) or []
+    assert_eq(host.sys_arr_len(wire), 1200)
+    peek = quic_peek_long(wire) or QHeader.{version: -1}
+    assert_eq(peek.version, QUIC_V1)
+    #assert(quic_same(peek.dcid, original))
+    pkt = quic_parse_packet(wire, 0, 8) or QHeader.{ptype: -9}
+    frames = quic_parse_frames(pkt.payload) or []
+    c = frames[0]
+    assert_eq(c.kind, QF_CRYPTO)
+    assert_eq(host.sys_arr_len(c.data), 300)
+    assert_eq(frames[1].kind, QF_PADDING)
+    ack = quic_ack_from_pns([pkt.pn], 0) or []
+    reply = quic_initial(QUIC_V1, client_cid, server_cid, [], 0, 1, ack) or []
+    rp = quic_parse_packet(reply, 0, 8) or QHeader.{ptype: -9}
+    #assert(quic_same(rp.dcid, client_cid))
+    #assert(quic_same(rp.scid, server_cid))
+    rf = quic_parse_frames(rp.payload) or []
+    #assert(quic_ack_covers(rf[0], 0))
+    one_rtt = quic_short_packet(server_cid, 1, 1, false, false, quic_stream(0, 0, [104, 105], true, true) or []) or []
+    sp = quic_parse_packet(one_rtt, 0, 8) or QHeader.{ptype: -9}
+    sf = quic_parse_frames(sp.payload) or []
+    assert_eq(sf[0].data, [104, 105])
+    unsupported = host.sys_arr_set(wire, 4, 77)
+    uh = quic_peek_long(unsupported) or QHeader.{version: -1}
+    assert_eq(uh.version, 77 + 0)
+    vn = quic_version_negotiation(uh.scid, uh.dcid, [QUIC_V1, QUIC_V2], 0) or []
+    vh = quic_parse_packet(vn, 0, 0) or QHeader.{ptype: -9}
+    assert_eq(vh.ptype, QUIC_VERSION_NEGOTIATION)
+    #assert(quic_same(vh.dcid, client_cid))
+    assert_eq(vh.versions, [1, 1805313023])
+}

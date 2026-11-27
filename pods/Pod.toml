@@ -1,0 +1,15 @@
+[workspace]
+members = [
+  "claude",
+  "deepseek",
+  "elevenlabs",
+  "gemini",
+  "openai",
+  "openrouter",
+  "seedance",
+  "supabase",
+  "neon",
+  "cockroachdb",
+  "mariadb",
+  "meilisearch",
+]

@@ -1,0 +1,56 @@
+// 11_voxel_raycast — software DDA raycast over a fixed voxel grid (par scanlines)
+use std.math.core
+
++W = 64
++H = 48
++MAP = 16
++MAX_STEPS = 32
+
++sample(map, x: i64, y: i64, z: i64): i64 {
+    return 0 if x < 0 || y < 0 || z < 0 || x >= MAP || y >= MAP || z >= MAP
+    map[y * MAP * MAP + z * MAP + x]
+}
+
++cast(map, ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64): i64 {
+    x, y, z, dist = ox, oy, oz, 0
+    for 0..MAX_STEPS {
+        ix, iy, iz = x.to_int(), y.to_int(), z.to_int()
+        hit = sample(map, ix, iy, iz)
+        return dist if hit != 0
+        x += dx
+        y += dy
+        z += dz
+        dist += 1
+    }
+    0
+}
+
++main() {
+    map = [0; 4096]
+    // solid floor + a pillar
+    for z in 0..MAP {
+        for x in 0..MAP {
+            map[0 * MAP * MAP + z * MAP + x] = 1
+        }
+    }
+    map[2 * MAP * MAP + 8 * MAP + 8] = 2
+    rows = [0; H]
+    par y in 0..H {
+        local = 0
+        for x in 0..W {
+            u = (x * 1.0 / W) * 2.0 - 1.0
+            v = (y * 1.0 / H) * 2.0 - 1.0
+            local += cast(map, 8.0, 3.0, 8.0, u * 0.05, -0.02, v * 0.05)
+        }
+        rows[y] = local
+    }
+    cs = rows.sum()
+    print("CHECKSUM={cs}")
+}
+
+test "floor is solid" {
+    map = [0; 4096]
+    map[0] = 1
+    assert_eq(sample(map, 0, 0, 0), 1)
+    assert_eq(sample(map, -1, 0, 0), 0)
+}

@@ -1,0 +1,39 @@
+//! Human-locked laws for `std.core.reduce` associative reducers.
+//! AI agents must not edit this file; put discharges in `reduce.proof.sr`.
+//! Round 7: real Iterable pipeline bodies (`sum` / `product` / `min` / `max`).
+//! Implementation anchors: `reduce_with`, `SumReducer`, `ProductReducer`,
+//! `MinReducer`, `MaxReducer` in `reduce.sr` (pipelines are the preferred API).
+
+#law("xs.sum folds small integer arrays")
+reduce_sum_small() {
+    xs = [2, 3, 4]
+    #assert(xs.sum() == 9)
+}
+
+#law("xs.product folds small integer arrays")
+reduce_product_small() {
+    xs = [2, 3, 4]
+    #assert(xs.product() == 24)
+}
+
+#law("xs.min and xs.max on a three-element array")
+reduce_min_max_small() {
+    xs = [4, 1, 7]
+    #assert(xs.min() == 1)
+    #assert(xs.max() == 7)
+}
+
+#law("integer addition is associative under -fwrapv wraparound")
+i64_add_associative(a: i64, b: i64, c: i64) {
+    #assert((a + b) + c == a + (b + c))
+}
+
+#law("integer addition is commutative under -fwrapv wraparound")
+i64_add_commutative(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}
+
+#law("integer multiplication distributes over addition under wraparound")
+i64_mul_distributes(a: i64, b: i64, c: i64) {
+    #assert(a * (b + c) == a * b + a * c)
+}

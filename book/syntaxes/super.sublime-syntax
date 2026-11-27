@@ -1,0 +1,50 @@
+%YAML 1.2
+---
+name: Super
+file_extensions: [sr, super]
+scope: source.super
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - match: '\b(par|sum|for|when|else|if|break|continue|return|ensure|fail|or|err|test|use|mod|state|await|spawn|scope|shared|chan|none|true|false|loop|while|in|and|not)\b'
+      scope: keyword.control.super
+    - match: '\b(i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|str|void)\b'
+      scope: storage.type.super
+    - match: '(?<![A-Za-z0-9_])@(?:[A-Za-z_][A-Za-z0-9_]*)?'
+      scope: keyword.operator.mut.super
+    - match: '(?<![A-Za-z0-9_])#(?:[A-Za-z_][A-Za-z0-9_]*)?'
+      scope: keyword.other.comptime.super
+    - match: '\+|=>'
+      scope: keyword.operator.super
+    - match: '[=!<>]=|[+\-*/%<>=|&^~?:.]|\.\.'
+      scope: keyword.operator.super
+    - match: '\b[A-Z][A-Za-z0-9_]*\b'
+      scope: entity.name.type.super
+    - match: '\b[a-z_][A-Za-z0-9_]*\b'
+      scope: variable.other.super
+
+  comments:
+    - match: '///.*$'
+      scope: comment.line.documentation.super
+    - match: '//.*$'
+      scope: comment.line.double-slash.super
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.super
+      push:
+        - meta_scope: string.quoted.double.super
+        - match: '\\.'
+          scope: constant.character.escape.super
+        - match: '\{[^}]*\}'
+          scope: constant.other.placeholder.super
+        - match: '"'
+          scope: punctuation.definition.string.end.super
+          pop: true
+
+  numbers:
+    - match: '\b0x[0-9a-fA-F_]+|\b0b[01_]+|\b[0-9][0-9_]*(\.[0-9_]+)?([eE][+-]?[0-9_]+)?\b'
+      scope: constant.numeric.super

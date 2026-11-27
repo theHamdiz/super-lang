@@ -1,0 +1,3 @@
+# cargo-audit policy (0.1.0). Add advisories only with a CVE link in the commit message.
+[advisories]
+ignore = []

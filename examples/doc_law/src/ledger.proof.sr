@@ -1,0 +1,6 @@
+//! Discharges for `ledger.law.sr`.
+
+#proof(transfer_conserves)
+prove_transfer_conserves(src: i64, dst: i64, amount: i64) {
+    #assert((src - amount) + (dst + amount) == src + dst)
+}

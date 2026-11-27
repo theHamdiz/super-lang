@@ -1,0 +1,76 @@
+//! std.net.dns — hostname → address list via host resolver
+//!
+//! Import with:
+//!   use std.net.dns
+
+use std.core.collections
+use std.core.str
+use std.io.socket
+
+/// `HostPort` is a hostname plus a numeric port.
++HostPort = {
+    /// Host on `HostPort` (`str`). Defaults to `""`.
+    host: str = ""
+    /// Port on `HostPort` (`i64`). Defaults to `0`.
+    port: i64 = 0
+}
+
+/// `Dns` looks up hostnames.
++Dns = {
+    /// Placeholder so the type is a real value type (static-only types hang Type.method).
+    tag: i64 = 0
+
+    /// Lookup on this `Dns` (`hostport`), or fail.
+    lookup(hostport: str) : _! {
+        socket_dns_lookup(hostport) or err { fail "{err}" }
+    }
+
+    /// Lookup host on this `Dns` (`name`, `port`), or fail.
+    lookup_host(name: str, port: i64) : _! => Dns.lookup("{name}:{port}")
+
+    /// First on this `Dns` (`hostport`). Returns `str`, or `none`.
+    first(hostport: str) : str? {
+        addrs = Dns.lookup(hostport) or err { return none }
+        ensure len(addrs) > 0 else { return none }
+        addrs[0]
+    }
+
+    /// Host port on this `Dns` (`name`, `port`). Returns `str`.
+    host_port(name: str, port: i64) : str => "{name}:{port}"
+
+    /// Lookup port on this `Dns` (`name`, `service`), or fail.
+    lookup_port(name: str, service: str) : _! {
+        Dns.lookup("{name}:{service}")
+    }
+
+    /// Split host port on this `Dns` (`hostport`). Returns `HostPort`, or `none`.
+    split_host_port(hostport: str) : HostPort? {
+        pos = -1
+        n = host.sys_str_len(hostport)
+        for 0..n {
+            if hostport[it] == ":" { pos = it }
+        }
+        if pos <= 0 { return none }
+        h = hostport[0..pos]
+        port = to_i64(hostport[(pos + 1)..n]) or -1
+        if port < 0 { return none }
+        HostPort.{host: h, port}
+    }
+}
+
+/// Test that literal lookup.
+test "literal lookup" {
+    r = Dns.lookup("127.0.0.1:443") or err {
+        assert_eq(1, 0)
+        return
+    }
+    #assert(len(r) >= 1)
+    assert_eq(r[0], "127.0.0.1:443")
+    assert_eq(Dns.first("127.0.0.1:9") or "?", "127.0.0.1:9")
+}
+
+/// Test that host_port helper.
+test "host_port helper" {
+    assert_eq(Dns.host_port("localhost", 80), "localhost:80")
+    assert_eq(Dns.host_port("127.0.0.1", 443), "127.0.0.1:443")
+}

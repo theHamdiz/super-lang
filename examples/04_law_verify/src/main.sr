@@ -1,0 +1,28 @@
+//! Conformance fixture for `#law` / `#proof` / `super verify`.
+//!
+//! Companions: `ledger.law.sr`, `ledger.proof.sr`.
+
++Account = {
+    balance: i64 = 0
+}
+
++transfer(@src: Account, @dst: Account, amount: i64) : bool {
+    if amount < 0 { return false }
+    if src.balance < amount { return false }
+    src.balance -= amount
+    dst.balance += amount
+    true
+}
+
++main() {
+    print("law verify example — run: super verify")
+}
+
+test "transfer moves funds" {
+    s = Account.{balance: 100}
+    d = Account.{balance: 0}
+    ok = transfer(@s, @d, 40)
+    #assert(ok)
+    assert_eq(s.balance, 60)
+    assert_eq(d.balance, 40)
+}

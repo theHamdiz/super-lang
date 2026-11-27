@@ -1,0 +1,1229 @@
+//! std.math.integrate — quadrature and ODE integration
+//!
+//! Import with:
+//!   use std.math.integrate
+//!
+//!   f = tape_poly([0.0, 0.0, 1.0])                       // x^2 (a `ReverseTape`)
+//!   r = quad_gk(f, 0.0, 3.0, 0.0000000001, 0.0000000001, 50)  // r.value ~ 9, r.error, r.evals
+//!   s = tanh_sinh(g, 0.0, 1.0, 0.00000000001)            // endpoint singularities are fine
+//!   t = quad_gk_inf(h, 0.0, 1, 0.000000001, 0.000000001, 60)  // [0, inf); mode 2 is (-inf, inf)
+//!
+//!   ode = ode_decay(0.5)                                 // y' = -0.5 y; inputs [t, y], outputs [y']
+//!   a = rk4(ode, 0.0, [1.0], 4.0, 400)                   // a.final()
+//!   b = dopri5(ode, 0.0, [1.0], 4.0, 0.000001, 0.000000001, 0.1, 10000)
+//!   c = rosenbrock4(ode_robertson(), 0.0, [1.0, 0.0, 0.0], 40.0, 0.000001, 0.000000001, 0.0, 10000)  // stiff
+//!   d = bdf2(ode_stiff_relax(1000.0), 0.0, [0.0], 2.0, 200)    // fixed-step implicit BDF2
+//!
+//! Functions are `ReverseTape` values from `std.math.ad` (Super has no first-class function
+//! values in 0.1.0). Scalar integrands are one-input tapes; an ODE right-hand side is a tape
+//! with inputs `[t, y_0, ..., y_{n-1}]` and `n` outputs. `quad_gk` is adaptive Gauss-Kronrod
+//! (G7 / K15, QUADPACK error scaling, bisect the worst interval). `tanh_sinh` is the
+//! double-exponential rule with level doubling. `rk4` is fixed-step classical Runge-Kutta;
+//! `dopri5` is Dormand-Prince 5(4) with error control and FSAL. For stiff systems `rosenbrock4`
+//! is an adaptive A-stable 4th-order Rosenbrock (Shampine / Kaps-Rentrop form, gamma = 1/2,
+//! embedded 3rd-order error estimate) and `bdf2` is the fixed-step 2-step backward differentiation formula solved
+//! by Newton iteration; both take exact Jacobians (`df/dt`, `df/dy`) from the tape's forward-mode
+//! pass and solve the linear systems with partial-pivot Gaussian elimination (`ode_lin_solve`).
+//! Public helpers are prefixed `quad_` / `ode_` (modules merge flat).
+
+use std.math.ad
+
+/// `QUAD_PI` is pi.
++QUAD_PI = 3.141592653589793
+
+/// Result of a quadrature.
++QuadResult = {
+    /// Estimated integral.
+    value: f64 = 0.0
+    /// Estimated absolute error.
+    error: f64 = 0.0
+    /// Integrand evaluations.
+    evals: i64 = 0
+    /// Subdivisions (Gauss-Kronrod) or refinement levels (tanh-sinh).
+    levels: i64 = 0
+    /// True when the tolerance was met.
+    converged: bool = false
+}
+
+/// Absolute value of `x`.
++quad_abs(x: f64) : f64 {
+    if x < 0.0 { return -x }
+    x
+}
+
+/// Integrand value for the substitution `mode` at parameter `t`:
+/// 0 = finite interval (x = t, w = 1), 1 = `[a, inf)` (x = a + t / (1 - t)), 2 = `(-inf, inf)` (x = t / (1 - t^2)).
++quad_eval(f: ReverseTape, mode: i64, a: f64, t: f64) : f64 {
+    if mode == 1 {
+        om = 1.0 - t
+        x = a + t / om
+        return f.value([x]) / (om * om)
+    }
+    if mode == 2 {
+        q = 1.0 - t * t
+        x = t / q
+        return f.value([x]) * (1.0 + t * t) / (q * q)
+    }
+    f.value([t])
+}
+
+/// Gauss-Kronrod 15-point rule on `[lo, hi]` for substitution `mode`: returns `[integral, error, evals]`.
++quad_gk15(f: ReverseTape, mode: i64, a: f64, lo: f64, hi: f64) {
+    xgk = [0.9914553711208126, 0.9491079123427585, 0.8648644233597691, 0.7415311855993945, 0.5860872354676911, 0.4058451513773972, 0.2077849550078985, 0.0]
+    wgk = [0.022935322010529224, 0.06309209262997855, 0.10479001032225018, 0.14065325971552592, 0.16900472663926790, 0.19035057806478540, 0.20443294007529889, 0.20948214108472782]
+    wg = [0.1294849661688697, 0.2797053914892767, 0.3818300505051189, 0.4179591836734694]
+    center = 0.5 * (lo + hi)
+    half = 0.5 * (hi - lo)
+    fc = quad_eval(f, mode, a, center)
+    resk = wgk[7] * fc
+    resg = wg[3] * fc
+    resabs = wgk[7] * quad_abs(fc)
+    fv1 = host.sys_arr_new(7, 0.0)
+    fv2 = host.sys_arr_new(7, 0.0)
+    j = 0
+    while j < 7 {
+        dx = half * xgk[j]
+        f1 = quad_eval(f, mode, a, center - dx)
+        f2 = quad_eval(f, mode, a, center + dx)
+        fv1 = host.sys_arr_set(fv1, j, f1)
+        fv2 = host.sys_arr_set(fv2, j, f2)
+        resk += wgk[j] * (f1 + f2)
+        resabs += wgk[j] * (quad_abs(f1) + quad_abs(f2))
+        if j % 2 == 1 { resg += wg[j / 2] * (f1 + f2) }
+        j += 1
+    }
+    reskh = resk * 0.5
+    resasc = wgk[7] * quad_abs(fc - reskh)
+    j = 0
+    while j < 7 {
+        resasc += wgk[j] * (quad_abs(fv1[j] - reskh) + quad_abs(fv2[j] - reskh))
+        j += 1
+    }
+    ah = quad_abs(half)
+    result = resk * half
+    resabs = resabs * ah
+    resasc = resasc * ah
+    err = quad_abs((resk - resg) * half)
+    if resasc > 0.0 {
+        if err > 0.0 {
+            ratio = 200.0 * err / resasc
+            scale = ratio * host.sys_sqrt(ratio)
+            if scale > 1.0 { scale = 1.0 }
+            err = resasc * scale
+        }
+    }
+    floor_err = 0.00000000000000888 * 5.0 * resabs
+    if floor_err > err { err = floor_err }
+    return [result, err, 15.0]
+}
+
+/// Adaptive Gauss-Kronrod quadrature of a one-input tape over the finite interval `[a, b]` (sign follows the orientation).
+/// Stops when the error estimate is below `max(abs_tol, rel_tol * |I|)` or after `max_sub` bisections.
++quad_gk(f: ReverseTape, a: f64, b: f64, abs_tol: f64, rel_tol: f64, max_sub: i64) : QuadResult => quad_adaptive(f, 0, 0.0, a, b, abs_tol, rel_tol, max_sub)
+
+/// Quadrature over an infinite range: `mode` 1 is `[a, inf)` and `mode` 2 is `(-inf, inf)` (`a` is ignored).
++quad_gk_inf(f: ReverseTape, a: f64, mode: i64, abs_tol: f64, rel_tol: f64, max_sub: i64) : QuadResult {
+    if mode == 1 { return quad_adaptive(f, 1, a, 0.0, 1.0, abs_tol, rel_tol, max_sub) }
+    quad_adaptive(f, 2, 0.0, -1.0, 1.0, abs_tol, rel_tol, max_sub)
+}
+
+/// Shared adaptive driver over the substituted parameter interval `[lo, hi]`.
++quad_adaptive(f: ReverseTape, mode: i64, a: f64, lo: f64, hi: f64, abs_tol: f64, rel_tol: f64, max_sub: i64) : QuadResult {
+    first = quad_gk15(f, mode, a, lo, hi)
+    los = [lo]
+    his = [hi]
+    vals = [first[0]]
+    errs = [first[1]]
+    evals = 15
+    total = first[0]
+    total_err = first[1]
+    subs = 0
+    done = false
+    while !done {
+        thr = abs_tol
+        rel = rel_tol * quad_abs(total)
+        if rel > thr { thr = rel }
+        if total_err <= thr {
+            done = true
+        } else {
+            if subs >= max_sub {
+                done = true
+            } else {
+                // bisect the interval with the largest error
+                worst = 0
+                i = 1
+                while i < host.sys_arr_len(errs) {
+                    if errs[i] > errs[worst] { worst = i }
+                    i += 1
+                }
+                wl = los[worst]
+                wh = his[worst]
+                mid = 0.5 * (wl + wh)
+                left = quad_gk15(f, mode, a, wl, mid)
+                right = quad_gk15(f, mode, a, mid, wh)
+                evals += 30
+                subs += 1
+                los = host.sys_arr_set(los, worst, wl)
+                his = host.sys_arr_set(his, worst, mid)
+                vals = host.sys_arr_set(vals, worst, left[0])
+                errs = host.sys_arr_set(errs, worst, left[1])
+                los = host.sys_arr_push(los, mid)
+                his = host.sys_arr_push(his, wh)
+                vals = host.sys_arr_push(vals, right[0])
+                errs = host.sys_arr_push(errs, right[1])
+                total = 0.0
+                total_err = 0.0
+                i = 0
+                while i < host.sys_arr_len(vals) {
+                    total += vals[i]
+                    total_err += errs[i]
+                    i += 1
+                }
+            }
+        }
+    }
+    thr = abs_tol
+    rel = rel_tol * quad_abs(total)
+    if rel > thr { thr = rel }
+    QuadResult.{value: total, error: total_err, evals, levels: subs, converged: total_err <= thr}
+}
+
+// --- tanh-sinh -------------------------------------------------------------------------------------------
+
+/// Tanh-sinh (double exponential) quadrature of a one-input tape over `[a, b]`. The rule never evaluates
+/// the endpoints, so integrable singularities there (`ln x`, `x^-0.5`) are handled (interior singularities are not);
+/// `tol` is the relative change between successive levels.
++tanh_sinh(f: ReverseTape, a: f64, b: f64, tol: f64) : QuadResult {
+    half = 0.5 * (b - a)
+    mid = 0.5 * (a + b)
+    tmax = 3.6
+    evals = 0
+    // level 0: step h = 1 over all integer nodes
+    h = 1.0
+    total = 0.0
+    j = -3
+    while j <= 3 {
+        total += quad_ts_term(f, a, b, mid, half, host.sys_to_float(j) * h)
+        evals += 1
+        j += 1
+    }
+    prev = total * h * half
+    cur = prev
+    level = 0
+    done = false
+    err = 1.0e300
+    while level < 9 && !done {
+        level += 1
+        h = h / 2.0
+        // new nodes are the odd multiples of h
+        add = 0.0
+        nmax = host.sys_to_int(tmax / h)
+        j = 1
+        while j <= nmax {
+            t = host.sys_to_float(j) * h
+            add += quad_ts_term(f, a, b, mid, half, t)
+            add += quad_ts_term(f, a, b, mid, half, -t)
+            evals += 2
+            j += 2
+        }
+        total = total * 0.5 + add * h
+        cur = total * half
+        err = quad_abs(cur - prev)
+        if err <= tol * (1.0 + quad_abs(cur)) { done = true }
+        prev = cur
+    }
+    QuadResult.{value: cur, error: err, evals, levels: level, converged: done}
+}
+
+/// One weighted tanh-sinh node at abscissa `t`: `w(t) * f(x(t))` (without the `h * half` factor).
++quad_ts_term(f: ReverseTape, a: f64, b: f64, mid: f64, half: f64, t: f64) : f64 {
+    u = 0.5 * QUAD_PI * host.sys_sinh(t)
+    ch = host.sys_cosh(u)
+    w = 0.5 * QUAD_PI * host.sys_cosh(t) / (ch * ch)
+    if w < 1.0e-300 { return 0.0 }
+    // distance from the nearer endpoint, computed without cancellation
+    dist = 0.0
+    x = mid
+    if u >= 0.0 {
+        dist = half * 2.0 / (1.0 + host.sys_exp(2.0 * u))
+        x = b - dist
+    } else {
+        dist = half * 2.0 / (1.0 + host.sys_exp(-2.0 * u))
+        x = a + dist
+    }
+    if dist <= 0.0 { return 0.0 }
+    w * f.value([x])
+}
+
+// --- sample-based rules -----------------------------------------------------------------------------------
+
+/// Trapezoid rule on equally spaced samples `ys` with spacing `h`.
++quad_trapz(ys: _, h: f64) : f64 {
+    n = host.sys_arr_len(ys)
+    ensure n >= 2 else { return 0.0 }
+    s = 0.5 * (ys[0] + ys[n - 1])
+    i = 1
+    while i < n - 1 {
+        s += ys[i]
+        i += 1
+    }
+    s * h
+}
+
+/// Simpson's rule on equally spaced samples (odd count; a trailing interval uses the trapezoid).
++quad_simpson(ys: _, h: f64) : f64 {
+    n = host.sys_arr_len(ys)
+    ensure n >= 2 else { return 0.0 }
+    if n == 2 { return 0.5 * h * (ys[0] + ys[1]) }
+    m = n
+    extra = 0.0
+    if n % 2 == 0 {
+        m = n - 1
+        extra = 0.5 * h * (ys[n - 2] + ys[n - 1])
+    }
+    s = ys[0] + ys[m - 1]
+    i = 1
+    while i < m - 1 {
+        if i % 2 == 1 { s += 4.0 * ys[i] } else { s += 2.0 * ys[i] }
+        i += 1
+    }
+    s * h / 3.0 + extra
+}
+
+/// Sample a one-input tape at `n + 1` equally spaced points of `[a, b]`.
++quad_sample(f: ReverseTape, a: f64, b: f64, n: i64) {
+    out = []
+    i = 0
+    while i <= n {
+        x = a + (b - a) * host.sys_to_float(i) / host.sys_to_float(n)
+        out = host.sys_arr_push(out, f.value([x]))
+        i += 1
+    }
+    out
+}
+
+// --- ODEs -------------------------------------------------------------------------------------------------------
+
+/// Result of an ODE integration: a trajectory of `steps + 1` states.
++OdeResult = {
+    /// Time of each stored state.
+    ts: _ = []
+    /// States, row-major `(steps + 1) x n`.
+    ys: _ = []
+    /// State dimension.
+    n: i64 = 0
+    /// Accepted steps.
+    steps: i64 = 0
+    /// Rejected steps (adaptive solvers).
+    rejected: i64 = 0
+    /// Right-hand-side evaluations.
+    evals: i64 = 0
+    /// True when the end time was reached.
+    converged: bool = false
+
+    /// The state at the end of the integration.
+    final(self) {
+        out = []
+        base = self.steps * self.n
+        i = 0
+        while i < self.n {
+            out = host.sys_arr_push(out, self.ys[base + i])
+            i += 1
+        }
+        out
+    }
+
+    /// State `k` (0 is the initial state).
+    state(self, k: i64) {
+        out = []
+        i = 0
+        while i < self.n {
+            out = host.sys_arr_push(out, self.ys[k * self.n + i])
+            i += 1
+        }
+        out
+    }
+
+    /// Final time reached.
+    t_end(self) : f64 => self.ts[self.steps]
+}
+
+/// Right-hand side `f(t, y)` of an ODE tape.
++ode_rhs(f: ReverseTape, t: f64, y: _) => f.values(ode_input(t, y))
+
+/// `y + h * k` as a new array.
++ode_axpy(y: _, h: f64, k: _) {
+    out = []
+    i = 0
+    while i < host.sys_arr_len(y) {
+        out = host.sys_arr_push(out, y[i] + h * k[i])
+        i += 1
+    }
+    out
+}
+
+/// Tape input vector `[t, y_0, ..., y_{n-1}]`.
++ode_input(t: f64, y: _) {
+    out = [t]
+    i = 0
+    while i < host.sys_arr_len(y) {
+        out = host.sys_arr_push(out, y[i])
+        i += 1
+    }
+    out
+}
+
+/// One classical RK4 step of size `h` from `(t, y)`; returns the new state.
++rk4_step(f: ReverseTape, t: f64, y: _, h: f64) {
+    k1 = f.values(ode_input(t, y))
+    k2 = f.values(ode_input(t + 0.5 * h, ode_axpy(y, 0.5 * h, k1)))
+    k3 = f.values(ode_input(t + 0.5 * h, ode_axpy(y, 0.5 * h, k2)))
+    k4 = f.values(ode_input(t + h, ode_axpy(y, h, k3)))
+    out = []
+    i = 0
+    while i < host.sys_arr_len(y) {
+        out = host.sys_arr_push(out, y[i] + h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]))
+        i += 1
+    }
+    out
+}
+
+/// Fixed-step RK4 from `t0` to `t1` in `n_steps` steps (works backward when `t1 < t0`).
++rk4(f: ReverseTape, t0: f64, y0: _, t1: f64, n_steps: i64) : OdeResult {
+    n = host.sys_arr_len(y0)
+    ts = [t0]
+    ys = y0
+    y = y0
+    h = (t1 - t0) / host.sys_to_float(n_steps)
+    k = 0
+    while k < n_steps {
+        t = t0 + h * host.sys_to_float(k)
+        y = rk4_step(f, t, y, h)
+        ts = host.sys_arr_push(ts, t0 + h * host.sys_to_float(k + 1))
+        i = 0
+        while i < n {
+            ys = host.sys_arr_push(ys, y[i])
+            i += 1
+        }
+        k += 1
+    }
+    OdeResult.{ts, ys, n, steps: n_steps, rejected: 0, evals: 4 * n_steps, converged: true}
+}
+
+/// Error-normalised RMS of `e` against `atol + rtol * max(|y|, |ynew|)`.
++ode_err_norm(e: _, y: _, ynew: _, rtol: f64, atol: f64) : f64 {
+    n = host.sys_arr_len(e)
+    s = 0.0
+    i = 0
+    while i < n {
+        m = quad_abs(y[i])
+        if quad_abs(ynew[i]) > m { m = quad_abs(ynew[i]) }
+        sc = atol + rtol * m
+        r = e[i] / sc
+        s += r * r
+        i += 1
+    }
+    host.sys_sqrt(s / host.sys_to_float(n))
+}
+
+/// Linear combination `y + h * sum c_j k_j` where `ks` is an array of stage arrays.
++ode_comb(y: _, h: f64, cs: _, ks: _) {
+    out = []
+    i = 0
+    while i < host.sys_arr_len(y) {
+        acc = 0.0
+        j = 0
+        while j < host.sys_arr_len(cs) {
+            kj = ks[j]
+            acc += cs[j] * kj[i]
+            j += 1
+        }
+        out = host.sys_arr_push(out, y[i] + h * acc)
+        i += 1
+    }
+    out
+}
+
+/// Dormand-Prince 5(4) adaptive integrator from `t0` to `t1` with relative / absolute tolerances,
+/// initial step `h0` (0 picks one automatically) and at most `max_steps` accepted + rejected steps.
++dopri5(f: ReverseTape, t0: f64, y0: _, t1: f64, rtol: f64, atol: f64, h0: f64, max_steps: i64) : OdeResult {
+    n = host.sys_arr_len(y0)
+    dir = 1.0
+    if t1 < t0 { dir = -1.0 }
+    span = quad_abs(t1 - t0)
+    t = t0
+    y = y0
+    ts = [t0]
+    ys = y0
+    k1 = f.values(ode_input(t, y))
+    evals = 1
+    h = h0
+    if h <= 0.0 {
+        d0 = ode_err_norm(y, y, y, rtol, atol) * 1.0
+        d1 = ode_err_norm(k1, y, y, rtol, atol)
+        h = 0.01 * span
+        if d0 > 0.00001 {
+            if d1 > 0.00001 { h = 0.01 * d0 / d1 }
+        }
+    }
+    if h > span { h = span }
+    steps = 0
+    rejected = 0
+    iters = 0
+    while quad_abs(t1 - t) > 1.0e-14 * (1.0 + quad_abs(t1)) && iters < max_steps {
+        iters += 1
+        if h > quad_abs(t1 - t) { h = quad_abs(t1 - t) }
+        hs = dir * h
+        k2 = f.values(ode_input(t + 0.2 * hs, ode_comb(y, hs, [0.2], [k1])))
+        k3 = f.values(ode_input(t + 0.3 * hs, ode_comb(y, hs, [0.075, 0.225], [k1, k2])))
+        k4 = f.values(ode_input(t + 0.8 * hs, ode_comb(y, hs, [0.9777777777777777, -3.7333333333333334, 3.5555555555555554], [k1, k2, k3])))
+        k5 = f.values(ode_input(t + 8.0 / 9.0 * hs, ode_comb(y, hs, [2.9525986892242035, -11.595793324188385, 9.822892851699436, -0.2908093278463649], [k1, k2, k3, k4])))
+        k6 = f.values(ode_input(t + hs, ode_comb(y, hs, [2.8462752525252526, -10.757575757575758, 8.906422717743473, 0.2784090909090909, -0.2735313036020583], [k1, k2, k3, k4, k5])))
+        ynew = ode_comb(y, hs, [0.09114583333333333, 0.0, 0.44923629829290207, 0.6510416666666666, -0.322376179245283, 0.13095238095238096], [k1, k2, k3, k4, k5, k6])
+        k7 = f.values(ode_input(t + hs, ynew))
+        evals += 6
+        err_vec = ode_comb(host.sys_arr_new(n, 0.0), hs, [0.0012326388888888888, 0.0, -0.0042527702905061394, 0.03697916666666667, -0.05086379716981132, 0.0419047619047619, -0.025], [k1, k2, k3, k4, k5, k6, k7])
+        en = ode_err_norm(err_vec, y, ynew, rtol, atol)
+        if en <= 1.0 {
+            t = t + hs
+            y = ynew
+            k1 = k7
+            ts = host.sys_arr_push(ts, t)
+            i = 0
+            while i < n {
+                ys = host.sys_arr_push(ys, y[i])
+                i += 1
+            }
+            steps += 1
+        } else {
+            rejected += 1
+        }
+        fac = 5.0
+        if en > 0.0 {
+            fac = 0.9 * host.sys_pow(en, -0.2)
+            if fac > 5.0 { fac = 5.0 }
+        }
+        if fac < 0.2 { fac = 0.2 }
+        h = h * fac
+    }
+    reached = quad_abs(t1 - t) <= 1.0e-14 * (1.0 + quad_abs(t1))
+    OdeResult.{ts, ys, n, steps, rejected, evals, converged: reached}
+}
+
+// --- stiff solvers: Rosenbrock4 and BDF2 --------------------------------------------------------------------------
+
+/// Solve `A x = b` for a dense row-major `n x n` matrix by Gaussian elimination with partial
+/// pivoting. Returns an empty array when `A` is singular.
++ode_lin_solve(a: _, b: _, n: i64) {
+    m = a
+    x = b
+    for 0..n {
+        k = it
+        piv = k
+        best = quad_abs(m[k * n + k])
+        for (k + 1)..n {
+            r = it
+            v = quad_abs(m[r * n + k])
+            if v > best {
+                best = v
+                piv = r
+            }
+        }
+        if best < 1.0e-300 { return [] }
+        if piv != k {
+            for 0..n {
+                tmp = m[k * n + it]
+                m = host.sys_arr_set(m, k * n + it, m[piv * n + it])
+                m = host.sys_arr_set(m, piv * n + it, tmp)
+            }
+            tx = x[k]
+            x = host.sys_arr_set(x, k, x[piv])
+            x = host.sys_arr_set(x, piv, tx)
+        }
+        for (k + 1)..n {
+            r = it
+            f = m[r * n + k] / m[k * n + k]
+            for k..n { m = host.sys_arr_set(m, r * n + it, m[r * n + it] - f * m[k * n + it]) }
+            x = host.sys_arr_set(x, r, x[r] - f * x[k])
+        }
+    }
+    i = n - 1
+    while i >= 0 {
+        acc = x[i]
+        j = i + 1
+        while j < n {
+            acc -= m[i * n + j] * x[j]
+            j += 1
+        }
+        x = host.sys_arr_set(x, i, acc / m[i * n + i])
+        i -= 1
+    }
+    x
+}
+
+/// Jacobian pieces of an ODE tape at `(t, y)`: `[J, dfdt]` with `J` the row-major `n x n` matrix
+/// `df/dy` and `dfdt` the time derivative, both from one forward-mode sweep.
++ode_jac(f: ReverseTape, t: f64, y: _) {
+    n = host.sys_arr_len(y)
+    jf = f.jacobian(ode_input(t, y))
+    w = n + 1
+    jm = []
+    ft = []
+    for 0..n {
+        i = it
+        ft = host.sys_arr_push(ft, jf[i * w])
+        for 0..n { jm = host.sys_arr_push(jm, jf[i * w + it + 1]) }
+    }
+    out = [jm, ft]
+    out
+}
+
+/// One Rosenbrock stage right-hand side: `d + h cx dfdt + (sum c_j g_j) / h`.
+ros4_rhs(d: _, ft: _, cx: f64, h: f64, cs: _, gs: _) {
+    out = []
+    for 0..host.sys_arr_len(d) {
+        i = it
+        acc = 0.0
+        for 0..host.sys_arr_len(cs) {
+            gj = gs[it]
+            acc += cs[it] * gj[i]
+        }
+        out = host.sys_arr_push(out, d[i] + h * cx * ft[i] + acc / h)
+    }
+    out
+}
+
+/// Result of one Rosenbrock step: new state, embedded error vector, and whether the linear solves worked.
+Ros4Out = {
+    y: _ = []
+    est: _ = []
+    ok: bool = true
+}
+
+/// One 4-stage Rosenbrock step (gamma = 1/2, Shampine's A-stable 4th-order coefficients with an
+/// embedded 3rd-order error estimate) from `(t, y)` with step `h`.
+ros4_core(f: ReverseTape, t: f64, y: _, h: f64) : Ros4Out {
+    n = host.sys_arr_len(y)
+    jp = ode_jac(f, t, y)
+    jm = jp[0]
+    ft = jp[1]
+    amat = []
+    for 0..n {
+        i = it
+        for 0..n {
+            d = 0.0
+            if i == it { d = 2.0 / h }
+            amat = host.sys_arr_push(amat, d - jm[i * n + it])
+        }
+    }
+    f0 = f.values(ode_input(t, y))
+    g1 = ode_lin_solve(amat, ros4_rhs(f0, ft, 0.5, h, [], []), n)
+    if host.sys_arr_len(g1) == 0 { return Ros4Out.{y, est: y, ok: false} }
+    d2 = f.values(ode_input(t + h, ode_axpy(y, 2.0, g1)))
+    g2 = ode_lin_solve(amat, ros4_rhs(d2, ft, -1.5, h, [-8.0], [g1]), n)
+    if host.sys_arr_len(g2) == 0 { return Ros4Out.{y, est: y, ok: false} }
+    d3 = f.values(ode_input(t + 0.6 * h, ode_comb(y, 1.0, [1.92, 0.24], [g1, g2])))
+    g3 = ode_lin_solve(amat, ros4_rhs(d3, ft, 2.42, h, [14.88, 2.4], [g1, g2]), n)
+    if host.sys_arr_len(g3) == 0 { return Ros4Out.{y, est: y, ok: false} }
+    g4 = ode_lin_solve(amat, ros4_rhs(d3, ft, 0.116, h, [-0.896, -0.432, -0.4], [g1, g2, g3]), n)
+    if host.sys_arr_len(g4) == 0 { return Ros4Out.{y, est: y, ok: false} }
+    ynew = ode_comb(y, 1.0, [2.111111111111111, 0.5, 0.23148148148148148, 1.1574074074074074], [g1, g2, g3, g4])
+    est = ode_comb(host.sys_arr_new(n, 0.0), 1.0, [0.3148148148148148, 0.19444444444444445, 0.0, 1.1574074074074074], [g1, g2, g3, g4])
+    Ros4Out.{y: ynew, est, ok: true}
+}
+
+/// One Rosenbrock4 step of size `h` from `(t, y)`; returns the new state (an empty array when the
+/// linear solve is singular).
++ros4_step(f: ReverseTape, t: f64, y: _, h: f64) {
+    r = ros4_core(f, t, y, h)
+    if !r.ok { return [] }
+    r.y
+}
+
+/// Adaptive A-stable Rosenbrock4 integrator for stiff systems from `t0` to `t1` with relative /
+/// absolute tolerances, initial step `h0` (0 picks `1e-3 * |t1 - t0|`) and at most `max_steps`
+/// accepted + rejected steps. Uses exact Jacobians from the tape; `evals` counts right-hand-side
+/// evaluations (the Jacobian sweeps are extra).
++rosenbrock4(f: ReverseTape, t0: f64, y0: _, t1: f64, rtol: f64, atol: f64, h0: f64, max_steps: i64) : OdeResult {
+    n = host.sys_arr_len(y0)
+    dir = 1.0
+    if t1 < t0 { dir = -1.0 }
+    span = quad_abs(t1 - t0)
+    t = t0
+    y = y0
+    ts = [t0]
+    ys = y0
+    h = h0
+    if h <= 0.0 { h = 0.001 * span }
+    if h > span { h = span }
+    steps = 0
+    rejected = 0
+    evals = 0
+    iters = 0
+    failed = false
+    while quad_abs(t1 - t) > 1.0e-14 * (1.0 + quad_abs(t1)) && iters < max_steps && !failed {
+        iters += 1
+        if h > quad_abs(t1 - t) { h = quad_abs(t1 - t) }
+        hs = dir * h
+        r = ros4_core(f, t, y, hs)
+        evals += 3
+        if !r.ok {
+            h = h * 0.25
+            rejected += 1
+            if h < 1.0e-14 * (1.0 + quad_abs(t)) { failed = true }
+        } else {
+            en = ode_err_norm(r.est, y, r.y, rtol, atol)
+            if en <= 1.0 {
+                t = t + hs
+                y = r.y
+                ts = host.sys_arr_push(ts, t)
+                for 0..n { ys = host.sys_arr_push(ys, y[it]) }
+                steps += 1
+            } else {
+                rejected += 1
+            }
+            fac = 5.0
+            if en > 0.0 {
+                fac = 0.9 * host.sys_pow(en, -0.25)
+                if fac > 5.0 { fac = 5.0 }
+            }
+            if fac < 0.2 { fac = 0.2 }
+            h = h * fac
+        }
+    }
+    reached = quad_abs(t1 - t) <= 1.0e-14 * (1.0 + quad_abs(t1))
+    OdeResult.{ts, ys, n, steps, rejected, evals, converged: reached}
+}
+
+/// Result of one Newton solve of `y - rhs - c f(t, y) = 0`.
+NewtonOut = {
+    y: _ = []
+    iters: i64 = 0
+    ok: bool = false
+}
+
+/// Newton iteration (exact tape Jacobian, 25 iterations max) for the implicit equation
+/// `y - rhs - c f(t, y) = 0` starting from `guess`.
+ode_newton(f: ReverseTape, t: f64, guess: _, rhs: _, c: f64) : NewtonOut {
+    n = host.sys_arr_len(guess)
+    y = guess
+    iter = 0
+    while iter < 25 {
+        iter += 1
+        fv = f.values(ode_input(t, y))
+        jp = ode_jac(f, t, y)
+        jm = jp[0]
+        g = []
+        amat = []
+        for 0..n {
+            i = it
+            g = host.sys_arr_push(g, y[i] - rhs[i] - c * fv[i])
+            for 0..n {
+                d = 0.0
+                if i == it { d = 1.0 }
+                amat = host.sys_arr_push(amat, d - c * jm[i * n + it])
+            }
+        }
+        dy = ode_lin_solve(amat, g, n)
+        if host.sys_arr_len(dy) == 0 { return NewtonOut.{y, iters: iter, ok: false} }
+        big = 0.0
+        ymax = 0.0
+        for 0..n {
+            y = host.sys_arr_set(y, it, y[it] - dy[it])
+            if quad_abs(dy[it]) > big { big = quad_abs(dy[it]) }
+            if quad_abs(y[it]) > ymax { ymax = quad_abs(y[it]) }
+        }
+        if big <= 1.0e-12 * (1.0 + ymax) { return NewtonOut.{y, iters: iter, ok: true} }
+    }
+    NewtonOut.{y, iters: iter, ok: false}
+}
+
+/// Fixed-step second-order BDF (`y_{n+1} = 4/3 y_n - 1/3 y_{n-1} + 2h/3 f(t_{n+1}, y_{n+1})`) from
+/// `t0` to `t1` in `n_steps` steps (works backward when `t1 < t0`). A-stable, so it takes large
+/// steps on stiff systems; each step solves the implicit equation by Newton iteration with the
+/// tape's exact Jacobian. The start value `y_1` is backward Euler Richardson-extrapolated from one
+/// step of `h` and two of `h/2` (local error O(h^3), and it damps stiff modes like backward Euler).
+/// `converged` is false when a Newton solve fails, a Jacobian is singular, or `n_steps < 1`.
++bdf2(f: ReverseTape, t0: f64, y0: _, t1: f64, n_steps: i64) : OdeResult {
+    n = host.sys_arr_len(y0)
+    h = (t1 - t0) / host.sys_to_float(n_steps)
+    ts = [t0]
+    ys = y0
+    evals = 0
+    ok = n_steps >= 1
+    yprev = y0
+    ycur = y0
+    if ok {
+        full = ode_newton(f, t0 + h, y0, y0, h)
+        half1 = ode_newton(f, t0 + 0.5 * h, y0, y0, 0.5 * h)
+        half2 = ode_newton(f, t0 + h, half1.y, half1.y, 0.5 * h)
+        evals += full.iters + half1.iters + half2.iters
+        if !full.ok || !half1.ok || !half2.ok {
+            ok = false
+        } else {
+            ycur = []
+            for 0..n { ycur = host.sys_arr_push(ycur, 2.0 * half2.y[it] - full.y[it]) }
+            ts = host.sys_arr_push(ts, t0 + h)
+            for 0..n { ys = host.sys_arr_push(ys, ycur[it]) }
+        }
+    }
+    steps = 0
+    if ok { steps = 1 }
+    k = 1
+    while ok && k < n_steps {
+        tn = t0 + h * host.sys_to_float(k + 1)
+        rhs = []
+        guess = []
+        for 0..n {
+            rhs = host.sys_arr_push(rhs, 4.0 / 3.0 * ycur[it] - yprev[it] / 3.0)
+            guess = host.sys_arr_push(guess, 2.0 * ycur[it] - yprev[it])
+        }
+        r = ode_newton(f, tn, guess, rhs, 2.0 * h / 3.0)
+        evals += r.iters
+        if r.ok {
+            yprev = ycur
+            ycur = r.y
+            ts = host.sys_arr_push(ts, tn)
+            for 0..n { ys = host.sys_arr_push(ys, ycur[it]) }
+            steps += 1
+        } else {
+            ok = false
+        }
+        k += 1
+    }
+    OdeResult.{ts, ys, n, steps, rejected: 0, evals, converged: ok && steps == n_steps}
+}
+
+// --- test systems --------------------------------------------------------------------------------------------------
+
+/// Tape for `y' = -k y` (inputs `[t, y]`).
++ode_decay(k: f64) : ReverseTape {
+    tp = ReverseTape.new()
+    _t = @tp.input()
+    y = @tp.input()
+    r = @tp.n_mulc(y, -k)
+    @tp.out(r)
+    tp
+}
+
+/// Tape for the harmonic oscillator `y' = v`, `v' = -w^2 y` (inputs `[t, y, v]`).
++ode_oscillator(w: f64) : ReverseTape {
+    tp = ReverseTape.new()
+    _t = @tp.input()
+    y = @tp.input()
+    v = @tp.input()
+    r = @tp.n_mulc(y, -w * w)
+    @tp.out(v)
+    @tp.out(r)
+    tp
+}
+
+/// Tape for the logistic equation `y' = r y (1 - y / cap)` (inputs `[t, y]`).
++ode_logistic(r: f64, cap: f64) : ReverseTape {
+    tp = ReverseTape.new()
+    _t = @tp.input()
+    y = @tp.input()
+    q = @tp.n_mulc(y, -1.0 / cap)
+    q = @tp.n_addc(q, 1.0)
+    p = @tp.n_mul(y, q)
+    d = @tp.n_mulc(p, r)
+    @tp.out(d)
+    tp
+}
+
+/// Tape for Lotka-Volterra `x' = a x - b x y`, `y' = d x y - c y` (inputs `[t, x, y]`).
++ode_lotka_volterra(a: f64, b: f64, c: f64, d: f64) : ReverseTape {
+    tp = ReverseTape.new()
+    _t = @tp.input()
+    x = @tp.input()
+    y = @tp.input()
+    xy = @tp.n_mul(x, y)
+    ax = @tp.n_mulc(x, a)
+    bxy = @tp.n_mulc(xy, -b)
+    dx = @tp.n_add(ax, bxy)
+    dxy = @tp.n_mulc(xy, d)
+    cy = @tp.n_mulc(y, -c)
+    dy = @tp.n_add(dxy, cy)
+    @tp.out(dx)
+    @tp.out(dy)
+    tp
+}
+
+/// Tape for the stiff relaxation `y' = -k (y - cos t)` (inputs `[t, y]`); see `ode_stiff_relax_exact`.
++ode_stiff_relax(k: f64) : ReverseTape {
+    tp = ReverseTape.new()
+    t = @tp.input()
+    y = @tp.input()
+    c = @tp.n_cos(t)
+    d = @tp.n_sub(y, c)
+    r = @tp.n_mulc(d, -k)
+    @tp.out(r)
+    tp
+}
+
+/// Exact solution of `y' = -k (y - cos t)` with `y(0) = y0` at time `t`.
++ode_stiff_relax_exact(k: f64, y0: f64, t: f64) : f64 {
+    d = k * k + 1.0
+    part = (k * k * host.sys_cos(t) + k * host.sys_sin(t)) / d
+    part + (y0 - k * k / d) * host.sys_exp(-k * t)
+}
+
+/// Tape for Robertson's stiff chemical kinetics (inputs `[t, y1, y2, y3]`, `y1 + y2 + y3` is conserved).
++ode_robertson() : ReverseTape {
+    tp = ReverseTape.new()
+    _t = @tp.input()
+    y1 = @tp.input()
+    y2 = @tp.input()
+    y3 = @tp.input()
+    y2y3 = @tp.n_mul(y2, y3)
+    k2 = @tp.n_mulc(y2y3, 10000.0)
+    y2sq = @tp.n_square(y2)
+    k3 = @tp.n_mulc(y2sq, 30000000.0)
+    a = @tp.n_mulc(y1, -0.04)
+    d1 = @tp.n_add(a, k2)
+    b = @tp.n_mulc(y1, 0.04)
+    b2 = @tp.n_sub(b, k2)
+    d2 = @tp.n_sub(b2, k3)
+    @tp.out(d1)
+    @tp.out(d2)
+    @tp.out(k3)
+    tp
+}
+
+/// Tape for `exp(-x^2)`.
++quad_gaussian() : ReverseTape {
+    tp = ReverseTape.new()
+    x = @tp.input()
+    s = @tp.n_square(x)
+    n = @tp.n_neg(s)
+    e = @tp.n_exp(n)
+    @tp.out(e)
+    tp
+}
+
+// --- tests ----------------------------------------------------------------------------------------------------------
+
+/// Test Gauss-Kronrod on smooth integrands.
+test "quad_gk smooth integrals" {
+    sq = quad_gk(tape_poly([0.0, 0.0, 1.0]), 0.0, 3.0, 0.0000000001, 0.0000000001, 50)
+    #assert(sq.converged)
+    #assert(quad_abs(sq.value - 9.0) < 1.0e-10)
+    assert_eq(sq.evals, 15)
+    assert_eq(sq.levels, 0)
+    t = ReverseTape.new()
+    x = @t.input()
+    s = @t.n_sin(x)
+    @t.out(s)
+    sine = quad_gk(t, 0.0, 3.141592653589793, 0.00000000001, 0.00000000001, 50)
+    #assert(quad_abs(sine.value - 2.0) < 1.0e-10)
+    #assert(sine.error < 1.0e-9)
+    rev = quad_gk(t, 3.141592653589793, 0.0, 0.00000000001, 0.00000000001, 50)
+    #assert(quad_abs(rev.value + 2.0) < 1.0e-10)
+    zero = quad_gk(t, 1.0, 1.0, 0.00000001, 0.00000001, 10)
+    #assert(quad_abs(zero.value) < 1.0e-12)
+    g = quad_gk(quad_gaussian(), -3.0, 3.0, 0.00000000001, 0.00000000001, 60)
+    #assert(quad_abs(g.value - 1.7724538509055159 * 0.9999779095030014) < 1.0e-9)
+    osc = ReverseTape.new()
+    ox = @osc.input()
+    om = @osc.n_mulc(ox, 20.0)
+    oc = @osc.n_cos(om)
+    @osc.out(oc)
+    hard = quad_gk(osc, 0.0, 6.0, 0.0000000001, 0.0000000001, 200)
+    #assert(quad_abs(hard.value - host.sys_sin(120.0) / 20.0) < 1.0e-8)
+    #assert(hard.levels > 0)
+}
+
+/// Test Gauss-Kronrod on endpoint singularities and infinite ranges.
+test "quad_gk singular and infinite" {
+    root = quad_gk(tape_poly([0.0, 1.0]), 0.0, 1.0, 0.00000001, 0.00000001, 20)
+    #assert(quad_abs(root.value - 0.5) < 1.0e-9)
+    t = ReverseTape.new()
+    x = @t.input()
+    r = @t.n_sqrt(x)
+    @t.out(r)
+    sqrt_int = quad_gk(t, 0.0, 1.0, 0.00000001, 0.00000001, 200)
+    #assert(quad_abs(sqrt_int.value - 2.0 / 3.0) < 1.0e-7)
+    e = ReverseTape.new()
+    ex = @e.input()
+    en = @e.n_neg(ex)
+    ee = @e.n_exp(en)
+    @e.out(ee)
+    half_line = quad_gk_inf(e, 0.0, 1, 0.000000001, 0.000000001, 100)
+    #assert(half_line.converged)
+    #assert(quad_abs(half_line.value - 1.0) < 1.0e-7)
+    shifted = quad_gk_inf(e, 2.0, 1, 0.000000001, 0.000000001, 100)
+    #assert(quad_abs(shifted.value - host.sys_exp(-2.0)) < 1.0e-7)
+    full = quad_gk_inf(quad_gaussian(), 0.0, 2, 0.000000001, 0.000000001, 100)
+    #assert(full.converged)
+    #assert(quad_abs(full.value - 1.7724538509055159) < 1.0e-7)
+    lorentz = ReverseTape.new()
+    lx = @lorentz.input()
+    lsq = @lorentz.n_square(lx)
+    lden = @lorentz.n_addc(lsq, 1.0)
+    lone = @lorentz.konst(1.0)
+    lf = @lorentz.n_div(lone, lden)
+    @lorentz.out(lf)
+    cauchy = quad_gk_inf(lorentz, 0.0, 2, 0.000000001, 0.000000001, 200)
+    #assert(quad_abs(cauchy.value - 3.141592653589793) < 1.0e-6)
+    capped = quad_gk(t, 0.0, 1.0, 0.0000000000000001, 0.0000000000000001, 2)
+    #assert(capped.levels <= 2)
+}
+
+/// Test tanh-sinh on endpoint singularities.
+test "tanh_sinh handles endpoint singularities" {
+    t = ReverseTape.new()
+    x = @t.input()
+    l = @t.n_ln(x)
+    @t.out(l)
+    ln_int = tanh_sinh(t, 0.0, 1.0, 0.00000000001)
+    #assert(ln_int.converged)
+    #assert(quad_abs(ln_int.value + 1.0) < 1.0e-9)
+    r = ReverseTape.new()
+    rx = @r.input()
+    rp = @r.n_pow(rx, -0.5)
+    @r.out(rp)
+    inv_sqrt = tanh_sinh(r, 0.0, 1.0, 0.00000000001)
+    #assert(quad_abs(inv_sqrt.value - 2.0) < 1.0e-7)
+    smooth = tanh_sinh(tape_poly([0.0, 0.0, 1.0]), 0.0, 3.0, 0.00000000001)
+    #assert(smooth.converged)
+    #assert(quad_abs(smooth.value - 9.0) < 1.0e-9)
+    off = tanh_sinh(tape_poly([1.0, 2.0]), -1.0, 4.0, 0.00000000001)
+    #assert(quad_abs(off.value - (5.0 + 15.0)) < 1.0e-9)
+    #assert(off.evals > 7)
+    mixed = ReverseTape.new()
+    mx = @mixed.input()
+    ms = @mixed.n_sqrt(mx)
+    ml = @mixed.n_ln(mx)
+    mp = @mixed.n_mul(ms, ml)
+    @mixed.out(mp)
+    log_sqrt = tanh_sinh(mixed, 0.0, 1.0, 0.00000000001)
+    // integral of sqrt(x) ln(x) over [0, 1] is -4/9
+    #assert(quad_abs(log_sqrt.value + 4.0 / 9.0) < 1.0e-9)
+}
+
+/// Test the sample-based rules.
+test "trapezoid and Simpson on samples" {
+    f = tape_poly([0.0, 0.0, 0.0, 1.0])
+    ys = quad_sample(f, 0.0, 2.0, 100)
+    assert_eq(host.sys_arr_len(ys), 101)
+    #assert(quad_abs(quad_trapz(ys, 0.02) - 4.0) < 1.0e-3)
+    #assert(quad_abs(quad_simpson(ys, 0.02) - 4.0) < 1.0e-10)
+    odd = quad_sample(f, 0.0, 2.0, 7)
+    #assert(quad_abs(quad_simpson(odd, 2.0 / 7.0) - 4.0) < 0.05)
+    assert_eq(quad_trapz([1.0], 0.1), 0.0)
+    assert_eq(quad_simpson([], 0.1), 0.0)
+    #assert(quad_abs(quad_simpson([1.0, 3.0], 2.0) - 4.0) < 1.0e-12)
+}
+
+/// Test fixed-step RK4 and its fourth-order convergence.
+test "rk4 solves ODEs with fourth-order accuracy" {
+    decay = ode_decay(1.0)
+    coarse = rk4(decay, 0.0, [1.0], 1.0, 10)
+    fine = rk4(decay, 0.0, [1.0], 1.0, 20)
+    exact = host.sys_exp(-1.0)
+    ec = quad_abs(coarse.final()[0] - exact)
+    ef = quad_abs(fine.final()[0] - exact)
+    #assert(ec < 1.0e-6)
+    #assert(ef < 1.0e-7)
+    ratio = ec / ef
+    #assert(ratio > 12.0)
+    #assert(ratio < 20.0)
+    assert_eq(coarse.steps, 10)
+    assert_eq(host.sys_arr_len(coarse.ts), 11)
+    #assert(quad_abs(coarse.t_end() - 1.0) < 1.0e-12)
+    assert_eq(coarse.evals, 40)
+    osc = rk4(ode_oscillator(2.0), 0.0, [1.0, 0.0], 3.141592653589793, 400)
+    fin = osc.final()
+    // y = cos 2t, v = -2 sin 2t; after t = pi the state returns to (1, 0)
+    #assert(quad_abs(fin[0] - 1.0) < 1.0e-7)
+    #assert(quad_abs(fin[1]) < 1.0e-6)
+    energy0 = 0.5 * 0.0 + 0.5 * 4.0 * 1.0
+    mid = osc.state(200)
+    energy = 0.5 * mid[1] * mid[1] + 0.5 * 4.0 * mid[0] * mid[0]
+    #assert(quad_abs(energy - energy0) < 1.0e-6)
+    back = rk4(decay, 1.0, [host.sys_exp(-1.0)], 0.0, 50)
+    #assert(quad_abs(back.final()[0] - 1.0) < 1.0e-8)
+    logi = rk4(ode_logistic(1.0, 10.0), 0.0, [1.0], 5.0, 200)
+    exact_logistic = 10.0 / (1.0 + 9.0 * host.sys_exp(-5.0))
+    #assert(quad_abs(logi.final()[0] - exact_logistic) < 1.0e-6)
+}
+
+/// Test adaptive Dormand-Prince.
+test "dopri5 controls its error" {
+    decay = ode_decay(0.5)
+    r = dopri5(decay, 0.0, [1.0], 4.0, 0.000001, 0.000000001, 0.1, 10000)
+    #assert(r.converged)
+    #assert(quad_abs(r.final()[0] - host.sys_exp(-2.0)) < 1.0e-7)
+    #assert(r.steps < 60)
+    #assert(quad_abs(r.t_end() - 4.0) < 1.0e-12)
+    tight = dopri5(decay, 0.0, [1.0], 4.0, 0.000000000001, 0.000000000001, 0.0, 10000)
+    #assert(quad_abs(tight.final()[0] - host.sys_exp(-2.0)) < 1.0e-10)
+    #assert(tight.steps > r.steps)
+    lv = ode_lotka_volterra(1.0, 0.1, 1.5, 0.075)
+    a = dopri5(lv, 0.0, [10.0, 5.0], 10.0, 0.0000000001, 0.0000000001, 0.0, 20000)
+    b = rk4(lv, 0.0, [10.0, 5.0], 10.0, 20000)
+    #assert(a.converged)
+    #assert(quad_abs(a.final()[0] - b.final()[0]) < 1.0e-6)
+    #assert(quad_abs(a.final()[1] - b.final()[1]) < 1.0e-6)
+    // conserved quantity V = d x - c ln x + b y - a ln y
+    v0 = 0.075 * 10.0 - 1.5 * host.sys_ln(10.0) + 0.1 * 5.0 - 1.0 * host.sys_ln(5.0)
+    f = a.final()
+    v1 = 0.075 * f[0] - 1.5 * host.sys_ln(f[0]) + 0.1 * f[1] - 1.0 * host.sys_ln(f[1])
+    #assert(quad_abs(v1 - v0) < 1.0e-6)
+    osc = dopri5(ode_oscillator(1.0), 0.0, [0.0, 1.0], 6.283185307179586, 0.00000001, 0.00000001, 0.0, 10000)
+    #assert(quad_abs(osc.final()[0]) < 1.0e-6)
+    #assert(quad_abs(osc.final()[1] - 1.0) < 1.0e-6)
+    backward = dopri5(decay, 4.0, [host.sys_exp(-2.0)], 0.0, 0.0000000001, 0.0000000001, 0.0, 10000)
+    #assert(quad_abs(backward.final()[0] - 1.0) < 1.0e-7)
+    starved = dopri5(decay, 0.0, [1.0], 4.0, 0.000000000001, 0.000000000001, 0.01, 3)
+    #assert(!(starved.converged))
+    #assert(starved.steps + starved.rejected <= 3)
+    stiffish = dopri5(ode_decay(50.0), 0.0, [1.0], 1.0, 0.000001, 0.000000001, 0.0, 10000)
+    #assert(stiffish.converged)
+    #assert(stiffish.final()[0] < 1.0e-8)
+    #assert(stiffish.rejected >= 0)
+}
+
+test "ode_lin_solve solves dense systems with pivoting" {
+    x = ode_lin_solve([2.0, 1.0, 1.0, 3.0], [3.0, 5.0], 2)
+    #assert(quad_abs(x[0] - 0.8) < 1.0e-12)
+    #assert(quad_abs(x[1] - 1.4) < 1.0e-12)
+    // zero leading pivot forces a row swap
+    y = ode_lin_solve([0.0, 2.0, 3.0, 1.0], [4.0, 5.0], 2)
+    #assert(quad_abs(y[0] - 1.0) < 1.0e-12)
+    #assert(quad_abs(y[1] - 2.0) < 1.0e-12)
+    z = ode_lin_solve([1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 2.0, 0.0, 1.0], [14.0, 6.0, 5.0], 3)
+    #assert(quad_abs(z[0] - 1.0) < 1.0e-12)
+    #assert(quad_abs(z[1] - 2.0) < 1.0e-12)
+    #assert(quad_abs(z[2] - 3.0) < 1.0e-12)
+    assert_eq(host.sys_arr_len(ode_lin_solve([1.0, 2.0, 2.0, 4.0], [1.0, 2.0], 2)), 0)
+    a = [2.0, 1.0, 1.0, 3.0]
+    ode_lin_solve(a, [3.0, 5.0], 2)
+    assert_eq(a[0], 2.0)
+}
+
+test "ode_jac returns df/dy and df/dt" {
+    jp = ode_jac(ode_stiff_relax(10.0), 0.5, [2.0])
+    jm = jp[0]
+    ft = jp[1]
+    assert_eq(host.sys_arr_len(jm), 1)
+    #assert(quad_abs(jm[0] + 10.0) < 1.0e-12)
+    // d/dt of -k (y - cos t) is -k sin t
+    #assert(quad_abs(ft[0] + 10.0 * host.sys_sin(0.5)) < 1.0e-12)
+    osc = ode_jac(ode_oscillator(3.0), 0.0, [1.0, 0.0])
+    om = osc[0]
+    assert_eq(om[0], 0.0)
+    assert_eq(om[1], 1.0)
+    #assert(quad_abs(om[2] + 9.0) < 1.0e-12)
+    assert_eq(om[3], 0.0)
+}
+
+test "rosenbrock4 is fourth order and matches smooth solutions" {
+    // exponential decay
+    d = rosenbrock4(ode_decay(0.5), 0.0, [1.0], 4.0, 0.000000001, 0.000000000001, 0.0, 10000)
+    #assert(d.converged)
+    #assert(quad_abs(d.final()[0] - host.sys_exp(-2.0)) < 1.0e-8)
+    #assert(quad_abs(d.t_end() - 4.0) < 1.0e-12)
+    // fixed-step order check with ros4_step on a non-autonomous problem
+    k = 3.0
+    e1 = 0.0
+    e2 = 0.0
+    y = [0.0]
+    for 0..10 { y = ros4_step(ode_stiff_relax(k), 0.1 * host.sys_to_float(it), y, 0.1) }
+    e1 = quad_abs(y[0] - ode_stiff_relax_exact(k, 0.0, 1.0))
+    y = [0.0]
+    for 0..20 { y = ros4_step(ode_stiff_relax(k), 0.05 * host.sys_to_float(it), y, 0.05) }
+    e2 = quad_abs(y[0] - ode_stiff_relax_exact(k, 0.0, 1.0))
+    #assert(e1 < 1.0e-4)
+    #assert(e1 / e2 > 12.0 && e1 / e2 < 20.0)
+    // harmonic oscillator: y = cos(2 t)
+    o = rosenbrock4(ode_oscillator(2.0), 0.0, [1.0, 0.0], 3.0, 0.00000001, 0.00000001, 0.0, 10000)
+    #assert(o.converged)
+    #assert(quad_abs(o.final()[0] - host.sys_cos(6.0)) < 1.0e-5)
+    #assert(quad_abs(o.final()[1] + 2.0 * host.sys_sin(6.0)) < 1.0e-5)
+    // logistic growth against its closed form
+    lg = rosenbrock4(ode_logistic(1.5, 10.0), 0.0, [0.5], 3.0, 0.000000001, 0.000000001, 0.0, 10000)
+    want = 10.0 / (1.0 + 19.0 * host.sys_exp(-4.5))
+    #assert(quad_abs(lg.final()[0] - want) < 1.0e-6)
+    // backward integration
+    b = rosenbrock4(ode_decay(1.0), 1.0, [host.sys_exp(-1.0)], 0.0, 0.000000001, 0.000000000001, 0.0, 10000)
+    #assert(b.converged)
+    #assert(quad_abs(b.final()[0] - 1.0) < 1.0e-7)
+    #assert(b.t_end() < 1.0e-12)
+    // the step cap reports non-convergence
+    cap = rosenbrock4(ode_decay(0.5), 0.0, [1.0], 4.0, 0.000000001, 0.000000000001, 0.01, 3)
+    #assert(!(cap.converged))
+}
+
+test "rosenbrock4 integrates stiff systems in few steps" {
+    // y' = -10000 (y - cos t): dopri5 is stability-limited, Rosenbrock4 is not
+    k = 10000.0
+    st = rosenbrock4(ode_stiff_relax(k), 0.0, [0.0], 2.0, 0.000001, 0.00000001, 0.0, 10000)
+    #assert(st.converged)
+    #assert(quad_abs(st.final()[0] - ode_stiff_relax_exact(k, 0.0, 2.0)) < 1.0e-5)
+    ex = dopri5(ode_stiff_relax(k), 0.0, [0.0], 2.0, 0.000001, 0.00000001, 0.0, 400000)
+    #assert(ex.converged)
+    #assert(st.steps * 3 < ex.steps)
+    // Robertson kinetics: reference values from Radau (rtol 1e-12)
+    rb = rosenbrock4(ode_robertson(), 0.0, [1.0, 0.0, 0.0], 40.0, 0.000001, 0.000000000001, 0.0, 100000)
+    #assert(rb.converged)
+    f = rb.final()
+    #assert(quad_abs(f[0] - 0.715827069) < 1.0e-5)
+    #assert(quad_abs(f[1] - 0.00000918553476) < 1.0e-8)
+    #assert(quad_abs(f[2] - 0.284163746) < 1.0e-5)
+    #assert(quad_abs(f[0] + f[1] + f[2] - 1.0) < 1.0e-8)
+    #assert(rb.steps < 400)
+    early = rosenbrock4(ode_robertson(), 0.0, [1.0, 0.0, 0.0], 0.4, 0.000001, 0.000000000001, 0.0, 100000)
+    g = early.final()
+    #assert(quad_abs(g[0] - 0.985172114) < 1.0e-5)
+    #assert(quad_abs(g[1] - 0.0000338639538) < 1.0e-7)
+}
+
+test "bdf2 is second order and A-stable" {
+    r = 1.5
+    cap = 10.0
+    y0 = 0.5
+    t1 = 2.0
+    want = cap / (1.0 + (cap / y0 - 1.0) * host.sys_exp(-r * t1))
+    a = bdf2(ode_logistic(r, cap), 0.0, [y0], t1, 50)
+    b = bdf2(ode_logistic(r, cap), 0.0, [y0], t1, 100)
+    c = bdf2(ode_logistic(r, cap), 0.0, [y0], t1, 200)
+    #assert(a.converged && b.converged && c.converged)
+    assert_eq(a.steps, 50)
+    assert_eq(host.sys_arr_len(a.ts), 51)
+    ea = quad_abs(a.final()[0] - want)
+    eb = quad_abs(b.final()[0] - want)
+    ec = quad_abs(c.final()[0] - want)
+    #assert(ea < 0.01)
+    #assert(ea / eb > 3.2 && ea / eb < 4.6)
+    #assert(eb / ec > 3.5 && eb / ec < 4.4)
+    // oscillator
+    o = bdf2(ode_oscillator(1.0), 0.0, [1.0, 0.0], 3.0, 600)
+    #assert(o.converged)
+    #assert(quad_abs(o.final()[0] - host.sys_cos(3.0)) < 0.001)
+    // stiff relaxation with a step 100x the explicit stability limit
+    k = 1000.0
+    st = bdf2(ode_stiff_relax(k), 0.0, [0.0], 2.0, 100)
+    #assert(st.converged)
+    #assert(quad_abs(st.final()[0] - ode_stiff_relax_exact(k, 0.0, 2.0)) < 0.001)
+    // a stiff decay stays bounded and dies out even with steps 100x the explicit limit
+    big = bdf2(ode_decay(1000.0), 0.0, [1.0], 1.0, 10)
+    #assert(big.converged)
+    ok = true
+    for 1..11 {
+        if quad_abs(big.state(it)[0]) > 0.05 { ok = false }
+    }
+    #assert(ok)
+    #assert(quad_abs(big.final()[0]) < 1.0e-6)
+    // backward in time
+    back = bdf2(ode_decay(1.0), 1.0, [host.sys_exp(-1.0)], 0.0, 200)
+    #assert(back.converged)
+    #assert(quad_abs(back.final()[0] - 1.0) < 1.0e-4)
+    // degenerate step counts
+    one = bdf2(ode_decay(1.0), 0.0, [1.0], 1.0, 1)
+    assert_eq(one.steps, 1)
+    #assert(one.converged)
+    #assert(quad_abs(one.final()[0] - host.sys_exp(-1.0)) < 0.05)
+    zero = bdf2(ode_decay(1.0), 0.0, [1.0], 1.0, 0)
+    #assert(!(zero.converged))
+}

@@ -1,0 +1,31 @@
+//! Laws for std.math.core — real-body clamp / min / smoothstep.
+//! AI agents must not edit this file; put discharges in `core.proof.sr`.
+
+#law("m_clamp is idempotent")
+math_clamp_idempotent() {
+    v = m_clamp(1.5, 0.0, 2.0)
+    #assert(m_clamp(v, 0.0, 2.0) == v)
+}
+
+#law("m_min commutes")
+math_min_commutes() {
+    #assert(m_min(3.0, 7.0) == m_min(7.0, 3.0))
+    #assert(m_min(1.0, 2.0) == 1.0)
+}
+
+#law("m_smoothstep at edges and midpoint")
+math_smoothstep_edges() {
+    #assert(m_smoothstep(0.0, 1.0, 0.0) == 0.0)
+    #assert(m_smoothstep(0.0, 1.0, 1.0) == 1.0)
+    #assert(m_smoothstep(0.0, 1.0, 0.5) == 0.5)
+    // Non-zero edge so (x - e0) mutants change the result.
+    #assert(m_smoothstep(1.0, 3.0, 2.0) == 0.5)
+}
+
+#law("m_smootherstep midpoint is half")
+math_smootherstep_mid() {
+    #assert(m_smootherstep(0.0, 1.0, 0.5) == 0.5)
+    #assert(m_smootherstep(1.0, 3.0, 2.0) == 0.5)
+    #assert(m_smootherstep(0.0, 1.0, 0.0) == 0.0)
+    #assert(m_smootherstep(0.0, 1.0, 1.0) == 1.0)
+}

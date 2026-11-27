@@ -1,0 +1,33 @@
+{
+  "$schema": "https://zed.dev/schema/icon_themes/v0.2.0.json",
+  "name": "Super Icons",
+  "author": "Super Contributors",
+  "themes": [
+    {
+      "name": "Super Icons Dark",
+      "appearance": "dark",
+      "file_suffixes": {
+        "sr": "super",
+        "sup": "super"
+      },
+      "file_icons": {
+        "super": {
+          "path": "./icons/super.svg"
+        }
+      }
+    },
+    {
+      "name": "Super Icons Light",
+      "appearance": "light",
+      "file_suffixes": {
+        "sr": "super",
+        "sup": "super"
+      },
+      "file_icons": {
+        "super": {
+          "path": "./icons/super.svg"
+        }
+      }
+    }
+  ]
+}

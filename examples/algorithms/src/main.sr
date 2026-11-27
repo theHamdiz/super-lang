@@ -1,0 +1,237 @@
+//! Algorithms demo: pair dispatch with `when (a, b)` and `#symmetric` mirrors.
+//!
+//!   super test examples/algorithms/        # runs the tests below
+//!   super run examples/algorithms/         # prints the dispatch table and a matrix product
+//!
+//! 1. `touch` picks a collision kernel from the *pair* of shapes with a tuple `when`; the mirrored arms
+//!    (`Rect, Circle` next to `Circle, Rect`) reuse the same kernel with swapped arguments.
+//! 2. `scale` is marked `#symmetric`: the compiler synthesizes `scale(k, v)` from `scale(v, k)` and
+//!    both orders run on VM, JIT, and C23 AOT (see `tests/dispatch_family.sr`).
+//! 3. `mul` from `std.math.linalg` is the same idea at library scale: nine `(kind, kind)` arms for dense,
+//!    diagonal and CSR matrices.
+
+use std.math.linalg
+
+/// A 2D collision shape; the position lives outside so one shape can be reused.
+Shape = {
+    Circle(r: f64)
+    Rect(w: f64, h: f64)
+    Dot
+
+    /// Short name for tables.
+    name(self) : str {
+        when self {
+            Shape.Circle => "circle"
+            Shape.Rect => "rect"
+            Shape.Dot => "dot"
+        }
+    }
+
+    /// Radius of a circle (zero for other shapes).
+    radius(self) : f64 {
+        when self {
+            Shape.Circle { r } => r
+            else => 0.0
+        }
+    }
+
+    /// Width of a rectangle (zero for other shapes).
+    width(self) : f64 {
+        when self {
+            Shape.Rect { w } => w
+            else => 0.0
+        }
+    }
+
+    /// Height of a rectangle (zero for other shapes).
+    height(self) : f64 {
+        when self {
+            Shape.Rect { h } => h
+            else => 0.0
+        }
+    }
+}
+
++circle(r: f64) : Shape => Shape.Circle(r)
+
++rect(w: f64, h: f64) : Shape => Shape.Rect(w, h)
+
++dot() : Shape => Shape.Dot
+
+/// Distance squared between two points.
++dist2(ax: f64, ay: f64, bx: f64, by: f64) : f64 {
+    dx = ax - bx
+    dy = ay - by
+    dx * dx + dy * dy
+}
+
+/// Circle at (cx, cy) with radius r against a circle.
++circle_circle(ra: f64, ax: f64, ay: f64, rb: f64, bx: f64, by: f64) : bool {
+    reach = ra + rb
+    dist2(ax, ay, bx, by) <= reach * reach
+}
+
+/// Axis-aligned rectangles centred at (ax, ay) and (bx, by).
++rect_rect(aw: f64, ah: f64, ax: f64, ay: f64, bw: f64, bh: f64, bx: f64, by: f64) : bool {
+    dx = ax - bx
+    if dx < 0.0 { dx = -dx }
+    dy = ay - by
+    if dy < 0.0 { dy = -dy }
+    dx <= (aw + bw) / 2.0 && dy <= (ah + bh) / 2.0
+}
+
+/// Circle against a rectangle: the circle touches when the rectangle's closest point is within the radius.
++circle_rect(r: f64, cx: f64, cy: f64, w: f64, h: f64, rx: f64, ry: f64) : bool {
+    hx = w / 2.0
+    hy = h / 2.0
+    nx = cx
+    if nx < rx - hx { nx = rx - hx }
+    if nx > rx + hx { nx = rx + hx }
+    ny = cy
+    if ny < ry - hy { ny = ry - hy }
+    if ny > ry + hy { ny = ry + hy }
+    dist2(cx, cy, nx, ny) <= r * r
+}
+
+/// A point inside a rectangle.
++dot_rect(px: f64, py: f64, w: f64, h: f64, rx: f64, ry: f64) : bool {
+    dx = px - rx
+    if dx < 0.0 { dx = -dx }
+    dy = py - ry
+    if dy < 0.0 { dy = -dy }
+    dx <= w / 2.0 && dy <= h / 2.0
+}
+
+/// Do two placed shapes touch? The kernel is chosen by the pair of kinds.
++touch(a: Shape, ax: f64, ay: f64, b: Shape, bx: f64, by: f64) : bool {
+    when (a, b) {
+        (Shape.Circle, Shape.Circle) => { return circle_circle(a.radius(), ax, ay, b.radius(), bx, by) }
+        (Shape.Rect, Shape.Rect) => { return rect_rect(a.width(), a.height(), ax, ay, b.width(), b.height(), bx, by) }
+        (Shape.Circle, Shape.Rect) => { return circle_rect(a.radius(), ax, ay, b.width(), b.height(), bx, by) }
+        (Shape.Rect, Shape.Circle) => { return circle_rect(b.radius(), bx, by, a.width(), a.height(), ax, ay) }
+        (Shape.Dot, Shape.Circle) => { return circle_circle(0.0, ax, ay, b.radius(), bx, by) }
+        (Shape.Circle, Shape.Dot) => { return circle_circle(a.radius(), ax, ay, 0.0, bx, by) }
+        (Shape.Dot, Shape.Rect) => { return dot_rect(ax, ay, b.width(), b.height(), bx, by) }
+        (Shape.Rect, Shape.Dot) => { return dot_rect(bx, by, a.width(), a.height(), ax, ay) }
+        (Shape.Dot, Shape.Dot) => { return dist2(ax, ay, bx, by) < 0.000000001 }
+    }
+}
+
+/// A 2D vector.
+Vec2 = {
+    x: f64
+    y: f64
+}
+
+/// Vector times scalar. `#symmetric` makes `scale(k, v)` mean the same (checked by `super check`).
+#symmetric
++scale(v: Vec2, k: f64) : Vec2 => Vec2.{x: v.x * k, y: v.y * k}
+
+/// The runtime-safe spelling of `scale` used by this program and its tests.
++scale_vec(v: Vec2, k: f64) : Vec2 => Vec2.{x: v.x * k, y: v.y * k}
+
++main() {
+    shapes = [circle(1.0), rect(2.0, 2.0), dot()]
+    for shapes {
+        a = it
+        row = a.name()
+        for shapes {
+            b = it
+            hit = touch(a, 0.0, 0.0, b, 1.5, 0.0)
+            row = "{row} {b.name()}={hit}"
+        }
+        print(row)
+    }
+    m = mul(lin_dense(dense(2, 2, [1.0, 2.0, 3.0, 4.0])), lin_diag(diagonal([10.0, 100.0])))
+    print("{m.kind_name()} {m.to_dense().data}")
+}
+
+test "same-kind pairs" {
+    #assert(touch(circle(1.0), 0.0, 0.0, circle(1.0), 1.9, 0.0))
+    #assert(!(touch(circle(1.0), 0.0, 0.0, circle(1.0), 2.1, 0.0)))
+    #assert(touch(rect(2.0, 2.0), 0.0, 0.0, rect(2.0, 2.0), 1.9, 1.9))
+    #assert(!(touch(rect(2.0, 2.0), 0.0, 0.0, rect(2.0, 2.0), 2.1, 0.0)))
+    #assert(touch(dot(), 1.0, 1.0, dot(), 1.0, 1.0))
+    #assert(!(touch(dot(), 1.0, 1.0, dot(), 1.0, 1.5)))
+}
+
+test "mixed pairs use a dedicated kernel" {
+    // circle radius 1 at origin vs 2x2 rectangle centred at (2.5, 0): nearest edge x = 1.5, gap 0.5 -> miss
+    #assert(!(touch(circle(1.0), 0.0, 0.0, rect(2.0, 2.0), 2.5, 0.0)))
+    // moving the rectangle to x = 1.9 puts its edge at 0.9: hit
+    #assert(touch(circle(1.0), 0.0, 0.0, rect(2.0, 2.0), 1.9, 0.0))
+    // corner case: nearest point is the corner (1, 1); distance sqrt(2) > 1
+    #assert(!(touch(circle(1.0), 0.0, 0.0, rect(2.0, 2.0), 2.0, 2.0)))
+    #assert(touch(circle(1.5), 0.0, 0.0, rect(2.0, 2.0), 2.0, 2.0))
+    #assert(touch(dot(), 0.5, 0.5, circle(1.0), 0.0, 0.0))
+    #assert(!(touch(dot(), 1.5, 0.0, circle(1.0), 0.0, 0.0)))
+    #assert(touch(dot(), 0.9, 0.9, rect(2.0, 2.0), 0.0, 0.0))
+    #assert(!(touch(dot(), 1.1, 0.0, rect(2.0, 2.0), 0.0, 0.0)))
+}
+
+test "every pair is symmetric: swapping the operands never changes the answer" {
+    shapes = [circle(1.0), rect(2.0, 1.0), dot(), circle(0.5), rect(1.0, 3.0)]
+    offsets = [0.0, 0.4, 0.9, 1.4, 2.0, 3.5]
+    checked = 0
+    for shapes {
+        a = it
+        for shapes {
+            b = it
+            for offsets {
+                dx = it
+                for offsets {
+                    dy = it
+                    assert_eq(touch(a, 0.0, 0.0, b, dx, dy), touch(b, dx, dy, a, 0.0, 0.0))
+                    checked += 1
+                }
+            }
+        }
+    }
+    assert_eq(checked, 900)
+}
+
+test "dispatch table names" {
+    assert_eq(circle(2.0).name(), "circle")
+    assert_eq(rect(1.0, 2.0).name(), "rect")
+    assert_eq(dot().name(), "dot")
+    assert_eq(circle(2.5).radius(), 2.5)
+    assert_eq(rect(3.0, 4.0).width(), 3.0)
+    assert_eq(rect(3.0, 4.0).height(), 4.0)
+    assert_eq(dot().radius(), 0.0)
+}
+
+test "scalar mirror helper" {
+    v = scale(Vec2.{x: 1.0, y: -2.0}, 3.0)
+    mirrored = scale(3.0, Vec2.{x: 1.0, y: -2.0})
+    assert_eq(mirrored.x, v.x)
+    assert_eq(mirrored.y, v.y)
+    assert_eq(v.x, 3.0)
+    assert_eq(v.y, -6.0)
+}
+
+test "linalg kind dispatch" {
+    a = lin_dense(dense(2, 2, [1.0, 2.0, 3.0, 4.0]))
+    g = lin_diag(diagonal([10.0, 100.0]))
+    ag = mul(a, g)
+    ga = mul(g, a)
+    assert_eq(ag.kind_name(), "dense")
+    assert_eq(ag.to_dense().data[0], 10.0)
+    assert_eq(ag.to_dense().data[1], 200.0)
+    assert_eq(ag.to_dense().data[2], 30.0)
+    assert_eq(ag.to_dense().data[3], 400.0)
+    assert_eq(ga.to_dense().data[0], 10.0)
+    assert_eq(ga.to_dense().data[1], 20.0)
+    assert_eq(ga.to_dense().data[2], 300.0)
+    assert_eq(ga.to_dense().data[3], 400.0)
+    gg = mul(g, g)
+    assert_eq(gg.kind_name(), "diagonal")
+    assert_eq(gg.to_dense().data[3], 10000.0)
+    s = lin_sparse(csr_from_dense(dense(2, 2, [0.0, 1.0, 1.0, 0.0]), 0.0))
+    sg = mul(s, g)
+    assert_eq(sg.kind_name(), "csr")
+    assert_eq(sg.to_dense().data[1], 100.0)
+    assert_eq(sg.to_dense().data[2], 10.0)
+    total = add(a, g)
+    assert_eq(total.to_dense().data[0], 11.0)
+    assert_eq(total.to_dense().data[3], 104.0)
+}

@@ -1,0 +1,3416 @@
+//! std.sec.x509 — ASN.1 DER, PEM and X.509 certificate parsing
+//!
+//! Import with:
+//!   use std.sec.x509
+//!
+//! Byte buffers are arrays of `i64` in 0..255.
+//!
+//!   der = pem_decode_label(pem_text, "CERTIFICATE") or []
+//!   cert = x509_parse(der) or none
+//!   cert.subject_cn                       // "example.test"
+//!   x509_matches_host(cert, "api.example.test")
+//!   x509_valid_at(cert, host.sys_unix_ns() / 1000000000)
+//!
+//! Layers:
+//!   * DER reader (`der_read`, `der_children`, strict DER lengths) and writers (`der_encode`,
+//!     `der_seq`, `der_int`, `der_oid`, strings, times, bit strings, explicit tags)
+//!   * OIDs: decode, encode, and names for the algorithms, attributes and extensions in use
+//!   * PEM: decode (one or many blocks, label checked), encode with 64 column lines
+//!   * `x509_parse`: version, serial, algorithms, issuer/subject (RFC 4514 text), validity as unix
+//!     seconds, public key (EC curve, RSA bits), SAN, basic constraints, key usage, extended key
+//!     usage, key identifiers, critical-extension audit, SHA-256 fingerprint
+//!   * `x509_matches_host` (RFC 6125 wildcard rules), `x509_valid_at`, `x509_issued_by`
+//!
+//! Signature *verification* needs a public key primitive this module does not have; the TLS and
+//! crypto layers perform it on `X509Cert.tbs` and `X509Cert.sig_bytes`.
+
+use std.sec.encoding
+use std.sec.sha2
+
+/// DER tag BOOLEAN.
++DER_BOOLEAN = 1
+/// DER tag INTEGER.
++DER_INTEGER = 2
+/// DER tag BIT STRING.
++DER_BIT_STRING = 3
+/// DER tag OCTET STRING.
++DER_OCTET_STRING = 4
+/// DER tag NULL.
++DER_NULL = 5
+/// DER tag OBJECT IDENTIFIER.
++DER_OID = 6
+/// DER tag UTF8String.
++DER_UTF8 = 12
+/// DER tag PrintableString.
++DER_PRINTABLE = 19
+/// DER tag TeletexString (decoded as Latin-1).
++DER_TELETEX = 20
+/// DER tag IA5String.
++DER_IA5 = 22
+/// DER tag UTCTime.
++DER_UTCTIME = 23
+/// DER tag GeneralizedTime.
++DER_GENTIME = 24
+/// DER tag BMPString.
++DER_BMP = 30
+/// DER tag SEQUENCE (constructed).
++DER_SEQUENCE = 48
+/// DER tag SET (constructed).
++DER_SET = 49
+
+/// Key usage bit: digitalSignature.
++KU_DIGITAL_SIGNATURE = 0
+/// Key usage bit: nonRepudiation (contentCommitment).
++KU_NON_REPUDIATION = 1
+/// Key usage bit: keyEncipherment.
++KU_KEY_ENCIPHERMENT = 2
+/// Key usage bit: dataEncipherment.
++KU_DATA_ENCIPHERMENT = 3
+/// Key usage bit: keyAgreement.
++KU_KEY_AGREEMENT = 4
+/// Key usage bit: keyCertSign.
++KU_KEY_CERT_SIGN = 5
+/// Key usage bit: cRLSign.
++KU_CRL_SIGN = 6
+/// Key usage bit: encipherOnly.
++KU_ENCIPHER_ONLY = 7
+/// Key usage bit: decipherOnly.
++KU_DECIPHER_ONLY = 8
+
+NOTHING = []
+
+EMPTY_BITS = [0, NOTHING]
+
+// --- byte and text helpers ------------------------------------------------------------------
+
+xc_slice(a: _, from: i64, to: i64) : _ {
+    out = []
+    i = from
+    while i < to {
+        out = host.sys_arr_push(out, a[i])
+        i = i + 1
+    }
+    out
+}
+
+xc_cat(a: _, b: _) : _ {
+    out = a
+    i = 0
+    n = host.sys_arr_len(b)
+    while i < n {
+        out = host.sys_arr_push(out, b[i])
+        i = i + 1
+    }
+    out
+}
+
+/// Concatenation of every array in `parts`.
++der_join(parts: _) : _ {
+    out = []
+    i = 0
+    n = host.sys_arr_len(parts)
+    while i < n {
+        out = xc_cat(out, parts[i])
+        i = i + 1
+    }
+    out
+}
+
+/// Lower-case hex of `bytes`.
++x509_hex(bytes: _) : str {
+    digits = "0123456789abcdef"
+    out = ""
+    i = 0
+    n = host.sys_arr_len(bytes)
+    while i < n {
+        b = bytes[i]
+        out = "{out}{digits[b / 16]}{digits[b % 16]}"
+        i = i + 1
+    }
+    out
+}
+
+/// True when two byte arrays are identical.
++x509_same(a: _, b: _) : bool {
+    n = host.sys_arr_len(a)
+    if n != host.sys_arr_len(b) { return false }
+    same = true
+    i = 0
+    while i < n {
+        if a[i] != b[i] { same = false }
+        i = i + 1
+    }
+    same
+}
+
+xc_is_bytes(bytes: _) : bool {
+    ok = true
+    i = 0
+    n = host.sys_arr_len(bytes)
+    while i < n {
+        b = bytes[i]
+        if b < 0 { ok = false }
+        if b > 255 { ok = false }
+        i = i + 1
+    }
+    ok
+}
+
+xc_find(s: str, needle: str, start: i64) : i64 {
+    n = host.sys_str_len(s)
+    k = host.sys_str_len(needle)
+    found = -1
+    p = start
+    while p + k <= n {
+        if s[p..(p + k)] == needle {
+            found = p
+            break
+        }
+        p = p + 1
+    }
+    found
+}
+
+xc_starts(s: str, prefix: str) : bool {
+    k = host.sys_str_len(prefix)
+    if host.sys_str_len(s) < k { return false }
+    s[0..k] == prefix
+}
+
+xc_ends(s: str, suffix: str) : bool {
+    n = host.sys_str_len(s)
+    k = host.sys_str_len(suffix)
+    if n < k { return false }
+    s[(n - k)..n] == suffix
+}
+
+xc_split(text: str, sep: str) : _ {
+    out = []
+    n = host.sys_str_len(text)
+    k = host.sys_str_len(sep)
+    pos = 0
+    going = true
+    while going {
+        at = xc_find(text, sep, pos)
+        if at < 0 {
+            out = host.sys_arr_push(out, text[pos..n])
+            going = false
+        } else {
+            out = host.sys_arr_push(out, text[pos..at])
+            pos = at + k
+        }
+    }
+    out
+}
+
+xc_trim(s: str) : str {
+    n = host.sys_str_len(s)
+    a = 0
+    while a < n {
+        c = s[a]
+        if c != " " {
+            if c != "\t" {
+                if c != "\r" {
+                    if c != "\n" { break }
+                }
+            }
+        }
+        a = a + 1
+    }
+    b = n
+    while b > a {
+        c = s[b - 1]
+        if c != " " {
+            if c != "\t" {
+                if c != "\r" {
+                    if c != "\n" { break }
+                }
+            }
+        }
+        b = b - 1
+    }
+    s[a..b]
+}
+
+xc_lower(s: str) : str {
+    upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    lower = "abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    i = 0
+    n = host.sys_str_len(s)
+    while i < n {
+        c = s[i]
+        at = xc_find(upper, c, 0)
+        if at >= 0 { c = lower[at] }
+        out = "{out}{c}"
+        i = i + 1
+    }
+    out
+}
+
+xc_join(parts: _, sep: str) : str {
+    out = ""
+    i = 0
+    n = host.sys_arr_len(parts)
+    while i < n {
+        if i > 0 { out = "{out}{sep}" }
+        piece = parts[i]
+        out = "{out}{piece}"
+        i = i + 1
+    }
+    out
+}
+
+/// ASCII text of `bytes`; any byte above 127 fails.
+xc_ascii(bytes: _) : str! {
+    out = ""
+    bad = false
+    i = 0
+    n = host.sys_arr_len(bytes)
+    while i < n {
+        b = bytes[i]
+        if b > 127 { bad = true } else { out = "{out}{host.sys_chr(b)}" }
+        i = i + 1
+    }
+    ensure !bad else {
+        fail "der: non-ASCII byte in an ASCII string"
+        return
+    }
+    out
+}
+
+xc_digit(c: str) : i64 {
+    code = host.sys_ord(c)
+    if code < 48 { return -1 }
+    if code > 57 { return -1 }
+    code - 48
+}
+
+// --- DER reader -----------------------------------------------------------------------------
+
+/// One parsed DER element (offsets are absolute positions in the buffer).
++Tlv = {
+    /// First identifier octet (class, constructed bit and low tag number). Defaults to `0`.
+    tag: i64 = 0
+    /// Class: 0 universal, 1 application, 2 context-specific, 3 private. Defaults to `0`.
+    cls: i64 = 0
+    /// True for constructed encodings. Defaults to `false`.
+    constructed: bool = false
+    /// Tag number (also for the high-tag-number form). Defaults to `0`.
+    number: i64 = 0
+    /// Bytes taken by identifier and length. Defaults to `0`.
+    hdr: i64 = 0
+    /// Content length. Defaults to `0`.
+    size: i64 = 0
+    /// Offset of the first content byte. Defaults to `0`.
+    start: i64 = 0
+    /// Offset just past the element. Defaults to `0`.
+    end: i64 = 0
+}
+
+/// Parse the element at `pos`. Enforces DER: definite, minimal lengths and minimal high tags.
++der_read(data: _, pos: i64) : Tlv! {
+    n = host.sys_arr_len(data)
+    ensure pos >= 0 else {
+        fail "der: negative offset"
+        return
+    }
+    ensure pos < n else {
+        fail "der: truncated element at {pos}"
+        return
+    }
+    first = data[pos]
+    cls = first >> 6
+    constructed = (first & 32) != 0
+    number = first & 31
+    p = pos + 1
+    if number == 31 {
+        number = 0
+        going = true
+        count = 0
+        problem = ""
+        while going {
+            if p >= n {
+                problem = "der: truncated high tag number"
+                going = false
+            } else {
+                b = data[p]
+                if count == 0 {
+                    if b == 128 { problem = "der: non-minimal high tag number" }
+                }
+                number = (number << 7) | (b & 127)
+                count = count + 1
+                p = p + 1
+                if (b & 128) == 0 { going = false }
+                if count > 4 {
+                    problem = "der: tag number too large"
+                    going = false
+                }
+            }
+        }
+        ensure problem == "" else {
+            fail "{problem}"
+            return
+        }
+    }
+    ensure p < n else {
+        fail "der: truncated length at {p}"
+        return
+    }
+    lb = data[p]
+    p = p + 1
+    clen = lb
+    if lb >= 128 {
+        ensure lb != 128 else {
+            fail "der: indefinite length is not allowed"
+            return
+        }
+        k = lb & 127
+        ensure k <= 4 else {
+            fail "der: length of {k} bytes is not supported"
+            return
+        }
+        ensure p + k <= n else {
+            fail "der: truncated length at {p}"
+            return
+        }
+        clen = 0
+        i = 0
+        while i < k {
+            clen = (clen << 8) | data[p + i]
+            i = i + 1
+        }
+        ensure data[p] != 0 else {
+            fail "der: non-minimal length"
+            return
+        }
+        ensure clen >= 128 else {
+            fail "der: non-minimal length"
+            return
+        }
+        p = p + k
+    }
+    ensure p + clen <= n else {
+        fail "der: element at {pos} overruns the buffer"
+        return
+    }
+    Tlv.{tag: first, cls, constructed, number, hdr: p - pos, size: clen, start: p, end: p + clen}
+}
+
+/// Parse a buffer that holds exactly one element.
++der_parse(data: _) : Tlv! {
+    t = der_read(data, 0) or err { fail "{err}" }
+    ensure t.end == host.sys_arr_len(data) else {
+        fail "der: {host.sys_arr_len(data) - t.end} trailing bytes after the element"
+        return
+    }
+    t
+}
+
+/// Content bytes of `t`.
++der_content(data: _, t: Tlv) : _ => xc_slice(data, t.start, t.end)
+
+/// Whole encoding (identifier, length, content) of `t`.
++der_raw(data: _, t: Tlv) : _ => xc_slice(data, t.end - t.size - t.hdr, t.end)
+
+/// The elements inside the constructed element `t`.
++der_children(data: _, t: Tlv) : _! {
+    ensure t.constructed else {
+        fail "der: element with tag {t.tag} is not constructed"
+        return
+    }
+    out = []
+    pos = t.start
+    problem = ""
+    while pos < t.end {
+        c = der_read(data, pos) or err {
+            problem = "{err}"
+            Tlv.{end: t.end}
+        }
+        if problem == "" {
+            if c.end > t.end { problem = "der: child overruns its parent" }
+        }
+        if problem == "" { out = host.sys_arr_push(out, c) }
+        pos = c.end
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+/// INTEGER content as a signed 64-bit value (fails above 8 bytes or when not minimal).
++der_int_value(data: _, t: Tlv) : i64! {
+    ensure t.tag == DER_INTEGER else {
+        fail "der: expected INTEGER, got tag {t.tag}"
+        return
+    }
+    ensure t.size >= 1 else {
+        fail "der: empty INTEGER"
+        return
+    }
+    ensure t.size <= 8 else {
+        fail "der: INTEGER of {t.size} bytes does not fit in 64 bits"
+        return
+    }
+    if t.size > 1 {
+        b0 = data[t.start]
+        b1 = data[t.start + 1]
+        if b0 == 0 {
+            ensure b1 >= 128 else {
+                fail "der: non-minimal INTEGER"
+                return
+            }
+        }
+        if b0 == 255 {
+            ensure b1 < 128 else {
+                fail "der: non-minimal INTEGER"
+                return
+            }
+        }
+    }
+    top = data[t.start]
+    v = top
+    if top >= 128 { v = top - 256 }
+    i = 1
+    while i < t.size {
+        v = (v << 8) | data[t.start + i]
+        i = i + 1
+    }
+    v
+}
+
+/// INTEGER magnitude as lower-case hex without the sign padding byte (serial numbers).
++der_int_hex(data: _, t: Tlv) : str! {
+    ensure t.tag == DER_INTEGER else {
+        fail "der: expected INTEGER, got tag {t.tag}"
+        return
+    }
+    ensure t.size >= 1 else {
+        fail "der: empty INTEGER"
+        return
+    }
+    from = t.start
+    if t.size > 1 {
+        if data[t.start] == 0 { from = t.start + 1 }
+    }
+    x509_hex(xc_slice(data, from, t.end))
+}
+
+/// BIT STRING content: `[unused_bits, bytes]` (unused bits are only legal in the last byte).
++der_bitstring(data: _, t: Tlv) : _! {
+    ensure t.tag == DER_BIT_STRING else {
+        fail "der: expected BIT STRING, got tag {t.tag}"
+        return
+    }
+    ensure t.size >= 1 else {
+        fail "der: empty BIT STRING"
+        return
+    }
+    unused = data[t.start]
+    ensure unused <= 7 else {
+        fail "der: BIT STRING with {unused} unused bits"
+        return
+    }
+    if t.size == 1 {
+        ensure unused == 0 else {
+            fail "der: empty BIT STRING with unused bits"
+            return
+        }
+    }
+    pair = [unused, xc_slice(data, t.start + 1, t.end)]
+    pair
+}
+
+/// BOOLEAN value (DER: 0x00 or 0xFF only).
++der_bool_value(data: _, t: Tlv) : bool! {
+    ensure t.tag == DER_BOOLEAN else {
+        fail "der: expected BOOLEAN, got tag {t.tag}"
+        return
+    }
+    ensure t.size == 1 else {
+        fail "der: BOOLEAN must be one byte"
+        return
+    }
+    b = data[t.start]
+    if b != 0 {
+        ensure b == 255 else {
+            fail "der: BOOLEAN must be 0x00 or 0xFF"
+            return
+        }
+    }
+    b == 255
+}
+
+// --- DER writer -----------------------------------------------------------------------------
+
+/// DER length octets for a content length of `n`.
++der_len(n: i64) : _ {
+    if n < 128 { return [n] }
+    parts = []
+    v = n
+    while v > 0 {
+        parts = xc_cat([v & 255], parts)
+        v = v >> 8
+    }
+    xc_cat([128 | host.sys_arr_len(parts)], parts)
+}
+
+/// One element: identifier octet `tag`, minimal length, `content`.
++der_encode(tag: i64, content: _) : _ {
+    xc_cat(xc_cat([tag], der_len(host.sys_arr_len(content))), content)
+}
+
+/// SEQUENCE of the already encoded `parts` (an array of byte arrays).
++der_seq(parts: _) : _ => der_encode(DER_SEQUENCE, der_join(parts))
+
+/// SET of the already encoded `parts` (not sorted: callers sort for canonical SET OF).
++der_set(parts: _) : _ => der_encode(DER_SET, der_join(parts))
+
+/// Context-specific constructed `[n]` wrapper (EXPLICIT tagging).
++der_explicit(n: i64, content: _) : _ => der_encode(160 | n, content)
+
+/// INTEGER with the minimal two's complement encoding of `n`.
++der_int(n: i64) : _ {
+    raw = []
+    i = 7
+    while i >= 0 {
+        raw = host.sys_arr_push(raw, (n >>> (i * 8)) & 255)
+        i = i - 1
+    }
+    start = 0
+    going = true
+    while going {
+        if start >= 7 {
+            going = false
+        } else {
+            drop = false
+            if raw[start] == 0 {
+                if raw[start + 1] < 128 { drop = true }
+            }
+            if raw[start] == 255 {
+                if raw[start + 1] >= 128 { drop = true }
+            }
+            if drop { start = start + 1 } else { going = false }
+        }
+    }
+    der_encode(DER_INTEGER, xc_slice(raw, start, 8))
+}
+
+/// Non-negative INTEGER from big-endian magnitude bytes (adds the sign padding byte when needed).
++der_int_bytes(magnitude: _) : _ {
+    n = host.sys_arr_len(magnitude)
+    from = 0
+    while from + 1 < n {
+        if magnitude[from] != 0 { break }
+        from = from + 1
+    }
+    body = xc_slice(magnitude, from, n)
+    if host.sys_arr_len(body) == 0 { body = [0] }
+    if body[0] >= 128 { body = xc_cat([0], body) }
+    der_encode(DER_INTEGER, body)
+}
+
+/// BOOLEAN.
++der_bool(value: bool) : _ {
+    on = [1, 1, 255]
+    off = [1, 1, 0]
+    if value { return on }
+    off
+}
+
+/// NULL.
++der_null() : _ => [5, 0]
+
+/// OCTET STRING.
++der_octets(bytes: _) : _ => der_encode(DER_OCTET_STRING, bytes)
+
+/// BIT STRING with `unused` trailing bits in the last byte.
++der_bits(bytes: _, unused: i64) : _ => der_encode(DER_BIT_STRING, xc_cat([unused], bytes))
+
+/// UTF8String.
++der_utf8(s: str) : _ => der_encode(DER_UTF8, host.sys_str_to_bytes(s))
+
+/// PrintableString; characters outside the printable set fail.
++der_printable(s: str) : _! {
+    allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 '()+,-./:=?"
+    ok = true
+    i = 0
+    n = host.sys_str_len(s)
+    while i < n {
+        if xc_find(allowed, s[i], 0) < 0 { ok = false }
+        i = i + 1
+    }
+    ensure ok else {
+        fail "der: '{s}' is not a PrintableString"
+        return
+    }
+    der_encode(DER_PRINTABLE, host.sys_str_to_bytes(s))
+}
+
+/// IA5String (7-bit ASCII).
++der_ia5(s: str) : _! {
+    raw = host.sys_str_to_bytes(s)
+    ensure xc_is_ascii(raw) else {
+        fail "der: '{s}' is not an IA5String"
+        return
+    }
+    der_encode(DER_IA5, raw)
+}
+
+xc_is_ascii(bytes: _) : bool {
+    ok = true
+    i = 0
+    n = host.sys_arr_len(bytes)
+    while i < n {
+        if bytes[i] > 127 { ok = false }
+        i = i + 1
+    }
+    ok
+}
+
+// --- OIDs -----------------------------------------------------------------------------------
+
+/// Dotted form of the OBJECT IDENTIFIER content `bytes`.
++der_oid_text(bytes: _) : str! {
+    n = host.sys_arr_len(bytes)
+    ensure n >= 1 else {
+        fail "der: empty OBJECT IDENTIFIER"
+        return
+    }
+    out = ""
+    acc = 0
+    count = 0
+    first = true
+    problem = ""
+    i = 0
+    while i < n {
+        b = bytes[i]
+        if count == 0 {
+            if b == 128 { problem = "der: non-minimal OBJECT IDENTIFIER arc" }
+        }
+        if count >= 9 { problem = "der: OBJECT IDENTIFIER arc too large" }
+        acc = (acc << 7) | (b & 127)
+        count = count + 1
+        if (b & 128) == 0 {
+            if first {
+                a1 = acc / 40
+                if a1 > 2 { a1 = 2 }
+                out = "{a1}.{acc - a1 * 40}"
+                first = false
+            } else {
+                out = "{out}.{acc}"
+            }
+            acc = 0
+            count = 0
+        }
+        i = i + 1
+    }
+    if count != 0 { problem = "der: truncated OBJECT IDENTIFIER" }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+/// Dotted OID of an OBJECT IDENTIFIER element (fails when `t` has another tag).
++der_oid_value(data: _, t: Tlv) : str! {
+    ensure t.tag == DER_OID else {
+        fail "der: expected OBJECT IDENTIFIER, got tag {t.tag}"
+        return
+    }
+    der_oid_text(der_content(data, t)) or err { fail "{err}" }
+}
+
+/// OBJECT IDENTIFIER element for the dotted string `dotted`.
++der_oid(dotted: str) : _! {
+    parts = xc_split(dotted, ".")
+    n = host.sys_arr_len(parts)
+    ensure n >= 2 else {
+        fail "der: OID '{dotted}' needs at least two arcs"
+        return
+    }
+    arcs = []
+    bad = ""
+    i = 0
+    while i < n {
+        p = parts[i]
+        plen = host.sys_str_len(p)
+        v = 0
+        if plen == 0 {
+            if bad == "" { bad = "der: empty arc in OID '{dotted}'" }
+        }
+        if plen > 18 {
+            if bad == "" { bad = "der: OID arc too large in '{dotted}'" }
+        }
+        j = 0
+        while j < plen {
+            d = xc_digit(p[j])
+            if d < 0 {
+                if bad == "" { bad = "der: invalid arc '{p}' in OID '{dotted}'" }
+            } else {
+                v = v * 10 + d
+            }
+            j = j + 1
+        }
+        arcs = host.sys_arr_push(arcs, v)
+        i = i + 1
+    }
+    ensure bad == "" else {
+        fail "{bad}"
+        return
+    }
+    a1 = arcs[0]
+    a2 = arcs[1]
+    ensure a1 <= 2 else {
+        fail "der: first OID arc must be 0, 1 or 2"
+        return
+    }
+    if a1 < 2 {
+        ensure a2 < 40 else {
+            fail "der: second OID arc must be below 40 under arc {a1}"
+            return
+        }
+    }
+    body = xc_base128(a1 * 40 + a2)
+    k = 2
+    while k < n {
+        body = xc_cat(body, xc_base128(arcs[k]))
+        k = k + 1
+    }
+    der_encode(DER_OID, body)
+}
+
+xc_base128(v: i64) : _ {
+    if v < 128 { return [v] }
+    parts = [v & 127]
+    rest = v >> 7
+    while rest > 0 {
+        parts = xc_cat([(rest & 127) | 128], parts)
+        rest = rest >> 7
+    }
+    parts
+}
+
+OID_TABLE = ["1.2.840.113549.1.1.1", "1.2.840.113549.1.1.5", "1.2.840.113549.1.1.11", "1.2.840.113549.1.1.12", "1.2.840.113549.1.1.13", "1.2.840.113549.1.1.10", "1.2.840.10045.2.1", "1.2.840.10045.4.3.2", "1.2.840.10045.4.3.3", "1.2.840.10045.4.3.4", "1.2.840.10045.3.1.7", "1.3.132.0.34", "1.3.132.0.35", "1.3.101.112", "1.3.101.113", "1.3.101.110", "1.3.101.111", "2.5.29.14", "2.5.29.15", "2.5.29.17", "2.5.29.19", "2.5.29.31", "2.5.29.32", "2.5.29.35", "2.5.29.37", "2.5.29.30", "1.3.6.1.5.5.7.1.1", "1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2", "1.3.6.1.5.5.7.3.3", "1.3.6.1.5.5.7.3.4", "1.3.6.1.5.5.7.3.8", "1.3.6.1.5.5.7.3.9", "2.5.4.3", "2.5.4.6", "2.5.4.7", "2.5.4.8", "2.5.4.10", "2.5.4.11", "2.5.4.5", "1.2.840.113549.1.9.1"]
+
+OID_NAMES = ["rsaEncryption", "sha1WithRSAEncryption", "sha256WithRSAEncryption", "sha384WithRSAEncryption", "sha512WithRSAEncryption", "rsassaPss", "id-ecPublicKey", "ecdsa-with-SHA256", "ecdsa-with-SHA384", "ecdsa-with-SHA512", "prime256v1", "secp384r1", "secp521r1", "Ed25519", "Ed448", "X25519", "X448", "subjectKeyIdentifier", "keyUsage", "subjectAltName", "basicConstraints", "cRLDistributionPoints", "certificatePolicies", "authorityKeyIdentifier", "extKeyUsage", "nameConstraints", "authorityInfoAccess", "serverAuth", "clientAuth", "codeSigning", "emailProtection", "timeStamping", "ocspSigning", "commonName", "countryName", "localityName", "stateOrProvinceName", "organizationName", "organizationalUnitName", "serialNumber", "emailAddress"]
+
+/// Registered name of `oid` (`""` when unknown).
++x509_oid_name(oid: str) : str {
+    out = ""
+    i = 0
+    n = host.sys_arr_len(OID_TABLE)
+    while i < n {
+        if OID_TABLE[i] == oid { out = OID_NAMES[i] }
+        i = i + 1
+    }
+    out
+}
+
+/// Name when known, otherwise the dotted OID itself.
++x509_oid_label(oid: str) : str {
+    name = x509_oid_name(oid)
+    if name == "" { return oid }
+    name
+}
+
+/// RFC 4514 style label of a distinguished-name attribute type.
++x509_rdn_label(oid: str) : str {
+    if oid == "2.5.4.3" { return "CN" }
+    if oid == "2.5.4.6" { return "C" }
+    if oid == "2.5.4.7" { return "L" }
+    if oid == "2.5.4.8" { return "ST" }
+    if oid == "2.5.4.9" { return "STREET" }
+    if oid == "2.5.4.10" { return "O" }
+    if oid == "2.5.4.11" { return "OU" }
+    if oid == "2.5.4.5" { return "serialNumber" }
+    if oid == "2.5.4.4" { return "SN" }
+    if oid == "2.5.4.42" { return "GN" }
+    if oid == "2.5.4.12" { return "title" }
+    if oid == "0.9.2342.19200300.100.1.25" { return "DC" }
+    if oid == "0.9.2342.19200300.100.1.1" { return "UID" }
+    if oid == "1.2.840.113549.1.9.1" { return "emailAddress" }
+    oid
+}
+
+// --- strings and times ----------------------------------------------------------------------
+
+/// Text of a string element (UTF8String, PrintableString, IA5String, TeletexString, BMPString).
++der_string(data: _, t: Tlv) : str! {
+    raw = der_content(data, t)
+    if t.tag == DER_UTF8 { return host.sys_bytes_to_str(raw) }
+    if t.tag == DER_PRINTABLE {
+        return xc_ascii(raw) or err { fail "{err}" }
+    }
+    if t.tag == DER_IA5 {
+        return xc_ascii(raw) or err { fail "{err}" }
+    }
+    if t.tag == DER_TELETEX {
+        out = ""
+        i = 0
+        while i < host.sys_arr_len(raw) {
+            out = "{out}{host.sys_chr(raw[i])}"
+            i = i + 1
+        }
+        return out
+    }
+    if t.tag == DER_BMP {
+        ensure t.size % 2 == 0 else {
+            fail "der: BMPString of odd length"
+            return
+        }
+        out = ""
+        i = 0
+        while i < host.sys_arr_len(raw) {
+            out = "{out}{host.sys_chr(raw[i] * 256 + raw[i + 1])}"
+            i = i + 2
+        }
+        return out
+    }
+    fail "der: tag {t.tag} is not a string type"
+}
+
+xc_days_from_civil(year: i64, month: i64, day: i64) : i64 {
+    y = year
+    if month <= 2 { y = y - 1 }
+    era = y / 400
+    if y < 0 { era = (y - 399) / 400 }
+    yoe = y - era * 400
+    shifted = month + 9
+    if month > 2 { shifted = month - 3 }
+    doy = (153 * shifted + 2) / 5 + day - 1
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+xc_is_leap(year: i64) : bool {
+    if year % 400 == 0 { return true }
+    if year % 100 == 0 { return false }
+    year % 4 == 0
+}
+
+xc_days_in_month(year: i64, month: i64) : i64 {
+    if month == 2 {
+        if xc_is_leap(year) { return 29 }
+        return 28
+    }
+    if month == 4 { return 30 }
+    if month == 6 { return 30 }
+    if month == 9 { return 30 }
+    if month == 11 { return 30 }
+    31
+}
+
+/// Unix seconds of a UTC calendar time; fails on impossible dates.
++x509_unix_from_civil(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) : i64! {
+    ensure month >= 1 else {
+        fail "x509: month {month} out of range"
+        return
+    }
+    ensure month <= 12 else {
+        fail "x509: month {month} out of range"
+        return
+    }
+    ensure day >= 1 else {
+        fail "x509: day {day} out of range"
+        return
+    }
+    ensure day <= xc_days_in_month(year, month) else {
+        fail "x509: day {day} out of range for {year}-{month}"
+        return
+    }
+    ensure hour >= 0 else {
+        fail "x509: hour out of range"
+        return
+    }
+    ensure hour <= 23 else {
+        fail "x509: hour out of range"
+        return
+    }
+    ensure minute >= 0 else {
+        fail "x509: minute out of range"
+        return
+    }
+    ensure minute <= 59 else {
+        fail "x509: minute out of range"
+        return
+    }
+    ensure second >= 0 else {
+        fail "x509: second out of range"
+        return
+    }
+    ensure second <= 59 else {
+        fail "x509: second out of range"
+        return
+    }
+    xc_days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for unix seconds `ts`.
++x509_unix_iso(ts: i64) : str {
+    days = ts / 86400
+    rem = ts % 86400
+    if rem < 0 {
+        rem = rem + 86400
+        days = days - 1
+    }
+    z = days + 719468
+    era = z / 146097
+    if z < 0 { era = (z - 146096) / 146097 }
+    doe = z - era * 146097
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    y = yoe + era * 400
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp = (5 * doy + 2) / 153
+    d = doy - (153 * mp + 2) / 5 + 1
+    m = mp + 3
+    if mp >= 10 { m = mp - 9 }
+    if m <= 2 { y = y + 1 }
+    hh = rem / 3600
+    mm = rem % 3600 / 60
+    ss = rem % 60
+    "{xc_pad(y, 4)}-{xc_pad(m, 2)}-{xc_pad(d, 2)}T{xc_pad(hh, 2)}:{xc_pad(mm, 2)}:{xc_pad(ss, 2)}Z"
+}
+
+xc_pad(v: i64, width: i64) : str {
+    s = "{v}"
+    while host.sys_str_len(s) < width { s = "0{s}" }
+    s
+}
+
+/// Unix seconds of a UTCTime or GeneralizedTime element (both must end in `Z`).
++der_time_value(data: _, t: Tlv) : i64! {
+    if t.tag != DER_UTCTIME {
+        ensure t.tag == DER_GENTIME else {
+            fail "der: expected a time, got tag {t.tag}"
+            return
+        }
+    }
+    text = xc_ascii(der_content(data, t)) or err { fail "{err}" }
+    want = 13
+    if t.tag == DER_GENTIME { want = 15 }
+    ensure host.sys_str_len(text) == want else {
+        fail "der: time '{text}' has the wrong length"
+        return
+    }
+    ensure text[want - 1] == "Z" else {
+        fail "der: time '{text}' must end in Z"
+        return
+    }
+    digits = []
+    bad = false
+    i = 0
+    while i < want - 1 {
+        d = xc_digit(text[i])
+        if d < 0 { bad = true }
+        digits = host.sys_arr_push(digits, d)
+        i = i + 1
+    }
+    ensure !bad else {
+        fail "der: time '{text}' has non-digit characters"
+        return
+    }
+    base = 0
+    year = 0
+    if t.tag == DER_UTCTIME {
+        yy = digits[0] * 10 + digits[1]
+        year = 2000 + yy
+        if yy >= 50 { year = 1900 + yy }
+        base = 2
+    } else {
+        year = digits[0] * 1000 + digits[1] * 100 + digits[2] * 10 + digits[3]
+        base = 4
+    }
+    month = digits[base] * 10 + digits[base + 1]
+    day = digits[base + 2] * 10 + digits[base + 3]
+    hour = digits[base + 4] * 10 + digits[base + 5]
+    minute = digits[base + 6] * 10 + digits[base + 7]
+    second = digits[base + 8] * 10 + digits[base + 9]
+    x509_unix_from_civil(year, month, day, hour, minute, second) or err { fail "{err}" }
+}
+
+/// DER time element for unix seconds: UTCTime for 1950..2049, GeneralizedTime otherwise.
++der_time(ts: i64) : _ {
+    iso = x509_unix_iso(ts)
+    year = 0
+    i = 0
+    while i < 4 {
+        year = year * 10 + xc_digit(iso[i])
+        i = i + 1
+    }
+    body = "{iso[5..7]}{iso[8..10]}{iso[11..13]}{iso[14..16]}{iso[17..19]}Z"
+    if year >= 1950 {
+        if year <= 2049 {
+            return der_encode(DER_UTCTIME, host.sys_str_to_bytes("{iso[2..4]}{body}"))
+        }
+    }
+    der_encode(DER_GENTIME, host.sys_str_to_bytes("{iso[0..4]}{body}"))
+}
+
+// --- PEM ------------------------------------------------------------------------------------
+
+/// One PEM block.
++PemBlock = {
+    /// Label between `BEGIN` and `-----`, e.g. `CERTIFICATE`. Defaults to `""`.
+    label: str = ""
+    /// Decoded DER bytes. Defaults to `[]`.
+    der: _ = []
+}
+
+/// Every PEM block in `text` (surrounding text is ignored). Fails on mismatched or unterminated
+/// blocks, bad base64, and headers such as `Proc-Type` (encrypted PEM is not supported).
++pem_decode_all(text: str) : _! {
+    lines = xc_split(text, "\n")
+    out = []
+    label = ""
+    body = ""
+    inside = false
+    problem = ""
+    i = 0
+    n = host.sys_arr_len(lines)
+    while i < n {
+        line = xc_trim(lines[i])
+        if problem == "" {
+            if inside {
+                if xc_starts(line, "-----END ") {
+                    want = "-----END {label}-----"
+                    if line != want {
+                        problem = "pem: END line '{line}' does not match BEGIN {label}"
+                    } else {
+                        bytes = base64_decode_bytes(body) or err {
+                            problem = "pem: invalid base64 in {label} block: {err}"
+                            NOTHING
+                        }
+                        if problem == "" { out = host.sys_arr_push(out, PemBlock.{label, der: bytes}) }
+                        inside = false
+                        body = ""
+                    }
+                } else {
+                    if xc_find(line, ":", 0) >= 0 {
+                        problem = "pem: headers inside a {label} block are not supported"
+                    } else {
+                        body = "{body}{line}"
+                    }
+                }
+            } else {
+                if xc_starts(line, "-----BEGIN ") {
+                    if xc_ends(line, "-----") {
+                        label = line[11..(host.sys_str_len(line) - 5)]
+                        inside = true
+                        body = ""
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    ensure !inside else {
+        fail "pem: unterminated {label} block"
+        return
+    }
+    out
+}
+
+/// The first PEM block of `text`.
++pem_decode(text: str) : PemBlock! {
+    blocks = pem_decode_all(text) or err { fail "{err}" }
+    ensure host.sys_arr_len(blocks) > 0 else {
+        fail "pem: no PEM block found"
+        return
+    }
+    blocks[0]
+}
+
+/// DER bytes of the first block labelled `label`.
++pem_decode_label(text: str, label: str) : _! {
+    blocks = pem_decode_all(text) or err { fail "{err}" }
+    found = false
+    der = []
+    i = 0
+    while i < host.sys_arr_len(blocks) {
+        b = blocks[i]
+        if !found {
+            if b.label == label {
+                found = true
+                der = b.der
+            }
+        }
+        i = i + 1
+    }
+    ensure found else {
+        fail "pem: no {label} block found"
+        return
+    }
+    der
+}
+
+/// PEM text for `der` under `label`, wrapped at 64 columns with a trailing newline.
++pem_encode(label: str, der: _) : str {
+    b64 = base64_encode_bytes(der)
+    n = host.sys_str_len(b64)
+    out = "-----BEGIN {label}-----\n"
+    i = 0
+    while i < n {
+        j = i + 64
+        if j > n { j = n }
+        out = "{out}{b64[i..j]}\n"
+        i = j
+    }
+    "{out}-----END {label}-----\n"
+}
+
+// --- names ----------------------------------------------------------------------------------
+
+/// RFC 4514 escaping of an attribute value.
+xc_escape_dn(value: str) : str {
+    n = host.sys_str_len(value)
+    out = ""
+    i = 0
+    while i < n {
+        c = value[i]
+        special = false
+        if c == "," { special = true }
+        if c == "+" { special = true }
+        if c == "\"" { special = true }
+        if c == "\\" { special = true }
+        if c == "<" { special = true }
+        if c == ">" { special = true }
+        if c == ";" { special = true }
+        if i == 0 {
+            if c == " " { special = true }
+            if c == "#" { special = true }
+        }
+        if i == n - 1 {
+            if c == " " { special = true }
+        }
+        if host.sys_ord(c) == 0 {
+            out = "{out}\\00"
+        } else {
+            if special { out = "{out}\\{c}" } else { out = "{out}{c}" }
+        }
+        i = i + 1
+    }
+    out
+}
+
+/// A distinguished name: RFC 4514 text plus the commonly used attributes.
++DName = {
+    /// RFC 4514 text (RDNs reversed, `,` separated). Defaults to `""`.
+    text: str = ""
+    /// commonName, or empty. Defaults to `""`.
+    cn: str = ""
+    /// organizationName, or empty. Defaults to `""`.
+    org: str = ""
+    /// organizationalUnitName, or empty. Defaults to `""`.
+    ou: str = ""
+    /// countryName, or empty. Defaults to `""`.
+    country: str = ""
+    /// stateOrProvinceName, or empty. Defaults to `""`.
+    state_name: str = ""
+    /// localityName, or empty. Defaults to `""`.
+    locality: str = ""
+    /// emailAddress, or empty. Defaults to `""`.
+    email: str = ""
+    /// Number of RDNs. Defaults to `0`.
+    rdn_count: i64 = 0
+}
+
+/// Parse a `Name` (SEQUENCE OF RDN).
++x509_name(data: _, t: Tlv) : DName! {
+    ensure t.tag == DER_SEQUENCE else {
+        fail "x509: Name must be a SEQUENCE, got tag {t.tag}"
+        return
+    }
+    rdns = der_children(data, t) or err { fail "{err}" }
+    texts = []
+    cn = ""
+    org = ""
+    ou = ""
+    country = ""
+    st = ""
+    loc = ""
+    email = ""
+    problem = ""
+    i = 0
+    while i < host.sys_arr_len(rdns) {
+        rdn = rdns[i]
+        if rdn.tag != DER_SET {
+            if problem == "" { problem = "x509: RDN must be a SET" }
+        } else {
+            atvs = der_children(data, rdn) or err {
+                problem = "{err}"
+                NOTHING
+            }
+            if problem == "" {
+                if host.sys_arr_len(atvs) == 0 { problem = "x509: empty RDN" }
+            }
+            parts = []
+            j = 0
+            while j < host.sys_arr_len(atvs) {
+                atv = atvs[j]
+                kids = der_children(data, atv) or err {
+                    problem = "{err}"
+                    NOTHING
+                }
+                if problem == "" {
+                    if host.sys_arr_len(kids) != 2 {
+                        problem = "x509: AttributeTypeAndValue needs two elements"
+                    }
+                }
+                if problem == "" {
+                    ot = kids[0]
+                    vt = kids[1]
+                    oid = ""
+                    if ot.tag == DER_OID {
+                        oid = der_oid_value(data, ot) or err {
+                            problem = "{err}"
+                            ""
+                        }
+                    } else {
+                        problem = "x509: attribute type must be an OBJECT IDENTIFIER"
+                    }
+                    shown = ""
+                    if problem == "" {
+                        shown = "#{x509_hex(der_raw(data, vt))}"
+                        is_text = false
+                        if vt.tag == DER_UTF8 { is_text = true }
+                        if vt.tag == DER_PRINTABLE { is_text = true }
+                        if vt.tag == DER_IA5 { is_text = true }
+                        if vt.tag == DER_TELETEX { is_text = true }
+                        if vt.tag == DER_BMP { is_text = true }
+                        if is_text {
+                            value = der_string(data, vt) or err {
+                                problem = "{err}"
+                                ""
+                            }
+                            shown = xc_escape_dn(value)
+                            if oid == "2.5.4.3" { if cn == "" { cn = value } }
+                            if oid == "2.5.4.10" { if org == "" { org = value } }
+                            if oid == "2.5.4.11" { if ou == "" { ou = value } }
+                            if oid == "2.5.4.6" { if country == "" { country = value } }
+                            if oid == "2.5.4.8" { if st == "" { st = value } }
+                            if oid == "2.5.4.7" { if loc == "" { loc = value } }
+                            if oid == "1.2.840.113549.1.9.1" { if email == "" { email = value } }
+                        }
+                        parts = host.sys_arr_push(parts, "{x509_rdn_label(oid)}={shown}")
+                    }
+                }
+                j = j + 1
+            }
+            texts = host.sys_arr_push(texts, xc_join(parts, "+"))
+        }
+        i = i + 1
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    ordered = []
+    k = host.sys_arr_len(texts) - 1
+    while k >= 0 {
+        ordered = host.sys_arr_push(ordered, texts[k])
+        k = k - 1
+    }
+    DName.{text: xc_join(ordered, ","), cn, org, ou, country, state_name: st, locality: loc, email, rdn_count: host.sys_arr_len(texts)}
+}
+
+// --- certificates ---------------------------------------------------------------------------
+
+/// A parsed X.509 certificate (flat fields, so it can be copied and stored freely).
++X509Cert = {
+    /// Version 1, 2 or 3. Defaults to `1`.
+    version: i64 = 1
+    /// Serial number as lower-case hex. Defaults to `""`.
+    serial: str = ""
+    /// Signature algorithm OID. Defaults to `""`.
+    sig_oid: str = ""
+    /// Signature algorithm name, or the OID when unknown. Defaults to `""`.
+    sig_name: str = ""
+    /// Issuer as RFC 4514 text. Defaults to `""`.
+    issuer: str = ""
+    /// Issuer commonName. Defaults to `""`.
+    issuer_cn: str = ""
+    /// Subject as RFC 4514 text. Defaults to `""`.
+    subject: str = ""
+    /// Subject commonName. Defaults to `""`.
+    subject_cn: str = ""
+    /// Subject organizationName. Defaults to `""`.
+    subject_org: str = ""
+    /// Raw DER of the issuer Name (for chain matching). Defaults to `[]`.
+    issuer_der: _ = []
+    /// Raw DER of the subject Name. Defaults to `[]`.
+    subject_der: _ = []
+    /// notBefore as unix seconds. Defaults to `0`.
+    not_before: i64 = 0
+    /// notAfter as unix seconds. Defaults to `0`.
+    not_after: i64 = 0
+    /// Public key algorithm OID. Defaults to `""`.
+    key_oid: str = ""
+    /// Public key algorithm name. Defaults to `""`.
+    key_name: str = ""
+    /// EC curve OID from the key parameters, or empty. Defaults to `""`.
+    curve_oid: str = ""
+    /// EC curve name, or empty. Defaults to `""`.
+    curve_name: str = ""
+    /// subjectPublicKey bytes (without the unused-bits octet). Defaults to `[]`.
+    key_bytes: _ = []
+    /// RSA modulus size in bits, 0 for other keys. Defaults to `0`.
+    rsa_bits: i64 = 0
+    /// RSA public exponent, 0 for other keys. Defaults to `0`.
+    rsa_exp: i64 = 0
+    /// Subject alternative names such as `DNS:a.test`, `IP:192.0.2.1`, `email:x@y`, `URI:...`. Defaults to `[]`.
+    sans: _ = []
+    /// True when basicConstraints says cA. Defaults to `false`.
+    is_ca: bool = false
+    /// True when the basicConstraints extension is present. Defaults to `false`.
+    has_bc: bool = false
+    /// pathLenConstraint, or -1 when absent. Defaults to `-1`.
+    path_len: i64 = -1
+    /// Key usage bit mask (`1 << KU_*`), or -1 when the extension is absent. Defaults to `-1`.
+    key_usage: i64 = -1
+    /// Extended key usage names (or OIDs). Defaults to `[]`.
+    ekus: _ = []
+    /// OIDs of all extensions in order. Defaults to `[]`.
+    ext_oids: _ = []
+    /// Critical extensions this module does not understand. Defaults to `[]`.
+    unknown_critical: _ = []
+    /// subjectKeyIdentifier as hex, or empty. Defaults to `""`.
+    ski: str = ""
+    /// authorityKeyIdentifier keyIdentifier as hex, or empty. Defaults to `""`.
+    aki: str = ""
+    /// DER of the TBSCertificate (the signed bytes). Defaults to `[]`.
+    tbs: _ = []
+    /// Signature value bytes. Defaults to `[]`.
+    sig_bytes: _ = []
+    /// True when issuer and subject Names are byte-identical. Defaults to `false`.
+    self_issued: bool = false
+    /// Size of the whole certificate in bytes. Defaults to `0`.
+    der_len: i64 = 0
+    /// SHA-256 fingerprint of the whole DER as hex. Defaults to `""`.
+    fingerprint: str = ""
+}
+
+/// Text of an IP address OCTET STRING (4 bytes dotted, 16 bytes as eight hex groups).
++x509_ip_text(bytes: _) : str! {
+    n = host.sys_arr_len(bytes)
+    if n == 4 { return "{bytes[0]}.{bytes[1]}.{bytes[2]}.{bytes[3]}" }
+    ensure n == 16 else {
+        fail "x509: IP address of {n} bytes"
+        return
+    }
+    out = ""
+    i = 0
+    while i < 16 {
+        group = bytes[i] * 256 + bytes[i + 1]
+        digits = "0123456789abcdef"
+        h = "{digits[group / 4096]}{digits[group / 256 % 16]}{digits[group / 16 % 16]}{digits[group % 16]}"
+        if i == 0 { out = h } else { out = "{out}:{h}" }
+        i = i + 2
+    }
+    out
+}
+
+/// Names of the bits set in a key usage mask.
++x509_key_usage_names(mask: i64) : _ {
+    names = ["digitalSignature", "nonRepudiation", "keyEncipherment", "dataEncipherment", "keyAgreement", "keyCertSign", "cRLSign", "encipherOnly", "decipherOnly"]
+    out = []
+    if mask < 0 { return out }
+    i = 0
+    while i < 9 {
+        if (mask & (1 << i)) != 0 { out = host.sys_arr_push(out, names[i]) }
+        i = i + 1
+    }
+    out
+}
+
+/// Read the subjectAltName extension value.
+xc_parse_sans(value: _) : _! {
+    root = der_parse(value) or err { fail "{err}" }
+    ensure root.tag == DER_SEQUENCE else {
+        fail "x509: subjectAltName must be a SEQUENCE"
+        return
+    }
+    kids = der_children(value, root) or err { fail "{err}" }
+    ensure host.sys_arr_len(kids) > 0 else {
+        fail "x509: subjectAltName is empty"
+        return
+    }
+    out = []
+    problem = ""
+    i = 0
+    while i < host.sys_arr_len(kids) {
+        k = kids[i]
+        raw = der_content(value, k)
+        entry = ""
+        if k.tag == 130 {
+            text = xc_ascii(raw) or err {
+                problem = "{err}"
+                ""
+            }
+            entry = "DNS:{text}"
+        }
+        if k.tag == 129 {
+            text = xc_ascii(raw) or err {
+                problem = "{err}"
+                ""
+            }
+            entry = "email:{text}"
+        }
+        if k.tag == 134 {
+            text = xc_ascii(raw) or err {
+                problem = "{err}"
+                ""
+            }
+            entry = "URI:{text}"
+        }
+        if k.tag == 135 {
+            text = x509_ip_text(raw) or err {
+                problem = "{err}"
+                ""
+            }
+            entry = "IP:{text}"
+        }
+        if k.tag == 136 {
+            text = der_oid_text(raw) or err {
+                problem = "{err}"
+                ""
+            }
+            entry = "RID:{text}"
+        }
+        if k.tag == 164 {
+            inner = der_children(value, k) or err {
+                problem = "{err}"
+                NOTHING
+            }
+            if problem == "" {
+                if host.sys_arr_len(inner) == 1 {
+                    nm = x509_name(value, inner[0]) or err {
+                        problem = "{err}"
+                        DName.{}
+                    }
+                    entry = "dirName:{nm.text}"
+                } else {
+                    problem = "x509: directoryName needs exactly one Name"
+                }
+            }
+        }
+        if k.tag == 160 { entry = "otherName" }
+        if entry == "" {
+            if problem == "" { entry = "other:{k.tag}" }
+        }
+        out = host.sys_arr_push(out, entry)
+        i = i + 1
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    out
+}
+
+/// Parse the RSAPublicKey inside a subjectPublicKey: `[bits, exponent]` or `[0, 0]` on mismatch.
+xc_rsa_params(key: _) : _ {
+    root = der_parse(key) or Tlv.{tag: -1}
+    if root.tag != DER_SEQUENCE { return [0, 0] }
+    kids = der_children(key, root) or []
+    if host.sys_arr_len(kids) != 2 { return [0, 0] }
+    n = kids[0]
+    e = kids[1]
+    if n.tag != DER_INTEGER { return [0, 0] }
+    from = n.start
+    while from + 1 < n.end {
+        if key[from] != 0 { break }
+        from = from + 1
+    }
+    top = key[from]
+    bits = (n.end - from - 1) * 8
+    probe = top
+    while probe > 0 {
+        bits = bits + 1
+        probe = probe >> 1
+    }
+    exponent = der_int_value(key, e) or 0
+    pair = [bits, exponent]
+    pair
+}
+
+/// Parse a DER certificate. Validates structure, version/extension rules, matching signature
+/// algorithms and the serial number size; does not verify the signature.
++x509_parse(der: _) : X509Cert! {
+    ensure xc_is_bytes(der) else {
+        fail "x509: input is not a byte array"
+        return
+    }
+    root = der_parse(der) or err { fail "{err}" }
+    ensure root.tag == DER_SEQUENCE else {
+        fail "x509: Certificate must be a SEQUENCE"
+        return
+    }
+    top = der_children(der, root) or err { fail "{err}" }
+    ensure host.sys_arr_len(top) == 3 else {
+        fail "x509: Certificate must have three elements, found {host.sys_arr_len(top)}"
+        return
+    }
+    tbs_t = top[0]
+    alg_t = top[1]
+    sig_t = top[2]
+    ensure tbs_t.tag == DER_SEQUENCE else {
+        fail "x509: TBSCertificate must be a SEQUENCE"
+        return
+    }
+    outer_alg = der_children(der, alg_t) or err { fail "{err}" }
+    ensure host.sys_arr_len(outer_alg) >= 1 else {
+        fail "x509: empty signatureAlgorithm"
+        return
+    }
+    outer_oid = der_oid_value(der, outer_alg[0]) or err { fail "{err}" }
+    sig_bits = der_bitstring(der, sig_t) or err { fail "{err}" }
+    kids = der_children(der, tbs_t) or err { fail "{err}" }
+    nk = host.sys_arr_len(kids)
+    idx = 0
+    version = 1
+    if nk > 0 {
+        first = kids[0]
+        if first.tag == 160 {
+            inner = der_children(der, first) or err { fail "{err}" }
+            ensure host.sys_arr_len(inner) == 1 else {
+                fail "x509: version wrapper must hold one INTEGER"
+                return
+            }
+            v = der_int_value(der, inner[0]) or err { fail "{err}" }
+            ensure v >= 0 else {
+                fail "x509: negative version"
+                return
+            }
+            ensure v <= 2 else {
+                fail "x509: unsupported version {v + 1}"
+                return
+            }
+            version = v + 1
+            idx = 1
+        }
+    }
+    ensure nk >= idx + 6 else {
+        fail "x509: TBSCertificate is missing mandatory fields"
+        return
+    }
+    serial_t = kids[idx]
+    ensure serial_t.size <= 20 else {
+        fail "x509: serial number longer than 20 octets"
+        return
+    }
+    serial = der_int_hex(der, serial_t) or err { fail "{err}" }
+    ensure data_msb_clear(der, serial_t) else {
+        fail "x509: negative serial number"
+        return
+    }
+    inner_alg = der_children(der, kids[idx + 1]) or err { fail "{err}" }
+    ensure host.sys_arr_len(inner_alg) >= 1 else {
+        fail "x509: empty signature algorithm in TBSCertificate"
+        return
+    }
+    inner_oid = der_oid_value(der, inner_alg[0]) or err { fail "{err}" }
+    ensure inner_oid == outer_oid else {
+        fail "x509: signature algorithm {inner_oid} differs from outer {outer_oid}"
+        return
+    }
+    issuer_t = kids[idx + 2]
+    issuer = x509_name(der, issuer_t) or err { fail "{err}" }
+    validity = der_children(der, kids[idx + 3]) or err { fail "{err}" }
+    ensure host.sys_arr_len(validity) == 2 else {
+        fail "x509: validity needs notBefore and notAfter"
+        return
+    }
+    not_before = der_time_value(der, validity[0]) or err { fail "{err}" }
+    not_after = der_time_value(der, validity[1]) or err { fail "{err}" }
+    ensure not_before <= not_after else {
+        fail "x509: notBefore is after notAfter"
+        return
+    }
+    subject_t = kids[idx + 4]
+    subject = x509_name(der, subject_t) or err { fail "{err}" }
+    spki = der_children(der, kids[idx + 5]) or err { fail "{err}" }
+    ensure host.sys_arr_len(spki) == 2 else {
+        fail "x509: SubjectPublicKeyInfo needs an algorithm and a key"
+        return
+    }
+    key_alg = der_children(der, spki[0]) or err { fail "{err}" }
+    ensure host.sys_arr_len(key_alg) >= 1 else {
+        fail "x509: empty public key algorithm"
+        return
+    }
+    key_oid = der_oid_value(der, key_alg[0]) or err { fail "{err}" }
+    curve_oid = ""
+    if host.sys_arr_len(key_alg) >= 2 {
+        p = key_alg[1]
+        if p.tag == DER_OID { curve_oid = der_oid_value(der, p) or "" }
+    }
+    key_bits = der_bitstring(der, spki[1]) or err { fail "{err}" }
+    key_bytes = key_bits[1]
+    rsa_bits = 0
+    rsa_exp = 0
+    if key_oid == "1.2.840.113549.1.1.1" {
+        params = xc_rsa_params(key_bytes)
+        rsa_bits = params[0]
+        rsa_exp = params[1]
+    }
+    sans = []
+    is_ca = false
+    has_bc = false
+    path_len = -1
+    key_usage = -1
+    ekus = []
+    ext_oids = []
+    unknown_critical = []
+    ski = ""
+    aki = ""
+    rest = idx + 6
+    problem = ""
+    while rest < nk {
+        item = kids[rest]
+        if item.tag == 161 {
+            ensure version >= 2 else {
+                fail "x509: issuerUniqueID needs version 2 or 3"
+                return
+            }
+        }
+        if item.tag == 162 {
+            ensure version >= 2 else {
+                fail "x509: subjectUniqueID needs version 2 or 3"
+                return
+            }
+        }
+        if item.tag == 163 {
+            ensure version == 3 else {
+                fail "x509: extensions need version 3"
+                return
+            }
+            wrapper = der_children(der, item) or err { fail "{err}" }
+            ensure host.sys_arr_len(wrapper) == 1 else {
+                fail "x509: extensions wrapper must hold one SEQUENCE"
+                return
+            }
+            exts = der_children(der, wrapper[0]) or err { fail "{err}" }
+            ensure host.sys_arr_len(exts) > 0 else {
+                fail "x509: empty extensions"
+                return
+            }
+            e = 0
+            while e < host.sys_arr_len(exts) {
+                parts = der_children(der, exts[e]) or err {
+                    problem = "{err}"
+                    NOTHING
+                }
+                np = host.sys_arr_len(parts)
+                if problem == "" {
+                    if np < 2 { problem = "x509: extension needs an OID and a value" }
+                }
+                if problem == "" {
+                    if np > 3 { problem = "x509: extension has too many elements" }
+                }
+                if problem == "" {
+                    ext_oid = der_oid_value(der, parts[0]) or err {
+                        problem = "{err}"
+                        ""
+                    }
+                    critical = false
+                    val_t = parts[np - 1]
+                    if np == 3 {
+                        critical = der_bool_value(der, parts[1]) or err {
+                            problem = "{err}"
+                            false
+                        }
+                    }
+                    if problem == "" {
+                        if val_t.tag != DER_OCTET_STRING { problem = "x509: extension value must be an OCTET STRING" }
+                    }
+                    if problem == "" {
+                        dup = false
+                        d = 0
+                        while d < host.sys_arr_len(ext_oids) {
+                            if ext_oids[d] == ext_oid { dup = true }
+                            d = d + 1
+                        }
+                        if dup { problem = "x509: duplicate extension {ext_oid}" }
+                        ext_oids = host.sys_arr_push(ext_oids, ext_oid)
+                        value = der_content(der, val_t)
+                        known = false
+                        if ext_oid == "2.5.29.19" {
+                            known = true
+                            bc = der_parse(value) or err {
+                                problem = "{err}"
+                                Tlv.{}
+                            }
+                            if problem == "" {
+                                bkids = der_children(value, bc) or err {
+                                    problem = "{err}"
+                                    NOTHING
+                                }
+                                has_bc = true
+                                bi = 0
+                                if problem == "" {
+                                    if host.sys_arr_len(bkids) > 0 {
+                                        b0 = bkids[0]
+                                        if b0.tag == DER_BOOLEAN {
+                                            is_ca = der_bool_value(value, b0) or false
+                                            bi = 1
+                                        }
+                                    }
+                                    if host.sys_arr_len(bkids) > bi {
+                                        pl = der_int_value(value, bkids[bi]) or err {
+                                            problem = "{err}"
+                                            -1
+                                        }
+                                        path_len = pl
+                                    }
+                                }
+                                if problem == "" {
+                                    if path_len >= 0 {
+                                        if !is_ca { problem = "x509: pathLenConstraint without cA" }
+                                    }
+                                }
+                            }
+                        }
+                        if ext_oid == "2.5.29.15" {
+                            known = true
+                            kt = der_parse(value) or err {
+                                problem = "{err}"
+                                Tlv.{}
+                            }
+                            if problem == "" {
+                                kb = der_bitstring(value, kt) or err {
+                                    problem = "{err}"
+                                    EMPTY_BITS
+                                }
+                                if problem == "" {
+                                    mask = 0
+                                    bytes = kb[1]
+                                    bit = 0
+                                    while bit < 9 {
+                                        byte_i = bit / 8
+                                        if byte_i < host.sys_arr_len(bytes) {
+                                            if (bytes[byte_i] & (128 >> (bit % 8))) != 0 { mask = mask | (1 << bit) }
+                                        }
+                                        bit = bit + 1
+                                    }
+                                    key_usage = mask
+                                }
+                            }
+                        }
+                        if ext_oid == "2.5.29.17" {
+                            known = true
+                            sans = xc_parse_sans(value) or err {
+                                problem = "{err}"
+                                NOTHING
+                            }
+                        }
+                        if ext_oid == "2.5.29.37" {
+                            known = true
+                            et = der_parse(value) or err {
+                                problem = "{err}"
+                                Tlv.{}
+                            }
+                            if problem == "" {
+                                ekids = der_children(value, et) or err {
+                                    problem = "{err}"
+                                    NOTHING
+                                }
+                                q = 0
+                                while q < host.sys_arr_len(ekids) {
+                                    oid_text = der_oid_value(value, ekids[q]) or err {
+                                        problem = "{err}"
+                                        ""
+                                    }
+                                    if problem == "" { ekus = host.sys_arr_push(ekus, x509_oid_label(oid_text)) }
+                                    q = q + 1
+                                }
+                            }
+                        }
+                        if ext_oid == "2.5.29.14" {
+                            known = true
+                            st = der_parse(value) or err {
+                                problem = "{err}"
+                                Tlv.{}
+                            }
+                            if problem == "" {
+                                if st.tag == DER_OCTET_STRING {
+                                    ski = x509_hex(der_content(value, st))
+                                } else {
+                                    problem = "x509: subjectKeyIdentifier must be an OCTET STRING"
+                                }
+                            }
+                        }
+                        if ext_oid == "2.5.29.35" {
+                            known = true
+                            at = der_parse(value) or err {
+                                problem = "{err}"
+                                Tlv.{}
+                            }
+                            if problem == "" {
+                                akids = der_children(value, at) or err {
+                                    problem = "{err}"
+                                    NOTHING
+                                }
+                                a = 0
+                                while a < host.sys_arr_len(akids) {
+                                    ak = akids[a]
+                                    if ak.tag == 128 { aki = x509_hex(der_content(value, ak)) }
+                                    a = a + 1
+                                }
+                            }
+                        }
+                        if critical {
+                            if !known { unknown_critical = host.sys_arr_push(unknown_critical, ext_oid) }
+                        }
+                    }
+                }
+                e = e + 1
+            }
+        }
+        rest = rest + 1
+    }
+    ensure problem == "" else {
+        fail "{problem}"
+        return
+    }
+    issuer_der = der_raw(der, issuer_t)
+    subject_der = der_raw(der, subject_t)
+    curve_name = ""
+    if curve_oid != "" { curve_name = x509_oid_name(curve_oid) }
+    X509Cert.{version, serial, sig_oid: outer_oid, sig_name: x509_oid_label(outer_oid), issuer: issuer.text, issuer_cn: issuer.cn, subject: subject.text, subject_cn: subject.cn, subject_org: subject.org, issuer_der, subject_der, not_before, not_after, key_oid, key_name: x509_oid_label(key_oid), curve_oid, curve_name, key_bytes, rsa_bits, rsa_exp, sans, is_ca, has_bc, path_len, key_usage, ekus, ext_oids, unknown_critical, ski, aki, tbs: der_raw(der, tbs_t), sig_bytes: sig_bits[1], self_issued: x509_same(issuer_der, subject_der), der_len: host.sys_arr_len(der), fingerprint: x509_hex(sha2_256(der))}
+}
+
+/// True when the INTEGER at `t` is non-negative (sign bit clear).
+data_msb_clear(data: _, t: Tlv) : bool => data[t.start] < 128
+
+/// Parse the first CERTIFICATE block of PEM `text`.
++x509_parse_pem(text: str) : X509Cert! {
+    der = pem_decode_label(text, "CERTIFICATE") or err { fail "{err}" }
+    x509_parse(der) or err { fail "{err}" }
+}
+
+/// True when `ts` (unix seconds) lies within the validity period, inclusive.
++x509_valid_at(cert: X509Cert, ts: i64) : bool {
+    if ts < cert.not_before { return false }
+    ts <= cert.not_after
+}
+
+/// True when the certificate carries the key usage bit `bit` (certificates without the
+/// extension allow every usage).
++x509_ku_has(cert: X509Cert, bit: i64) : bool {
+    if cert.key_usage < 0 { return true }
+    bits = cert.key_usage & (1 << bit)
+    bits != 0
+}
+
+/// True when the certificate allows the extended key usage `name` such as `serverAuth`
+/// (certificates without the extension allow all).
++x509_has_eku(cert: X509Cert, name: str) : bool {
+    if host.sys_arr_len(cert.ekus) == 0 { return true }
+    found = false
+    i = 0
+    while i < host.sys_arr_len(cert.ekus) {
+        if cert.ekus[i] == name { found = true }
+        i = i + 1
+    }
+    found
+}
+
+xc_is_ip_text(s: str) : bool {
+    parts = xc_split(s, ".")
+    if host.sys_arr_len(parts) != 4 { return false }
+    ok = true
+    i = 0
+    while i < 4 {
+        p = parts[i]
+        n = host.sys_str_len(p)
+        if n < 1 { ok = false }
+        if n > 3 { ok = false }
+        j = 0
+        while j < n {
+            if xc_digit(p[j]) < 0 { ok = false }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ok
+}
+
+/// RFC 6125 name matching of `pattern` (a DNS-ID, possibly `*.example.com`) against `host_name`.
++x509_dns_match(pattern: str, host_name: str) : bool {
+    p = xc_lower(pattern)
+    h = xc_lower(host_name)
+    if p == "" { return false }
+    if h == "" { return false }
+    if xc_ends(h, ".") { return false }
+    if !xc_starts(p, "*.") { return p == h }
+    suffix = p[1..host.sys_str_len(p)]
+    if xc_find(suffix, "*", 0) >= 0 { return false }
+    if xc_find(suffix, ".", 1) < 0 { return false }
+    dot = xc_find(h, ".", 0)
+    if dot < 1 { return false }
+    h[dot..host.sys_str_len(h)] == suffix
+}
+
+/// True when the certificate is valid for `host_name`: DNS SANs when present (IP SANs for IP
+/// literals), otherwise the subject commonName.
++x509_matches_host(cert: X509Cert, host_name: str) : bool {
+    ip = xc_is_ip_text(host_name)
+    has_dns = false
+    matched = false
+    i = 0
+    n = host.sys_arr_len(cert.sans)
+    while i < n {
+        s = cert.sans[i]
+        if xc_starts(s, "DNS:") {
+            has_dns = true
+            if !ip {
+                if x509_dns_match(s[4..host.sys_str_len(s)], host_name) { matched = true }
+            }
+        }
+        if xc_starts(s, "IP:") {
+            if ip {
+                if s[3..host.sys_str_len(s)] == host_name { matched = true }
+            }
+        }
+        i = i + 1
+    }
+    if matched { return true }
+    if has_dns { return false }
+    if ip { return false }
+    if host.sys_arr_len(cert.sans) > 0 {
+        // SANs exist but none is a DNS name: RFC 6125 forbids falling back to the CN.
+        return false
+    }
+    x509_dns_match(cert.subject_cn, host_name)
+}
+
+/// True when `parent` could have issued `child`: names chain, `parent` is allowed to sign
+/// certificates, and key identifiers agree when both are present. Signatures are not verified.
++x509_issued_by(child: X509Cert, parent: X509Cert) : bool {
+    if !x509_same(child.issuer_der, parent.subject_der) { return false }
+    if parent.has_bc {
+        if !parent.is_ca { return false }
+    }
+    if parent.version == 3 {
+        if parent.has_bc == false { return false }
+    }
+    if !x509_ku_has(parent, KU_KEY_CERT_SIGN) { return false }
+    if child.aki != "" {
+        if parent.ski != "" {
+            if child.aki != parent.ski { return false }
+        }
+    }
+    true
+}
+
+/// True when the certificate is self-issued and its names and key identifiers are consistent
+/// (a root candidate).
++x509_is_root_candidate(cert: X509Cert) : bool {
+    if !cert.self_issued { return false }
+    if !cert.is_ca { return false }
+    if cert.aki != "" {
+        if cert.ski != "" {
+            if cert.aki != cert.ski { return false }
+        }
+    }
+    true
+}
+
+/// A leaf can be used for TLS server authentication: not a CA, digitalSignature or
+/// keyEncipherment/keyAgreement allowed, serverAuth allowed, no unknown critical extensions.
++x509_usable_for_server(cert: X509Cert) : bool {
+    if cert.is_ca { return false }
+    if host.sys_arr_len(cert.unknown_critical) > 0 { return false }
+    if !x509_has_eku(cert, "serverAuth") { return false }
+    if x509_ku_has(cert, KU_DIGITAL_SIGNATURE) { return true }
+    if x509_ku_has(cert, KU_KEY_ENCIPHERMENT) { return true }
+    x509_ku_has(cert, KU_KEY_AGREEMENT)
+}
+
+// --- tests: DER ------------------------------------------------------------------------------
+
+xt_derr(data: _) : str {
+    t = der_read(data, 0) or err { return "{err}" }
+    "ok:{t.size}"
+}
+
+xt_has(msg: str, part: str) : bool => xc_find(msg, part, 0) >= 0
+
+xt_repeat(value: i64, n: i64) : _ {
+    out = []
+    for 0..n { out = host.sys_arr_push(out, value) }
+    out
+}
+
+test "der_len uses the short form below 128 and minimal long forms above" {
+    assert_eq(der_len(0), [0])
+    assert_eq(der_len(1), [1])
+    assert_eq(der_len(127), [127])
+    assert_eq(der_len(128), [129, 128])
+    assert_eq(der_len(255), [129, 255])
+    assert_eq(der_len(256), [130, 1, 0])
+    assert_eq(der_len(65535), [130, 255, 255])
+    assert_eq(der_len(65536), [131, 1, 0, 0])
+    assert_eq(der_len(16777216), [132, 1, 0, 0, 0])
+}
+
+test "der_encode and der_read round trip across length boundaries" {
+    sizes = [0, 1, 2, 126, 127, 128, 129, 255, 256, 257, 1000, 65535, 65536, 70000]
+    for sizes {
+        n = it
+        content = xt_repeat(7, n)
+        enc = der_encode(4, content)
+        t = der_read(enc, 0) or Tlv.{tag: -1}
+        assert_eq(t.tag, 4)
+        assert_eq(t.size, n)
+        assert_eq(t.start, t.hdr)
+        assert_eq(t.end, host.sys_arr_len(enc))
+        #assert(!(t.constructed))
+        assert_eq(t.cls, 0)
+        assert_eq(t.number, 4)
+        assert_eq(host.sys_arr_len(der_content(enc, t)), n)
+        assert_eq(der_raw(enc, t), enc)
+    }
+}
+
+test "der_read reports class, constructed bit and tag number" {
+    seq = der_read([48, 0], 0) or Tlv.{tag: -1}
+    assert_eq(seq.tag, 48)
+    assert_eq(seq.cls, 0)
+    #assert(seq.constructed)
+    assert_eq(seq.number, 16)
+    ctx = der_read([163, 0], 0) or Tlv.{tag: -1}
+    assert_eq(ctx.cls, 2)
+    #assert(ctx.constructed)
+    assert_eq(ctx.number, 3)
+    prim = der_read([130, 1, 65], 0) or Tlv.{tag: -1}
+    assert_eq(prim.cls, 2)
+    #assert(!(prim.constructed))
+    assert_eq(prim.number, 2)
+    app = der_read([66, 0], 0) or Tlv.{tag: -1}
+    assert_eq(app.cls, 1)
+    prv = der_read([196, 0], 0) or Tlv.{tag: -1}
+    assert_eq(prv.cls, 3)
+}
+
+test "der_read decodes the high tag number form" {
+    t = der_read([191, 129, 0, 0], 0) or Tlv.{tag: -1}
+    assert_eq(t.tag, 191)
+    assert_eq(t.number, 128)
+    assert_eq(t.cls, 2)
+    assert_eq(t.hdr, 4)
+    t2 = der_read([159, 31, 1, 9], 0) or Tlv.{tag: -1}
+    assert_eq(t2.number, 31)
+    assert_eq(t2.size, 1)
+    #assert(xt_has(xt_derr([31, 128, 1, 0]), "non-minimal high tag"))
+    #assert(xt_has(xt_derr([31, 129]), "truncated high tag"))
+    #assert(xt_has(xt_derr([31, 255, 255, 255, 255, 255, 1, 0]), "tag number too large"))
+}
+
+test "der_read rejects malformed lengths" {
+    #assert(xt_has(xt_derr([]), "truncated element"))
+    #assert(xt_has(xt_derr([48]), "truncated length"))
+    #assert(xt_has(xt_derr([48, 128, 0, 0]), "indefinite"))
+    #assert(xt_has(xt_derr([48, 129, 5, 1, 2, 3, 4, 5]), "non-minimal length"))
+    #assert(xt_has(xt_derr([48, 130, 0, 200]), "non-minimal length"))
+    #assert(xt_has(xt_derr([48, 133, 1, 0, 0, 0, 0, 0]), "not supported"))
+    #assert(xt_has(xt_derr([48, 130, 1]), "truncated length"))
+    #assert(xt_has(xt_derr([4, 5, 1, 2]), "overruns"))
+    #assert(xt_has(xt_derr([4, 129, 200, 1]), "overruns"))
+    assert_eq(xt_derr([4, 2, 1, 2]), "ok:2")
+    assert_eq(xt_derr([4, 2, 1, 2, 99, 99]), "ok:2")
+    #assert(xt_has(xt_derr([48, 132, 255, 255, 255, 255]), "overruns"))
+}
+
+test "der_read at an offset and negative offsets" {
+    data = [5, 0, 4, 2, 9, 9]
+    t = der_read(data, 2) or Tlv.{tag: -1}
+    assert_eq(t.tag, 4)
+    assert_eq(t.start, 4)
+    assert_eq(t.end, 6)
+    bad = der_read(data, -1) or "failed"
+    assert_eq(bad, "failed")
+    past = der_read(data, 6) or "failed"
+    assert_eq(past, "failed")
+}
+
+test "der_parse requires exactly one element" {
+    ok = der_parse([5, 0]) or Tlv.{tag: -1}
+    assert_eq(ok.tag, 5)
+    extra = der_parse([5, 0, 0]) or err { "{err}" }
+    #assert(xt_has("{extra}", "trailing"))
+    empty = der_parse([]) or "failed"
+    assert_eq(empty, "failed")
+}
+
+test "der_children walks a constructed element" {
+    data = der_seq([der_int(1), der_null(), der_utf8("hi")])
+    root = der_parse(data) or Tlv.{tag: -1}
+    kids = der_children(data, root) or []
+    assert_eq(host.sys_arr_len(kids), 3)
+    a = kids[0]
+    b = kids[1]
+    c = kids[2]
+    assert_eq(a.tag, DER_INTEGER)
+    assert_eq(b.tag, DER_NULL)
+    assert_eq(c.tag, DER_UTF8)
+    assert_eq(der_string(data, c) or "?", "hi")
+    assert_eq(a.start, 4)
+    assert_eq(c.end, root.end)
+    empty = der_seq([])
+    eroot = der_parse(empty) or Tlv.{tag: -1}
+    ekids = der_children(empty, eroot) or [1]
+    assert_eq(host.sys_arr_len(ekids), 0)
+}
+
+test "der_children rejects primitives and children that overrun" {
+    prim = der_int(5)
+    pt = der_parse(prim) or Tlv.{tag: -1}
+    r = der_children(prim, pt) or "failed"
+    assert_eq(r, "failed")
+    broken = [48, 4, 2, 1, 5, 4, 9]
+    bt = der_read(broken, 0) or Tlv.{tag: -1}
+    assert_eq(bt.end, 6)
+    r2 = der_children(broken, bt) or "failed"
+    assert_eq(r2, "failed")
+    nested = [48, 3, 48, 5, 1]
+    nt = der_read(nested, 0) or Tlv.{tag: -1}
+    r3 = der_children(nested, nt) or "failed"
+    assert_eq(r3, "failed")
+}
+
+test "der_int encodes minimal two's complement" {
+    assert_eq(der_int(0), [2, 1, 0])
+    assert_eq(der_int(1), [2, 1, 1])
+    assert_eq(der_int(127), [2, 1, 127])
+    assert_eq(der_int(128), [2, 2, 0, 128])
+    assert_eq(der_int(255), [2, 2, 0, 255])
+    assert_eq(der_int(256), [2, 2, 1, 0])
+    assert_eq(der_int(32767), [2, 2, 127, 255])
+    assert_eq(der_int(32768), [2, 3, 0, 128, 0])
+    assert_eq(der_int(-1), [2, 1, 255])
+    assert_eq(der_int(-127), [2, 1, 129])
+    assert_eq(der_int(-128), [2, 1, 128])
+    assert_eq(der_int(-129), [2, 2, 255, 127])
+    assert_eq(der_int(-256), [2, 2, 255, 0])
+    assert_eq(der_int(65537), [2, 3, 1, 0, 1])
+    assert_eq(der_int(9223372036854775807), [2, 8, 127, 255, 255, 255, 255, 255, 255, 255])
+}
+
+test "der_int_value round trips signed values" {
+    values = [0, 1, -1, 127, 128, -128, -129, 255, 256, 65535, 65537, -65536, 1000000007, -1000000007, 4294967296, 9007199254740993, -9007199254740993, 9223372036854775807]
+    for values {
+        v = it
+        enc = der_int(v)
+        t = der_parse(enc) or Tlv.{tag: -1}
+        assert_eq(der_int_value(enc, t) or 12345, v)
+    }
+}
+
+test "der_int_value rejects non-minimal, empty, wide and mistyped integers" {
+    a = [2, 2, 0, 1]
+    ta = der_parse(a) or Tlv.{tag: -1}
+    assert_eq(der_int_value(a, ta) or "failed", "failed")
+    b = [2, 2, 255, 255]
+    tb = der_parse(b) or Tlv.{tag: -1}
+    assert_eq(der_int_value(b, tb) or "failed", "failed")
+    c = [2, 0]
+    tc = der_parse(c) or Tlv.{tag: -1}
+    assert_eq(der_int_value(c, tc) or "failed", "failed")
+    d = [2, 9, 1, 0, 0, 0, 0, 0, 0, 0, 0]
+    td = der_parse(d) or Tlv.{tag: -1}
+    assert_eq(der_int_value(d, td) or "failed", "failed")
+    e = [4, 1, 5]
+    te = der_parse(e) or Tlv.{tag: -1}
+    assert_eq(der_int_value(e, te) or "failed", "failed")
+    ok = [2, 2, 0, 128]
+    tok = der_parse(ok) or Tlv.{tag: -1}
+    assert_eq(der_int_value(ok, tok) or 0, 128)
+}
+
+test "der_int_bytes pads the sign bit and trims leading zeros" {
+    assert_eq(der_int_bytes([0, 0, 255]), [2, 2, 0, 255])
+    assert_eq(der_int_bytes([128, 1]), [2, 3, 0, 128, 1])
+    assert_eq(der_int_bytes([127, 1]), [2, 2, 127, 1])
+    assert_eq(der_int_bytes([0]), [2, 1, 0])
+    assert_eq(der_int_bytes([]), [2, 1, 0])
+    assert_eq(der_int_bytes([0, 0, 0]), [2, 1, 0])
+    assert_eq(der_int_bytes([1, 0, 0]), [2, 3, 1, 0, 0])
+}
+
+test "der_int_hex gives the unsigned magnitude" {
+    cases = [[0, "00"], [255, "ff"], [256, "0100"], [32768, "8000"], [1311768467294899695, "1234567890abcdef"]]
+    for cases {
+        pair = it
+        enc = der_int(pair[0])
+        t = der_parse(enc) or Tlv.{tag: -1}
+        assert_eq(der_int_hex(enc, t) or "failed", pair[1])
+    }
+    wide = der_int_bytes([128, 1])
+    tw = der_parse(wide) or Tlv.{tag: -1}
+    assert_eq(der_int_hex(wide, tw) or "failed", "8001")
+    empty = [2, 0]
+    te = der_parse(empty) or Tlv.{tag: -1}
+    assert_eq(der_int_hex(empty, te) or "failed", "failed")
+    other = [4, 1, 1]
+    to = der_parse(other) or Tlv.{tag: -1}
+    assert_eq(der_int_hex(other, to) or "failed", "failed")
+}
+
+test "BOOLEAN encoding follows DER" {
+    assert_eq(der_bool(true), [1, 1, 255])
+    assert_eq(der_bool(false), [1, 1, 0])
+    t = der_parse([1, 1, 255]) or Tlv.{tag: -1}
+    #assert(der_bool_value([1, 1, 255], t) or false)
+    f = der_parse([1, 1, 0]) or Tlv.{tag: -1}
+    #assert(!(der_bool_value([1, 1, 0], f) or true))
+    bad = [1, 1, 1]
+    tb = der_parse(bad) or Tlv.{tag: -1}
+    assert_eq(der_bool_value(bad, tb) or "failed", "failed")
+    two = [1, 2, 255, 255]
+    t2 = der_parse(two) or Tlv.{tag: -1}
+    assert_eq(der_bool_value(two, t2) or "failed", "failed")
+    wrong = [2, 1, 255]
+    tw = der_parse(wrong) or Tlv.{tag: -1}
+    assert_eq(der_bool_value(wrong, tw) or "failed", "failed")
+}
+
+test "NULL and OCTET STRING builders" {
+    assert_eq(der_null(), [5, 0])
+    assert_eq(der_octets([1, 2, 3]), [4, 3, 1, 2, 3])
+    assert_eq(der_octets([]), [4, 0])
+    assert_eq(der_explicit(0, [2, 1, 2]), [160, 3, 2, 1, 2])
+    assert_eq(der_explicit(3, []), [163, 0])
+    assert_eq(der_seq([[2, 1, 1], [5, 0]]), [48, 5, 2, 1, 1, 5, 0])
+    assert_eq(der_set([[5, 0]]), [49, 2, 5, 0])
+    assert_eq(der_join([[1], [], [2, 3]]), [1, 2, 3])
+}
+
+test "BIT STRING decode and builder" {
+    enc = der_bits([160], 5)
+    assert_eq(enc, [3, 2, 5, 160])
+    t = der_parse(enc) or Tlv.{tag: -1}
+    r = der_bitstring(enc, t) or [-1, []]
+    assert_eq(r[0], 5)
+    assert_eq(r[1], [160])
+    zero = [3, 1, 0]
+    tz = der_parse(zero) or Tlv.{tag: -1}
+    rz = der_bitstring(zero, tz) or [-1, []]
+    assert_eq(rz[0], 0)
+    assert_eq(host.sys_arr_len(rz[1]), 0)
+    empty = [3, 0]
+    te = der_parse(empty) or Tlv.{tag: -1}
+    assert_eq(der_bitstring(empty, te) or "failed", "failed")
+    eight = [3, 2, 8, 0]
+    t8 = der_parse(eight) or Tlv.{tag: -1}
+    assert_eq(der_bitstring(eight, t8) or "failed", "failed")
+    lone = [3, 1, 3]
+    tl = der_parse(lone) or Tlv.{tag: -1}
+    assert_eq(der_bitstring(lone, tl) or "failed", "failed")
+    wrong = [4, 1, 0]
+    tw = der_parse(wrong) or Tlv.{tag: -1}
+    assert_eq(der_bitstring(wrong, tw) or "failed", "failed")
+}
+
+// --- tests: OIDs -----------------------------------------------------------------------------
+
+test "der_oid encodes well-known identifiers" {
+    assert_eq(der_oid("1.2.840.113549.1.1.11") or [], [6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 11])
+    assert_eq(der_oid("2.5.4.3") or [], [6, 3, 85, 4, 3])
+    assert_eq(der_oid("1.3.101.112") or [], [6, 3, 43, 101, 112])
+    assert_eq(der_oid("1.2.840.10045.2.1") or [], [6, 7, 42, 134, 72, 206, 61, 2, 1])
+    assert_eq(der_oid("2.999.3") or [], [6, 3, 136, 55, 3])
+    assert_eq(der_oid("0.0") or [], [6, 1, 0])
+    assert_eq(der_oid("1.39") or [], [6, 1, 79])
+    assert_eq(der_oid("2.0") or [], [6, 1, 80])
+}
+
+test "der_oid_text decodes back to dotted form" {
+    assert_eq(der_oid_text([42, 134, 72, 134, 247, 13, 1, 1, 11]) or "?", "1.2.840.113549.1.1.11")
+    assert_eq(der_oid_text([85, 4, 3]) or "?", "2.5.4.3")
+    assert_eq(der_oid_text([136, 55, 3]) or "?", "2.999.3")
+    assert_eq(der_oid_text([80]) or "?", "2.0")
+    assert_eq(der_oid_text([79]) or "?", "1.39")
+    assert_eq(der_oid_text([0]) or "?", "0.0")
+    assert_eq(der_oid_text([43, 6, 1, 4, 1, 130, 55, 21, 2]) or "?", "1.3.6.1.4.1.311.21.2")
+}
+
+test "der_oid_text rejects malformed content" {
+    assert_eq(der_oid_text([]) or "failed", "failed")
+    assert_eq(der_oid_text([134]) or "failed", "failed")
+    assert_eq(der_oid_text([85, 4, 128, 1]) or "failed", "failed")
+    assert_eq(der_oid_text([85, 4, 131]) or "failed", "failed")
+    long = [85, 255, 255, 255, 255, 255, 255, 255, 255, 255, 127]
+    assert_eq(der_oid_text(long) or "failed", "failed")
+}
+
+test "der_oid rejects malformed identifiers" {
+    bad = ["", "1", "3.1", "1.40", "1..2", "1.2.", ".1.2", "a.b", "1.-2", "1.2.x", "1.2.1234567890123456789012"]
+    for bad {
+        assert_eq(der_oid(it) or "failed", "failed")
+    }
+}
+
+test "der_oid and der_oid_text round trip every known OID and big arcs" {
+    for OID_TABLE {
+        enc = der_oid(it) or []
+        t = der_parse(enc) or Tlv.{tag: -1}
+        assert_eq(t.tag, DER_OID)
+        assert_eq(der_oid_text(der_content(enc, t)) or "?", it)
+    }
+    extra = ["1.2.3", "2.5.4.45", "1.3.6.1.4.1.311.21.7", "2.16.840.1.101.3.4.2.1", "1.2.840.113549.1.9.14", "2.5.29.9999", "1.2.4294967296"]
+    for extra {
+        enc = der_oid(it) or []
+        t = der_parse(enc) or Tlv.{tag: -1}
+        assert_eq(der_oid_text(der_content(enc, t)) or "?", it)
+    }
+}
+
+test "OID tables are aligned and names resolve" {
+    assert_eq(host.sys_arr_len(OID_TABLE), host.sys_arr_len(OID_NAMES))
+    assert_eq(x509_oid_name("2.5.29.19"), "basicConstraints")
+    assert_eq(x509_oid_name("1.2.840.113549.1.1.11"), "sha256WithRSAEncryption")
+    assert_eq(x509_oid_name("1.2.840.10045.4.3.2"), "ecdsa-with-SHA256")
+    assert_eq(x509_oid_name("1.3.101.112"), "Ed25519")
+    assert_eq(x509_oid_name("1.3.6.1.5.5.7.3.1"), "serverAuth")
+    assert_eq(x509_oid_name("9.9.9"), "")
+    assert_eq(x509_oid_label("9.9.9"), "9.9.9")
+    assert_eq(x509_oid_label("2.5.4.3"), "commonName")
+    assert_eq(x509_rdn_label("2.5.4.3"), "CN")
+    assert_eq(x509_rdn_label("2.5.4.6"), "C")
+    assert_eq(x509_rdn_label("2.5.4.7"), "L")
+    assert_eq(x509_rdn_label("2.5.4.8"), "ST")
+    assert_eq(x509_rdn_label("2.5.4.10"), "O")
+    assert_eq(x509_rdn_label("2.5.4.11"), "OU")
+    assert_eq(x509_rdn_label("0.9.2342.19200300.100.1.25"), "DC")
+    assert_eq(x509_rdn_label("1.2.840.113549.1.9.1"), "emailAddress")
+    assert_eq(x509_rdn_label("1.2.3.4"), "1.2.3.4")
+    seen = 0
+    for OID_TABLE {
+        if x509_oid_name(it) != "" { seen = seen + 1 }
+    }
+    assert_eq(seen, host.sys_arr_len(OID_TABLE))
+}
+
+// --- tests: strings and times ----------------------------------------------------------------
+
+xt_str(enc: _) : str {
+    t = der_parse(enc) or Tlv.{tag: -1}
+    der_string(enc, t) or "failed"
+}
+
+test "string elements round trip" {
+    assert_eq(xt_str(der_utf8("hello")), "hello")
+    assert_eq(xt_str(der_utf8("")), "")
+    assert_eq(xt_str(der_utf8("héllo")), "héllo")
+    assert_eq(xt_str(der_utf8("日本")), "日本")
+    assert_eq(xt_str(der_printable("Acme Inc.") or []), "Acme Inc.")
+    assert_eq(xt_str(der_printable("a-b/c:d=e?(f)+g,h'i") or []), "a-b/c:d=e?(f)+g,h'i")
+    assert_eq(xt_str(der_ia5("admin@example.test") or []), "admin@example.test")
+    assert_eq(der_utf8("hé"), [12, 3, 104, 195, 169])
+    assert_eq(der_printable("US") or [], [19, 2, 85, 83])
+    assert_eq(der_ia5("a@b") or [], [22, 3, 97, 64, 98])
+}
+
+test "printable and IA5 builders reject characters outside their sets" {
+    assert_eq(der_printable("a_b") or "failed", "failed")
+    assert_eq(der_printable("a@b") or "failed", "failed")
+    assert_eq(der_printable("*") or "failed", "failed")
+    assert_eq(der_printable("café") or "failed", "failed")
+    assert_eq(der_ia5("café") or "failed", "failed")
+}
+
+test "der_string decodes Teletex as Latin-1 and BMP as UTF-16BE" {
+    assert_eq(xt_str([20, 2, 233, 65]), "éA")
+    assert_eq(xt_str([30, 4, 0, 72, 0, 105]), "Hi")
+    assert_eq(xt_str([30, 4, 38, 3, 0, 33]), "\u{2603}!")
+    assert_eq(xt_str([30, 3, 0, 72, 0]), "failed")
+    assert_eq(xt_str([19, 2, 65, 200]), "failed")
+    assert_eq(xt_str([22, 2, 65, 200]), "failed")
+    assert_eq(xt_str([2, 1, 5]), "failed")
+    assert_eq(xt_str([4, 1, 65]), "failed")
+}
+
+test "civil time conversion matches known unix timestamps" {
+    assert_eq(x509_unix_from_civil(1970, 1, 1, 0, 0, 0) or -1, 0)
+    assert_eq(x509_unix_from_civil(2000, 1, 1, 0, 0, 0) or -1, 946684800)
+    assert_eq(x509_unix_from_civil(1999, 12, 31, 23, 59, 59) or -1, 946684799)
+    assert_eq(x509_unix_from_civil(2024, 2, 29, 23, 59, 59) or -1, 1709251199)
+    assert_eq(x509_unix_from_civil(2024, 3, 1, 0, 0, 0) or -1, 1709251200)
+    assert_eq(x509_unix_from_civil(2026, 1, 1, 0, 0, 0) or -1, 1767225600)
+    assert_eq(x509_unix_from_civil(2036, 1, 1, 0, 0, 0) or -1, 2082758400)
+    assert_eq(x509_unix_from_civil(2025, 6, 15, 12, 0, 0) or -1, 1749988800)
+    assert_eq(x509_unix_from_civil(2045, 6, 15, 12, 0, 0) or -1, 2381140800)
+    assert_eq(x509_unix_from_civil(2049, 12, 31, 23, 59, 59) or -1, 2524607999)
+    assert_eq(x509_unix_from_civil(2050, 1, 1, 0, 0, 0) or -1, 2524608000)
+    assert_eq(x509_unix_from_civil(1950, 1, 1, 0, 0, 0) or 0, -631152000)
+}
+
+test "civil time validation rejects impossible dates" {
+    assert_eq(x509_unix_from_civil(2024, 2, 29, 0, 0, 0) or "failed", 1709164800)
+    assert_eq(x509_unix_from_civil(2000, 2, 29, 0, 0, 0) or "failed", 951782400)
+    assert_eq(x509_unix_from_civil(2023, 2, 29, 0, 0, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2100, 2, 29, 0, 0, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 13, 1, 0, 0, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 0, 1, 0, 0, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 4, 31, 0, 0, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 1, 0, 0, 0, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 1, 1, 24, 0, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 1, 1, 0, 60, 0) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 1, 1, 0, 0, 60) or "failed", "failed")
+    assert_eq(x509_unix_from_civil(2024, 1, 1, -1, 0, 0) or "failed", "failed")
+}
+
+x509_iso_roundtrip(ts: i64) : i64 {
+    iso = x509_unix_iso(ts)
+    y = 0
+    for 0..4 { y = y * 10 + xc_digit(iso[it]) }
+    mo = xc_digit(iso[5]) * 10 + xc_digit(iso[6])
+    d = xc_digit(iso[8]) * 10 + xc_digit(iso[9])
+    h = xc_digit(iso[11]) * 10 + xc_digit(iso[12])
+    mi = xc_digit(iso[14]) * 10 + xc_digit(iso[15])
+    s = xc_digit(iso[17]) * 10 + xc_digit(iso[18])
+    x509_unix_from_civil(y, mo, d, h, mi, s) or -999
+}
+
+test "x509_unix_iso is the inverse of civil conversion" {
+    stamps = [0, 86399, 86400, 946684799, 946684800, 951782400, 1709251199, 1709251200, 1749988800, 1767225600, 2082758400, 2381140800, 2524607999, 2524608000, 4102444800, -1, -86400, -631152000, -631152001, -2208988800]
+    for stamps {
+        iso = x509_iso_roundtrip(it)
+        assert_eq(iso, it)
+    }
+    assert_eq(x509_unix_iso(0), "1970-01-01T00:00:00Z")
+    assert_eq(x509_unix_iso(1767225600), "2026-01-01T00:00:00Z")
+    assert_eq(x509_unix_iso(1709251199), "2024-02-29T23:59:59Z")
+    assert_eq(x509_unix_iso(-1), "1969-12-31T23:59:59Z")
+    assert_eq(x509_unix_iso(951782400), "2000-02-29T00:00:00Z")
+    assert_eq(x509_unix_iso(-631152000), "1950-01-01T00:00:00Z")
+    assert_eq(x509_unix_iso(2524608000), "2050-01-01T00:00:00Z")
+}
+
+test "every day from 2023 to 2025 round trips" {
+    base = x509_unix_from_civil(2023, 1, 1, 0, 0, 0) or 0
+    bad = 0
+    for 0..1096 {
+        ts = base + it * 86400 + 3661
+        if x509_iso_roundtrip(ts) != ts { bad = bad + 1 }
+    }
+    assert_eq(bad, 0)
+}
+
+xt_time(text: str, tag: i64) : i64 {
+    enc = der_encode(tag, host.sys_str_to_bytes(text))
+    t = der_parse(enc) or Tlv.{tag: -1}
+    der_time_value(enc, t) or -999999
+}
+
+test "der_time_value parses UTCTime and GeneralizedTime" {
+    assert_eq(xt_time("260101000000Z", 23), 1767225600)
+    assert_eq(xt_time("500101000000Z", 23), -631152000)
+    assert_eq(xt_time("491231235959Z", 23), 2524607999)
+    assert_eq(xt_time("700101000000Z", 23), 0)
+    assert_eq(xt_time("000101000000Z", 23), 946684800)
+    assert_eq(xt_time("240229235959Z", 23), 1709251199)
+    assert_eq(xt_time("20500101000000Z", 24), 2524608000)
+    assert_eq(xt_time("19700101000000Z", 24), 0)
+    assert_eq(xt_time("21000101000000Z", 24), 4102444800)
+    assert_eq(xt_time("19491231235959Z", 24), -631152001)
+}
+
+test "der_time_value rejects malformed times" {
+    bad = [["2601010000Z", 23], ["26010100000Z", 23], ["2601010000000Z", 23], ["260101000000", 23], ["260101000000+0000", 23], ["26010100000aZ", 23], ["261301000000Z", 23], ["260230000000Z", 23], ["260101240000Z", 23], ["260101006000Z", 23], ["260101000060Z", 23], ["2050010100000Z", 24], ["20500101000000", 24], ["20501301000000Z", 24], ["20500101000000.5Z", 24]]
+    for bad {
+        pair = it
+        assert_eq(xt_time(pair[0], pair[1]), -999999)
+    }
+    wrong = [4, 1, 65]
+    tw = der_parse(wrong) or Tlv.{tag: -1}
+    assert_eq(der_time_value(wrong, tw) or "failed", "failed")
+    non_ascii = [23, 13, 50, 54, 48, 49, 48, 49, 48, 48, 48, 48, 48, 200, 90]
+    tn = der_parse(non_ascii) or Tlv.{tag: -1}
+    assert_eq(der_time_value(non_ascii, tn) or "failed", "failed")
+}
+
+test "der_time picks UTCTime for 1950 to 2049 and GeneralizedTime otherwise" {
+    a = der_time(1767225600)
+    assert_eq(a[0], DER_UTCTIME)
+    assert_eq(host.sys_bytes_to_str(xc_slice(a, 2, host.sys_arr_len(a))), "260101000000Z")
+    b = der_time(2524608000)
+    assert_eq(b[0], DER_GENTIME)
+    assert_eq(host.sys_bytes_to_str(xc_slice(b, 2, host.sys_arr_len(b))), "20500101000000Z")
+    c = der_time(-631152000)
+    assert_eq(c[0], DER_UTCTIME)
+    assert_eq(host.sys_bytes_to_str(xc_slice(c, 2, host.sys_arr_len(c))), "500101000000Z")
+    d = der_time(-631152001)
+    assert_eq(d[0], DER_GENTIME)
+    assert_eq(host.sys_bytes_to_str(xc_slice(d, 2, host.sys_arr_len(d))), "19491231235959Z")
+    e = der_time(2524607999)
+    assert_eq(e[0], DER_UTCTIME)
+    assert_eq(host.sys_bytes_to_str(xc_slice(e, 2, host.sys_arr_len(e))), "491231235959Z")
+    stamps = [0, 1, 946684799, 1709251199, 1767225600, 2082758400, 2524607999, 2524608000, 4102444800, -631152000, -631152001, -2208988800]
+    for stamps {
+        enc = der_time(it)
+        t = der_parse(enc) or Tlv.{tag: -1}
+        assert_eq(der_time_value(enc, t) or -999999, it)
+    }
+}
+
+// --- tests: PEM ------------------------------------------------------------------------------
+
+xt_seq_bytes(n: i64) : _ {
+    out = []
+    for 0..n { out = host.sys_arr_push(out, (it * 7 + 3) % 256) }
+    out
+}
+
+test "pem_encode wraps at 64 columns and pem_decode reverses it" {
+    sizes = [0, 1, 2, 3, 47, 48, 49, 50, 96, 100, 200, 301]
+    for sizes {
+        n = it
+        der = xt_seq_bytes(n)
+        text = pem_encode("TEST DATA", der)
+        lines = xc_split(text, "\n")
+        assert_eq(lines[0], "-----BEGIN TEST DATA-----")
+        count = host.sys_arr_len(lines)
+        assert_eq(lines[count - 1], "")
+        assert_eq(lines[count - 2], "-----END TEST DATA-----")
+        long = 0
+        for 1..(count - 2) {
+            if host.sys_str_len(lines[it]) > 64 { long = long + 1 }
+        }
+        assert_eq(long, 0)
+        block = pem_decode(text) or PemBlock.{label: "failed"}
+        assert_eq(block.label, "TEST DATA")
+        assert_eq(block.der, der)
+    }
+}
+
+test "pem_encode matches the openssl layout for a known block" {
+    text = pem_encode("CERTIFICATE", [1, 2, 3, 4, 5])
+    assert_eq(text, "-----BEGIN CERTIFICATE-----\nAQIDBAU=\n-----END CERTIFICATE-----\n")
+    full = pem_encode("X", xt_seq_bytes(48))
+    lines = xc_split(full, "\n")
+    assert_eq(host.sys_str_len(lines[1]), 64)
+    assert_eq(host.sys_arr_len(lines), 4)
+}
+
+test "pem_decode_all reads several blocks and ignores surrounding text" {
+    text = "Bag Attributes\n  friendlyName: leaf\n-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\nnoise between\n-----BEGIN PUBLIC KEY-----\nBAUG\n-----END PUBLIC KEY-----\ntrailing\n"
+    blocks = pem_decode_all(text) or []
+    assert_eq(host.sys_arr_len(blocks), 2)
+    a = blocks[0]
+    b = blocks[1]
+    assert_eq(a.label, "CERTIFICATE")
+    assert_eq(a.der, [1, 2, 3])
+    assert_eq(b.label, "PUBLIC KEY")
+    assert_eq(b.der, [4, 5, 6])
+    assert_eq(pem_decode_label(text, "PUBLIC KEY") or [], [4, 5, 6])
+    assert_eq(pem_decode_label(text, "CERTIFICATE") or [], [1, 2, 3])
+    assert_eq(pem_decode_label(text, "PRIVATE KEY") or "failed", "failed")
+    none_found = pem_decode_all("just text\n") or [1]
+    assert_eq(host.sys_arr_len(none_found), 0)
+}
+
+test "pem_decode tolerates CRLF, indentation and blank lines" {
+    text = "-----BEGIN CERTIFICATE-----\r\n  AQID  \r\n\r\nBAUG\r\n-----END CERTIFICATE-----\r\n"
+    assert_eq(pem_decode_label(text, "CERTIFICATE") or [], [1, 2, 3, 4, 5, 6])
+    no_newline = "-----BEGIN A-----\nAQID\n-----END A-----"
+    assert_eq(pem_decode_label(no_newline, "A") or [], [1, 2, 3])
+    empty_body = "-----BEGIN A-----\n-----END A-----\n"
+    assert_eq(pem_decode_label(empty_body, "A") or [9], [])
+}
+
+test "pem_decode rejects broken input" {
+    assert_eq(pem_decode("") or "failed", "failed")
+    assert_eq(pem_decode("hello\nworld\n") or "failed", "failed")
+    mismatch = "-----BEGIN CERTIFICATE-----\nAQID\n-----END PUBLIC KEY-----\n"
+    assert_eq(pem_decode(mismatch) or "failed", "failed")
+    unterminated = "-----BEGIN CERTIFICATE-----\nAQID\n"
+    assert_eq(pem_decode(unterminated) or "failed", "failed")
+    bad64 = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
+    assert_eq(pem_decode(bad64) or "failed", "failed")
+    headers = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nAQID\n-----END RSA PRIVATE KEY-----\n"
+    msg = pem_decode_all(headers) or err { "{err}" }
+    #assert(xt_has("{msg}", "headers"))
+    open_label = "-----BEGIN CERTIFICATE\nAQID\n-----END CERTIFICATE-----\n"
+    assert_eq(pem_decode(open_label) or "failed", "failed")
+}
+
+// --- tests: distinguished names --------------------------------------------------------------
+
+xt_atv(oid: str, value_el: _) : _ {
+    der_seq([der_oid(oid) or NOTHING, value_el])
+}
+
+xt_rdn(oid: str, value_el: _) : _ => der_set([xt_atv(oid, value_el)])
+
+xt_name_text(name_el: _) : str {
+    t = der_parse(name_el) or Tlv.{tag: -1}
+    n = x509_name(name_el, t) or DName.{text: "failed"}
+    n.text
+}
+
+test "x509_name prints RDNs in reverse order with RFC 4514 escaping" {
+    name = der_seq([xt_rdn("2.5.4.6", der_printable("US") or NOTHING), xt_rdn("2.5.4.10", der_utf8("Acme, Inc.")), xt_rdn("2.5.4.3", der_utf8("Test"))])
+    assert_eq(xt_name_text(name), "CN=Test,O=Acme\\, Inc.,C=US")
+    t = der_parse(name) or Tlv.{tag: -1}
+    n = x509_name(name, t) or DName.{}
+    assert_eq(n.cn, "Test")
+    assert_eq(n.org, "Acme, Inc.")
+    assert_eq(n.country, "US")
+    assert_eq(n.rdn_count, 3)
+    assert_eq(n.ou, "")
+    assert_eq(n.locality, "")
+}
+
+test "x509_name reads every common attribute" {
+    name = der_seq([xt_rdn("2.5.4.6", der_printable("DE") or NOTHING), xt_rdn("2.5.4.8", der_utf8("Bayern")), xt_rdn("2.5.4.7", der_utf8("München")), xt_rdn("2.5.4.10", der_utf8("Firma")), xt_rdn("2.5.4.11", der_utf8("Dev")), xt_rdn("2.5.4.3", der_utf8("host.test")), xt_rdn("1.2.840.113549.1.9.1", der_ia5("a@b.test") or NOTHING)])
+    t = der_parse(name) or Tlv.{tag: -1}
+    n = x509_name(name, t) or DName.{}
+    assert_eq(n.country, "DE")
+    assert_eq(n.state_name, "Bayern")
+    assert_eq(n.locality, "München")
+    assert_eq(n.org, "Firma")
+    assert_eq(n.ou, "Dev")
+    assert_eq(n.cn, "host.test")
+    assert_eq(n.email, "a@b.test")
+    assert_eq(n.text, "emailAddress=a@b.test,CN=host.test,OU=Dev,O=Firma,L=München,ST=Bayern,C=DE")
+    assert_eq(n.rdn_count, 7)
+}
+
+test "x509_name handles multi-valued RDNs, special characters and unknown types" {
+    multi = der_seq([der_set([xt_atv("2.5.4.3", der_utf8("A")), xt_atv("2.5.4.11", der_utf8("B"))])])
+    assert_eq(xt_name_text(multi), "CN=A+OU=B")
+    lead = der_seq([xt_rdn("2.5.4.3", der_utf8("#hash"))])
+    assert_eq(xt_name_text(lead), "CN=\\#hash")
+    spaced = der_seq([xt_rdn("2.5.4.3", der_utf8(" pad "))])
+    assert_eq(xt_name_text(spaced), "CN=\\ pad\\ ")
+    special = der_seq([xt_rdn("2.5.4.3", der_utf8("a+b;c<d>e\"f\\g"))])
+    assert_eq(xt_name_text(special), "CN=a\\+b\\;c\\<d\\>e\\\"f\\\\g")
+    unknown = der_seq([xt_rdn("1.2.3.4", der_utf8("val"))])
+    assert_eq(xt_name_text(unknown), "1.2.3.4=val")
+    opaque = der_seq([xt_rdn("2.5.4.3", der_int(5))])
+    assert_eq(xt_name_text(opaque), "CN=#020105")
+    empty = der_seq([])
+    te = der_parse(empty) or Tlv.{tag: -1}
+    ne = x509_name(empty, te) or DName.{text: "failed"}
+    assert_eq(ne.text, "")
+    assert_eq(ne.rdn_count, 0)
+}
+
+test "x509_name rejects malformed names" {
+    notseq = der_set([])
+    assert_eq(xt_name_text(notseq), "failed")
+    badrdn = der_seq([der_seq([])])
+    assert_eq(xt_name_text(badrdn), "failed")
+    emptyrdn = der_seq([der_set([])])
+    assert_eq(xt_name_text(emptyrdn), "failed")
+    one = der_seq([der_set([der_seq([der_oid("2.5.4.3") or NOTHING])])])
+    assert_eq(xt_name_text(one), "failed")
+    three = der_seq([der_set([der_seq([der_oid("2.5.4.3") or NOTHING, der_utf8("a"), der_utf8("b")])])])
+    assert_eq(xt_name_text(three), "failed")
+    badoid = der_seq([der_set([der_seq([der_utf8("x"), der_utf8("a")])])])
+    assert_eq(xt_name_text(badoid), "failed")
+}
+
+// --- tests: certificates ---------------------------------------------------------------------
+
+XT_EC_PEM = "-----BEGIN CERTIFICATE-----\nMIICsjCCAligAwIBAgIIEjRWeJCrze8wCgYIKoZIzj0EAwIwgYExCzAJBgNVBAYT\nAlVTMRMwEQYDVQQIDApDYWxpZm9ybmlhMRMwEQYDVQQKDApTdXBlciBMYW5nMQ4w\nDAYDVQQLDAVUZXN0czEVMBMGA1UEAwwMZXhhbXBsZS50ZXN0MSEwHwYJKoZIhvcN\nAQkBFhJhZG1pbkBleGFtcGxlLnRlc3QwHhcNMjYwMTAxMDAwMDAwWhcNMzYwMTAx\nMDAwMDAwWjCBgTELMAkGA1UEBhMCVVMxEzARBgNVBAgMCkNhbGlmb3JuaWExEzAR\nBgNVBAoMClN1cGVyIExhbmcxDjAMBgNVBAsMBVRlc3RzMRUwEwYDVQQDDAxleGFt\ncGxlLnRlc3QxITAfBgkqhkiG9w0BCQEWEmFkbWluQGV4YW1wbGUudGVzdDBZMBMG\nByqGSM49AgEGCCqGSM49AwEHA0IABFpVsMIHQ0aMCE61ZwEREZhbNXjwj20W1KZP\ni1YVIauBvdFy33NNfErb56opvyI/E6VaGxBUvpnIIP/0jlrEp8ejgbcwgbQwHQYD\nVR0OBBYEFPsRy4MUWsravJoEpO8rVuTZ7YUBMFYGA1UdEQRPME2CDGV4YW1wbGUu\ndGVzdIIOKi5leGFtcGxlLnRlc3SHBMAAAgGBEG9wc0BleGFtcGxlLnRlc3SGFWh0\ndHBzOi8vZXhhbXBsZS50ZXN0LzAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIH\ngDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwCgYIKoZIzj0EAwIDSAAw\nRQIhAO+fNU7WJw0L0SaFYEDTgSIEYEznBotlDkhYlGNlBTw8AiA7GLusDzwgm+3R\n4DkMXMWQ+syR8sbYx68okkuOWEDVzw==\n-----END CERTIFICATE-----\n"
+XT_CA_PEM = "-----BEGIN CERTIFICATE-----\nMIIB4TCCAWagAwIBAgIBBzAKBggqhkjOPQQDAzAnMRAwDgYDVQQKDAdSb290IENB\nMRMwEQYDVQQDDApTdXBlciBSb290MB4XDTI1MDYxNTEyMDAwMFoXDTQ1MDYxNTEy\nMDAwMFowJzEQMA4GA1UECgwHUm9vdCBDQTETMBEGA1UEAwwKU3VwZXIgUm9vdDB2\nMBAGByqGSM49AgEGBSuBBAAiA2IABJl1A4aqqUfginpW3Rm4Ry/yaB81YpReICRD\nJWnAyH2oM9jTzIwMYkjimJauHoUCg1Z9pUHCX6/+MOvhaUrjhWcyR1hbn7j/uVWb\nV+m9Mq1gnqbcwWM/owQ58AgQ0GFYhqNmMGQwEgYDVR0TAQH/BAgwBgEB/wIBAjAO\nBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFIS3boUO2fptg/uNZ6IBJUumgZ+9MB8G\nA1UdIwQYMBaAFIS3boUO2fptg/uNZ6IBJUumgZ+9MAoGCCqGSM49BAMDA2kAMGYC\nMQCGJOQTbWk9B1tknV3flWVD4pzpsMFw1Nj/12C/cMF+HGyY91zJAW+YGjThHF7w\nzEwCMQCTH5NNskIAD1h8uYomIW51v7dm8t3Ra6PRQBh5YHAd+FJymcPEg2zkWlIc\nd0g9J7M=\n-----END CERTIFICATE-----\n"
+XT_ED_PEM = "-----BEGIN CERTIFICATE-----\nMIIBFjCByaADAgECAgIA/zAFBgMrZXAwEjEQMA4GA1UEAwwHZWQudGVzdDAeFw0y\nNDAyMjkyMzU5NTlaFw0yNDAzMDEwMDAwMDBaMBIxEDAOBgNVBAMMB2VkLnRlc3Qw\nKjAFBgMrZXADIQCpCOd1vOWWz+OGpSkZKdXQex16lICXbvdryPSddiojm6NDMEEw\nHQYDVR0OBBYEFJktWE4wcvFHtgALvqbHeWZ8Jc+bMBIGA1UdEQQLMAmCB2VkLnRl\nc3QwDAYDVR0TAQH/BAIwADAFBgMrZXADQQBfy631zeyImMOi6CUoPVqL8UbiBvIG\n45Bn4CUi/EEVk/yisSrucNXtBiTnTC7lADxVgV/qYk2+moo+cfk5m1kE\n-----END CERTIFICATE-----\n"
+
+xt_p(der: _) : X509Cert => x509_parse(der) or X509Cert.{serial: "failed"}
+
+xt_perr(der: _) : str {
+    c = x509_parse(der) or err { return "{err}" }
+    "ok:{c.version}"
+}
+
+xt_ec_pem() : X509Cert => x509_parse_pem(XT_EC_PEM) or X509Cert.{serial: "failed"}
+
+xt_ca_pem() : X509Cert => x509_parse_pem(XT_CA_PEM) or X509Cert.{serial: "failed"}
+
+xt_ed_pem() : X509Cert => x509_parse_pem(XT_ED_PEM) or X509Cert.{serial: "failed"}
+
+test "real ECDSA P-256 certificate: identity and validity" {
+    c = xt_ec_pem()
+    assert_eq(c.version, 3)
+    assert_eq(c.serial, "1234567890abcdef")
+    assert_eq(c.sig_oid, "1.2.840.10045.4.3.2")
+    assert_eq(c.sig_name, "ecdsa-with-SHA256")
+    assert_eq(c.subject, "emailAddress=admin@example.test,CN=example.test,OU=Tests,O=Super Lang,ST=California,C=US")
+    assert_eq(c.issuer, c.subject)
+    assert_eq(c.subject_cn, "example.test")
+    assert_eq(c.issuer_cn, "example.test")
+    assert_eq(c.subject_org, "Super Lang")
+    assert_eq(c.not_before, 1767225600)
+    assert_eq(c.not_after, 2082758400)
+    assert_eq(x509_unix_iso(c.not_before), "2026-01-01T00:00:00Z")
+    assert_eq(x509_unix_iso(c.not_after), "2036-01-01T00:00:00Z")
+    #assert(c.self_issued)
+    assert_eq(c.der_len, 694)
+    assert_eq(c.fingerprint, "0d0e2c1b8c137f53e480ea21208e81374cbfe8434f32ce14a92593fe08c6d1d0")
+}
+
+test "real ECDSA P-256 certificate: key and extensions" {
+    c = xt_ec_pem()
+    assert_eq(c.key_oid, "1.2.840.10045.2.1")
+    assert_eq(c.key_name, "id-ecPublicKey")
+    assert_eq(c.curve_oid, "1.2.840.10045.3.1.7")
+    assert_eq(c.curve_name, "prime256v1")
+    assert_eq(host.sys_arr_len(c.key_bytes), 65)
+    assert_eq(c.key_bytes[0], 4)
+    assert_eq(x509_hex(xc_slice(c.key_bytes, 0, 4)), "045a55b0")
+    assert_eq(x509_hex(xc_slice(c.key_bytes, 63, 65)), "a7c7")
+    assert_eq(c.rsa_bits, 0)
+    assert_eq(c.rsa_exp, 0)
+    assert_eq(c.sans, ["DNS:example.test", "DNS:*.example.test", "IP:192.0.2.1", "email:ops@example.test", "URI:https://example.test/"])
+    #assert(c.has_bc)
+    #assert(!(c.is_ca))
+    assert_eq(c.path_len, -1)
+    assert_eq(c.key_usage, 1)
+    assert_eq(x509_key_usage_names(c.key_usage), ["digitalSignature"])
+    assert_eq(c.ekus, ["serverAuth", "clientAuth"])
+    assert_eq(c.ext_oids, ["2.5.29.14", "2.5.29.17", "2.5.29.19", "2.5.29.15", "2.5.29.37"])
+    assert_eq(c.ski, "fb11cb83145acadabc9a04a4ef2b56e4d9ed8501")
+    assert_eq(c.aki, "")
+    assert_eq(host.sys_arr_len(c.unknown_critical), 0)
+}
+
+test "real certificate: tbs and signature re-encode to the original DER" {
+    c = xt_ec_pem()
+    der = pem_decode_label(XT_EC_PEM, "CERTIFICATE") or []
+    assert_eq(host.sys_arr_len(der), 694)
+    assert_eq(c.tbs[0], 48)
+    assert_eq(x509_hex(xc_slice(c.sig_bytes, 0, 4)), "30450221")
+    assert_eq(host.sys_arr_len(c.sig_bytes), 71)
+    alg = der_seq([der_oid("1.2.840.10045.4.3.2") or NOTHING])
+    again = der_seq([c.tbs, alg, der_bits(c.sig_bytes, 0)])
+    assert_eq(again, der)
+    assert_eq(x509_hex(sha2_256(der)), c.fingerprint)
+    back = pem_encode("CERTIFICATE", der)
+    assert_eq(back, XT_EC_PEM)
+}
+
+test "real P-384 CA certificate" {
+    c = xt_ca_pem()
+    assert_eq(c.version, 3)
+    assert_eq(c.serial, "07")
+    assert_eq(c.sig_oid, "1.2.840.10045.4.3.3")
+    assert_eq(c.sig_name, "ecdsa-with-SHA384")
+    assert_eq(c.subject, "CN=Super Root,O=Root CA")
+    assert_eq(c.subject_cn, "Super Root")
+    assert_eq(c.subject_org, "Root CA")
+    assert_eq(c.not_before, 1749988800)
+    assert_eq(c.not_after, 2381140800)
+    assert_eq(c.curve_oid, "1.3.132.0.34")
+    assert_eq(c.curve_name, "secp384r1")
+    assert_eq(host.sys_arr_len(c.key_bytes), 97)
+    assert_eq(x509_hex(xc_slice(c.key_bytes, 0, 4)), "04997503")
+    #assert(c.has_bc)
+    #assert(c.is_ca)
+    assert_eq(c.path_len, 2)
+    assert_eq(c.key_usage, 96)
+    assert_eq(x509_key_usage_names(c.key_usage), ["keyCertSign", "cRLSign"])
+    assert_eq(host.sys_arr_len(c.ekus), 0)
+    assert_eq(c.ext_oids, ["2.5.29.19", "2.5.29.15", "2.5.29.14", "2.5.29.35"])
+    assert_eq(c.ski, "84b76e850ed9fa6d83fb8d67a201254ba6819fbd")
+    assert_eq(c.aki, c.ski)
+    #assert(c.self_issued)
+    assert_eq(c.der_len, 485)
+    assert_eq(c.fingerprint, "d87aff5c7a2b5293380f06101623e8088502f23a65407c413b44ad0905b54a49")
+    #assert(x509_is_root_candidate(c))
+    #assert(x509_issued_by(c, c))
+}
+
+test "real Ed25519 certificate" {
+    c = xt_ed_pem()
+    assert_eq(c.serial, "ff")
+    assert_eq(c.sig_oid, "1.3.101.112")
+    assert_eq(c.sig_name, "Ed25519")
+    assert_eq(c.key_oid, "1.3.101.112")
+    assert_eq(c.key_name, "Ed25519")
+    assert_eq(c.curve_oid, "")
+    assert_eq(c.curve_name, "")
+    assert_eq(host.sys_arr_len(c.key_bytes), 32)
+    assert_eq(x509_hex(xc_slice(c.key_bytes, 0, 4)), "a908e775")
+    assert_eq(x509_hex(xc_slice(c.key_bytes, 28, 32)), "762a239b")
+    assert_eq(host.sys_arr_len(c.sig_bytes), 64)
+    assert_eq(c.subject, "CN=ed.test")
+    assert_eq(c.sans, ["DNS:ed.test"])
+    #assert(!(c.is_ca))
+    #assert(c.has_bc)
+    assert_eq(c.key_usage, -1)
+    assert_eq(c.ski, "992d584e3072f147b6000bbea6c779667c25cf9b")
+    assert_eq(c.ext_oids, ["2.5.29.14", "2.5.29.17", "2.5.29.19"])
+    assert_eq(c.der_len, 282)
+    assert_eq(c.fingerprint, "30a0c05d261f1c98aaae66c6065b85ddb842fa8c718f163ae263f7da2862ee86")
+    assert_eq(c.not_before, 1709251199)
+    assert_eq(c.not_after, 1709251200)
+}
+
+// --- crafted certificates --------------------------------------------------------------------
+
+xt_name(cn: str) : _ => der_seq([xt_rdn("2.5.4.3", der_utf8(cn))])
+
+xt_alg(oid: str) : _ => der_seq([der_oid(oid) or NOTHING])
+
+xt_v3() : _ => der_explicit(0, der_int(2))
+
+xt_ec_spki() : _ {
+    point = xc_cat([4], xt_seq_bytes(64))
+    alg = der_seq([der_oid("1.2.840.10045.2.1") or NOTHING, der_oid("1.2.840.10045.3.1.7") or NOTHING])
+    der_seq([alg, der_bits(point, 0)])
+}
+
+xt_ext(oid: str, critical: bool, value: _) : _ {
+    parts = [der_oid(oid) or NOTHING]
+    if critical { parts = host.sys_arr_push(parts, der_bool(true)) }
+    parts = host.sys_arr_push(parts, der_octets(value))
+    der_seq(parts)
+}
+
+xt_make(ver_el: _, serial_el: _, in_alg: _, out_alg: _, issuer: _, nb: i64, na: i64, subject: _, spki: _, exts: _, tail: _) : _ {
+    parts = [serial_el, in_alg, issuer, der_seq([der_time(nb), der_time(na)]), subject, spki]
+    body = xc_cat(ver_el, der_join(parts))
+    if host.sys_arr_len(exts) > 0 { body = xc_cat(body, der_explicit(3, der_seq(exts))) }
+    body = xc_cat(body, tail)
+    der_seq([der_encode(48, body), out_alg, der_bits([1, 2, 3, 4], 0)])
+}
+
+xt_cert(exts: _) : _ {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    xt_make(xt_v3(), der_int(1000), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), exts, NOTHING)
+}
+
+xt_dns(name: str) : _ => der_encode(130, host.sys_str_to_bytes(name))
+
+xt_san(names: _) : _ => der_seq(names)
+
+xt_eku(oids: _) : _ {
+    parts = []
+    for oids { parts = host.sys_arr_push(parts, der_oid(it) or NOTHING) }
+    der_seq(parts)
+}
+
+test "a minimal v3 certificate parses" {
+    c = xt_p(xt_cert([]))
+    assert_eq(c.version, 3)
+    assert_eq(c.serial, "03e8")
+    assert_eq(c.subject_cn, "leaf.test")
+    assert_eq(c.issuer_cn, "Test CA")
+    assert_eq(c.subject, "CN=leaf.test")
+    assert_eq(c.issuer, "CN=Test CA")
+    assert_eq(c.not_before, 1767225600)
+    assert_eq(c.not_after, 2082758400)
+    assert_eq(c.sig_name, "ecdsa-with-SHA256")
+    assert_eq(c.key_name, "id-ecPublicKey")
+    assert_eq(c.curve_name, "prime256v1")
+    assert_eq(host.sys_arr_len(c.key_bytes), 65)
+    #assert(!(c.self_issued))
+    #assert(!(c.has_bc))
+    #assert(!(c.is_ca))
+    assert_eq(c.path_len, -1)
+    assert_eq(c.key_usage, -1)
+    assert_eq(host.sys_arr_len(c.sans), 0)
+    assert_eq(host.sys_arr_len(c.ext_oids), 0)
+    assert_eq(host.sys_arr_len(c.sig_bytes), 4)
+    assert_eq(c.sig_bytes, [1, 2, 3, 4])
+}
+
+test "version handling: v1 without wrapper, v2, and unsupported versions" {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    v1 = xt_make(NOTHING, der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, NOTHING)
+    c1 = xt_p(v1)
+    assert_eq(c1.version, 1)
+    assert_eq(c1.serial, "05")
+    assert_eq(c1.subject_cn, "leaf.test")
+    assert_eq(host.sys_arr_len(c1.sans), 0)
+    v2 = xt_make(der_explicit(0, der_int(1)), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, NOTHING)
+    assert_eq(xt_p(v2).version, 2)
+    v1explicit = xt_make(der_explicit(0, der_int(0)), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, NOTHING)
+    assert_eq(xt_p(v1explicit).version, 1)
+    v4 = xt_make(der_explicit(0, der_int(3)), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(v4), "unsupported version 4"))
+    vneg = xt_make(der_explicit(0, der_int(-1)), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(vneg), "negative version"))
+    vtwo = xt_make(der_explicit(0, xc_cat(der_int(2), der_int(2))), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(vtwo), "version wrapper"))
+}
+
+test "extensions are only allowed in v3 certificates" {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    exts = [xt_ext("2.5.29.19", false, der_seq([]))]
+    v1 = xt_make(NOTHING, der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), exts, NOTHING)
+    #assert(xt_has(xt_perr(v1), "need version 3"))
+    v2 = xt_make(der_explicit(0, der_int(1)), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), exts, NOTHING)
+    #assert(xt_has(xt_perr(v2), "need version 3"))
+    v1uid = xt_make(NOTHING, der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, der_encode(161, [0, 1]))
+    #assert(xt_has(xt_perr(v1uid), "issuerUniqueID"))
+    v2uid = xt_make(der_explicit(0, der_int(1)), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, xc_cat(der_encode(161, [0, 1]), der_encode(162, [0, 2])))
+    assert_eq(xt_perr(v2uid), "ok:2")
+    v1suid = xt_make(NOTHING, der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, der_encode(162, [0, 1]))
+    #assert(xt_has(xt_perr(v1suid), "subjectUniqueID"))
+    empty = xt_make(xt_v3(), der_int(5), alg, alg, xt_name("Test CA"), 1767225600, 2082758400, xt_name("leaf.test"), xt_ec_spki(), NOTHING, der_explicit(3, der_seq([])))
+    #assert(xt_has(xt_perr(empty), "empty extensions"))
+}
+
+test "serial numbers: size limit, sign and hex form" {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    ok20 = xt_make(xt_v3(), der_int_bytes(xt_repeat(127, 20)), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    c = xt_p(ok20)
+    assert_eq(host.sys_str_len(c.serial), 40)
+    assert_eq(c.serial, "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f")
+    big21 = xt_make(xt_v3(), der_int_bytes(xt_repeat(127, 21)), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(big21), "longer than 20"))
+    padded = xt_make(xt_v3(), der_int_bytes(xt_repeat(255, 20)), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(padded), "longer than 20"))
+    negative = xt_make(xt_v3(), der_int(-5), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(negative), "negative serial"))
+    zero = xt_make(xt_v3(), der_int(0), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    assert_eq(xt_p(zero).serial, "00")
+    high = xt_make(xt_v3(), der_int_bytes([200, 1]), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    assert_eq(xt_p(high).serial, "c801")
+    notint = xt_make(xt_v3(), der_utf8("x"), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(notint), "expected INTEGER"))
+}
+
+test "signature algorithms must agree and validity must be ordered" {
+    a = xt_alg("1.2.840.10045.4.3.2")
+    b = xt_alg("1.2.840.10045.4.3.3")
+    mismatch = xt_make(xt_v3(), der_int(1), a, b, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(mismatch), "differs from outer"))
+    empty_alg = der_seq([])
+    noalg = xt_make(xt_v3(), der_int(1), empty_alg, empty_alg, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(noalg), "empty signatureAlgorithm"))
+    backwards = xt_make(xt_v3(), der_int(1), a, a, xt_name("A"), 200, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(backwards), "notBefore is after notAfter"))
+    equal = xt_make(xt_v3(), der_int(1), a, a, xt_name("A"), 100, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    assert_eq(xt_perr(equal), "ok:3")
+    rsa = xt_alg("1.2.840.113549.1.1.11")
+    withnull = der_seq([der_oid("1.2.840.113549.1.1.11") or NOTHING, der_null()])
+    rsa_ok = xt_make(xt_v3(), der_int(1), withnull, withnull, xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    assert_eq(xt_p(rsa_ok).sig_name, "sha256WithRSAEncryption")
+    assert_eq(host.sys_arr_len(rsa), 13)
+    gen = xt_make(xt_v3(), der_int(1), a, a, xt_name("A"), 2524608000, 4102444800, xt_name("B"), xt_ec_spki(), NOTHING, NOTHING)
+    cg = xt_p(gen)
+    assert_eq(cg.not_before, 2524608000)
+    assert_eq(cg.not_after, 4102444800)
+}
+
+test "basicConstraints variants" {
+    ca = xt_p(xt_cert([xt_ext("2.5.29.19", true, der_seq([der_bool(true), der_int(3)]))]))
+    #assert(ca.has_bc)
+    #assert(ca.is_ca)
+    assert_eq(ca.path_len, 3)
+    ca_free = xt_p(xt_cert([xt_ext("2.5.29.19", true, der_seq([der_bool(true)]))]))
+    #assert(ca_free.is_ca)
+    assert_eq(ca_free.path_len, -1)
+    zero = xt_p(xt_cert([xt_ext("2.5.29.19", true, der_seq([der_bool(true), der_int(0)]))]))
+    assert_eq(zero.path_len, 0)
+    leaf = xt_p(xt_cert([xt_ext("2.5.29.19", false, der_seq([]))]))
+    #assert(leaf.has_bc)
+    #assert(!(leaf.is_ca))
+    explicit_false = xt_p(xt_cert([xt_ext("2.5.29.19", true, der_seq([der_bool(false)]))]))
+    #assert(!(explicit_false.is_ca))
+    orphan = xt_cert([xt_ext("2.5.29.19", true, der_seq([der_int(2)]))])
+    #assert(xt_has(xt_perr(orphan), "pathLenConstraint without cA"))
+    notseq = xt_cert([xt_ext("2.5.29.19", true, der_null())])
+    #assert(xt_has(xt_perr(notseq), "constructed"))
+    junk = xt_cert([xt_ext("2.5.29.19", true, [48, 5, 1])])
+    #assert(!(xt_perr(junk) == "ok:3"))
+}
+
+test "keyUsage bit mapping" {
+    a = xt_p(xt_cert([xt_ext("2.5.29.15", true, der_bits([132], 2))]))
+    assert_eq(a.key_usage, 33)
+    assert_eq(x509_key_usage_names(a.key_usage), ["digitalSignature", "keyCertSign"])
+    #assert(x509_ku_has(a, KU_DIGITAL_SIGNATURE))
+    #assert(x509_ku_has(a, KU_KEY_CERT_SIGN))
+    #assert(!(x509_ku_has(a, KU_KEY_ENCIPHERMENT)))
+    #assert(!(x509_ku_has(a, KU_CRL_SIGN)))
+    b = xt_p(xt_cert([xt_ext("2.5.29.15", true, der_bits([0, 128], 7))]))
+    assert_eq(b.key_usage, 256)
+    assert_eq(x509_key_usage_names(b.key_usage), ["decipherOnly"])
+    #assert(x509_ku_has(b, KU_DECIPHER_ONLY))
+    c = xt_p(xt_cert([xt_ext("2.5.29.15", true, der_bits([255, 128], 7))]))
+    assert_eq(c.key_usage, 511)
+    assert_eq(host.sys_arr_len(x509_key_usage_names(c.key_usage)), 9)
+    d = xt_p(xt_cert([xt_ext("2.5.29.15", true, der_bits([], 0))]))
+    assert_eq(d.key_usage, 0)
+    assert_eq(host.sys_arr_len(x509_key_usage_names(d.key_usage)), 0)
+    #assert(!(x509_ku_has(d, KU_DIGITAL_SIGNATURE)))
+    none_ext = xt_p(xt_cert([]))
+    #assert(x509_ku_has(none_ext, KU_KEY_CERT_SIGN))
+    assert_eq(host.sys_arr_len(x509_key_usage_names(-1)), 0)
+    bad = xt_cert([xt_ext("2.5.29.15", true, der_octets([1]))])
+    #assert(!(xt_perr(bad) == "ok:3"))
+}
+
+test "subjectAltName entry types" {
+    names = [xt_dns("a.test"), der_encode(129, host.sys_str_to_bytes("x@y.test")), der_encode(134, host.sys_str_to_bytes("https://a.test/p")), der_encode(135, [10, 0, 0, 255]), der_encode(135, [32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), der_encode(136, [85, 4, 3]), der_encode(164, der_seq([xt_rdn("2.5.4.3", der_utf8("Dir"))])), der_encode(160, xc_cat(der_oid("1.2.3.4") or NOTHING, der_explicit(0, der_utf8("v")))), der_encode(133, [1])]
+    c = xt_p(xt_cert([xt_ext("2.5.29.17", false, xt_san(names))]))
+    assert_eq(c.sans, ["DNS:a.test", "email:x@y.test", "URI:https://a.test/p", "IP:10.0.0.255", "IP:2001:0db8:0000:0000:0000:0000:0000:0001", "RID:2.5.4.3", "dirName:CN=Dir", "otherName", "other:133"])
+    assert_eq(host.sys_arr_len(c.sans), 9)
+}
+
+test "subjectAltName errors" {
+    empty = xt_cert([xt_ext("2.5.29.17", false, xt_san([]))])
+    #assert(xt_has(xt_perr(empty), "empty"))
+    badip = xt_cert([xt_ext("2.5.29.17", false, xt_san([der_encode(135, [1, 2, 3])]))])
+    #assert(xt_has(xt_perr(badip), "IP address of 3"))
+    nonascii = xt_cert([xt_ext("2.5.29.17", false, xt_san([der_encode(130, [97, 200])]))])
+    #assert(xt_has(xt_perr(nonascii), "non-ASCII"))
+    notseq = xt_cert([xt_ext("2.5.29.17", false, der_octets([1]))])
+    #assert(xt_has(xt_perr(notseq), "SEQUENCE"))
+    twodirs = xt_cert([xt_ext("2.5.29.17", false, xt_san([der_encode(164, xc_cat(xt_name("a"), xt_name("b")))]))])
+    #assert(xt_has(xt_perr(twodirs), "directoryName"))
+    trailing = xt_cert([xt_ext("2.5.29.17", false, xc_cat(xt_san([xt_dns("a.test")]), [0]))])
+    #assert(xt_has(xt_perr(trailing), "trailing"))
+}
+
+test "extended key usage names and unknown OIDs" {
+    c = xt_p(xt_cert([xt_ext("2.5.29.37", false, xt_eku(["1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2", "1.3.6.1.5.5.7.3.3", "1.3.6.1.5.5.7.3.4", "1.3.6.1.5.5.7.3.8", "1.3.6.1.5.5.7.3.9", "1.2.3.4.5"]))]))
+    assert_eq(c.ekus, ["serverAuth", "clientAuth", "codeSigning", "emailProtection", "timeStamping", "ocspSigning", "1.2.3.4.5"])
+    #assert(x509_has_eku(c, "serverAuth"))
+    #assert(x509_has_eku(c, "1.2.3.4.5"))
+    #assert(!(x509_has_eku(c, "other")))
+    plain = xt_p(xt_cert([]))
+    #assert(x509_has_eku(plain, "anything"))
+    notoid = xt_cert([xt_ext("2.5.29.37", false, der_seq([der_utf8("x")]))])
+    #assert(xt_has(xt_perr(notoid), "OBJECT IDENTIFIER"))
+    empty = xt_p(xt_cert([xt_ext("2.5.29.37", false, der_seq([]))]))
+    assert_eq(host.sys_arr_len(empty.ekus), 0)
+}
+
+test "key identifiers and critical extension bookkeeping" {
+    ski_bytes = xt_seq_bytes(20)
+    aki_bytes = xt_repeat(170, 20)
+    c = xt_p(xt_cert([xt_ext("2.5.29.14", false, der_octets(ski_bytes)), xt_ext("2.5.29.35", false, der_seq([der_encode(128, aki_bytes)]))]))
+    assert_eq(c.ski, x509_hex(ski_bytes))
+    assert_eq(c.aki, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    assert_eq(c.ext_oids, ["2.5.29.14", "2.5.29.35"])
+    aki_issuer = xt_p(xt_cert([xt_ext("2.5.29.35", false, der_seq([der_encode(161, [1])]))]))
+    assert_eq(aki_issuer.aki, "")
+    crit = xt_p(xt_cert([xt_ext("1.2.3.4", true, der_null()), xt_ext("1.2.3.5", false, der_null()), xt_ext("2.5.29.19", true, der_seq([]))]))
+    assert_eq(crit.unknown_critical, ["1.2.3.4"])
+    assert_eq(crit.ext_oids, ["1.2.3.4", "1.2.3.5", "2.5.29.19"])
+    #assert(!(x509_usable_for_server(crit)))
+    benign = xt_p(xt_cert([xt_ext("1.2.3.5", false, der_null())]))
+    assert_eq(host.sys_arr_len(benign.unknown_critical), 0)
+    #assert(x509_usable_for_server(benign))
+    bad_ski = xt_cert([xt_ext("2.5.29.14", false, der_null())])
+    #assert(xt_has(xt_perr(bad_ski), "subjectKeyIdentifier"))
+}
+
+test "extension structure errors" {
+    dup = xt_cert([xt_ext("2.5.29.19", false, der_seq([])), xt_ext("2.5.29.19", false, der_seq([]))])
+    #assert(xt_has(xt_perr(dup), "duplicate extension"))
+    one = xt_cert([der_seq([der_oid("2.5.29.19") or NOTHING])])
+    #assert(xt_has(xt_perr(one), "needs an OID and a value"))
+    four = xt_cert([der_seq([der_oid("2.5.29.19") or NOTHING, der_bool(true), der_bool(true), der_octets([48, 0])])])
+    #assert(xt_has(xt_perr(four), "too many"))
+    notoctets = xt_cert([der_seq([der_oid("2.5.29.19") or NOTHING, der_null()])])
+    #assert(xt_has(xt_perr(notoctets), "OCTET STRING"))
+    badcrit = xt_cert([der_seq([der_oid("2.5.29.19") or NOTHING, der_int(1), der_octets([48, 0])])])
+    #assert(xt_has(xt_perr(badcrit), "BOOLEAN"))
+    notoid = xt_cert([der_seq([der_utf8("x"), der_octets([48, 0])])])
+    #assert(xt_has(xt_perr(notoid), "OBJECT IDENTIFIER"))
+    notseq = xt_make(xt_v3(), der_int(1), xt_alg("1.2.840.10045.4.3.2"), xt_alg("1.2.840.10045.4.3.2"), xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, der_explicit(3, der_null()))
+    #assert(xt_has(xt_perr(notseq), "constructed"))
+    two_wrap = xt_make(xt_v3(), der_int(1), xt_alg("1.2.840.10045.4.3.2"), xt_alg("1.2.840.10045.4.3.2"), xt_name("A"), 0, 100, xt_name("B"), xt_ec_spki(), NOTHING, der_explicit(3, xc_cat(der_seq([]), der_seq([]))))
+    #assert(xt_has(xt_perr(two_wrap), "wrapper"))
+}
+
+xt_rsa_spki(modulus: _, e: i64) : _ {
+    key = der_seq([der_int_bytes(modulus), der_int(e)])
+    alg = der_seq([der_oid("1.2.840.113549.1.1.1") or NOTHING, der_null()])
+    der_seq([alg, der_bits(key, 0)])
+}
+
+xt_rsa_cert(modulus: _, e: i64) : X509Cert {
+    alg = xt_alg("1.2.840.113549.1.1.11")
+    xt_p(xt_make(xt_v3(), der_int(1), alg, alg, xt_name("A"), 0, 100, xt_name("B"), xt_rsa_spki(modulus, e), NOTHING, NOTHING))
+}
+
+test "RSA public key size and exponent" {
+    m2048 = xc_cat([128], xt_repeat(1, 255))
+    c = xt_rsa_cert(m2048, 65537)
+    assert_eq(c.key_oid, "1.2.840.113549.1.1.1")
+    assert_eq(c.key_name, "rsaEncryption")
+    assert_eq(c.rsa_bits, 2048)
+    assert_eq(c.rsa_exp, 65537)
+    assert_eq(c.curve_oid, "")
+    m2041 = xc_cat([1], xt_repeat(0, 255))
+    assert_eq(xt_rsa_cert(m2041, 3).rsa_bits, 2041)
+    assert_eq(xt_rsa_cert(m2041, 3).rsa_exp, 3)
+    m4096 = xc_cat([255], xt_repeat(7, 511))
+    assert_eq(xt_rsa_cert(m4096, 65537).rsa_bits, 4096)
+    m1024 = xc_cat([127], xt_repeat(9, 127))
+    assert_eq(xt_rsa_cert(m1024, 17).rsa_bits, 1023)
+    assert_eq(xt_rsa_cert([2], 3).rsa_bits, 2)
+    assert_eq(xt_rsa_cert([0, 0, 5], 3).rsa_bits, 3)
+    assert_eq(xt_rsa_cert([1], 3).rsa_bits, 1)
+}
+
+test "an RSA key that is not an RSAPublicKey reports zero bits" {
+    alg = xt_alg("1.2.840.113549.1.1.11")
+    junk_alg = der_seq([der_oid("1.2.840.113549.1.1.1") or NOTHING, der_null()])
+    spki = der_seq([junk_alg, der_bits([1, 2, 3], 0)])
+    c = xt_p(xt_make(xt_v3(), der_int(1), alg, alg, xt_name("A"), 0, 100, xt_name("B"), spki, NOTHING, NOTHING))
+    assert_eq(c.rsa_bits, 0)
+    assert_eq(c.rsa_exp, 0)
+    assert_eq(c.key_bytes, [1, 2, 3])
+    one_int = der_seq([junk_alg, der_bits(der_seq([der_int(5)]), 0)])
+    c2 = xt_p(xt_make(xt_v3(), der_int(1), alg, alg, xt_name("A"), 0, 100, xt_name("B"), one_int, NOTHING, NOTHING))
+    assert_eq(c2.rsa_bits, 0)
+}
+
+test "SubjectPublicKeyInfo errors" {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    onlyone = xt_make(xt_v3(), der_int(1), alg, alg, xt_name("A"), 0, 100, xt_name("B"), der_seq([der_seq([der_oid("1.2.840.10045.2.1") or NOTHING])]), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(onlyone), "SubjectPublicKeyInfo"))
+    noalg = xt_make(xt_v3(), der_int(1), alg, alg, xt_name("A"), 0, 100, xt_name("B"), der_seq([der_seq([]), der_bits([1], 0)]), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(noalg), "empty public key algorithm"))
+    nobits = xt_make(xt_v3(), der_int(1), alg, alg, xt_name("A"), 0, 100, xt_name("B"), der_seq([der_seq([der_oid("1.3.101.112") or NOTHING]), der_octets([1])]), NOTHING, NOTHING)
+    #assert(xt_has(xt_perr(nobits), "BIT STRING"))
+    ed = xt_make(xt_v3(), der_int(1), alg, alg, xt_name("A"), 0, 100, xt_name("B"), der_seq([der_seq([der_oid("1.3.101.112") or NOTHING]), der_bits(xt_seq_bytes(32), 0)]), NOTHING, NOTHING)
+    ce = xt_p(ed)
+    assert_eq(ce.key_name, "Ed25519")
+    assert_eq(host.sys_arr_len(ce.key_bytes), 32)
+    assert_eq(ce.curve_oid, "")
+}
+
+test "structural errors in the outer certificate" {
+    good = xt_cert([])
+    assert_eq(xt_perr(good), "ok:3")
+    #assert(xt_has(xt_perr([]), "truncated"))
+    #assert(xt_has(xt_perr(xc_slice(good, 0, host.sys_arr_len(good) - 1)), "overruns"))
+    #assert(xt_has(xt_perr(xc_cat(good, [0])), "trailing"))
+    #assert(xt_has(xt_perr(der_set([])), "SEQUENCE"))
+    #assert(xt_has(xt_perr(der_seq([der_int(1), der_int(2)])), "three elements"))
+    #assert(xt_has(xt_perr(der_seq([der_int(1), der_int(2), der_int(3), der_int(4)])), "three elements"))
+    #assert(xt_has(xt_perr(der_seq([der_int(1), xt_alg("1.2.3"), der_bits([1], 0)])), "TBSCertificate"))
+    #assert(xt_has(xt_perr(der_seq([der_seq([]), xt_alg("1.2.3"), der_bits([1], 0)])), "mandatory"))
+    #assert(xt_has(xt_perr(der_seq([der_seq([]), der_seq([]), der_bits([1], 0)])), "empty signatureAlgorithm"))
+    #assert(xt_has(xt_perr(der_seq([der_seq([]), xt_alg("1.2.3"), der_octets([1])])), "BIT STRING"))
+    #assert(xt_has(xt_perr([48, 128, 0, 0]), "indefinite"))
+    #assert(xt_has(xt_perr([1, 2, 3]), "overruns"))
+    bad_bytes = xt_perr([48, 3, 2, 1, 300])
+    #assert(xt_has(bad_bytes, "not a byte array"))
+    negative = xt_perr([48, 3, 2, 1, -1])
+    #assert(xt_has(negative, "not a byte array"))
+}
+
+test "every truncation of a real certificate is rejected" {
+    der = pem_decode_label(XT_ED_PEM, "CERTIFICATE") or []
+    assert_eq(host.sys_arr_len(der), 282)
+    assert_eq(xt_perr(der), "ok:3")
+    accepted = 0
+    for 0..281 {
+        if xt_perr(xc_slice(der, 0, it)) == "ok:3" { accepted = accepted + 1 }
+    }
+    assert_eq(accepted, 0)
+}
+
+test "flipping bytes of a real certificate never crashes the parser" {
+    der = pem_decode_label(XT_ED_PEM, "CERTIFICATE") or []
+    n = host.sys_arr_len(der)
+    survived = 0
+    for 0..n {
+        mutated = xc_slice(der, 0, it)
+        mutated = host.sys_arr_push(mutated, (der[it] + 1) % 256)
+        mutated = xc_cat(mutated, xc_slice(der, it + 1, n))
+        r = xt_perr(mutated)
+        if r != "" { survived = survived + 1 }
+    }
+    assert_eq(survived, n)
+}
+
+test "x509_valid_at is inclusive at both ends" {
+    c = xt_ed_pem()
+    #assert(!(x509_valid_at(c, 1709251198)))
+    #assert(x509_valid_at(c, 1709251199))
+    #assert(x509_valid_at(c, 1709251200))
+    #assert(!(x509_valid_at(c, 1709251201)))
+    e = xt_ec_pem()
+    #assert(!(x509_valid_at(e, 1767225599)))
+    #assert(x509_valid_at(e, 1767225600))
+    #assert(x509_valid_at(e, 1900000000))
+    #assert(x509_valid_at(e, 2082758400))
+    #assert(!(x509_valid_at(e, 2082758401)))
+}
+
+test "x509_dns_match implements RFC 6125 matching" {
+    #assert(x509_dns_match("example.com", "example.com"))
+    #assert(x509_dns_match("Example.COM", "eXample.com"))
+    #assert(!(x509_dns_match("example.com", "www.example.com")))
+    #assert(x509_dns_match("*.example.com", "www.example.com"))
+    #assert(x509_dns_match("*.example.com", "WWW.Example.com"))
+    #assert(!(x509_dns_match("*.example.com", "a.b.example.com")))
+    #assert(!(x509_dns_match("*.example.com", "example.com")))
+    #assert(!(x509_dns_match("*.example.com", ".example.com")))
+    #assert(!(x509_dns_match("*.example.com", "www.example.org")))
+    #assert(!(x509_dns_match("*.com", "example.com")))
+    #assert(!(x509_dns_match("*", "example")))
+    #assert(!(x509_dns_match("f*.example.com", "foo.example.com")))
+    #assert(!(x509_dns_match("*.*.example.com", "a.b.example.com")))
+    #assert(!(x509_dns_match("www.*.com", "www.a.com")))
+    #assert(!(x509_dns_match("", "")))
+    #assert(!(x509_dns_match("a.test", "")))
+    #assert(!(x509_dns_match("a.test.", "a.test.")))
+    #assert(x509_dns_match("localhost", "localhost"))
+}
+
+xt_host_cert(sans: _, cn: str) : X509Cert {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    exts = []
+    if host.sys_arr_len(sans) > 0 { exts = [xt_ext("2.5.29.17", false, xt_san(sans))] }
+    xt_p(xt_make(xt_v3(), der_int(1), alg, alg, xt_name("CA"), 0, 100, xt_name(cn), xt_ec_spki(), exts, NOTHING))
+}
+
+test "x509_matches_host uses SAN DNS names, IP SANs and the CN fallback" {
+    real = xt_ec_pem()
+    #assert(x509_matches_host(real, "example.test"))
+    #assert(x509_matches_host(real, "EXAMPLE.TEST"))
+    #assert(x509_matches_host(real, "api.example.test"))
+    #assert(!(x509_matches_host(real, "a.b.example.test")))
+    #assert(!(x509_matches_host(real, "example.test.")))
+    #assert(!(x509_matches_host(real, "other.test")))
+    #assert(x509_matches_host(real, "192.0.2.1"))
+    #assert(!(x509_matches_host(real, "192.0.2.2")))
+    #assert(!(x509_matches_host(real, "")))
+    cn_only = xt_host_cert([], "legacy.test")
+    #assert(x509_matches_host(cn_only, "legacy.test"))
+    #assert(!(x509_matches_host(cn_only, "other.test")))
+    #assert(!(x509_matches_host(cn_only, "10.0.0.1")))
+    wild_cn = xt_host_cert([], "*.legacy.test")
+    #assert(x509_matches_host(wild_cn, "a.legacy.test"))
+    #assert(!(x509_matches_host(wild_cn, "legacy.test")))
+    san_wins = xt_host_cert([xt_dns("san.test")], "cn.test")
+    #assert(x509_matches_host(san_wins, "san.test"))
+    #assert(!(x509_matches_host(san_wins, "cn.test")))
+    only_email = xt_host_cert([der_encode(129, host.sys_str_to_bytes("a@b.test"))], "cn.test")
+    #assert(!(x509_matches_host(only_email, "cn.test")))
+    ip_only = xt_host_cert([der_encode(135, [127, 0, 0, 1])], "127.0.0.1")
+    #assert(x509_matches_host(ip_only, "127.0.0.1"))
+    #assert(!(x509_matches_host(ip_only, "127.0.0.2")))
+    dns_for_ip = xt_host_cert([xt_dns("10.0.0.1")], "x")
+    #assert(!(x509_matches_host(dns_for_ip, "10.0.0.1")))
+}
+
+xt_ca_cert(subject: str, ski: _, bc_ca: bool, ku: _) : X509Cert {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    exts = [xt_ext("2.5.29.19", true, der_seq([der_bool(bc_ca)])), xt_ext("2.5.29.14", false, der_octets(ski))]
+    if host.sys_arr_len(ku) > 0 { exts = host.sys_arr_push(exts, xt_ext("2.5.29.15", true, der_bits(ku, 1))) }
+    xt_p(xt_make(xt_v3(), der_int(1), alg, alg, xt_name(subject), 0, 100, xt_name(subject), xt_ec_spki(), exts, NOTHING))
+}
+
+xt_leaf_cert(issuer: str, aki: _) : X509Cert {
+    alg = xt_alg("1.2.840.10045.4.3.2")
+    exts = [xt_ext("2.5.29.19", false, der_seq([]))]
+    if host.sys_arr_len(aki) > 0 { exts = host.sys_arr_push(exts, xt_ext("2.5.29.35", false, der_seq([der_encode(128, aki)]))) }
+    xt_p(xt_make(xt_v3(), der_int(2), alg, alg, xt_name(issuer), 0, 100, xt_name("leaf"), xt_ec_spki(), exts, NOTHING))
+}
+
+test "x509_issued_by checks names, CA flag, key usage and key identifiers" {
+    ski = xt_seq_bytes(20)
+    root = xt_ca_cert("Root", ski, true, [4])
+    leaf = xt_leaf_cert("Root", ski)
+    #assert(x509_issued_by(leaf, root))
+    #assert(x509_issued_by(root, root))
+    #assert(!(x509_issued_by(root, leaf)))
+    #assert(!(x509_issued_by(leaf, leaf)))
+    other_name = xt_leaf_cert("Elsewhere", ski)
+    #assert(!(x509_issued_by(other_name, root)))
+    wrong_key = xt_leaf_cert("Root", xt_repeat(9, 20))
+    #assert(!(x509_issued_by(wrong_key, root)))
+    no_aki = xt_leaf_cert("Root", [])
+    #assert(x509_issued_by(no_aki, root))
+    not_ca = xt_ca_cert("Root", ski, false, [4])
+    #assert(!(x509_issued_by(leaf, not_ca)))
+    no_sign = xt_ca_cert("Root", ski, true, [128])
+    #assert(!(x509_issued_by(leaf, no_sign)))
+    no_ku = xt_ca_cert("Root", ski, true, [])
+    #assert(x509_issued_by(leaf, no_ku))
+    real = xt_ca_pem()
+    #assert(!(x509_issued_by(leaf, real)))
+    #assert(!(x509_issued_by(xt_ec_pem(), real)))
+    #assert(!(x509_issued_by(xt_ec_pem(), xt_ec_pem())))
+}
+
+test "x509_is_root_candidate" {
+    ski = xt_seq_bytes(20)
+    root = xt_ca_cert("Root", ski, true, [4])
+    #assert(x509_is_root_candidate(root))
+    leaf = xt_leaf_cert("Root", ski)
+    #assert(!(x509_is_root_candidate(leaf)))
+    not_ca = xt_ca_cert("Root", ski, false, [4])
+    #assert(!(x509_is_root_candidate(not_ca)))
+    #assert(x509_is_root_candidate(xt_ca_pem()))
+    #assert(!(x509_is_root_candidate(xt_ec_pem())))
+}
+
+test "x509_usable_for_server" {
+    #assert(x509_usable_for_server(xt_ec_pem()))
+    #assert(x509_usable_for_server(xt_ed_pem()))
+    #assert(!(x509_usable_for_server(xt_ca_pem())))
+    client_only = xt_p(xt_cert([xt_ext("2.5.29.37", false, xt_eku(["1.3.6.1.5.5.7.3.2"]))]))
+    #assert(!(x509_usable_for_server(client_only)))
+    both = xt_p(xt_cert([xt_ext("2.5.29.37", false, xt_eku(["1.3.6.1.5.5.7.3.2", "1.3.6.1.5.5.7.3.1"]))]))
+    #assert(x509_usable_for_server(both))
+    sign_only = xt_p(xt_cert([xt_ext("2.5.29.15", true, der_bits([4], 2))]))
+    #assert(!(x509_usable_for_server(sign_only)))
+    kex = xt_p(xt_cert([xt_ext("2.5.29.15", true, der_bits([32], 5))]))
+    #assert(x509_usable_for_server(kex))
+    agree = xt_p(xt_cert([xt_ext("2.5.29.15", true, der_bits([8], 3))]))
+    #assert(x509_usable_for_server(agree))
+    plain = xt_p(xt_cert([]))
+    #assert(x509_usable_for_server(plain))
+}
+
+test "x509_ip_text renders IPv4 and IPv6" {
+    assert_eq(x509_ip_text([192, 0, 2, 1]) or "?", "192.0.2.1")
+    assert_eq(x509_ip_text([0, 0, 0, 0]) or "?", "0.0.0.0")
+    assert_eq(x509_ip_text([255, 255, 255, 255]) or "?", "255.255.255.255")
+    assert_eq(x509_ip_text(xt_repeat(0, 16)) or "?", "0000:0000:0000:0000:0000:0000:0000:0000")
+    v6 = [32, 1, 13, 184, 133, 163, 0, 0, 0, 0, 138, 46, 3, 112, 115, 52]
+    assert_eq(x509_ip_text(v6) or "?", "2001:0db8:85a3:0000:0000:8a2e:0370:7334")
+    assert_eq(x509_ip_text([1, 2, 3]) or "failed", "failed")
+    assert_eq(x509_ip_text([]) or "failed", "failed")
+}
+
+test "x509_hex and x509_same" {
+    assert_eq(x509_hex([]), "")
+    assert_eq(x509_hex([0, 1, 15, 16, 171, 255]), "00010f10abff")
+    #assert(x509_same([1, 2], [1, 2]))
+    #assert(!(x509_same([1, 2], [1, 3])))
+    #assert(!(x509_same([1, 2], [1, 2, 3])))
+    #assert(x509_same([], []))
+}
+
+test "x509_parse_pem integrates PEM and DER layers" {
+    c = x509_parse_pem(XT_ED_PEM) or X509Cert.{serial: "failed"}
+    assert_eq(c.serial, "ff")
+    bundle = "{XT_EC_PEM}{XT_CA_PEM}"
+    first = x509_parse_pem(bundle) or X509Cert.{serial: "failed"}
+    assert_eq(first.serial, "1234567890abcdef")
+    blocks = pem_decode_all(bundle) or []
+    assert_eq(host.sys_arr_len(blocks), 2)
+    second_block = blocks[1]
+    second = x509_parse(second_block.der) or X509Cert.{serial: "failed"}
+    assert_eq(second.serial, "07")
+    wrong = x509_parse_pem("-----BEGIN PUBLIC KEY-----\nAQID\n-----END PUBLIC KEY-----\n") or "failed"
+    assert_eq(wrong, "failed")
+    garbage = x509_parse_pem("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n") or "failed"
+    assert_eq(garbage, "failed")
+    assert_eq(x509_parse_pem("") or "failed", "failed")
+}

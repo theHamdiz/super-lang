@@ -1,0 +1,17 @@
+#cfg(feature = "text")
++mode() : str => "text"
+
+#cfg(all(not(feature = "text"), feature = "binary"))
++mode() : str => "binary"
+
+#cfg(not(any(feature = "text", feature = "binary")))
++mode() : str => "minimal"
+
++main() {
+    print(mode())
+    0
+}
+
+test "selected feature produces one mode" {
+    #assert(mode() != "")
+}

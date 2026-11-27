@@ -1,0 +1,364 @@
+//! std.diag.bench — micro-benchmark harness: warmup, black_box, laps and BenchResult
+//!
+//! Import with:
+//!   use std.diag.bench
+//!
+//!   b = Bench.new("sum_to_1000", 100, 1000)
+//!   for 0..b.warmup { bench_black_box(work(it)) }      // warm caches and the JIT
+//!   @b.begin()
+//!   for 0..b.iters {
+//!       bench_black_box(work(it))
+//!       @b.lap(0)                                       // one sample per iteration
+//!   }
+//!   r = @b.finish()
+//!   print(r.report())                                   // name: 1000 iters, mean 412ns ...
+//!
+//! Closures leave the typed AOT path and would skew timings, so instead of `run(f)` the harness is a
+//! recorder: you keep the loop, `Bench` keeps the clock. `lap` stores the nanoseconds since the
+//! previous lap (or `begin`) and tracks peak memory when you pass the bytes in use (the host
+//! kernel has no allocator probe). `bench_run_iters` builds the same `BenchResult` from a
+//! sample array you already have. Time comes from `host.sys_unix_ns`; `Bench.manual` swaps in
+//! a settable fake clock so the statistics are testable without touching wall time.
+//! `bench_black_box` is an identity barrier that forces a value to be consumed so the
+//! optimiser cannot drop the work. Public helpers are prefixed `bench_` (modules merge flat).
+
+/// `BENCH_NS_PER_SEC` is `1000000000`.
++BENCH_NS_PER_SEC = 1000000000
+
+/// Identity barrier: returns `x` unchanged so the work that produced it must run.
++bench_black_box(x: _) : _ => x
+
+/// Wall clock in nanoseconds since the Unix epoch.
++bench_now_ns() : i64 => host.sys_unix_ns()
+
+/// Sorted copy of `a` (ascending insertion sort; sample arrays are small).
++bench_sorted(a: _) {
+    out = []
+    for a { out = host.sys_arr_push(out, it) }
+    n = host.sys_arr_len(out)
+    i = 1
+    while i < n {
+        key = out[i]
+        j = i - 1
+        while j >= 0 {
+            if out[j] > key {
+                out = host.sys_arr_set(out, j + 1, out[j])
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        out = host.sys_arr_set(out, j + 1, key)
+        i += 1
+    }
+    out
+}
+
+/// Nearest-rank percentile (`p` in 0..100) of an ascending sample array; 0 when empty.
++bench_percentile(sorted: _, p: i64) : i64 {
+    n = host.sys_arr_len(sorted)
+    ensure n > 0 else { return 0 }
+    rank = (p * n + 99) / 100
+    if rank < 1 { rank = 1 }
+    if rank > n { rank = n }
+    sorted[rank - 1]
+}
+
+/// `BenchResult` summarises one benchmark run. All times are nanoseconds per iteration.
++BenchResult = {
+    /// Benchmark name. Defaults to `""`.
+    name: str = ""
+    /// Warmup iterations that ran before timing. Defaults to `0`.
+    warmup: i64 = 0
+    /// Timed iterations (samples). Defaults to `0`.
+    iters: i64 = 0
+    /// Sum of all samples. Defaults to `0`.
+    total_ns: i64 = 0
+    /// Fastest sample. Defaults to `0`.
+    min_ns: i64 = 0
+    /// Slowest sample. Defaults to `0`.
+    max_ns: i64 = 0
+    /// Arithmetic mean. Defaults to `0.0`.
+    mean_ns: f64 = 0.0
+    /// Median sample. Defaults to `0`.
+    median_ns: i64 = 0
+    /// 95th percentile sample. Defaults to `0`.
+    p95_ns: i64 = 0
+    /// Population standard deviation. Defaults to `0.0`.
+    stddev_ns: f64 = 0.0
+    /// Iterations per second implied by the mean. Defaults to `0.0`.
+    ops_per_sec: f64 = 0.0
+    /// Peak memory in bytes reported through `lap`/`note_mem`. Defaults to `0`.
+    peak_mem: i64 = 0
+
+    /// One-line human summary.
+    report(self) : str {
+        "{self.name}: {self.iters} iters, mean {self.mean_ns}ns, median {self.median_ns}ns, p95 {self.p95_ns}ns, min {self.min_ns}ns, max {self.max_ns}ns, {self.ops_per_sec} ops/s, peak {self.peak_mem}B"
+    }
+
+    /// How many times faster this run's mean is than `base` (0.0 when this mean is 0).
+    speedup(self, base: BenchResult) : f64 {
+        ensure self.mean_ns > 0.0 else { return 0.0 }
+        base.mean_ns / self.mean_ns
+    }
+
+    /// True when the slowest sample is within `factor` times the median (a stability check).
+    is_stable(self, factor: i64) : bool {
+        ensure self.median_ns > 0 else { return self.max_ns == 0 }
+        self.max_ns <= self.median_ns * factor
+    }
+}
+
+/// Build a `BenchResult` from per-iteration `samples` (ns). `warmup` and `peak_mem` are recorded as given.
++bench_run_iters(name: str, warmup: i64, samples: _, peak_mem: i64) : BenchResult {
+    n = host.sys_arr_len(samples)
+    ensure n > 0 else {
+        return BenchResult.{name, warmup, iters: 0, total_ns: 0, min_ns: 0, max_ns: 0, mean_ns: 0.0, median_ns: 0, p95_ns: 0, stddev_ns: 0.0, ops_per_sec: 0.0, peak_mem}
+    }
+    sorted = bench_sorted(samples)
+    total = 0
+    for sorted { total += it }
+    mean = host.sys_to_float(total) / host.sys_to_float(n)
+    acc = 0.0
+    for sorted {
+        d = host.sys_to_float(it) - mean
+        acc += d * d
+    }
+    ops = 0.0
+    if mean > 0.0 { ops = host.sys_to_float(BENCH_NS_PER_SEC) / mean }
+    BenchResult.{
+        name,
+        warmup,
+        iters: n,
+        total_ns: total,
+        min_ns: sorted[0],
+        max_ns: sorted[n - 1],
+        mean_ns: mean,
+        median_ns: bench_percentile(sorted, 50),
+        p95_ns: bench_percentile(sorted, 95),
+        stddev_ns: host.sys_sqrt(acc / host.sys_to_float(n)),
+        ops_per_sec: ops,
+        peak_mem,
+    }
+}
+
+/// `Bench` is the recorder behind a benchmark loop.
++Bench = {
+    /// Benchmark name. Defaults to `""`.
+    name: str = ""
+    /// Warmup iterations the caller should run before `begin`. Defaults to `0`.
+    warmup: i64 = 0
+    /// Timed iterations the caller should run between `begin` and `finish`. Defaults to `0`.
+    iters: i64 = 0
+    /// Per-iteration samples in nanoseconds. Defaults to `[]`.
+    samples: _ = []
+    /// Clock reading at `begin`. Defaults to `0`.
+    started_ns: i64 = 0
+    /// Clock reading at the last lap. Defaults to `0`.
+    last_ns: i64 = 0
+    /// Largest memory figure passed to `lap` or `note_mem`. Defaults to `0`.
+    peak_mem: i64 = 0
+    /// True when `fake_ns` replaces the wall clock. Defaults to `false`.
+    use_fake: bool = false
+    /// Settable clock used when `use_fake` is true. Defaults to `0`.
+    fake_ns: i64 = 0
+
+    /// Recorder on the wall clock.
+    new(name: str, warmup: i64, iters: i64) : Bench {
+        Bench.{name, warmup, iters, samples: [], started_ns: 0, last_ns: 0, peak_mem: 0, use_fake: false, fake_ns: 0}
+    }
+
+    /// Recorder on a settable fake clock (deterministic tests).
+    manual(name: str, warmup: i64, iters: i64) : Bench {
+        Bench.{name, warmup, iters, samples: [], started_ns: 0, last_ns: 0, peak_mem: 0, use_fake: true, fake_ns: 0}
+    }
+
+    /// Current clock reading in nanoseconds.
+    now(self) : i64 {
+        if self.use_fake { return self.fake_ns }
+        host.sys_unix_ns()
+    }
+
+    /// Advance the fake clock by `ns` (no effect on the wall clock). Returns the new reading.
+    tick(@self, ns: i64) : i64 {
+        self.fake_ns += ns
+        self.fake_ns
+    }
+
+    /// Start timing: clears samples and the peak figure, and stamps the clock.
+    begin(@self) : i64 {
+        self.samples = []
+        self.peak_mem = 0
+        self.started_ns = self.now()
+        self.last_ns = self.started_ns
+        self.started_ns
+    }
+
+    /// Record one sample (ns since the previous lap) and fold `mem_bytes` into the peak. Returns the sample.
+    lap(@self, mem_bytes: i64) : i64 {
+        t = self.now()
+        dt = t - self.last_ns
+        if dt < 0 { dt = 0 }
+        self.samples = host.sys_arr_push(self.samples, dt)
+        self.last_ns = t
+        if mem_bytes > self.peak_mem { self.peak_mem = mem_bytes }
+        dt
+    }
+
+    /// Fold a memory reading into the peak without taking a sample.
+    note_mem(@self, mem_bytes: i64) : i64 {
+        if mem_bytes > self.peak_mem { self.peak_mem = mem_bytes }
+        self.peak_mem
+    }
+
+    /// Number of samples recorded since `begin`.
+    count(self) : i64 => host.sys_arr_len(self.samples)
+
+    /// Nanoseconds since `begin`.
+    elapsed_ns(self) : i64 => self.now() - self.started_ns
+
+    /// End the run and summarise it. With no laps, the whole interval counts as one sample.
+    finish(@self) : BenchResult {
+        if host.sys_arr_len(self.samples) == 0 {
+            total = self.elapsed_ns()
+            if total < 0 { total = 0 }
+            self.samples = [total]
+        }
+        bench_run_iters(self.name, self.warmup, self.samples, self.peak_mem)
+    }
+}
+
+// --- tests ----------------------------------------------------------------------------------
+
+/// Test that black_box is an identity barrier.
+test "black_box is an identity barrier" {
+    assert_eq(bench_black_box(42), 42)
+    assert_eq(bench_black_box("x"), "x")
+    assert_eq(bench_black_box(1.5), 1.5)
+    assert_eq(host.sys_arr_len(bench_black_box([1, 2, 3])), 3)
+}
+
+/// Test that sorting and percentiles use nearest rank.
+test "sorting and percentiles use nearest rank" {
+    s = bench_sorted([5, 1, 4, 2, 3])
+    assert_eq(s[0], 1)
+    assert_eq(s[4], 5)
+    assert_eq(bench_percentile(s, 50), 3)
+    assert_eq(bench_percentile(s, 95), 5)
+    assert_eq(bench_percentile(s, 0), 1)
+    assert_eq(bench_percentile(s, 100), 5)
+    assert_eq(bench_percentile([], 50), 0)
+    assert_eq(host.sys_arr_len(bench_sorted([])), 0)
+    ten = bench_sorted([10, 9, 8, 7, 6, 5, 4, 3, 2, 1])
+    assert_eq(bench_percentile(ten, 50), 5)
+    assert_eq(bench_percentile(ten, 90), 9)
+}
+
+/// Test that run_iters summarises samples.
+test "run_iters summarises samples" {
+    r = bench_run_iters("fixed", 3, [100, 200, 300, 400], 2048)
+    assert_eq(r.name, "fixed")
+    assert_eq(r.warmup, 3)
+    assert_eq(r.iters, 4)
+    assert_eq(r.total_ns, 1000)
+    assert_eq(r.min_ns, 100)
+    assert_eq(r.max_ns, 400)
+    assert_eq(r.mean_ns, 250.0)
+    assert_eq(r.median_ns, 200)
+    assert_eq(r.p95_ns, 400)
+    assert_eq(r.peak_mem, 2048)
+    #assert(host.sys_abs(r.stddev_ns - host.sys_sqrt(12500.0)) < 0.0001)
+    #assert(host.sys_abs(r.ops_per_sec - 4000000.0) < 0.001)
+    #assert(r.is_stable(2))
+    #assert(!(r.is_stable(1)))
+}
+
+/// Test that empty runs yield a zero result.
+test "empty runs yield a zero result" {
+    r = bench_run_iters("none", 0, [], 7)
+    assert_eq(r.iters, 0)
+    assert_eq(r.total_ns, 0)
+    assert_eq(r.mean_ns, 0.0)
+    assert_eq(r.ops_per_sec, 0.0)
+    assert_eq(r.peak_mem, 7)
+    z = bench_run_iters("zeros", 0, [0, 0], 0)
+    assert_eq(z.ops_per_sec, 0.0)
+    #assert(z.is_stable(1))
+    assert_eq(z.speedup(r), 0.0)
+}
+
+/// Test that the fake clock drives laps deterministically.
+test "the fake clock drives laps deterministically" {
+    b = Bench.manual("laps", 2, 3)
+    assert_eq(b.warmup, 2)
+    assert_eq(b.iters, 3)
+    assert_eq(@b.tick(1000), 1000)
+    assert_eq(@b.begin(), 1000)
+    @b.tick(10)
+    assert_eq(@b.lap(100), 10)
+    @b.tick(30)
+    assert_eq(@b.lap(4096), 30)
+    @b.tick(20)
+    assert_eq(@b.lap(512), 20)
+    assert_eq(b.count(), 3)
+    assert_eq(b.elapsed_ns(), 60)
+    assert_eq(b.peak_mem, 4096)
+    r = @b.finish()
+    assert_eq(r.iters, 3)
+    assert_eq(r.total_ns, 60)
+    assert_eq(r.min_ns, 10)
+    assert_eq(r.max_ns, 30)
+    assert_eq(r.mean_ns, 20.0)
+    assert_eq(r.median_ns, 20)
+    assert_eq(r.peak_mem, 4096)
+}
+
+/// Test that begin resets and finish without laps uses the whole interval.
+test "begin resets and finish without laps uses the whole interval" {
+    b = Bench.manual("whole", 0, 1)
+    @b.begin()
+    @b.tick(500)
+    r = @b.finish()
+    assert_eq(r.iters, 1)
+    assert_eq(r.total_ns, 500)
+    assert_eq(r.min_ns, 500)
+    @b.begin()
+    assert_eq(b.count(), 0)
+    assert_eq(@b.note_mem(64), 64)
+    assert_eq(@b.note_mem(32), 64)
+    @b.begin()
+    assert_eq(b.peak_mem, 0)
+}
+
+/// Test that speedup compares means and report names the benchmark.
+test "speedup compares means and report names the benchmark" {
+    slow = bench_run_iters("slow", 0, [400, 400], 0)
+    fast = bench_run_iters("fast", 0, [100, 100], 0)
+    assert_eq(fast.speedup(slow), 4.0)
+    assert_eq(slow.speedup(fast), 0.25)
+    line = fast.report()
+    #assert(host.sys_str_len(line) > 20)
+    assert_eq(line[0], "f")
+    assert_eq(line[1], "a")
+}
+
+/// Test that the wall clock moves forward during real laps.
+test "the wall clock moves forward during real laps" {
+    b = Bench.new("wall", 1, 50)
+    #assert(!(b.use_fake))
+    @b.begin()
+    acc = 0
+    for 0..50 {
+        acc += bench_black_box(it)
+        @b.lap(acc)
+    }
+    r = @b.finish()
+    assert_eq(r.iters, 50)
+    #assert(r.total_ns >= 0)
+    #assert(r.min_ns <= r.median_ns)
+    #assert(r.median_ns <= r.max_ns)
+    assert_eq(r.peak_mem, 1225)
+    #assert(bench_now_ns() > 0)
+    t0 = bench_now_ns()
+    #assert(bench_now_ns() >= t0)
+}

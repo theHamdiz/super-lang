@@ -1,0 +1,142 @@
+// 19_ws_multiroom_chat — WebSocket frame codec and multi-room pub/sub core.
+
+use std.net.ws
+use std.core.collections
+use std.diag.log
+
++ROOM_COUNT = 6
++CLIENT_COUNT = 24
++MESSAGE_COUNT = 4000
++MAX_FRAME = 128
+
++OP_TEXT = 1
++OP_BINARY = 2
++OP_PING = 9
+
++ChatFrame = {
+    opcode: i64 = 0
+    room: i64 = 0
+    sender: i64 = 0
+    sequence: i64 = 0
+    payload_sum: i64 = 0
+}
+
++encode_chat(@wire, opcode: i64, room: i64, sender: i64, sequence: i64, payload) : i64 {
+    payload_len = payload.len()
+    wire[0] = 128 + opcode
+    wire[1] = payload_len + 4
+    wire[2] = room
+    wire[3] = sender
+    wire[4] = sequence / 256
+    wire[5] = sequence % 256
+    for i in 0..payload_len {
+        wire[6 + i] = payload[i]
+    }
+    payload_len + 6
+}
+
++decode_chat(wire) : ChatFrame {
+    payload_len = wire[1] - 4
+    payload_sum = 0
+    for i in 0..payload_len {
+        payload_sum += wire[6 + i]
+    }
+    ChatFrame{
+        opcode: wire[0] - 128,
+        room: wire[2],
+        sender: wire[3],
+        sequence: wire[4] * 256 + wire[5],
+        payload_sum,
+    }
+}
+
++room_join(@memberships, client: i64, room: i64) {
+    memberships[client * ROOM_COUNT + room] = 1
+}
+
++room_leave(@memberships, client: i64, room: i64) {
+    memberships[client * ROOM_COUNT + room] = 0
+}
+
++publish(memberships, frame: ChatFrame, @inboxes) : i64 {
+    delivered = 0
+    for client in 0..CLIENT_COUNT {
+        if client != frame.sender && memberships[client * ROOM_COUNT + frame.room] == 1 {
+            inboxes[client] += frame.payload_sum + frame.sequence
+            delivered += 1
+        }
+    }
+    delivered
+}
+
++seed_rooms(@memberships) {
+    for client in 0..CLIENT_COUNT {
+        room_join(@memberships, client, client % ROOM_COUNT)
+        room_join(@memberships, client, (client + 1) % ROOM_COUNT)
+    }
+}
+
++run_chat(messages: i64) : i64 {
+    memberships = [0; CLIENT_COUNT * ROOM_COUNT]
+    inboxes = [0; CLIENT_COUNT]
+    seed_rooms(@memberships)
+    wire = [0; MAX_FRAME]
+    deliveries = 0
+    for sequence in 0..messages {
+        sender = sequence % CLIENT_COUNT
+        room = sequence % ROOM_COUNT
+        payload = [65 + sequence % 26, 32, 97 + sequence % 26]
+        _size = encode_chat(@wire, OP_TEXT, room, sender, sequence, payload)
+        frame = decode_chat(wire)
+        deliveries += publish(memberships, frame, @inboxes)
+    }
+    deliveries * 53 + (inboxes.sum())
+}
+
++main() {
+    lg = Logger.console("ws_chat")
+    checksum = run_chat(MESSAGE_COUNT)
+    @lg.info("CHECKSUM={checksum}")
+}
+
+test "chat frame round trip" {
+    wire = [0; MAX_FRAME]
+    assert_eq(encode_chat(@wire, OP_TEXT, 2, 7, 300, [10, 20]), 8)
+    frame = decode_chat(wire)
+    assert_eq(frame.opcode, OP_TEXT)
+    assert_eq(frame.room, 2)
+    assert_eq(frame.sender, 7)
+    assert_eq(frame.sequence, 300)
+    assert_eq(frame.payload_sum, 30)
+}
+
+test "rooms exclude sender during publish" {
+    memberships = [0; CLIENT_COUNT * ROOM_COUNT]
+    inboxes = [0; CLIENT_COUNT]
+    room_join(@memberships, 0, 1)
+    room_join(@memberships, 2, 1)
+    frame = ChatFrame{opcode: OP_TEXT, room: 1, sender: 0, sequence: 4, payload_sum: 10}
+    assert_eq(publish(memberships, frame, @inboxes), 1)
+    assert_eq(inboxes[0], 0)
+    assert_eq(inboxes[2], 14)
+}
+
+test "leaving room stops delivery" {
+    memberships = [0; CLIENT_COUNT * ROOM_COUNT]
+    inboxes = [0; CLIENT_COUNT]
+    room_join(@memberships, 3, 2)
+    room_leave(@memberships, 3, 2)
+    frame = ChatFrame{opcode: OP_TEXT, room: 2, sender: 1, sequence: 0, payload_sum: 1}
+    assert_eq(publish(memberships, frame, @inboxes), 0)
+}
+
+test "stdlib WebSocket text round trip" {
+    encoded = ws_encode(ws_text("room message"), 0) or []
+    decoded = ws_decode(encoded) or ws_close(1002, "bad")
+    assert_eq(ws_text_of(decoded), "room message")
+}
+
+test "chat workload is deterministic" {
+    assert_eq(run_chat(100), run_chat(100))
+    #assert(run_chat(100) > 0)
+}

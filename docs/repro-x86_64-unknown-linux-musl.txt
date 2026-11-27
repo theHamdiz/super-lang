@@ -1,0 +1,6 @@
+target=x86_64-unknown-linux-musl
+source_date_epoch=1795776879
+version=0.1.0
+build_A=6dcdeb01febcc285b8ae7e91e34fcdfaf4c929b9e7f1555d644be1d9b79dc773
+build_B=6dcdeb01febcc285b8ae7e91e34fcdfaf4c929b9e7f1555d644be1d9b79dc773
+result=PASS

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://thehamdiz.github.io/super-lang/</loc><priority>1.0</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/benchmarks/</loc><priority>0.95</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/quickstart/</loc><priority>0.9</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/docs-hub/</loc><priority>0.85</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/install/</loc><priority>0.9</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/spec/</loc><priority>0.85</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/cfg/</loc><priority>0.8</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/features/</loc><priority>0.8</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/http-server/</loc><priority>0.8</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/api-style/</loc><priority>0.75</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/platform/</loc><priority>0.8</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/stdlib-ref/</loc><priority>0.8</priority></url>
+  <url><loc>https://thehamdiz.github.io/super-lang/llms.txt</loc><priority>0.7</priority></url>
+</urlset>

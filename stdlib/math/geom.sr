@@ -1,0 +1,218 @@
+//! std.math.geom — 2D geometry primitives for games and GIS-lite
+//!
+//! Import with:
+//!   use std.math.geom
+//!
+//!   c = Circle.new(0.0, 0.0, 5.0)
+//!   #assert(c.contains(3.0, 4.0))
+//!   hit = seg_aabb(0.0, 0.0, 10.0, 10.0, Aabb.new(4.0, 4.0, 6.0, 6.0))
+
+/// `G_EPS` is `0.000001`.
++G_EPS = 0.000001
+
+/// `GVec2` is a 2D point or vector used by the geometry helpers.
++GVec2 = {
+    /// X on `GVec2` (`f64`). Defaults to `0.0`.
+    x: f64 = 0.0
+    /// Y on `GVec2` (`f64`). Defaults to `0.0`.
+    y: f64 = 0.0
+}
+
+/// Gv2 (`x`, `y`). Returns `GVec2`.
++gv2(x: f64, y: f64) : GVec2 => GVec2.{x, y}
+/// Sum of the 2D vectors `a` and `b`.
++gv2_add(a: GVec2, b: GVec2) : GVec2 => GVec2.{x: a.x + b.x, y: a.y + b.y}
+/// Difference `a` minus `b`.
++gv2_sub(a: GVec2, b: GVec2) : GVec2 => GVec2.{x: a.x - b.x, y: a.y - b.y}
+/// Dot product of `a` and `b`.
++gv2_dot(a: GVec2, b: GVec2) : f64 => a.x * b.x + a.y * b.y
+/// Length of `a`.
++gv2_len(a: GVec2) : f64 => host.sys_hypot(a.x, a.y)
+/// Distance between `a` and `b`.
++gv2_dist(a: GVec2, b: GVec2) : f64 => gv2_len(gv2_sub(a, b))
+/// Cross product of `a` and `b`.
++gv2_cross(a: GVec2, b: GVec2) : f64 => a.x * b.y - a.y * b.x
+
+/// `Aabb` is an axis-aligned box from a minimum corner to a maximum corner.
++Aabb = {
+    /// Left edge. Defaults to `0.0`.
+    min_x: f64 = 0.0
+    /// Bottom edge. Defaults to `0.0`.
+    min_y: f64 = 0.0
+    /// Right edge. Defaults to `0.0`.
+    max_x: f64 = 0.0
+    /// Top edge. Defaults to `0.0`.
+    max_y: f64 = 0.0
+
+    /// Create a fresh `Aabb`.
+    new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) : Aabb => Aabb.{min_x, min_y, max_x, max_y}
+    /// From center on this `Aabb` (`cx`, `cy`, `hw`, `hh`). Returns `Aabb`.
+    from_center(cx: f64, cy: f64, hw: f64, hh: f64) : Aabb => Aabb.{min_x: cx - hw, min_y: cy - hh, max_x: cx + hw, max_y: cy + hh}
+
+    /// Width on this `Aabb`. Returns `f64`.
+    width(self) : f64 => self.max_x - self.min_x
+    /// Height on this `Aabb`. Returns `f64`.
+    height(self) : f64 => self.max_y - self.min_y
+    /// Same as `width` on this `Aabb`.
+    area(self) : f64 => self.width() * self.height()
+    /// Center on this `Aabb`. Returns `GVec2`.
+    center(self) : GVec2 => GVec2.{x: (self.min_x + self.max_x) * 0.5, y: (self.min_y + self.max_y) * 0.5}
+
+    /// Contains on this `Aabb` (`x`, `y`).
+    contains(self, x: f64, y: f64) : bool => x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
+
+    /// Overlaps on this `Aabb` (`o`).
+    overlaps(self, o: Aabb) : bool {
+        self.min_x <= o.max_x && self.max_x >= o.min_x && self.min_y <= o.max_y && self.max_y >= o.min_y
+    }
+
+    /// Union on this `Aabb` (`o`). Returns `Aabb`.
+    union(self, o: Aabb) : Aabb {
+        nx = self.min_x
+        if o.min_x < nx { nx = o.min_x }
+        ny = self.min_y
+        if o.min_y < ny { ny = o.min_y }
+        xx = self.max_x
+        if o.max_x > xx { xx = o.max_x }
+        yy = self.max_y
+        if o.max_y > yy { yy = o.max_y }
+        Aabb.{min_x: nx, min_y: ny, max_x: xx, max_y: yy}
+    }
+
+    /// Expand on this `Aabb` (`pad`). Returns `Aabb`.
+    expand(self, pad: f64) : Aabb => Aabb.{min_x: self.min_x - pad, min_y: self.min_y - pad, max_x: self.max_x + pad, max_y: self.max_y + pad}
+}
+
+/// `Circle` is a disk with center and radius.
++Circle = {
+    /// Center x. Defaults to `0.0`.
+    x: f64 = 0.0
+    /// Center y. Defaults to `0.0`.
+    y: f64 = 0.0
+    /// Radius. Defaults to `1.0`.
+    r: f64 = 1.0
+
+    /// Create a fresh `Circle`.
+    new(x: f64, y: f64, r: f64) : Circle => Circle.{x, y, r}
+    /// Area on this `Circle`. Returns `f64`.
+    area(self) : f64 => 3.141592653589793 * self.r * self.r
+    /// Contains on this `Circle` (`px`, `py`).
+    contains(self, px: f64, py: f64) : bool {
+        dx = px - self.x
+        dy = py - self.y
+        dx * dx + dy * dy <= self.r * self.r
+    }
+    /// Overlaps on this `Circle` (`o`).
+    overlaps(self, o: Circle) : bool {
+        dx = o.x - self.x
+        dy = o.y - self.y
+        rr = self.r + o.r
+        dx * dx + dy * dy <= rr * rr
+    }
+    /// Aabb on this `Circle`. Returns `Aabb`.
+    aabb(self) : Aabb => Aabb.new(self.x - self.r, self.y - self.r, self.x + self.r, self.y + self.r)
+}
+
+/// Closest point on segment AB to P.
++closest_on_seg(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) : GVec2 {
+    abx = bx - ax
+    aby = by - ay
+    den = abx * abx + aby * aby
+    ensure den > G_EPS else { return gv2(ax, ay) }
+    t = ((px - ax) * abx + (py - ay) * aby) / den
+    if t < 0.0 { t = 0.0 }
+    if t > 1.0 { t = 1.0 }
+    gv2(ax + abx * t, ay + aby * t)
+}
+
+/// Point seg dist (`px`, `py`, `ax`, `ay`, `bx`, `by`). Returns `f64`.
++point_seg_dist(px: f64, py: f64, ax: f64, ay: f64, bx: f64, by: f64) : f64 {
+    c = closest_on_seg(ax, ay, bx, by, px, py)
+    gv2_dist(gv2(px, py), c)
+}
+
+/// Segment vs AABB intersection.
++seg_aabb(ax: f64, ay: f64, bx: f64, by: f64, bb: Aabb) : bool {
+    minx = ax
+    if bx < minx { minx = bx }
+    maxx = ax
+    if bx > maxx { maxx = bx }
+    miny = ay
+    if by < miny { miny = by }
+    maxy = ay
+    if by > maxy { maxy = by }
+    bminx = bb.min_x
+    bmaxx = bb.max_x
+    bminy = bb.min_y
+    bmaxy = bb.max_y
+    if maxx < bminx { return false }
+    if minx > bmaxx { return false }
+    if maxy < bminy { return false }
+    if miny > bmaxy { return false }
+    true
+}
+
+/// Orientation of ordered triplet (p, q, r): 0 colinear, 1 CW, 2 CCW.
++orient(px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64) : i64 {
+    v = (qy - py) * (rx - qx) - (qx - px) * (ry - qy)
+    if host.sys_abs(v) < G_EPS { return 0 }
+    if v > 0.0 { return 1 }
+    2
+}
+
+/// On segment (`px`, `py`, `qx`, `qy`, `rx`, `ry`).
++on_segment(px: f64, py: f64, qx: f64, qy: f64, rx: f64, ry: f64) : bool {
+    if qx > m_maxf(px, rx) { return false }
+    if qx < m_minf(px, rx) { return false }
+    if qy > m_maxf(py, ry) { return false }
+    if qy < m_minf(py, ry) { return false }
+    true
+}
+
+/// M maxf (`a`, `b`). Returns `f64`.
++m_maxf(a: f64, b: f64) : f64 {
+    if a > b { return a }
+    b
+}
+/// M minf (`a`, `b`). Returns `f64`.
++m_minf(a: f64, b: f64) : f64 {
+    if a < b { return a }
+    b
+}
+
+/// Seg intersect (`a1x`, `a1y`, `a2x`, `a2y`, `b1x`, `b1y`, `b2x`, `b2y`).
++seg_intersect(a1x: f64, a1y: f64, a2x: f64, a2y: f64, b1x: f64, b1y: f64, b2x: f64, b2y: f64) : bool {
+    o1 = orient(a1x, a1y, a2x, a2y, b1x, b1y)
+    o2 = orient(a1x, a1y, a2x, a2y, b2x, b2y)
+    o3 = orient(b1x, b1y, b2x, b2y, a1x, a1y)
+    o4 = orient(b1x, b1y, b2x, b2y, a2x, a2y)
+    if o1 != o2 && o3 != o4 { return true }
+    if o1 == 0 && on_segment(a1x, a1y, b1x, b1y, a2x, a2y) { return true }
+    if o2 == 0 && on_segment(a1x, a1y, b2x, b2y, a2x, a2y) { return true }
+    if o3 == 0 && on_segment(b1x, b1y, a1x, a1y, b2x, b2y) { return true }
+    if o4 == 0 && on_segment(b1x, b1y, a2x, a2y, b2x, b2y) { return true }
+    false
+}
+
+/// Test that aabb circle.
+test "aabb circle" {
+    b = Aabb.new(0.0, 0.0, 10.0, 10.0)
+    #assert(b.contains(5.0, 5.0))
+    #assert(!(b.contains(11.0, 5.0)))
+    assert_eq(b.area(), 100.0)
+    c = Circle.new(0.0, 0.0, 5.0)
+    #assert(c.contains(3.0, 4.0))
+    #assert(!(c.contains(4.0, 4.0)))
+    #assert(c.overlaps(Circle.new(8.0, 0.0, 4.0)))
+    #assert(b.overlaps(c.aabb()))
+}
+
+/// Test that segments.
+test "segments" {
+    #assert(host.sys_abs(point_seg_dist(0.0, 1.0, 0.0, 0.0, 2.0, 0.0) - 1.0) < 0.0001)
+    boxx = Aabb.new(4.0, 4.0, 6.0, 6.0)
+    #assert(seg_aabb(0.0, 0.0, 10.0, 10.0, boxx))
+    #assert(!(seg_aabb(0.0, 0.0, 1.0, 1.0, boxx)))
+    #assert(seg_intersect(0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0))
+    #assert(!(seg_intersect(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0)))
+}

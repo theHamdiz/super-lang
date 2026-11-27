@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/features/"/>
+<meta name="description" content="Declare Pod features and select them from the Super CLI."/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="Super · Pod features"/>
+<meta property="og:description" content="Declare Pod features and select them from the Super CLI."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/features/"/>
+<link rel="stylesheet" href="../site.css"/>
+<title>Super · Pod features</title>
+</head>
+<body>
+<header class="site-nav">
+  <a class="mark" href="../">Super</a>
+  <nav><a href="../">Home</a><a href="../quickstart/">Quickstart</a><a href="../docs-hub/" aria-current="page">Docs</a><a href="../spec/">Spec</a><a href="../benchmarks/">Benchmarks</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a></nav>
+  <a class="cta" href="../quickstart/">Quickstart</a>
+</header>
+<section class="section">
+<h1>Pod features</h1>
+<p>Pod manifests declare a closed feature set. Defaults are enabled unless <code>--no-default-features</code> is present, and feature dependencies are expanded transitively before <code>#cfg(feature = "...")</code> is evaluated.</p>
+<pre><code>[features]
+default = ["tls"]
+tls = []
+full-io = ["tls"]</code></pre>
+<pre><code>super check --features tls,full-io src/main.sr
+super test --all-features .
+super build --no-default-features src/main.sr</code></pre>
+<p><code>--features</code>, <code>--all-features</code>, and <code>--no-default-features</code> are accepted by feature-aware build, check, run, and test commands. Unknown feature names, dependency cycles, and malformed declarations fail before compilation.</p>
+<p>Use <code>#cfg(feature = "tls")</code> on complete items. Disabled items are stripped before imports, macro expansion, semantic analysis, laws/proofs, and code generation.</p>
+<p><strong>Related:</strong> <a href="../cfg/">Conditional compilation</a> · <a href="../spec/#311-conditional-compilation">Normative specification</a></p>
+</section>
+<footer class="site-footer"><p>Super 0.1.0 · <a href="../">Home</a></p></footer>
+</body>
+</html>

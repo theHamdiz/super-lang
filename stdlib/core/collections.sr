@@ -1,0 +1,1180 @@
+//! std.core.collections — Set, RingBuf, PriorityQueue, BitSet, LruCache, SpatialGrid
+//!
+//! Import with:
+//!   use std.core.collections
+//!
+//! Then:  s = Set.new()   @s.add(7)   s.has(7)   scores.map(it * 2)
+//!
+//! Container types use nested methods (Type.new, UFCS @s.add(...)); array helpers
+//! stay as free functions. Array growth uses host `sys_arr_new` / `sys_arr_push` /
+//! `sys_arr_set` (value semantics); reads are `arr[i]` / `for arr`.
+
+// --- pipeline entry point kept from the original std.core.collections ------------
+
+/// Returns `x` unchanged.
++identity(x: i64) : i64 => x
+
+/// Running checksum into `acc[0]`: `(acc[0] * mul + v) % mod`.
+#inline
++fold_mul_mod(@acc, v: i64, mul: i64, mod: i64) {
+    acc[0] = (acc[0] * mul + v) % mod
+}
+
+/// Park–Miller multiplicative LCG (`s = s * 48271 % 2^31-1`).
++Lcg = {
+    s: i64 = 0
+    roll(@self) : i64 {
+        self.s = self.s * 48271 % 2147483647
+        self.s
+    }
+}
+
+/// glibc-style LCG (`(s * 1103515245 + 12345) % 2^31`) with `draw` / `pick` for small ranges.
++LcgGlibc = {
+    s: i64 = 0
+    roll(@self) : i64 {
+        self.s = (self.s * 1103515245 + 12345) % 2147483648
+        self.s
+    }
+    draw(@self, m: i64) : i64 {
+        v = @self.roll()
+        v / 256 % m
+    }
+    /// Alias of `draw` (bench / pipeline naming).
+    pick(@self, n: i64) : i64 => @self.draw(n)
+}
+
+/// Truncating signed division toward zero for negative numerators.
+#inline
++i_sdiv(a: i64, d: i64) : i64 {
+    if a >= 0 { return a / d }
+    0 - ((0 - a) / d)
+}
+
+#inline
++fold_mul_mod3(@acc, a: i64, b: i64, c: i64, mul: i64, mod: i64) {
+    fold_mul_mod(@acc, a, mul, mod)
+    fold_mul_mod(@acc, b, mul, mod)
+    fold_mul_mod(@acc, c, mul, mod)
+}
+
+/// Fixed-point linear fit (`w`, `bias`, `loss`) for bench kernels.
++gd_lin_fit_i(@xs, @ys, n: i64, iters: i64) : _ {
+    w = 0
+    bias = 0
+    for 0..iters {
+        gw = 0
+        gb = 0
+        for i in 0..n {
+            err = i_sdiv(w * xs[i], 65536) + bias - ys[i]
+            gw += err * xs[i]
+            gb += err
+        }
+        w -= i_sdiv(gw * 65536, n * 8000)
+        bias -= i_sdiv(gb, n * 4)
+    }
+    loss = 0
+    for i in 0..n {
+        err = i_sdiv(w * xs[i], 65536) + bias - ys[i]
+        loss += err * err
+    }
+    .{w, bias, loss}
+}
+
+/// Hindley–Milner style unify over Var/Con/Arrow nodes (path-compressed parents).
+/// kind: 0=Var, 1=Con, 2=Arrow.
++HmTypes = {
+    kind: _ = []
+    left: _ = []
+    right: _ = []
+    parent: _ = []
+    work_a: _ = []
+    work_b: _ = []
+    unions: i64 = 0
+
+    root(@self, x0: i64) : i64 {
+        x = x0
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        }
+        x
+    }
+
+    unify(@self, x: i64, y: i64) : bool {
+        self.work_a[0] = x
+        self.work_b[0] = y
+        sp = 1
+        while sp > 0 {
+            sp -= 1
+            rx = @self.root(self.work_a[sp])
+            ry = @self.root(self.work_b[sp])
+            if rx != ry {
+                kx = self.kind[rx]
+                ky = self.kind[ry]
+                if kx == 0 {
+                    self.parent[rx] = ry
+                    self.unions += 1
+                } else {
+                    if ky == 0 {
+                        self.parent[ry] = rx
+                        self.unions += 1
+                    } else {
+                        if kx == 1 || ky == 1 {
+                            if kx == 1 && ky == 1 && self.left[rx] == self.left[ry] {
+                                self.parent[ry] = rx
+                                self.unions += 1
+                            } else {
+                                return false
+                            }
+                        } else {
+                            self.parent[ry] = rx
+                            self.unions += 1
+                            self.work_a[sp] = self.left[rx]
+                            self.work_b[sp] = self.left[ry]
+                            sp += 1
+                            self.work_a[sp] = self.right[rx]
+                            self.work_b[sp] = self.right[ry]
+                            sp += 1
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+// --- array helpers -------------------------------------------------------
+
+// `len(value)` / `value.len()` is a compiler intrinsic: element count for
+// collections and UTF-8 byte count for strings. `char_count` counts scalars.
+
+/// New array of length `n` filled with `fill`.
++arr_new(n: i64, fill: i64) => host.sys_arr_new(n, fill)
+/// `a` with `v` appended.
++arr_push(a: _, v: _) => host.sys_arr_push(a, v)
+/// `a` without its last element (empty stays empty).
++arr_pop(a: _) => host.sys_arr_pop(a)
+/// `a` with index `i` replaced by `v`.
++arr_set(a: _, i: i64, v: _) => host.sys_arr_set(a, i, v)
+/// New array of `n` copies of `val`.
++arr_fill(n: i64, val: i64) => host.sys_arr_new(n, val)
+/// Fill `a[0..min(len(a), n))` with `val` (returns the filled array; bulk host path).
++arr_memset(a: _, n: i64, val: i64) => host.sys_arr_memset(a, n, val)
+/// Fill every element of `a` with `val`.
++arr_memset_all(a: _, val: i64) => host.sys_arr_memset(a, len(a), val)
+/// Stable in-place merge of the sorted runs a[lo..mid) and a[mid..hi) (`tmp` is scratch, len >= hi).
++merge_sorted(a: _, tmp: _, lo: i64, mid: i64, hi: i64) => host.sys_i64_merge(a, tmp, lo, mid, hi)
+
+/// Copy of `a` without the element at `at`.
++arr_remove_at(a: _, at: i64) {
+    out = []
+    for a {
+        if index != at { out = arr_push(out, it) }
+    }
+    out
+}
+
+/// Position of `v` in `a`, or -1.
++arr_find(a: _, v: i64) : i64 {
+    #inline
+    pos = -1
+    #unroll(8)
+    for a {
+        if pos < 0 && it == v { pos = index }
+    }
+    pos
+}
+
+// --- Set (unordered, unique i64 members) -----------------------------------
+
+/// Non-negative 31-bit hash of `v`.
++hash_i64(v: i64) : i64 {
+    // FX/Fibonacci-style avalanche constrained to a non-negative 31-bit value.
+    x = v ^ (v >> 32)
+    x = (x * 2654435761) ^ (x >> 16)
+    x & 2147483647
+}
+
+/// Smallest power of two greater than or equal to `n`.
++next_pow2_i64(n: i64) : i64 {
+    ensure n > 1 else { return 1 }
+    x = n - 1
+    x = x | (x >> 1)
+    x = x | (x >> 2)
+    x = x | (x >> 4)
+    x = x | (x >> 8)
+    x = x | (x >> 16)
+    x = x | (x >> 32)
+    x + 1
+}
+
+/// `Set` is an unordered set of unique `i64` values.
++Set = {
+    /// Stored members. Empty slots are unused. Defaults to `[]`.
+    items: _ = []
+    /// Probe state of each slot (empty, live, or tombstone). Defaults to `[]`.
+    states: _ = []
+    /// Slot count. Always a power of two once the set has grown. Defaults to `0`.
+    cap: i64 = 0
+    /// Number of live members. Defaults to `0`.
+    size: i64 = 0
+
+    /// Empty `Set` ready to insert into.
+    new() : Set => Set.{items: arr_new(16, 0), states: arr_new(16, 0), cap: 16, size: 0}
+
+    /// Slot of `v`, or -1 when it is absent.
+    find(self, v: i64) : i64 {
+        at = hash_i64(v) & (self.cap - 1)
+        limit = self.cap
+        for 0..limit {
+            slot_state = self.states[at]
+            if slot_state == 0 { return -1 }
+            if slot_state == 1 && self.items[at] == v { return at }
+            at = (at + 1) & (self.cap - 1)
+        }
+        -1
+    }
+
+    /// True when `v` is a member.
+    has(self, v: i64) : bool => self.find(v) >= 0
+
+    /// Grow the table so the load stays bounded.
+    rehash(@self, wanted: i64) : i64 {
+        old_items = self.items
+        old_states = self.states
+        old_cap = self.cap
+        self.cap = next_pow2_i64(wanted)
+        self.items = arr_new(self.cap, 0)
+        self.states = arr_new(self.cap, 0)
+        self.size = 0
+        for 0..old_cap {
+            if old_states[it] == 1 { @self.add(old_items[it]) }
+        }
+        self.cap
+    }
+
+    /// true when `v` was newly inserted.
+    add(@self, v: i64) : bool {
+        ensure self.find(v) < 0 else { return false }
+        if (self.size + 1) * 10 >= self.cap * 7 { @self.rehash(self.cap * 2) }
+        at = hash_i64(v) & (self.cap - 1)
+        tomb = -1
+        limit = self.cap
+        for 0..limit {
+            slot_state = self.states[at]
+            if slot_state == 2 && tomb < 0 { tomb = at }
+            if slot_state == 0 {
+                if tomb >= 0 { at = tomb }
+                self.items = arr_set(self.items, at, v)
+                self.states = arr_set(self.states, at, 1)
+                self.size += 1
+                return true
+            }
+            at = (at + 1) & (self.cap - 1)
+        }
+        false
+    }
+
+    /// true when `v` was present.
+    remove(@self, v: i64) : bool {
+        at = self.find(v)
+        ensure at >= 0 else { return false }
+        self.states = arr_set(self.states, at, 2)
+        self.size -= 1
+        true
+    }
+
+    /// Remove every entry.
+    clear(@self) : i64 {
+        self.items = arr_new(self.cap, 0)
+        self.states = arr_new(self.cap, 0)
+        self.size = 0
+        0
+    }
+
+    /// Members that are in this set or in `b`.
+    union(self, b: Set) : Set {
+        out = Set.new()
+        acap = self.cap
+        bcap = b.cap
+        for 0..acap {
+            if self.states[it] == 1 { @out.add(self.items[it]) }
+        }
+        for 0..bcap {
+            if b.states[it] == 1 { @out.add(b.items[it]) }
+        }
+        out
+    }
+
+    /// Members that are in this set and in `b`.
+    intersect(self, b: Set) : Set {
+        out = Set.new()
+        cap = self.cap
+        for 0..cap {
+            if self.states[it] == 1 && b.has(self.items[it]) { @out.add(self.items[it]) }
+        }
+        out
+    }
+}
+
+// --- HashMap (open-addressed i64 -> i64) -----------------------------------
+
+/// `HashMap` stores `i64` keys and `i64` values in an open-addressed table.
++HashMap = {
+    /// Keys, parallel with `vals`. Defaults to `[]`.
+    keys: _ = []
+    /// Values, parallel with `keys`. Defaults to `[]`.
+    vals: _ = []
+    /// Probe state of each slot. Defaults to `[]`.
+    states: _ = []
+    /// Slot count. Defaults to `0`.
+    cap: i64 = 0
+    /// Number of live entries. Defaults to `0`.
+    size: i64 = 0
+
+    /// Empty `HashMap` ready to insert into.
+    new() : HashMap => HashMap.with_capacity(16)
+
+    /// `HashMap` sized for at least `wanted` entries.
+    with_capacity(wanted: i64) : HashMap {
+        cap = next_pow2_i64(wanted)
+        if cap < 4 { cap = 4 }
+        HashMap.{keys: arr_new(cap, 0), vals: arr_new(cap, 0), states: arr_new(cap, 0), cap, size: 0}
+    }
+
+    /// Slot of `key`, or -1 when it is absent.
+    find(self, key: i64) : i64 {
+        at = hash_i64(key) & (self.cap - 1)
+        limit = self.cap
+        for 0..limit {
+            slot_state = self.states[at]
+            if slot_state == 0 { return -1 }
+            if slot_state == 1 && self.keys[at] == key { return at }
+            at = (at + 1) & (self.cap - 1)
+        }
+        -1
+    }
+
+    /// True when `key` is a member.
+    has(self, key: i64) : bool => self.find(key) >= 0
+
+    /// Value stored for `key`, or `none` when absent.
+    get(self, key: i64) : i64? {
+        at = self.find(key)
+        ensure at >= 0 else { return none }
+        self.vals[at]
+    }
+
+    /// Grow the table so the load stays bounded.
+    rehash(@self, wanted: i64) : i64 {
+        old_keys = self.keys
+        old_vals = self.vals
+        old_states = self.states
+        old_cap = self.cap
+        self.cap = next_pow2_i64(wanted)
+        self.keys = arr_new(self.cap, 0)
+        self.vals = arr_new(self.cap, 0)
+        self.states = arr_new(self.cap, 0)
+        self.size = 0
+        for 0..old_cap {
+            if old_states[it] == 1 { @self.put(old_keys[it], old_vals[it]) }
+        }
+        self.cap
+    }
+
+    /// Returns the previous value when replacing an entry.
+    put(@self, key: i64, value: i64) : i64? {
+        found = self.find(key)
+        if found >= 0 {
+            old = self.vals[found]
+            self.vals = arr_set(self.vals, found, value)
+            return old
+        }
+        if (self.size + 1) * 10 >= self.cap * 7 { @self.rehash(self.cap * 2) }
+        at = hash_i64(key) & (self.cap - 1)
+        tomb = -1
+        limit = self.cap
+        for 0..limit {
+            slot_state = self.states[at]
+            if slot_state == 2 && tomb < 0 { tomb = at }
+            if slot_state == 0 {
+                if tomb >= 0 { at = tomb }
+                self.keys = arr_set(self.keys, at, key)
+                self.vals = arr_set(self.vals, at, value)
+                self.states = arr_set(self.states, at, 1)
+                self.size += 1
+                return none
+            }
+            at = (at + 1) & (self.cap - 1)
+        }
+        none
+    }
+
+    /// Delete `key`, or `none` when absent.
+    remove(@self, key: i64) : i64? {
+        at = self.find(key)
+        ensure at >= 0 else { return none }
+        old = self.vals[at]
+        self.states = arr_set(self.states, at, 2)
+        self.size -= 1
+        old
+    }
+
+    /// Remove every entry.
+    clear(@self) : i64 {
+        self.keys = arr_new(self.cap, 0)
+        self.vals = arr_new(self.cap, 0)
+        self.states = arr_new(self.cap, 0)
+        self.size = 0
+        0
+    }
+}
+
+// --- RingBuf (fixed capacity FIFO) ----------------------------------------
+
+/// `RingBuf` is a fixed-capacity circular buffer.
++RingBuf = {
+    /// Data on `RingBuf`. Defaults to `[]`.
+    data: _ = []
+    /// Cap on `RingBuf` (`i64`). Defaults to `0`.
+    cap: i64 = 0
+    /// Head on `RingBuf` (`i64`). Defaults to `0`.
+    head: i64 = 0
+    /// Count on `RingBuf` (`i64`). Defaults to `0`.
+    count: i64 = 0
+
+    /// Empty `RingBuf` ready to insert into.
+    new(cap: i64) : RingBuf => RingBuf.{data: arr_new(cap, 0), cap, head: 0, count: 0}
+
+    /// True when the buffer holds nothing.
+    is_empty(self) : bool => self.count == 0
+    /// True when another push would overwrite.
+    is_full(self) : bool => self.count == self.cap
+
+    /// Append at the tail. Returns false (and drops nothing) when full.
+    push(@self, v: i64) : bool {
+        ensure self.count < self.cap else { return false }
+        slot = (self.head + self.count) % self.cap
+        self.data = arr_set(self.data, slot, v)
+        self.count += 1
+        true
+    }
+
+    /// Append at the tail, overwriting the oldest element when full.
+    push_overwrite(@self, v: i64) : bool {
+        if (self.count < self.cap) { return @self.push(v) }
+        self.data = arr_set(self.data, self.head, v)
+        self.head = (self.head + 1) % self.cap
+        true
+    }
+
+    /// Remove and return the next value, or `none` when absent.
+    pop(@self) : i64? {
+        ensure self.count > 0 else { return none }
+        v = self.data[self.head]
+        self.head = (self.head + 1) % self.cap
+        self.count -= 1
+        v
+    }
+
+    /// Next value without removing it, or `none` when absent.
+    peek(self) : i64? {
+        ensure self.count > 0 else { return none }
+        self.data[self.head]
+    }
+
+    /// i-th oldest element (0 = next to pop).
+    at(self, i: i64) : i64? {
+        ensure i >= 0 && i < self.count else { return none }
+        self.data[(self.head + i) % self.cap]
+    }
+}
+
+// --- PriorityQueue (binary min-heap on integer priority) ---------------------
+
+/// `PriorityQueue` is a binary heap of values ordered by priority.
++PriorityQueue = {
+    /// Prio on `PriorityQueue`. Defaults to `[]`.
+    prio: _ = []
+    /// Vals on `PriorityQueue`. Defaults to `[]`.
+    vals: _ = []
+    /// Size on `PriorityQueue` (`i64`). Defaults to `0`.
+    size: i64 = 0
+
+    /// Empty `PriorityQueue` ready to insert into.
+    new() : PriorityQueue => PriorityQueue.{prio: [], vals: [], size: 0}
+
+    /// Exchange the entries at `a` and `b`.
+    swap(@self, a: i64, b: i64) : i64 {
+        pa = self.prio[a]
+        pb = self.prio[b]
+        va = self.vals[a]
+        vb = self.vals[b]
+        self.prio = arr_set(arr_set(self.prio, a, pb), b, pa)
+        self.vals = arr_set(arr_set(self.vals, a, vb), b, va)
+        0
+    }
+
+    /// Insert `priority`.
+    push(@self, priority: i64, value: i64) : i64 {
+        self.prio = arr_push(self.prio, priority)
+        self.vals = arr_push(self.vals, value)
+        self.size += 1
+        i = self.size - 1
+        n = self.size
+        for 0..n {
+            parent = (i - 1) / 2
+            if i > 0 && self.prio[i] < self.prio[parent] {
+                @self.swap(i, parent)
+                i = parent
+            }
+        }
+        self.size
+    }
+
+    /// Next value without removing it, or `none` when absent.
+    peek(self) : i64? {
+        ensure self.size > 0 else { return none }
+        self.vals[0]
+    }
+
+    /// Priority of the next value, without removing it, or `none` when absent.
+    peek_priority(self) : i64? {
+        ensure self.size > 0 else { return none }
+        self.prio[0]
+    }
+
+    /// Remove and return the next value, or `none` when absent.
+    pop(@self) : i64? {
+        ensure self.size > 0 else { return none }
+        top = self.vals[0]
+        last = self.size - 1
+        @self.swap(0, last)
+        self.prio = arr_remove_at(self.prio, last)
+        self.vals = arr_remove_at(self.vals, last)
+        self.size -= 1
+        i = 0
+        n = self.size
+        for 0..n {
+            l = 2 * i + 1
+            r = 2 * i + 2
+            smallest = i
+            if l < self.size && self.prio[l] < self.prio[smallest] { smallest = l }
+            if r < self.size && self.prio[r] < self.prio[smallest] { smallest = r }
+            if smallest != i {
+                @self.swap(i, smallest)
+                i = smallest
+            }
+        }
+        top
+    }
+}
+
+// --- BitSet (32 bits per word) -----------------------------------------------
+
+/// `BitSet` packs bits into machine words.
++BitSet = {
+    /// Words on `BitSet`. Defaults to `[]`.
+    words: _ = []
+    /// Nbits on `BitSet` (`i64`). Defaults to `0`.
+    nbits: i64 = 0
+
+    /// Empty `BitSet` ready to insert into.
+    new(nbits: i64) : BitSet => BitSet.{words: arr_new((nbits + 31) / 32, 0), nbits}
+
+    /// True when `i` is a member.
+    has(self, i: i64) : bool {
+        ensure i >= 0 && i < self.nbits else { return false }
+        word_has(self.words[i / 32], i % 32)
+    }
+
+    /// Turn the bit `i` on or off according to the value.
+    set(@self, i: i64) : bool {
+        ensure i >= 0 && i < self.nbits else { return false }
+        self.words = arr_set(self.words, i / 32, word_set(self.words[i / 32], i % 32))
+        true
+    }
+
+    /// Remove every entry.
+    clear(@self, i: i64) : bool {
+        ensure i >= 0 && i < self.nbits else { return false }
+        self.words = arr_set(self.words, i / 32, word_clear(self.words[i / 32], i % 32))
+        true
+    }
+
+    /// Number of set bits.
+    count(self) : i64 {
+        n = 0
+        words = self.words
+        for words { n += popcount32(it) }
+        n
+    }
+}
+
+/// Power-of-two capacity helper for `n`.
++pow2(n: i64) : i64 {
+    1 << n
+}
+
+/// True when bit `bit` of word `w` is set.
++word_has(w: i64, bit: i64) : bool => (w & (1 << bit)) != 0
+
+/// Word `w` with bit `bit` set.
++word_set(w: i64, bit: i64) : i64 => w | (1 << bit)
+
+/// Word `w` with bit `bit` cleared.
++word_clear(w: i64, bit: i64) : i64 => w & (4294967295 ^ (1 << bit))
+
+/// Number of 1-bits in the low 32 bits of `w`.
++popcount32(w: i64) : i64 {
+    x = w & 4294967295
+    x = x - ((x >> 1) & 1431655765)
+    x = (x & 858993459) + ((x >> 2) & 858993459)
+    x = (x + (x >> 4)) & 252645135
+    x = x + (x >> 8)
+    x = x + (x >> 16)
+    x & 63
+}
+
+// --- LruCache (i64 -> i64, least recently used evicted first) -----------------
+
+/// `LruCache` is a fixed-capacity cache that evicts the least recently used entry.
++LruCache = {
+    /// Cap on `LruCache` (`i64`). Defaults to `0`.
+    cap: i64 = 0
+    /// Keys on `LruCache`. Defaults to `[]`.
+    keys: _ = []
+    /// Vals on `LruCache`. Defaults to `[]`.
+    vals: _ = []
+    /// Used on `LruCache`. Defaults to `[]`.
+    used: _ = []
+    /// Prev on `LruCache`. Defaults to `[]`.
+    prev: _ = []
+    /// Next on `LruCache`. Defaults to `[]`.
+    next: _ = []
+    /// Free next on `LruCache`. Defaults to `[]`.
+    free_next: _ = []
+    /// Free head on `LruCache` (`i64`). Defaults to `-1`.
+    free_head: i64 = -1
+    /// Oldest on `LruCache` (`i64`). Defaults to `-1`.
+    oldest: i64 = -1
+    /// Newest on `LruCache` (`i64`). Defaults to `-1`.
+    newest: i64 = -1
+    /// Hash keys on `LruCache`. Defaults to `[]`.
+    hash_keys: _ = []
+    /// Hash vals on `LruCache`. Defaults to `[]`.
+    hash_vals: _ = []
+    /// Hash states on `LruCache`. Defaults to `[]`.
+    hash_states: _ = []
+    /// Hash cap on `LruCache` (`i64`). Defaults to `0`.
+    hash_cap: i64 = 0
+    /// Size on `LruCache` (`i64`). Defaults to `0`.
+    size: i64 = 0
+    /// Hits on `LruCache` (`i64`). Defaults to `0`.
+    hits: i64 = 0
+    /// Misses on `LruCache` (`i64`). Defaults to `0`.
+    misses: i64 = 0
+
+    /// Empty `LruCache` ready to insert into.
+    new(cap: i64) : LruCache {
+        slots = cap
+        if slots < 1 { slots = 1 }
+        free_next = arr_new(slots, -1)
+        for 0..slots {
+            if it + 1 < slots { free_next = arr_set(free_next, it, it + 1) }
+        }
+        hcap = next_pow2_i64(slots * 2)
+        LruCache.{cap, keys: arr_new(slots, 0), vals: arr_new(slots, 0), used: arr_new(slots, 0), prev: arr_new(slots, -1), next: arr_new(slots, -1), free_next, free_head: 0, oldest: -1, newest: -1, hash_keys: arr_new(hcap, 0), hash_vals: arr_new(hcap, -1), hash_states: arr_new(hcap, 0), hash_cap: hcap, size: 0, hits: 0, misses: 0}
+    }
+
+    /// Hash slot on this `LruCache` (`key`). Returns `i64`.
+    hash_slot(self, key: i64) : i64 {
+        at = hash_i64(key) & (self.hash_cap - 1)
+        limit = self.hash_cap
+        for 0..limit {
+            slot_state = self.hash_states[at]
+            if slot_state == 0 { return -1 }
+            if slot_state == 1 && self.hash_keys[at] == key { return at }
+            at = (at + 1) & (self.hash_cap - 1)
+        }
+        -1
+    }
+
+    /// Cache slot for `key`.
+    entry(self, key: i64) : i64 {
+        at = self.hash_slot(key)
+        if at < 0 { return -1 }
+        self.hash_vals[at]
+    }
+
+    /// Store `entry` under `key` in the hash index.
+    hash_put(@self, key: i64, entry: i64) : i64 {
+        at = hash_i64(key) & (self.hash_cap - 1)
+        tomb = -1
+        limit = self.hash_cap
+        for 0..limit {
+            slot_state = self.hash_states[at]
+            if slot_state == 2 && tomb < 0 { tomb = at }
+            if slot_state == 0 {
+                if tomb >= 0 { at = tomb }
+                self.hash_keys = arr_set(self.hash_keys, at, key)
+                self.hash_vals = arr_set(self.hash_vals, at, entry)
+                self.hash_states = arr_set(self.hash_states, at, 1)
+                return at
+            }
+            at = (at + 1) & (self.hash_cap - 1)
+        }
+        -1
+    }
+
+    /// Drop `key` from the hash index.
+    hash_remove(@self, key: i64) : bool {
+        at = self.hash_slot(key)
+        ensure at >= 0 else { return false }
+        self.hash_states = arr_set(self.hash_states, at, 2)
+        true
+    }
+
+    /// True when `key` is a member.
+    has(self, key: i64) : bool => self.entry(key) >= 0
+
+    /// Remove the slot from the LRU list.
+    unlink(@self, at: i64) : i64 {
+        p = self.prev[at]
+        n = self.next[at]
+        if p >= 0 { self.next = arr_set(self.next, p, n) } else { self.oldest = n }
+        if n >= 0 { self.prev = arr_set(self.prev, n, p) } else { self.newest = p }
+        self.prev = arr_set(self.prev, at, -1)
+        self.next = arr_set(self.next, at, -1)
+        at
+    }
+
+    /// Mark the slot most recently used.
+    touch(@self, at: i64) : i64 {
+        if (at != self.newest) {
+            @self.unlink(at)
+            self.prev = arr_set(self.prev, at, self.newest)
+            if self.newest >= 0 { self.next = arr_set(self.next, self.newest, at) }
+            self.newest = at
+            if self.oldest < 0 { self.oldest = at }
+        }
+        self.vals[at]
+    }
+
+    /// Cached value for `key`, or a miss, or `none` when absent.
+    lookup(@self, key: i64) : i64? {
+        at = self.entry(key)
+        if at < 0 {
+            self.misses += 1
+            none
+        } else {
+            self.hits += 1
+            @self.touch(at)
+        }
+    }
+
+    /// Insert or update. Returns the evicted key or -1.
+    put(@self, key: i64, value: i64) : i64 {
+        ensure self.cap > 0 else { return key }
+        at = self.entry(key)
+        if at >= 0 {
+            self.vals = arr_set(self.vals, at, value)
+            @self.touch(at)
+            return -1
+        }
+        evicted = -1
+        if (self.size >= self.cap) {
+            at = self.oldest
+            evicted = self.keys[at]
+            @self.hash_remove(evicted)
+            @self.unlink(at)
+        } else {
+            at = self.free_head
+            self.free_head = self.free_next[at]
+            self.size += 1
+        }
+        self.keys = arr_set(self.keys, at, key)
+        self.vals = arr_set(self.vals, at, value)
+        self.used = arr_set(self.used, at, 1)
+        self.prev = arr_set(self.prev, at, self.newest)
+        self.next = arr_set(self.next, at, -1)
+        if self.newest >= 0 { self.next = arr_set(self.next, self.newest, at) }
+        self.newest = at
+        if self.oldest < 0 { self.oldest = at }
+        @self.hash_put(key, at)
+        return evicted
+    }
+}
+
+// --- SpatialGrid (integer world coordinates, uniform cells) --------------------
+
+/// `SpatialGrid` buckets 2D points into cells for broad-phase queries.
++SpatialGrid = {
+    /// Cell on `SpatialGrid` (`i64`). Defaults to `1`.
+    cell: i64 = 1
+    /// Ids on `SpatialGrid`. Defaults to `[]`.
+    ids: _ = []
+    /// Xs on `SpatialGrid`. Defaults to `[]`.
+    xs: _ = []
+    /// Ys on `SpatialGrid`. Defaults to `[]`.
+    ys: _ = []
+    /// Cell xs on `SpatialGrid`. Defaults to `[]`.
+    cell_xs: _ = []
+    /// Cell ys on `SpatialGrid`. Defaults to `[]`.
+    cell_ys: _ = []
+    /// Next on `SpatialGrid`. Defaults to `[]`.
+    next: _ = []
+    /// Buckets on `SpatialGrid`. Defaults to `[]`.
+    buckets: _ = []
+    /// Bucket cap on `SpatialGrid` (`i64`). Defaults to `256`.
+    bucket_cap: i64 = 256
+
+    /// Empty `SpatialGrid` ready to insert into.
+    new(cell: i64) : SpatialGrid {
+        width = cell
+        if width < 1 { width = 1 }
+        SpatialGrid.{cell: width, ids: [], xs: [], ys: [], cell_xs: [], cell_ys: [], next: [], buckets: arr_new(256, -1), bucket_cap: 256}
+    }
+
+    /// Record point (`id`, `x`) under id `y`.
+    insert(@self, id: i64, x: i64, y: i64) : i64 {
+        cx = cell_coord(x, self.cell)
+        cy = cell_coord(y, self.cell)
+        bucket = spatial_hash(cx, cy) & (self.bucket_cap - 1)
+        entry = len(self.ids)
+        self.ids = arr_push(self.ids, id)
+        self.xs = arr_push(self.xs, x)
+        self.ys = arr_push(self.ys, y)
+        self.cell_xs = arr_push(self.cell_xs, cx)
+        self.cell_ys = arr_push(self.cell_ys, cy)
+        self.next = arr_push(self.next, self.buckets[bucket])
+        self.buckets = arr_set(self.buckets, bucket, entry)
+        len(self.ids)
+    }
+
+    /// Remove every entry.
+    clear(@self) : i64 {
+        self.ids = []
+        self.xs = []
+        self.ys = []
+        self.cell_xs = []
+        self.cell_ys = []
+        self.next = []
+        self.buckets = arr_new(self.bucket_cap, -1)
+        0
+    }
+
+    /// Ids within Chebyshev distance `radius` of (x, y): cell-range reject first,
+    /// exact distance check second.
+    query(self, x: i64, y: i64, radius: i64) {
+        x0 = cell_coord(x - radius, self.cell)
+        x1 = cell_coord(x + radius, self.cell)
+        y0 = cell_coord(y - radius, self.cell)
+        y1 = cell_coord(y + radius, self.cell)
+        out = []
+        for x0..(x1 + 1) {
+            cx = it
+            for y0..(y1 + 1) {
+                cy = it
+                entry = self.buckets[spatial_hash(cx, cy) & (self.bucket_cap - 1)]
+                for 0..len(self.ids) {
+                    ensure entry >= 0 else { break }
+                    if self.cell_xs[entry] == cx && self.cell_ys[entry] == cy {
+                        dx = self.xs[entry] - x
+                        dy = self.ys[entry] - y
+                        if dx < 0 { dx = -dx }
+                        if dy < 0 { dy = -dy }
+                        if dx <= radius && dy <= radius { out = arr_push(out, self.ids[entry]) }
+                    }
+                    entry = self.next[entry]
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Floor division so negative coordinates land in the right cell.
++cell_coord(v: i64, cell: i64) : i64 {
+    q = v / cell
+    if v < 0 && q * cell != v { return q - 1 }
+    q
+}
+
+/// Bucket for cell (`x`, `y`).
++spatial_hash(x: i64, y: i64) : i64 => hash_i64((x * 73856093) ^ (y * 19349663))
+
+// --- tests ---------------------------------------------------------------------
+
+/// Test that identity passes through.
+test "identity passes through" {
+    assert_eq(identity(7), 7)
+}
+
+/// Test that arr helpers: len / find.
+test "arr helpers: len / find" {
+    assert_eq(len([4, 5, 6]), 3)
+    assert_eq(len([]), 0)
+    assert_eq([4, 5, 6].len(), 3)
+    assert_eq(len("hé"), 3)
+    assert_eq(arr_find([4, 5, 6], 5), 1)
+    assert_eq(arr_find([4, 5, 6], 9), -1)
+}
+
+/// Test that arr_remove_at drops one element.
+test "arr_remove_at drops one element" {
+    xs = arr_remove_at([10, 20, 30], 1)
+    assert_eq(len(xs), 2)
+    assert_eq(xs[0], 10)
+    assert_eq(xs[1], 30)
+}
+
+/// Test that Set add / has / remove / len.
+test "Set add / has / remove / len" {
+    s = Set.new()
+    #assert(@s.add(3))
+    #assert(!(@s.add(3)))
+    #assert(@s.add(9))
+    assert_eq(s.size, 2)
+    #assert(s.has(9))
+    #assert(@s.remove(3))
+    #assert(!(@s.remove(3)))
+    #assert(!(s.has(3)))
+    assert_eq(s.size, 1)
+}
+
+/// Test that Set union and intersect.
+test "Set union and intersect" {
+    a = Set.new()
+    b = Set.new()
+    for [1, 2, 3] { @a.add(it) }
+    for [3, 4] { @b.add(it) }
+    assert_eq(a.union(b).size, 4)
+    assert_eq(a.intersect(b).size, 1)
+    #assert(a.intersect(b).has(3))
+}
+
+/// Test that Set rehashes and retains tombstone chains.
+test "Set rehashes and retains tombstone chains" {
+    s = Set.new()
+    for 0..200 { @s.add(it * 17) }
+    for 0..200 { #assert(s.has(it * 17)) }
+    for 0..100 { #assert(@s.remove(it * 34)) }
+    for 0..100 { #assert(!(s.has(it * 34))) }
+    assert_eq(s.size, 100)
+    assert_eq((s.cap & (s.cap - 1)), 0)
+}
+
+/// Test that HashMap inserts updates removes and rehashes.
+test "HashMap inserts updates removes and rehashes" {
+    m = HashMap.new()
+    for 0..128 { assert_eq(@m.put(it * 31, it) or -1, -1) }
+    assert_eq(m.size, 128)
+    for 0..128 { assert_eq(m.get(it * 31) or -1, it) }
+    assert_eq(@m.put(31, 900) or -1, 1)
+    assert_eq(m.get(31) or -1, 900)
+    assert_eq(@m.remove(31) or -1, 900)
+    #assert(!(m.has(31)))
+    assert_eq(@m.remove(31) or -1, -1)
+    assert_eq((m.cap & (m.cap - 1)), 0)
+}
+
+/// Test that RingBuf FIFO order and wraparound.
+test "RingBuf FIFO order and wraparound" {
+    r = RingBuf.new(3)
+    #assert(r.is_empty())
+    #assert(@r.push(1))
+    #assert(@r.push(2))
+    #assert(@r.push(3))
+    #assert(!(@r.push(4)))
+    #assert(r.is_full())
+    assert_eq(@r.pop() or -1, 1)
+    #assert(@r.push(4))
+    assert_eq(r.at(0) or -1, 2)
+    assert_eq(r.at(2) or -1, 4)
+    assert_eq(r.peek() or -1, 2)
+    assert_eq(r.count, 3)
+}
+
+/// Test that RingBuf overwrite drops the oldest.
+test "RingBuf overwrite drops the oldest" {
+    r = RingBuf.new(2)
+    @r.push_overwrite(10)
+    @r.push_overwrite(20)
+    @r.push_overwrite(30)
+    assert_eq(@r.pop() or -1, 20)
+    assert_eq(@r.pop() or -1, 30)
+    assert_eq(@r.pop() or -1, -1)
+}
+
+/// Test that PriorityQueue pops in ascending priority.
+test "PriorityQueue pops in ascending priority" {
+    q = PriorityQueue.new()
+    @q.push(5, 500)
+    @q.push(1, 100)
+    @q.push(3, 300)
+    @q.push(2, 200)
+    @q.push(4, 400)
+    assert_eq(q.size, 5)
+    assert_eq(q.peek_priority() or -1, 1)
+    assert_eq(@q.pop() or -1, 100)
+    assert_eq(@q.pop() or -1, 200)
+    assert_eq(@q.pop() or -1, 300)
+    assert_eq(@q.pop() or -1, 400)
+    assert_eq(@q.pop() or -1, 500)
+    assert_eq(@q.pop() or -1, -1)
+}
+
+/// Test that PriorityQueue handles duplicate priorities.
+test "PriorityQueue handles duplicate priorities" {
+    q = PriorityQueue.new()
+    @q.push(2, 1)
+    @q.push(2, 2)
+    @q.push(1, 3)
+    assert_eq(@q.pop() or -1, 3)
+    assert_eq(q.size, 2)
+}
+
+/// Test that bit words: set / clear / test / popcount.
+test "bit words: set / clear / test / popcount" {
+    assert_eq(pow2(10), 1024)
+    #assert(word_has(5, 0))
+    #assert(!(word_has(5, 1)))
+    #assert(word_has(5, 2))
+    assert_eq(word_set(0, 3), 8)
+    assert_eq(word_set(8, 3), 8)
+    assert_eq(word_clear(15, 0), 14)
+    assert_eq(word_clear(14, 0), 14)
+    assert_eq(popcount32(255), 8)
+    assert_eq(popcount32(0), 0)
+}
+
+/// Test that BitSet set / has / clear / len.
+test "BitSet set / has / clear / len" {
+    b = BitSet.new(70)
+    assert_eq(b.nbits, 70)
+    #assert(@b.set(0))
+    #assert(@b.set(33))
+    #assert(@b.set(69))
+    #assert(!(@b.set(70)))
+    #assert(b.has(33))
+    #assert(!(b.has(34)))
+    assert_eq(b.count(), 3)
+    #assert(@b.clear(33))
+    assert_eq(b.count(), 2)
+}
+
+/// Test that LruCache evicts the least recently used.
+test "LruCache evicts the least recently used" {
+    c = LruCache.new(2)
+    assert_eq(@c.put(1, 10), -1)
+    assert_eq(@c.put(2, 20), -1)
+    assert_eq(@c.lookup(1) or -1, 10)
+    assert_eq(@c.put(3, 30), 2)
+    #assert(!(c.has(2)))
+    #assert(c.has(1))
+    assert_eq(len(c.keys), 2)
+    assert_eq(@c.lookup(2) or -1, -1)
+    assert_eq(c.hits, 1)
+    assert_eq(c.misses, 1)
+}
+
+/// Test that LruCache update refreshes recency.
+test "LruCache update refreshes recency" {
+    c = LruCache.new(2)
+    @c.put(1, 10)
+    @c.put(2, 20)
+    @c.put(1, 11)
+    assert_eq(@c.put(3, 30), 2)
+    assert_eq(@c.lookup(1) or -1, 11)
+}
+
+/// Test that cell_coord floors negatives.
+test "cell_coord floors negatives" {
+    assert_eq(cell_coord(0, 10), 0)
+    assert_eq(cell_coord(9, 10), 0)
+    assert_eq(cell_coord(10, 10), 1)
+    assert_eq(cell_coord(-1, 10), -1)
+    assert_eq(cell_coord(-10, 10), -1)
+    assert_eq(cell_coord(-11, 10), -2)
+}
+
+/// Test that SpatialGrid radius query.
+test "SpatialGrid radius query" {
+    g = SpatialGrid.new(10)
+    @g.insert(1, 5, 5)
+    @g.insert(2, 12, 5)
+    @g.insert(3, 100, 100)
+    @g.insert(4, -3, -3)
+    near = g.query(6, 6, 8)
+    assert_eq(len(near), 2)
+    #assert(arr_find(near, 1) >= 0)
+    #assert(arr_find(near, 2) >= 0)
+    assert_eq(len(g.query(100, 100, 1)), 1)
+    assert_eq(len(g.ids), 4)
+}
+/// Test that arr_* primitives: len push pop set fill.
+test "arr_* primitives: len push pop set fill" {
+    a = arr_new(3, 7)
+    assert_eq(len(a), 3)
+    a = arr_push(a, 8)
+    assert_eq(len(a), 4)
+    assert_eq(a[3], 8)
+    a = arr_set(a, 0, 1)
+    assert_eq(a[0], 1)
+    assert_eq(a[1], 7)
+    a = arr_pop(a)
+    assert_eq(len(a), 3)
+    assert_eq(a[2], 7)
+    f = arr_fill(4, 9)
+    assert_eq(len(f), 4)
+    assert_eq(f[0], 9)
+    assert_eq(f[3], 9)
+    m = arr_memset([1, 2, 3, 4], 3, 0)
+    assert_eq(m[0], 0)
+    assert_eq(m[1], 0)
+    assert_eq(m[2], 0)
+    assert_eq(m[3], 4)
+    e = arr_pop(arr_pop(arr_pop([5])))
+    assert_eq(len(e), 0)
+    lit = arr_pop([1, 2, 3])
+    assert_eq(len(lit), 2)
+    assert_eq(lit[1], 2)
+}
+
+/// Test that arr_pop keeps the original array intact (value semantics).
+test "arr_pop keeps the original array intact (value semantics)" {
+    a = [1, 2, 3]
+    b = arr_pop(a)
+    assert_eq(len(a), 3)
+    assert_eq(len(b), 2)
+}
+
+/// Test that merge_sorted merges two sorted runs stably.
+test "merge_sorted merges two sorted runs stably" {
+    a = [1, 4, 9, 2, 3, 10, 11]
+    tmp = arr_new(7, 0)
+    a = merge_sorted(a, tmp, 0, 3, 7)
+    assert_eq(a[0], 1)
+    assert_eq(a[1], 2)
+    assert_eq(a[2], 3)
+    assert_eq(a[3], 4)
+    assert_eq(a[4], 9)
+    assert_eq(a[5], 10)
+    assert_eq(a[6], 11)
+    d = arr_new(6, 0)
+    d = arr_set(d, 0, 5)
+    d = arr_set(d, 1, 6)
+    d = arr_set(d, 2, 7)
+    d = arr_set(d, 3, 1)
+    d = arr_set(d, 4, 2)
+    d = arr_set(d, 5, 3)
+    d = merge_sorted(d, arr_new(6, 0), 0, 3, 6)
+    assert_eq(d[0], 1)
+    assert_eq(d[5], 7)
+    // invalid bounds leave the array unchanged
+    z = merge_sorted(d, arr_new(6, 0), 4, 2, 6)
+    assert_eq(z[0], 1)
+}

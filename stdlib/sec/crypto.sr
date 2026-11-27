@@ -1,0 +1,478 @@
+//! std.sec.crypto — hashing, MACs, password hashing, one-time codes and random tokens
+//!
+//! Import with:
+//!   use std.sec.crypto
+//!
+//! Then:  sha256_hex("abc")                          // ba7816bf...
+//!        hmac_sha256_hex("key", "message")          // MAC as hex
+//!        stored = pw_hash("hunter2", pw_new_salt()) // "pbkdf2-sha256$210000$<salt>$<hash>"
+//!        pw_verify("hunter2", stored)               // true
+//!        totp("12345678901234567890", unix_secs)    // 6-digit code
+//!
+//! Primitives (SHA-2, HMAC, PBKDF2, CSPRNG) come from the Tier-1 host kernel:
+//! `host.sys_sha256 / sys_sha512 / sys_hmac_sha256 / sys_pbkdf2_hmac_sha256 /
+//! sys_rand_bytes`. Everything built on top (constant-time compare, password
+//! hash format, HOTP/TOTP, UUIDv4, tokens, signed messages) is pure Super.
+//!
+//! Passwords use PBKDF2-HMAC-SHA256 — an honest, widely deployed KDF — with a
+//! self-describing record so the cost can be raised later (`pw_needs_rehash`).
+//! The host's AEAD / signature helpers are not wrapped here on purpose.
+
+/// `CR_HEXD` is `"0123456789abcdef"`.
++CR_HEXD = "0123456789abcdef"
+/// `CR_PW_ITERS` is `210000`.
++CR_PW_ITERS = 210000
+/// `CR_PW_SCHEME` is `"pbkdf2-sha256"`.
++CR_PW_SCHEME = "pbkdf2-sha256"
+
+// --- hashing -----------------------------------------------------------------------
+
+/// Lowercase hex SHA-256 of `s`.
++sha256_hex(s: str) : str => host.sys_sha256(s)
+/// Lowercase hex SHA-512 of `s`.
++sha512_hex(s: str) : str => host.sys_sha512(s)
+/// Lowercase hex BLAKE3 of `s`.
++blake3_hex(s: str) : str => host.sys_blake3(s)
+/// Lowercase hex BLAKE2s of `s`.
++blake2s_hex(s: str) : str => host.sys_blake2s(s)
+/// Lowercase hex BLAKE2b of `s`.
++blake2b_hex(s: str) : str => host.sys_blake2b(s)
+/// Lowercase hex SHA3-256 of `s`.
++sha3_256_hex(s: str) : str => host.sys_sha3_256(s)
+/// Lowercase hex SHA3-512 of `s`.
++sha3_512_hex(s: str) : str => host.sys_sha3_512(s)
+/// Lowercase hex Keccak-256 of `s`.
++keccak256_hex(s: str) : str => host.sys_keccak256(s)
+/// Lowercase hex SHAKE256 of `s`, at the default length.
++shake256_hex(s: str, n: i64) : str => host.sys_shake256(s, n)
+
+/// HMAC-SHA256 of `msg` under the text key `key`, as 64 hex chars.
++hmac_sha256_hex(key: str, msg: str) : str => host.sys_hmac_sha256(key, msg)
+
+/// PBKDF2-HMAC-SHA256, `dk_len` bytes, as hex.
++pbkdf2_hex(password: str, salt: str, iterations: i64, dk_len: i64) : str {
+    host.sys_pbkdf2_hmac_sha256(password, salt, iterations, dk_len)
+}
+
+// --- hex <-> bytes ------------------------------------------------------------------
+
+/// Hex character for the low nibble of `c`.
++cr_nibble(c: str) : i64 {
+    cp = host.sys_ord(c)
+    if cp >= 48 && cp <= 57 { return cp - 48 }
+    if cp >= 97 && cp <= 102 { return cp - 87 }
+    if cp >= 65 && cp <= 70 { return cp - 55 }
+    -1
+}
+
+/// Hex text -> array of byte values (invalid digits count as 0).
++hex_to_bytes(h: str) {
+    out = []
+    n = host.sys_str_len(h)
+    for 0..(n / 2) {
+        hi = cr_nibble(h[it * 2])
+        lo = cr_nibble(h[it * 2 + 1])
+        if hi < 0 { hi = 0 }
+        if lo < 0 { lo = 0 }
+        out = host.sys_arr_push(out, hi * 16 + lo)
+    }
+    out
+}
+
+/// Same as `hex_to_bytes`.
++sha256_bytes(s: str)  => hex_to_bytes(host.sys_sha256(s))
+
+/// Two hex characters for the byte `v`.
++cr_hex2(v: i64) : str => CR_HEXD[(v / 16) % 16] + CR_HEXD[v % 16]
+
+/// Fixed-width big-endian hex of a non-negative integer (`bytes` bytes wide).
++cr_be_hex(v: i64, bytes: i64) : str {
+    out = ""
+    rest = v
+    digits = []
+    for 0..bytes {
+        digits = host.sys_arr_push(digits, rest % 256)
+        rest = rest / 256
+    }
+    for 0..bytes {
+        out = out + cr_hex2(digits[bytes - 1 - it])
+    }
+    out
+}
+
+// --- comparison ---------------------------------------------------------------------
+
+/// Equality that inspects every character of equal-length inputs (no early exit).
++ct_eq(a: str, b: str) : bool {
+    na = host.sys_str_len(a)
+    nb = host.sys_str_len(b)
+    diff = 0
+    if na != nb { diff = 1 }
+    n = na
+    if nb > n { n = nb }
+    for 0..n {
+        if a[it] != b[it] { diff = 1 }
+    }
+    diff == 0
+}
+
+// --- randomness ---------------------------------------------------------------------
+
+/// `n` random bytes as 2n hex chars (OS CSPRNG).
++rand_hex(n: i64) : str => host.sys_hex_encode(host.sys_rand_bytes(n))
+
+/// URL-safe-ish random token of `n` bytes of entropy.
++rand_token(n: i64) : str => rand_hex(n)
+
+/// Fresh random password salt.
++pw_new_salt() : str => rand_hex(16)
+
+/// RFC 4122 version-4 UUID from a 32-hex-char random string.
++uuid_from_hex(h: str) : str {
+    variant = CR_HEXD[8 + cr_nibble(h[16]) % 4]
+    h[0..8] + "-" + h[8..12] + "-4" + h[13..16] + "-" + variant + h[17..20] + "-" + h[20..32]
+}
+
+/// Random UUID version 4.
++uuid_v4() : str => uuid_from_hex(rand_hex(16))
+
+// --- password hashing ---------------------------------------------------------------
+
+/// Record: scheme$iterations$salt$hash
++pw_hash_with(password: str, salt: str, iterations: i64) : str {
+    dk = host.sys_pbkdf2_hmac_sha256(password, salt, iterations, 32)
+    CR_PW_SCHEME + "$" + iterations + "$" + salt + "$" + dk
+}
+
+/// Password hash of `password` with salt `salt`.
++pw_hash(password: str, salt: str) : str => pw_hash_with(password, salt, CR_PW_ITERS)
+
+/// Split a stored record into [scheme, iterations, salt, hash] (empty when malformed).
++pw_parts(stored: str) {
+    out = []
+    cur = ""
+    n = host.sys_str_len(stored)
+    for 0..n {
+        c = stored[it]
+        if c == "$" {
+            out = host.sys_arr_push(out, cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+    }
+    out = host.sys_arr_push(out, cur)
+    if host.sys_arr_len(out) != 4 { return [] }
+    out
+}
+
+/// Integer parsed from the decimal text `s`.
++cr_to_int(s: str) : i64 {
+    n = host.sys_str_len(s)
+    ensure n > 0 else { return -1 }
+    v = 0
+    ok = true
+    for 0..n {
+        d = host.sys_ord(s[it]) - 48
+        if d < 0 || d > 9 { ok = false }
+        v = v * 10 + d
+    }
+    if ok { return v }
+    -1
+}
+
+/// True when `password` matches the stored hash `stored`.
++pw_verify(password: str, stored: str) : bool {
+    parts = pw_parts(stored)
+    ensure host.sys_arr_len(parts) == 4 else { return false }
+    ensure parts[0] == CR_PW_SCHEME else { return false }
+    iters = cr_to_int(parts[1])
+    ensure iters > 0 else { return false }
+    dk = host.sys_pbkdf2_hmac_sha256(password, parts[2], iters, 32)
+    ct_eq(dk, parts[3])
+}
+
+/// true when the record is malformed or uses fewer than `iterations` rounds.
++pw_needs_rehash(stored: str, iterations: i64) : bool {
+    parts = pw_parts(stored)
+    ensure host.sys_arr_len(parts) == 4 else { return true }
+    ensure parts[0] == CR_PW_SCHEME else { return true }
+    cr_to_int(parts[1]) < iterations
+}
+
+// --- message authentication ---------------------------------------------------------
+
+/// "<msg>.<mac>" — a message together with its HMAC-SHA256 tag.
++sign_message(key: str, msg: str) : str => msg + "." + hmac_sha256_hex(key, msg)
+
+/// The message when the tag verifies, `none` otherwise.
++open_message(key: str, signed: str) {
+    n = host.sys_str_len(signed)
+    dot = -1
+    for 0..n {
+        if signed[it] == "." { dot = it }
+    }
+    ensure dot >= 0 else { return none }
+    msg = signed[0..dot]
+    tag = signed[(dot + 1)..n]
+    ensure ct_eq(tag, hmac_sha256_hex(key, msg)) else { return none }
+    msg
+}
+
+// --- one-time passwords (RFC 4226 / RFC 6238) ----------------------------------------
+
+/// `10` raised to `n`.
++cr_pow10(n: i64) : i64 {
+    acc = 1
+    for 0..n { acc = acc * 10 }
+    acc
+}
+
+/// HOTP (RFC 4226 dynamic truncation) over HMAC-SHA256 — the SHA-256 mode of
+/// RFC 6238 — with an 8-byte big-endian counter; `digits` is 6..9.
++hotp(key: str, counter: i64, digits: i64) : i64 {
+    mac = hex_to_bytes(host.sys_hmac_sha256(key, host.sys_hex_decode(cr_be_hex(counter, 8))))
+    off = mac[31] % 16
+    bin = (mac[off] % 128) * 16777216 + mac[off + 1] * 65536 + mac[off + 2] * 256 + mac[off + 3]
+    bin % cr_pow10(digits)
+}
+
+/// Zero-padded decimal string of fixed width.
++cr_pad(v: i64, width: i64) : str {
+    s = "" + v
+    for 0..width {
+        if host.sys_str_len(s) < width { s = "0" + s }
+    }
+    s
+}
+
+/// TOTP code for secret `key` at time step `unix_secs`.
++totp(key: str, unix_secs: i64, step: i64, digits: i64) : str {
+    counter = unix_secs / step
+    cr_pad(hotp(key, counter, digits), digits)
+}
+
+// --- tests ---------------------------------------------------------------------------
+
+/// Test that SHA-256 and SHA-512 known vectors.
+test "SHA-256 and SHA-512 known vectors" {
+    assert_eq(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    assert_eq(sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert_eq(sha512_hex("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f")
+}
+
+/// Test that HMAC-SHA256 RFC 4231 case 2.
+test "HMAC-SHA256 RFC 4231 case 2" {
+    mac = hmac_sha256_hex("Jefe", "what do ya want for nothing?")
+    assert_eq(mac, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+    assert_eq(host.sys_str_len(mac), 64)
+    #assert(hmac_sha256_hex("k1", "m") != hmac_sha256_hex("k2", "m"))
+}
+
+/// Test that PBKDF2-HMAC-SHA256 known vectors.
+test "PBKDF2-HMAC-SHA256 known vectors" {
+    assert_eq(pbkdf2_hex("password", "salt", 1, 32), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+    assert_eq(pbkdf2_hex("password", "salt", 2, 32), "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43")
+    assert_eq(host.sys_str_len(pbkdf2_hex("p", "s", 1, 16)), 32)
+}
+
+/// Test that hex to bytes and big-endian hex.
+test "hex to bytes and big-endian hex" {
+    b = hex_to_bytes("00ff10Ab")
+    assert_eq(host.sys_arr_len(b), 4)
+    assert_eq(b[0], 0)
+    assert_eq(b[1], 255)
+    assert_eq(b[2], 16)
+    assert_eq(b[3], 171)
+    assert_eq(host.sys_arr_len(sha256_bytes("abc")), 32)
+    assert_eq(sha256_bytes("abc")[0], 186)
+    assert_eq(cr_hex2(255), "ff")
+    assert_eq(cr_hex2(7), "07")
+    assert_eq(cr_be_hex(1, 8), "0000000000000001")
+    assert_eq(cr_be_hex(258, 2), "0102")
+    assert_eq(cr_be_hex(0, 4), "00000000")
+}
+
+/// Test that constant-time equality.
+test "constant-time equality" {
+    #assert(ct_eq("secret", "secret"))
+    #assert(!(ct_eq("secret", "secreT")))
+    #assert(!(ct_eq("secret", "secre")))
+    #assert(ct_eq("", ""))
+    #assert(!(ct_eq("a", "")))
+}
+
+/// Test that random tokens have the requested size and differ.
+test "random tokens have the requested size and differ" {
+    a = rand_hex(16)
+    b = rand_hex(16)
+    assert_eq(host.sys_str_len(a), 32)
+    #assert(a != b)
+    assert_eq(host.sys_str_len(rand_token(8)), 16)
+    assert_eq(host.sys_str_len(pw_new_salt()), 32)
+}
+
+/// Test that uuid v4 layout.
+test "uuid v4 layout" {
+    u = uuid_from_hex("0123456789abcdef0123456789abcdef")
+    assert_eq(host.sys_str_len(u), 36)
+    assert_eq(u[8], "-")
+    assert_eq(u[13], "-")
+    assert_eq(u[14], "4")
+    assert_eq(u[18], "-")
+    assert_eq(u[23], "-")
+    assert_eq(u, "01234567-89ab-4def-8123-456789abcdef")
+    live = uuid_v4()
+    assert_eq(host.sys_str_len(live), 36)
+    assert_eq(live[14], "4")
+    v = live[19]
+    #assert(v == "8" || v == "9" || v == "a" || v == "b")
+    #assert(uuid_v4() != live)
+}
+
+/// Test that password hash round trip.
+test "password hash round trip" {
+    stored = pw_hash_with("hunter2", "abcd", 1000)
+    #assert(pw_verify("hunter2", stored))
+    #assert(!(pw_verify("hunter3", stored)))
+    #assert(!(pw_verify("", stored)))
+    parts = pw_parts(stored)
+    assert_eq(host.sys_arr_len(parts), 4)
+    assert_eq(parts[0], "pbkdf2-sha256")
+    assert_eq(parts[1], "1000")
+    assert_eq(parts[2], "abcd")
+    assert_eq(host.sys_str_len(parts[3]), 64)
+    again = pw_hash_with("hunter2", "abcd", 1000)
+    assert_eq(again, stored)
+    other_salt = pw_hash_with("hunter2", "abce", 1000)
+    #assert(other_salt != stored)
+}
+
+/// Test that password verify rejects malformed records.
+test "password verify rejects malformed records" {
+    #assert(!(pw_verify("x", "")))
+    #assert(!(pw_verify("x", "pbkdf2-sha256$abc$salt$hash")))
+    #assert(!(pw_verify("x", "md5$1000$salt$hash")))
+    #assert(!(pw_verify("x", "pbkdf2-sha256$0$salt$hash")))
+    #assert(!(pw_verify("x", "a$b$c")))
+    assert_eq(host.sys_arr_len(pw_parts("a$b$c")), 0)
+}
+
+/// Test that rehash policy.
+test "rehash policy" {
+    stored = pw_hash_with("pw", "salt", 1000)
+    #assert(!(pw_needs_rehash(stored, 1000)))
+    #assert(pw_needs_rehash(stored, 2000))
+    #assert(pw_needs_rehash("garbage", 1))
+    #assert(pw_needs_rehash("md5$1000$a$b", 1))
+    assert_eq(cr_to_int("0042"), 42)
+    assert_eq(cr_to_int("4x"), -1)
+    assert_eq(cr_to_int(""), -1)
+}
+
+// --- AEAD / Ed25519 / Argon2id (host Tier-1 primitives) -----------------------------
+
+/// AEAD ciphertext of `nonce` under key `key`.
++aead_encrypt(key: str, nonce: str, plaintext: str) : str => host.sys_aead_encrypt(key, nonce, plaintext)
+
+/// AEAD plaintext of `nonce` under key `key`, or fail.
++aead_decrypt(key: str, nonce: str, blob: str) : str! => host.sys_aead_decrypt(key, nonce, blob)
+
+/// Ed25519 signature of `msg` with secret key `seed`.
++ed25519_sign(seed: str, msg: str) : str => host.sys_ed25519_sign(seed, msg)
+
+/// True when `sig` is a valid Ed25519 signature of `msg` under public key `seed`.
++ed25519_verify(seed: str, msg: str, sig: str) : bool => host.sys_ed25519_verify(seed, msg, sig)
+
+/// Argon2id hash of password `password`.
++argon2id_hash(password: str, salt: str) : str => host.sys_argon2id_hash(password, salt)
+
+/// True when password `password` matches the Argon2id hash `encoded`.
++argon2id_verify(password: str, encoded: str) : bool => host.sys_argon2id_verify(password, encoded)
+
+/// bcrypt hash of password `password`.
++bcrypt_hash(password: str, cost: i64) : str => host.sys_bcrypt_hash(password, cost)
+
+/// True when password `password` matches the bcrypt hash `encoded`.
++bcrypt_verify(password: str, encoded: str) : bool => host.sys_bcrypt_verify(password, encoded)
+
+/// Test that default password cost is production grade.
+test "default password cost is production grade" {
+    #assert(CR_PW_ITERS >= 200000)
+    #assert(host.sys_str_len(pw_hash_with("pw", "salt", 1)) > 80)
+}
+
+/// Test that aead ed25519 host wrappers.
+test "aead ed25519 host wrappers" {
+    blob = aead_encrypt("k", "n", "secret")
+    assert_eq(aead_decrypt("k", "n", blob) or "bad", "secret")
+    assert_eq(aead_decrypt("bad", "n", blob) or "bad", "bad")
+    sig = ed25519_sign("seed", "hello")
+    #assert(ed25519_verify("seed", "hello", sig))
+    #assert(!(ed25519_verify("seed", "other", sig)))
+}
+
+/// Test that argon2id PHC round trip.
+test "argon2id PHC round trip" {
+    enc = argon2id_hash("pw", "salty")
+    #assert(host.sys_str_len(enc) > 40)
+    #assert(enc[0..9] == "$argon2id")
+    #assert(argon2id_verify("pw", enc))
+    #assert(!(argon2id_verify("nope", enc)))
+    #assert(!(argon2id_verify("pw", "not-a-phc-string")))
+    again = argon2id_hash("pw", "salty")
+    assert_eq(again, enc)
+    rnd = argon2id_hash("pw", "")
+    #assert(argon2id_verify("pw", rnd))
+    #assert(!(argon2id_verify("nope", rnd)))
+}
+
+/// Test that bcrypt round trip.
+test "bcrypt round trip" {
+    enc = bcrypt_hash("secret", 12)
+    #assert(host.sys_str_len(enc) > 50)
+    #assert(enc[0..4] == "$2b$")
+    #assert(bcrypt_verify("secret", enc))
+    #assert(!(bcrypt_verify("wrong", enc)))
+    #assert(!(bcrypt_verify("secret", "not-bcrypt")))
+    default_cost = bcrypt_hash("secret", 0)
+    #assert(bcrypt_verify("secret", default_cost))
+    low = bcrypt_hash("secret", 4)
+    #assert(bcrypt_verify("secret", low))
+}
+
+/// Test that signed messages detect tampering.
+test "signed messages detect tampering" {
+    signed = sign_message("k3y", "user=42")
+    assert_eq(open_message("k3y", signed) or "bad", "user=42")
+    assert_eq(open_message("other", signed) or "bad", "bad")
+    assert_eq(open_message("k3y", "user=43" + signed[7..host.sys_str_len(signed)]) or "bad", "bad")
+    assert_eq(open_message("k3y", "nodot") or "bad", "bad")
+    dotted = sign_message("k3y", "a.b.c")
+    assert_eq(open_message("k3y", dotted) or "bad", "a.b.c")
+}
+
+/// Test that HOTP follows the counter and truncates to the digit count.
+test "HOTP follows the counter and truncates to the digit count" {
+    a = hotp("12345678901234567890", 0, 6)
+    b = hotp("12345678901234567890", 1, 6)
+    #assert(a >= 0 && a < 1000000)
+    #assert(a != b)
+    assert_eq(hotp("12345678901234567890", 0, 6), a)
+    assert_eq(hotp("12345678901234567890", 0, 8) % 1000000, a)
+    #assert(hotp("other-key", 0, 6) != a)
+}
+
+/// Test that TOTP is stable inside a step and rolls over at the boundary.
+test "TOTP is stable inside a step and rolls over at the boundary" {
+    key = "12345678901234567890"
+    t0 = totp(key, 59, 30, 6)
+    assert_eq(host.sys_str_len(t0), 6)
+    assert_eq(totp(key, 30, 30, 6), t0)
+    assert_eq(totp(key, 45, 30, 6), t0)
+    #assert(totp(key, 60, 30, 6) != t0)
+    assert_eq(host.sys_str_len(totp(key, 1111111109, 30, 8)), 8)
+    assert_eq(cr_pad(42, 6), "000042")
+    assert_eq(cr_pad(123456, 6), "123456")
+    assert_eq(cr_pow10(3), 1000)
+}

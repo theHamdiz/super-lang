@@ -1,0 +1,39 @@
+//! Laws for std.fmt.csv — real-body (`csv_row_count`, `csv_finish_row`, `csv_quoted_doubled`).
+//! Non-empty `csv_parse` documents are runtime-tested; verify discharges helpers.
+//! AI agents must not edit this file; put discharges in `csv.proof.sr`.
+
+#law("csv_row_count on empty table")
+csv_row_count_empty() {
+    #assert(csv_row_count(csv_parse("")) == 0)
+}
+
+#law("csv_finish_row produces one row table")
+csv_finish_row_law() {
+    row = csv_push_field([], "only")
+    rows = csv_finish_row([], row)
+    #assert(csv_row_count(rows) == 1)
+}
+
+#law("csv_push_field extends row length")
+csv_push_field_law() {
+    row = csv_push_field([], "z")
+    #assert(csv_row_count([row]) == 1)
+}
+
+#law("csv delimiter predicates")
+csv_delim_laws() {
+    #assert(csv_is_comma(","))
+    #assert(!csv_is_comma("x"))
+    #assert(csv_is_lf("\n"))
+    #assert(csv_should_keep_char("a"))
+    #assert(!csv_should_keep_char("\r"))
+    #assert(!csv_close_quotes())
+    #assert(csv_open_quotes())
+    #assert(csv_is_quote("\""))
+    #assert(!csv_is_quote(","))
+}
+
+#law("csv_skip_after_doubled advances past pair")
+csv_skip_doubled_law() {
+    #assert(csv_skip_after_doubled(0) == 2)
+}

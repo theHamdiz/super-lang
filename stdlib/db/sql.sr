@@ -1,0 +1,579 @@
+//! std.db.sql — SQL text builders plus an in-memory fake database
+//!
+//! Import with:
+//!   use std.db.sql
+//!
+//!   q = sql_bind("SELECT * FROM users WHERE id = $1 AND name = $2", [sql_int(7), sql_quote("O'Hara")])
+//!   // SELECT * FROM users WHERE id = 7 AND name = 'O''Hara'
+//!
+//!   db = SqlDb.new()
+//!   db = db.create_table("users", ["id", "name"]) or db
+//!   db = db.insert("users", ["1", "Amina"]) or db
+//!   rows = db.rows_where("users", "name", "Amina")
+//!
+//! The fake stores every cell as text (like SQLite's loose typing) and is a pure
+//! value: every mutator returns the next `SqlDb`, so a transaction is just "keep the
+//! old value around" (`tx_begin` / `tx_commit` / `tx_rollback`). The driver modules
+//! (`std.db.postgres`, `std.db.sqlite`) layer pools and dialect details on top.
+
+use std.core.collections
+
+/// `SQL_NULL` is `"NULL"`.
++SQL_NULL = "NULL"
+/// `SQL_TRUE` is `"TRUE"`.
++SQL_TRUE = "TRUE"
+/// `SQL_FALSE` is `"FALSE"`.
++SQL_FALSE = "FALSE"
+/// `SQL_DIGITS` is `"0123456789"`.
++SQL_DIGITS = "0123456789"
+
+/// `SqlTable` is a named in-memory table with columns and rows.
++SqlTable = {
+    /// Name on `SqlTable` (`str`). Defaults to `""`.
+    name: str = ""
+    /// Cols on `SqlTable`. Defaults to `[]`.
+    cols: _ = []
+    /// Rows on `SqlTable`. Defaults to `[]`.
+    rows: _ = []
+
+    /// Column index of `col`, or -1.
+    col_index(self, col: str) : i64 {
+        found = -1
+        cols = self.cols
+        for cols {
+            if found < 0 && it == col { found = index }
+        }
+        found
+    }
+}
+
+/// `SqlDb` is a catalog of in-memory SQL tables.
++SqlDb = {
+    /// Tables on `SqlDb`. Defaults to `[]`.
+    tables: _ = []
+
+    /// Create a fresh `SqlDb`.
+    new() : SqlDb => SqlDb.{tables: []}
+
+    /// Index of the table named `name`, or -1.
+    table_index(self, name: str) : i64 {
+        found = -1
+        tables = self.tables
+        for tables {
+            t = it
+            if found < 0 && t.name == name { found = index }
+        }
+        found
+    }
+
+    /// True when a table named `name` exists.
+    has_table(self, name: str) : bool => self.table_index(name) >= 0
+
+    /// The table named `name`.
+    table(self, name: str) : SqlTable {
+        at = self.table_index(name)
+        ensure at >= 0 else { return SqlTable.{name: "", cols: [], rows: []} }
+        tables = self.tables
+        tables[at]
+    }
+
+    /// Insert or replace the table `at`.
+    put_table(self, at: i64, t: SqlTable) : SqlDb => SqlDb.{tables: arr_set(self.tables, at, t)}
+
+    /// Create a table named `name` with columns `cols`, or fail.
+    create_table(self, name: str, cols: _) : SqlDb! {
+        ensure !self.has_table(name) else {
+            fail "sql: table {name} already exists"
+            return
+        }
+        ensure sql_count(cols) > 0 else {
+            fail "sql: table {name} needs at least one column"
+            return
+        }
+        t = SqlTable.{name, cols, rows: []}
+        SqlDb.{tables: arr_push(self.tables, t)}
+    }
+
+    /// Drop the table named `name`, or fail.
+    drop_table(self, name: str) : SqlDb! {
+        at = self.table_index(name)
+        ensure at >= 0 else {
+            fail "sql: no such table {name}"
+            return
+        }
+        keep = []
+        tables = self.tables
+        for tables {
+            if index != at { keep = arr_push(keep, it) }
+        }
+        SqlDb.{tables: keep}
+    }
+
+    /// Append a row to the table named `name`, or fail.
+    insert(self, name: str, row: _) : SqlDb! {
+        at = self.table_index(name)
+        ensure at >= 0 else {
+            fail "sql: no such table {name}"
+            return
+        }
+        t = self.table(name)
+        ensure sql_count(row) == sql_count(t.cols) else {
+            fail "sql: {name} expects {sql_count(t.cols)} values, got {sql_count(row)}"
+            return
+        }
+        next = SqlTable.{name: t.name, cols: t.cols, rows: arr_push(t.rows, row)}
+        self.put_table(at, next)
+    }
+
+    /// How many rows match.
+    count(self, name: str) : i64 {
+        t = self.table(name)
+        sql_count(t.rows)
+    }
+
+    /// Rows whose `col` equals `val` (an empty array when the table or column is missing).
+    rows_where(self, name: str, col: str, val: str) : _ {
+        t = self.table(name)
+        ci = t.col_index(col)
+        hits = []
+        ensure ci >= 0 else { return hits }
+        rows = t.rows
+        for rows {
+            r = it
+            if r[ci] == val { hits = arr_push(hits, r) }
+        }
+        hits
+    }
+
+    /// Replace matching rows, or fail.
+    update_where(self, name: str, col: str, val: str, set_col: str, set_val: str) : SqlDb! {
+        at = self.table_index(name)
+        ensure at >= 0 else {
+            fail "sql: no such table {name}"
+            return
+        }
+        t = self.table(name)
+        ci = t.col_index(col)
+        si = t.col_index(set_col)
+        ensure ci >= 0 && si >= 0 else {
+            fail "sql: unknown column in {name}"
+            return
+        }
+        rows = t.rows
+        out = rows
+        for rows {
+            r = it
+            at_row = index
+            if r[ci] == val { out = arr_set(out, at_row, arr_set(r, si, set_val)) }
+        }
+        self.put_table(at, SqlTable.{name: t.name, cols: t.cols, rows: out})
+    }
+
+    /// Delete matching rows, or fail.
+    delete_where(self, name: str, col: str, val: str) : SqlDb! {
+        at = self.table_index(name)
+        ensure at >= 0 else {
+            fail "sql: no such table {name}"
+            return
+        }
+        t = self.table(name)
+        ci = t.col_index(col)
+        ensure ci >= 0 else {
+            fail "sql: unknown column {col}"
+            return
+        }
+        rows = t.rows
+        keep = []
+        for rows {
+            r = it
+            if r[ci] != val { keep = arr_push(keep, r) }
+        }
+        self.put_table(at, SqlTable.{name: t.name, cols: t.cols, rows: keep})
+    }
+}
+
+/// `SqlPool` tracks which connections are idle or in use.
++SqlPool = {
+    /// Store on `SqlPool` (`SqlDb`). Defaults to `SqlDb.{tables: []}`.
+    store: SqlDb = SqlDb.{tables: []}
+    /// Size on `SqlPool` (`i64`). Defaults to `1`.
+    size: i64 = 1
+    /// In use on `SqlPool` (`i64`). Defaults to `0`.
+    in_use: i64 = 0
+
+    /// Create a fresh `SqlPool`.
+    new(mem: SqlDb, size: i64) : SqlPool => SqlPool.{store: mem, size, in_use: 0}
+
+    /// Take an idle connection, or fail.
+    acquire(self) : SqlPool! {
+        ensure self.in_use < self.size else {
+            fail "sql: pool exhausted ({self.size} connections in use)"
+            return
+        }
+        SqlPool.{store: self.store, size: self.size, in_use: self.in_use + 1}
+    }
+
+    /// Return a connection to the pool.
+    release(self) : SqlPool {
+        ensure self.in_use > 0 else { return self }
+        SqlPool.{store: self.store, size: self.size, in_use: self.in_use - 1}
+    }
+
+    /// Run `mem` against the catalog.
+    with_catalog(self, mem: SqlDb) : SqlPool => SqlPool.{store: mem, size: self.size, in_use: self.in_use}
+}
+
+/// `SqlTx` is a transaction over an in-memory SQL catalog.
++SqlTx = {
+    /// Base on `SqlTx` (`SqlDb`). Defaults to `SqlDb.{tables: []}`.
+    base: SqlDb = SqlDb.{tables: []}
+    /// Work on `SqlTx` (`SqlDb`). Defaults to `SqlDb.{tables: []}`.
+    work: SqlDb = SqlDb.{tables: []}
+    /// Open on `SqlTx` (`bool`). Defaults to `true`.
+    open: bool = true
+
+    /// Begin a transaction.
+    begin(db: SqlDb) : SqlTx => SqlTx.{base: db, work: db, open: true}
+
+    /// Run `work` inside a transaction and commit when it returns.
+    with(self, work: SqlDb) : SqlTx => SqlTx.{base: self.base, work, open: self.open}
+
+    /// Commit this transaction, or fail.
+    commit(self) : SqlDb!  {
+        ensure self.open else {
+            fail "sql: transaction already finished"
+            return
+        }
+        self.work
+    }
+
+    /// Roll this transaction back.
+    rollback(self) : SqlDb {
+        self.base
+    }
+}
+
+// --- small helpers --------------------------------------------------------------------------------
+
+/// Length of `s`.
++sql_len(s: str) : i64 => host.sys_str_len(s)
+
+/// How many times the value occurs in `a`.
++sql_count(a: _) : i64 {
+    n = 0
+    for a { n += 1 }
+    n
+}
+
+/// True when `c` is a digit.
++sql_digit(c: str) : i64 {
+    found = -1
+    for 0..10 {
+        if found < 0 && SQL_DIGITS[it] == c { found = it }
+    }
+    found
+}
+
+/// Join text items with a separator.
++sql_join(items: _, sep: str) : str {
+    out = ""
+    for items {
+        if index == 0 {
+            out = "{it}"
+        } else {
+            out = "{out}{sep}{it}"
+        }
+    }
+    out
+}
+
+// --- literals --------------------------------------------------------------------------------------------
+
+/// 'text' with embedded quotes doubled.
++sql_quote(s: str) : str {
+    out = ""
+    for 0..sql_len(s) {
+        c = s[it]
+        if c == "'" {
+            out = "{out}''"
+        } else {
+            out = "{out}{c}"
+        }
+    }
+    "'{out}'"
+}
+
+/// "identifier" with embedded double quotes doubled.
++sql_ident(name: str) : str {
+    out = ""
+    for 0..sql_len(name) {
+        c = name[it]
+        if c == "\"" {
+            out = "{out}\"\""
+        } else {
+            out = "{out}{c}"
+        }
+    }
+    "\"{out}\""
+}
+
+/// SQL integer literal for `n`.
++sql_int(n: i64) : str => "{n}"
+/// SQL float literal for `x`.
++sql_float(x: f64) : str => "{x}"
+
+/// SQL boolean literal for `b`.
++sql_bool(b: bool) : str {
+    if b { return SQL_TRUE }
+    SQL_FALSE
+}
+
+// --- parameter binding -------------------------------------------------------------------------------
+
+/// SQL literal for parameter `params`, or fail.
++sql_param_lit(params: _, num: i64, have: bool) : str! {
+    ensure have else {
+        fail "sql: `$` without a parameter number"
+        return
+    }
+    ensure num >= 1 && num <= sql_count(params) else {
+        fail "sql: parameter ${num} out of range"
+        return
+    }
+    params[num - 1]
+}
+
+/// Replace `$1`, `$2`, ... with ready-made literals. `$n` inside single-quoted text is left alone.
++sql_bind(query: str, params: _) : str! {
+    out = ""
+    in_q = false
+    in_num = false
+    have = false
+    num = 0
+    for 0..sql_len(query) {
+        c = query[it]
+        d = sql_digit(c)
+        if in_num && d >= 0 {
+            num = num * 10 + d
+            have = true
+        } else {
+            if in_num {
+                lit = sql_param_lit(params, num, have) or ""
+                ensure lit != "" else {
+                    fail "sql: bad parameter reference"
+                    return
+                }
+                out = "{out}{lit}"
+                in_num = false
+            }
+            if c == "'" { in_q = !in_q }
+            if c == "$" && !in_q {
+                in_num = true
+                num = 0
+                have = false
+            } else {
+                out = "{out}{c}"
+            }
+        }
+    }
+    if in_num {
+        lit = sql_param_lit(params, num, have) or ""
+        ensure lit != "" else {
+            fail "sql: bad parameter reference"
+            return
+        }
+        out = "{out}{lit}"
+    }
+    out
+}
+
+// --- statement builders --------------------------------------------------------------------------------
+
+/// SELECT statement built from the table, columns, and predicate.
++sql_select(table: str, cols: _, where: str) : str {
+    list = "*"
+    if sql_count(cols) > 0 { list = sql_join(cols, ", ") }
+    base = "SELECT {list} FROM {table}"
+    if where == "" { return base }
+    "{base} WHERE {where}"
+}
+
+/// Values must already be literals (sql_quote / sql_int / ...).
++sql_insert(table: str, cols: _, vals: _) : str {
+    cs = sql_join(cols, ", ")
+    vs = sql_join(vals, ", ")
+    "INSERT INTO {table} ({cs}) VALUES ({vs})"
+}
+
+/// UPDATE statement built from the table, assignments, and predicate.
++sql_update(table: str, cols: _, vals: _, where: str) : str {
+    sets = []
+    for cols {
+        v = vals[index]
+        sets = arr_push(sets, "{it} = {v}")
+    }
+    list = sql_join(sets, ", ")
+    base = "UPDATE {table} SET {list}"
+    if where == "" { return base }
+    "{base} WHERE {where}"
+}
+
+/// DELETE statement built from the table and predicate.
++sql_delete(table: str, where: str) : str {
+    base = "DELETE FROM {table}"
+    if where == "" { return base }
+    "{base} WHERE {where}"
+}
+
+// --- tests -----------------------------------------------------------------------------------------------------
+
+/// Test that literals are escaped.
+test "literals are escaped" {
+    assert_eq(sql_quote("abc"), "'abc'")
+    assert_eq(sql_quote("O'Hara"), "'O''Hara'")
+    assert_eq(sql_quote("''"), "''''''")
+    assert_eq(sql_quote(""), "''")
+    assert_eq(sql_ident("users"), "\"users\"")
+    assert_eq(sql_ident("we\"ird"), "\"we\"\"ird\"")
+    assert_eq(sql_int(42), "42")
+    assert_eq(sql_bool(true), "TRUE")
+    assert_eq(sql_bool(false), "FALSE")
+    assert_eq(SQL_NULL, "NULL")
+}
+
+/// Test that join.
+test "join" {
+    assert_eq(sql_join([], ", "), "")
+    assert_eq(sql_join(["a"], ", "), "a")
+    assert_eq(sql_join(["a", "b", "c"], ", "), "a, b, c")
+}
+
+/// Test that bind replaces numbered placeholders.
+test "bind replaces numbered placeholders" {
+    q = sql_bind("SELECT * FROM t WHERE id = $1 AND name = $2", [sql_int(7), sql_quote("Amy")]) or "?"
+    assert_eq(q, "SELECT * FROM t WHERE id = 7 AND name = 'Amy'")
+    again = sql_bind("$1 $1 $1", ["x"]) or "?"
+    assert_eq(again, "x x x")
+    swapped = sql_bind("$2,$1", ["a", "b"]) or "?"
+    assert_eq(swapped, "b,a")
+}
+
+/// Test that bind handles multi-digit parameters and quoted dollars.
+test "bind handles multi-digit parameters and quoted dollars" {
+    params = ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10"]
+    assert_eq(sql_bind("$10-$1", params) or "?", "p10-p1")
+    assert_eq(sql_bind("'cost: $1' $1", ["z"]) or "?", "'cost: $1' z")
+    assert_eq(sql_bind("no params", []) or "?", "no params")
+}
+
+/// Test that bind rejects bad references.
+test "bind rejects bad references" {
+    assert_eq(sql_bind("$3", ["a"]) or "ERR", "ERR")
+    assert_eq(sql_bind("$0", ["a"]) or "ERR", "ERR")
+    assert_eq(sql_bind("a $ b", ["a"]) or "ERR", "ERR")
+    assert_eq(sql_bind("trailing $", ["a"]) or "ERR", "ERR")
+}
+
+/// Test that statement builders.
+test "statement builders" {
+    assert_eq(sql_select("users", [], ""), "SELECT * FROM users")
+    assert_eq(sql_select("users", ["id", "name"], "id = 1"), "SELECT id, name FROM users WHERE id = 1")
+    assert_eq(sql_insert("users", ["id", "name"], ["1", "'Amy'"]), "INSERT INTO users (id, name) VALUES (1, 'Amy')")
+    assert_eq(sql_update("users", ["name", "age"], ["'Bo'", "3"], "id = 1"), "UPDATE users SET name = 'Bo', age = 3 WHERE id = 1")
+    assert_eq(sql_update("users", ["a"], ["1"], ""), "UPDATE users SET a = 1")
+    assert_eq(sql_delete("users", "id = 2"), "DELETE FROM users WHERE id = 2")
+    assert_eq(sql_delete("users", ""), "DELETE FROM users")
+}
+
+/// Test that create table and insert.
+test "create table and insert" {
+    store = SqlDb.new()
+    store = store.create_table("users", ["id", "name"]) or store
+    #assert(store.has_table("users"))
+    #assert(!(store.has_table("nope")))
+    store = store.insert("users", ["1", "Amina"]) or store
+    store = store.insert("users", ["2", "Bo"]) or store
+    assert_eq(store.count("users"), 2)
+    rows = store.rows_where("users", "name", "Bo")
+    assert_eq(sql_count(rows), 1)
+    first = rows[0]
+    assert_eq(first[0], "2")
+}
+
+/// Test that schema errors surface through or.
+test "schema errors surface through or" {
+    store = SqlDb.new().create_table("t", ["a"]) or SqlDb.new()
+    dup = store.create_table("t", ["a"]) or SqlDb.new()
+    #assert(!(dup.has_table("t")))
+    empty = store.create_table("u", []) or SqlDb.new()
+    #assert(!(empty.has_table("u")))
+    missing = store.insert("zzz", ["1"]) or SqlDb.new()
+    assert_eq(missing.count("zzz"), 0)
+    wrong = store.insert("t", ["1", "2"]) or store
+    assert_eq(wrong.count("t"), 0)
+}
+
+/// Test that update and delete rows.
+test "update and delete rows" {
+    store = SqlDb.new().create_table("users", ["id", "name"]) or SqlDb.new()
+    store = store.insert("users", ["1", "A"]) or store
+    store = store.insert("users", ["2", "B"]) or store
+    store = store.insert("users", ["3", "B"]) or store
+    store = store.update_where("users", "name", "B", "name", "Z") or store
+    assert_eq(sql_count(store.rows_where("users", "name", "Z")), 2)
+    assert_eq(sql_count(store.rows_where("users", "name", "A")), 1)
+    store = store.delete_where("users", "id", "2") or store
+    assert_eq(store.count("users"), 2)
+    assert_eq(sql_count(store.rows_where("users", "id", "2")), 0)
+    same = store.update_where("users", "nope", "x", "name", "y") or SqlDb.new()
+    #assert(!(same.has_table("users")))
+}
+
+/// Test that drop table.
+test "drop table" {
+    store = SqlDb.new().create_table("a", ["x"]) or SqlDb.new()
+    store = store.create_table("b", ["x"]) or store
+    store = store.drop_table("a") or store
+    #assert(!(store.has_table("a")))
+    #assert(store.has_table("b"))
+    #assert(!((store.drop_table("a") or SqlDb.new()).has_table("b")))
+}
+
+/// Test that queries on missing things are empty, not errors.
+test "queries on missing things are empty, not errors" {
+    store = SqlDb.new()
+    assert_eq(store.count("ghost"), 0)
+    assert_eq(sql_count(store.rows_where("ghost", "x", "y")), 0)
+    store = store.create_table("t", ["a"]) or store
+    assert_eq(sql_count(store.rows_where("t", "zz", "y")), 0)
+}
+
+/// Test that transactions commit or roll back.
+test "transactions commit or roll back" {
+    store = SqlDb.new().create_table("t", ["a"]) or SqlDb.new()
+    store = store.insert("t", ["1"]) or store
+    open_tx = SqlTx.begin(store)
+    grown = open_tx.work.insert("t", ["2"]) or open_tx.work
+    tx = open_tx.with(grown)
+    assert_eq(tx.work.count("t"), 2)
+    assert_eq(tx.base.count("t"), 1)
+    assert_eq(tx.rollback().count("t"), 1)
+    committed = tx.commit() or store
+    assert_eq(committed.count("t"), 2)
+}
+
+/// Test that pool accounting.
+test "pool accounting" {
+    p = SqlPool.new(SqlDb.new(), 2)
+    p = p.acquire() or p
+    p = p.acquire() or p
+    assert_eq(p.in_use, 2)
+    full = p.acquire() or SqlPool.new(SqlDb.new(), 0)
+    assert_eq(full.size, 0)
+    p = p.release()
+    assert_eq(p.in_use, 1)
+    p = p.release(p.release())
+    assert_eq(p.in_use, 0)
+    swapped = p.with_catalog(SqlDb.new().create_table("k", ["a"]) or SqlDb.new())
+    #assert(swapped.store.has_table("k"))
+}

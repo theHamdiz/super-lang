@@ -1,0 +1,22 @@
+//! Round-trip / predicate laws for `std.fmt.json` (Round 7 real bodies).
+//! Implementation: `json_is_ws` / `json_is_ws_b` in `json.sr`.
+
+#law("json_is_ws accepts ASCII whitespace")
+json_is_ws_space() {
+    #assert(json_is_ws(" "))
+    #assert(json_is_ws("\t"))
+    #assert(json_is_ws("\n"))
+    #assert(json_is_ws("\r"))
+}
+
+#law("json_is_ws rejects a letter")
+json_is_ws_rejects_letter() {
+    #assert(!json_is_ws("a"))
+}
+
+#law("json_is_ws_b matches byte codes for space and newline")
+json_is_ws_b_codes() {
+    #assert(json_is_ws_b(32))
+    #assert(json_is_ws_b(10))
+    #assert(!json_is_ws_b(65))
+}

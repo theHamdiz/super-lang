@@ -1,0 +1,20 @@
+//! Law/proof tier — discharge with `super verify examples/doc_law/src/ledger.sr`.
+//! Run: super verify examples/doc_law/src/ledger.sr
+
++Account = { balance: i64 = 0 }
+
++transfer(@src: Account, @dst: Account, amount: i64) : bool {
+    if amount < 0 { return false }
+    if src.balance < amount { return false }
+    src.balance -= amount
+    dst.balance += amount
+    true
+}
+test "transfer keeps the total and refuses overdrafts" {
+    a = Account{balance: 10}
+    b = Account{balance: 0}
+    #assert(transfer(@a, @b, 4))
+    assert_eq(a.balance + b.balance, 10)
+    #assert(!transfer(@a, @b, 100))
+    assert_eq(a.balance, 6)
+}

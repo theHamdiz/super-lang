@@ -1,0 +1,91 @@
+//! deepseek — DeepSeek chat / reasoner (OpenAI-compatible)
+//!
+//!   use deepseek
+//!   d = DeepSeek.new("sk-…")
+//!   res = @d.chat([ai_user("hi")], "deepseek-chat")
+//!   res = @d.reason("prove 1+1=2")
+
+use std.ai.client
+use std.core.str
+
++DEEPSEEK_BASE = "https://api.deepseek.com"
+
++DeepSeek = {
+    client: AiClient = AiClient.new("deepseek", "", "")
+
+    new(api_key: str) : DeepSeek {
+        DeepSeek.{client: AiClient.new("deepseek", DEEPSEEK_BASE, api_key)}
+    }
+
+    set_offline(@self, on: bool) : bool {
+        c = self.client
+        @c.set_offline(on)
+        self.client = c
+        on
+    }
+
+    set_timeout(@self, ms: i64) : i64 {
+        c = self.client
+        @c.set_timeout(ms)
+        self.client = c
+        ms
+    }
+
+    push_mock(@self, body: str) : i64 {
+        c = self.client
+        n = @c.push_mock(body)
+        self.client = c
+        n
+    }
+
+    -run(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        c = self.client
+        res = @c.request(path, req, body)
+        self.client = c
+        res
+    }
+
+    chat_req(@self, req: AiRequest) : AiResponse {
+        body = self.client.chat_body(req)
+        @self.run("/chat/completions", req, body)
+    }
+
+    chat(@self, messages: _, model: str) : AiResponse {
+        @self.chat_req(ai_chat_req(model, messages, 2048))
+    }
+
+    chat_system(@self, system: str, messages: _, model: str) : AiResponse {
+        req = ai_chat_req(model, messages, 2048)
+        req.system = system
+        @self.chat_req(req)
+    }
+
+    complete(@self, prompt: str, model: str) : AiResponse {
+        @self.chat([ai_user(prompt)], model)
+    }
+
+    reason(@self, prompt: str) : AiResponse {
+        @self.chat([ai_user(prompt)], "deepseek-reasoner")
+    }
+
+    chat_tools(@self, messages: _, model: str, tools: _) : AiResponse {
+        req = ai_chat_req(model, messages, 2048)
+        req.tools = tools
+        @self.chat_req(req)
+    }
+}
+
+test "deepseek chat offline" {
+    d = DeepSeek.new("sk-ds")
+    @d.push_mock("{\"choices\":[{\"message\":{\"content\":\"ds-ok\"}}]}")
+    res = @d.chat([ai_user("hi")], "deepseek-chat")
+    assert_eq(res.text, "ds-ok")
+}
+
+test "deepseek reasoner model" {
+    d = DeepSeek.new("k")
+    @d.push_mock("{\"choices\":[{\"message\":{\"content\":\"42\"}}]}")
+    res = @d.reason("answer")
+    assert_eq(res.text, "42")
+    #assert(contains(d.client.last_body, "deepseek-reasoner"))
+}

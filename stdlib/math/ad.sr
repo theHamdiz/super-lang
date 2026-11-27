@@ -1,0 +1,1170 @@
+//! std.math.ad — automatic differentiation: dual numbers, hyper-duals, dual vectors, tape
+//!
+//! Import with:
+//!   use std.math.ad
+//!
+//!   // Forward mode on scalars: f(x) = sin(x) * x^2 at x = 1.5
+//!   x = dual_var(1.5)
+//!   y = x.sin().mul(x.square())
+//!   y.v   y.d                            // f(1.5), f'(1.5)
+//!
+//!   // Second derivatives with hyper-duals
+//!   h = hyper_var2(1.5)
+//!   h.exp().e12                          // f''(1.5) for f = exp
+//!
+//!   // Functions as data: a tape records the expression once, then evaluates it with
+//!   // plain floats, dual numbers (jvp), reverse sweeps (grad / vjp), or hyper-duals.
+//!   t = ReverseTape.new()
+//!   a = @t.input()
+//!   b = @t.input()
+//!   p = @t.n_mul(a, b)
+//!   q = @t.n_sin(p)
+//!   @t.out(q)
+//!   g = t.grad([1.0, 2.0])               // [2 cos 2, cos 2]
+//!   d = t.jvp([1.0, 2.0], [1.0, 0.0])    // directional derivative along (1, 0)
+//!   H = t.hessian([1.0, 2.0])            // row-major 2 x 2
+//!
+//! Super has no first-class function values in 0.1.0, so numerical routines that need a
+//! function (`std.math.optimize`, `integrate`, `poly`) take a `ReverseTape`. Forward mode
+//! (`jvp`, `grad_forward`, `jacobian`) is the primary engine and evaluates exactly the same
+//! derivative rules as `Dual64`; `grad` / `vjp` are the same rules swept backwards in one
+//! pass, and `hessian` uses `HyperDual64` rules. A tape implements `Differentiable`.
+//! Public helpers are prefixed `ad_` / `dual_` / `hyper_` (modules merge flat).
+
+use std.math.algebra
+use std.math.special
+
+/// Tape op: input variable `a[k]`.
++AD_INPUT = 0
+/// Tape op: constant `c[k]`.
++AD_CONST = 1
+/// Tape op: `a + b`.
++AD_ADD = 2
+/// Tape op: `a - b`.
++AD_SUB = 3
+/// Tape op: `a * b`.
++AD_MUL = 4
+/// Tape op: `a / b`.
++AD_DIV = 5
+/// Tape op: `max(a, b)`.
++AD_MAX = 6
+/// Tape op: `min(a, b)`.
++AD_MIN = 7
+/// Tape op: `-a`.
++AD_NEG = 10
+/// Tape op: `sin(a)`.
++AD_SIN = 11
+/// Tape op: `cos(a)`.
++AD_COS = 12
+/// Tape op: `tan(a)`.
++AD_TAN = 13
+/// Tape op: `exp(a)`.
++AD_EXP = 14
+/// Tape op: `ln(a)`.
++AD_LN = 15
+/// Tape op: `sqrt(a)`.
++AD_SQRT = 16
+/// Tape op: `a ^ c[k]` for a constant exponent.
++AD_POWC = 17
+/// Tape op: `|a|`.
++AD_ABS = 18
+/// Tape op: `tanh(a)`.
++AD_TANH = 19
+/// Tape op: `atan(a)`.
++AD_ATAN = 20
+/// Tape op: `sinh(a)`.
++AD_SINH = 21
+/// Tape op: `cosh(a)`.
++AD_COSH = 22
+/// Tape op: `erf(a)`.
++AD_ERF = 23
+
+/// `2 / sqrt(pi)`.
++AD_TWO_OVER_SQRT_PI = 1.1283791670955126
+
+/// True when |a - b| <= tol * (1 + |b|).
++ad_close(a: f64, b: f64, tol: f64) : bool {
+    d = a - b
+    if d < 0.0 { d = -d }
+    m = b
+    if m < 0.0 { m = -m }
+    d <= tol * (1.0 + m)
+}
+
+// --- scalar rules shared by Dual64, HyperDual64 and the tape ---------------------------
+
+/// Value of the unary op `op` at `x` (`c` is the constant exponent for `AD_POWC`).
++ad_apply1(op: i64, x: f64, c: f64) : f64 {
+    if op == AD_NEG { return -x }
+    if op == AD_SIN { return host.sys_sin(x) }
+    if op == AD_COS { return host.sys_cos(x) }
+    if op == AD_TAN { return host.sys_tan(x) }
+    if op == AD_EXP { return host.sys_exp(x) }
+    if op == AD_LN { return host.sys_ln(x) }
+    if op == AD_SQRT { return host.sys_sqrt(x) }
+    if op == AD_POWC { return host.sys_pow(x, c) }
+    if op == AD_ABS {
+        if x < 0.0 { return -x }
+        return x
+    }
+    if op == AD_TANH { return host.sys_tanh(x) }
+    if op == AD_ATAN { return host.sys_atan(x) }
+    if op == AD_SINH { return host.sys_sinh(x) }
+    if op == AD_COSH { return host.sys_cosh(x) }
+    if op == AD_ERF { return erf(x) }
+    x
+}
+
+/// First derivative of the unary op at `x` where the op's value is `y`.
++ad_d1(op: i64, x: f64, y: f64, c: f64) : f64 {
+    if op == AD_NEG { return -1.0 }
+    if op == AD_SIN { return host.sys_cos(x) }
+    if op == AD_COS { return -host.sys_sin(x) }
+    if op == AD_TAN { return 1.0 + y * y }
+    if op == AD_EXP { return y }
+    if op == AD_LN { return 1.0 / x }
+    if op == AD_SQRT { return 0.5 / y }
+    if op == AD_POWC {
+        if c > 0.999999999 {
+            if c < 1.000000001 { return 1.0 }
+        }
+        return c * host.sys_pow(x, c - 1.0)
+    }
+    if op == AD_ABS {
+        if x < 0.0 { return -1.0 }
+        if x > 0.0 { return 1.0 }
+        return 0.0
+    }
+    if op == AD_TANH { return 1.0 - y * y }
+    if op == AD_ATAN { return 1.0 / (1.0 + x * x) }
+    if op == AD_SINH { return host.sys_cosh(x) }
+    if op == AD_COSH { return host.sys_sinh(x) }
+    if op == AD_ERF { return AD_TWO_OVER_SQRT_PI * host.sys_exp(-x * x) }
+    1.0
+}
+
+/// Second derivative of the unary op at `x` where the op's value is `y`.
++ad_d2(op: i64, x: f64, y: f64, c: f64) : f64 {
+    if op == AD_NEG { return 0.0 }
+    if op == AD_SIN { return -y }
+    if op == AD_COS { return -y }
+    if op == AD_TAN { return 2.0 * y * (1.0 + y * y) }
+    if op == AD_EXP { return y }
+    if op == AD_LN { return -1.0 / (x * x) }
+    if op == AD_SQRT { return -0.25 / (x * y) }
+    if op == AD_POWC {
+        if c > 0.999999999 {
+            if c < 1.000000001 { return 0.0 }
+        }
+        return c * (c - 1.0) * host.sys_pow(x, c - 2.0)
+    }
+    if op == AD_ABS { return 0.0 }
+    if op == AD_TANH { return -2.0 * y * (1.0 - y * y) }
+    if op == AD_ATAN {
+        den = 1.0 + x * x
+        return -2.0 * x / (den * den)
+    }
+    if op == AD_SINH { return y }
+    if op == AD_COSH { return y }
+    if op == AD_ERF { return -2.0 * x * AD_TWO_OVER_SQRT_PI * host.sys_exp(-x * x) }
+    0.0
+}
+
+/// Value of the binary op `op` on `p`, `q`.
++ad_apply2(op: i64, p: f64, q: f64) : f64 {
+    if op == AD_ADD { return p + q }
+    if op == AD_SUB { return p - q }
+    if op == AD_MUL { return p * q }
+    if op == AD_DIV { return p / q }
+    if op == AD_MAX {
+        if p >= q { return p }
+        return q
+    }
+    if op == AD_MIN {
+        if p <= q { return p }
+        return q
+    }
+    p
+}
+
+/// Partial derivative of the binary op with respect to its first argument.
++ad_bin_da(op: i64, p: f64, q: f64) : f64 {
+    if op == AD_ADD { return 1.0 }
+    if op == AD_SUB { return 1.0 }
+    if op == AD_MUL { return q }
+    if op == AD_DIV { return 1.0 / q }
+    if op == AD_MAX {
+        if p >= q { return 1.0 }
+        return 0.0
+    }
+    if op == AD_MIN {
+        if p <= q { return 1.0 }
+        return 0.0
+    }
+    0.0
+}
+
+/// Partial derivative of the binary op with respect to its second argument.
++ad_bin_db(op: i64, p: f64, q: f64, y: f64) : f64 {
+    if op == AD_ADD { return 1.0 }
+    if op == AD_SUB { return -1.0 }
+    if op == AD_MUL { return p }
+    if op == AD_DIV { return -y / q }
+    if op == AD_MAX {
+        if p >= q { return 0.0 }
+        return 1.0
+    }
+    if op == AD_MIN {
+        if p <= q { return 0.0 }
+        return 1.0
+    }
+    0.0
+}
+
+/// True when `op` takes two operands.
++ad_is_binary(op: i64) : bool => op >= AD_ADD && op <= AD_MIN
+
+// --- Dual64 ---------------------------------------------------------------------------------------
+
+/// A forward-mode dual number `v + d * eps` with `eps^2 = 0`: a value and its derivative.
++Dual64: Add, Sub, Mul, Div, Neg, Display = {
+    /// Value.
+    v: f64 = 0.0
+    /// Derivative (tangent).
+    d: f64 = 0.0
+
+    add(self, other: Dual64) : Dual64 => Dual64.{v: self.v + other.v, d: self.d + other.d}
+    sub(self, other: Dual64) : Dual64 => Dual64.{v: self.v - other.v, d: self.d - other.d}
+    mul(self, other: Dual64) : Dual64 => Dual64.{v: self.v * other.v, d: self.v * other.d + self.d * other.v}
+
+    div(self, other: Dual64) : Dual64 {
+        q = self.v / other.v
+        Dual64.{v: q, d: (self.d - q * other.d) / other.v}
+    }
+
+    neg(self) : Dual64 => Dual64.{v: -self.v, d: -self.d}
+
+    /// Multiply by the plain float `k`.
+    scale(self, k: f64) : Dual64 => Dual64.{v: self.v * k, d: self.d * k}
+    /// Add the plain float `k`.
+    shift(self, k: f64) : Dual64 => Dual64.{v: self.v + k, d: self.d}
+    /// `self * self`.
+    square(self) : Dual64 => Dual64.{v: self.v * self.v, d: 2.0 * self.v * self.d}
+    /// `1 / self`.
+    recip(self) : Dual64 => Dual64.{v: 1.0 / self.v, d: -self.d / (self.v * self.v)}
+
+    /// Apply unary tape op `op` with the chain rule.
+    apply(self, op: i64, c: f64) : Dual64 {
+        y = ad_apply1(op, self.v, c)
+        Dual64.{v: y, d: ad_d1(op, self.v, y, c) * self.d}
+    }
+
+    sin(self) : Dual64 => self.apply(AD_SIN, 0.0)
+    cos(self) : Dual64 => self.apply(AD_COS, 0.0)
+    tan(self) : Dual64 => self.apply(AD_TAN, 0.0)
+    exp(self) : Dual64 => self.apply(AD_EXP, 0.0)
+    ln(self) : Dual64 => self.apply(AD_LN, 0.0)
+    sqrt(self) : Dual64 => self.apply(AD_SQRT, 0.0)
+    abs(self) : Dual64 => self.apply(AD_ABS, 0.0)
+    tanh(self) : Dual64 => self.apply(AD_TANH, 0.0)
+    atan(self) : Dual64 => self.apply(AD_ATAN, 0.0)
+    sinh(self) : Dual64 => self.apply(AD_SINH, 0.0)
+    cosh(self) : Dual64 => self.apply(AD_COSH, 0.0)
+    erf(self) : Dual64 => self.apply(AD_ERF, 0.0)
+
+    /// `self ^ k` for a constant exponent `k`.
+    pow(self, k: f64) : Dual64 => self.apply(AD_POWC, k)
+
+    /// `self ^ other` for a dual exponent (`self.v > 0`): d = y (e' ln b + e b'/b).
+    powd(self, other: Dual64) : Dual64 {
+        y = host.sys_pow(self.v, other.v)
+        Dual64.{v: y, d: y * (other.d * host.sys_ln(self.v) + other.v * self.d / self.v)}
+    }
+
+    display(self) : str => "{self.v} + {self.d}e"
+}
+
+/// A dual number with value `v` and derivative `d`.
++dual(v: f64, d: f64) : Dual64 => Dual64.{v, d}
+
+/// A constant: derivative 0.
++dual_const(v: f64) : Dual64 => Dual64.{v, d: 0.0}
+
+/// The independent variable at `v`: derivative 1.
++dual_var(v: f64) : Dual64 => Dual64.{v, d: 1.0}
+
+/// `sin(x) * x^2 + exp(x) / (1 + x^2)` in dual arithmetic, used by the tests as a reference closed form.
++ad_sample_dual(x: Dual64) : Dual64 => x.sin().mul(x.square()).add(x.exp().div(x.square().shift(1.0)))
+
+// --- HyperDual64 --------------------------------------------------------------------------------
+
+/// A hyper-dual number `f + e1 eps1 + e2 eps2 + e12 eps1 eps2`: value, two first derivatives, and the mixed second derivative.
++HyperDual64: Add, Sub, Mul, Div, Neg, Display = {
+    /// Value.
+    f: f64 = 0.0
+    /// Derivative along the first seed.
+    e1: f64 = 0.0
+    /// Derivative along the second seed.
+    e2: f64 = 0.0
+    /// Mixed second derivative.
+    e12: f64 = 0.0
+
+    add(self, other: HyperDual64) : HyperDual64 {
+        HyperDual64.{f: self.f + other.f, e1: self.e1 + other.e1, e2: self.e2 + other.e2, e12: self.e12 + other.e12}
+    }
+
+    sub(self, other: HyperDual64) : HyperDual64 {
+        HyperDual64.{f: self.f - other.f, e1: self.e1 - other.e1, e2: self.e2 - other.e2, e12: self.e12 - other.e12}
+    }
+
+    mul(self, other: HyperDual64) : HyperDual64 {
+        HyperDual64.{
+            f: self.f * other.f,
+            e1: self.f * other.e1 + self.e1 * other.f,
+            e2: self.f * other.e2 + self.e2 * other.f,
+            e12: self.f * other.e12 + self.e1 * other.e2 + self.e2 * other.e1 + self.e12 * other.f,
+        }
+    }
+
+    neg(self) : HyperDual64 => HyperDual64.{f: -self.f, e1: -self.e1, e2: -self.e2, e12: -self.e12}
+
+    /// Chain rule for a scalar map with value `g`, first derivative `g1`, second derivative `g2` at `self.f`.
+    chain(self, g: f64, g1: f64, g2: f64) : HyperDual64 {
+        HyperDual64.{f: g, e1: g1 * self.e1, e2: g1 * self.e2, e12: g1 * self.e12 + g2 * self.e1 * self.e2}
+    }
+
+    /// `1 / self`.
+    recip(self) : HyperDual64 {
+        r = 1.0 / self.f
+        self.chain(r, -r * r, 2.0 * r * r * r)
+    }
+
+    div(self, other: HyperDual64) : HyperDual64 => self.mul(other.recip())
+
+    /// Multiply by the plain float `k`.
+    scale(self, k: f64) : HyperDual64 => HyperDual64.{f: self.f * k, e1: self.e1 * k, e2: self.e2 * k, e12: self.e12 * k}
+    /// Add the plain float `k`.
+    shift(self, k: f64) : HyperDual64 => HyperDual64.{f: self.f + k, e1: self.e1, e2: self.e2, e12: self.e12}
+    /// `self * self`.
+    square(self) : HyperDual64 => self.mul(self)
+
+    /// Apply unary tape op `op`.
+    apply(self, op: i64, c: f64) : HyperDual64 {
+        y = ad_apply1(op, self.f, c)
+        self.chain(y, ad_d1(op, self.f, y, c), ad_d2(op, self.f, y, c))
+    }
+
+    sin(self) : HyperDual64 => self.apply(AD_SIN, 0.0)
+    cos(self) : HyperDual64 => self.apply(AD_COS, 0.0)
+    exp(self) : HyperDual64 => self.apply(AD_EXP, 0.0)
+    ln(self) : HyperDual64 => self.apply(AD_LN, 0.0)
+    sqrt(self) : HyperDual64 => self.apply(AD_SQRT, 0.0)
+    tanh(self) : HyperDual64 => self.apply(AD_TANH, 0.0)
+
+    /// `self ^ k` for a constant exponent `k`.
+    pow(self, k: f64) : HyperDual64 => self.apply(AD_POWC, k)
+
+    display(self) : str => "{self.f} + {self.e1}e1 + {self.e2}e2 + {self.e12}e12"
+}
+
+/// A hyper-dual number from its four parts.
++hyper(f: f64, e1: f64, e2: f64, e12: f64) : HyperDual64 => HyperDual64.{f, e1, e2, e12}
+
+/// A constant (all derivatives 0).
++hyper_const(f: f64) : HyperDual64 => HyperDual64.{f, e1: 0.0, e2: 0.0, e12: 0.0}
+
+/// The variable seeded in both directions, so `.e12` of a result is the second derivative.
++hyper_var2(f: f64) : HyperDual64 => HyperDual64.{f, e1: 1.0, e2: 1.0, e12: 0.0}
+
+// --- DualVec ------------------------------------------------------------------------------------------
+
+/// A vector with a tangent: `v` holds the values and `d` the derivative of each component.
++DualVec: Add, Sub = {
+    /// Component values.
+    v: _ = []
+    /// Component tangents.
+    d: _ = []
+
+    /// A dual vector from values `v` and tangents `d`.
+    of(v: _, d: _) : DualVec => DualVec.{v, d}
+
+    /// A constant vector (zero tangents).
+    constant(v: _) : DualVec {
+        z = []
+        i = 0
+        while i < host.sys_arr_len(v) {
+            z = host.sys_arr_push(z, 0.0)
+            i += 1
+        }
+        DualVec.{v, d: z}
+    }
+
+    /// `x` with the tangent seeded along coordinate `k`.
+    seed(x: _, k: i64) : DualVec {
+        z = []
+        i = 0
+        while i < host.sys_arr_len(x) {
+            s = 0.0
+            if i == k { s = 1.0 }
+            z = host.sys_arr_push(z, s)
+            i += 1
+        }
+        DualVec.{v: x, d: z}
+    }
+
+    len(self) : i64 => host.sys_arr_len(self.v)
+
+    /// Component `i` as a `Dual64`.
+    at(self, i: i64) : Dual64 => Dual64.{v: self.v[i], d: self.d[i]}
+
+    add(self, other: DualVec) : DualVec {
+        v = []
+        d = []
+        i = 0
+        while i < host.sys_arr_len(self.v) {
+            v = host.sys_arr_push(v, self.v[i] + other.v[i])
+            d = host.sys_arr_push(d, self.d[i] + other.d[i])
+            i += 1
+        }
+        DualVec.{v, d}
+    }
+
+    sub(self, other: DualVec) : DualVec {
+        v = []
+        d = []
+        i = 0
+        while i < host.sys_arr_len(self.v) {
+            v = host.sys_arr_push(v, self.v[i] - other.v[i])
+            d = host.sys_arr_push(d, self.d[i] - other.d[i])
+            i += 1
+        }
+        DualVec.{v, d}
+    }
+
+    /// Multiply every component by the plain float `k`.
+    scale(self, k: f64) : DualVec {
+        v = []
+        d = []
+        i = 0
+        while i < host.sys_arr_len(self.v) {
+            v = host.sys_arr_push(v, self.v[i] * k)
+            d = host.sys_arr_push(d, self.d[i] * k)
+            i += 1
+        }
+        DualVec.{v, d}
+    }
+
+    /// Dot product as a `Dual64`: value `sum a_i b_i`, derivative `sum (a_i' b_i + a_i b_i')`.
+    dot(self, other: DualVec) : Dual64 {
+        s = 0.0
+        t = 0.0
+        i = 0
+        while i < host.sys_arr_len(self.v) {
+            s += self.v[i] * other.v[i]
+            t += self.d[i] * other.v[i] + self.v[i] * other.d[i]
+            i += 1
+        }
+        Dual64.{v: s, d: t}
+    }
+
+    /// Squared Euclidean norm as a `Dual64`.
+    norm2(self) : Dual64 => self.dot(self)
+
+    /// Euclidean norm as a `Dual64`.
+    norm(self) : Dual64 => self.norm2().sqrt()
+}
+
+/// A dual vector from separate value and tangent arrays.
++dualvec(v: _, d: _) : DualVec => DualVec.of(v, d)
+
+/// Split an array of `Dual64` into a `DualVec`.
++dualvec_from(xs: _) : DualVec {
+    v = []
+    d = []
+    for xs {
+        v = host.sys_arr_push(v, it.v)
+        d = host.sys_arr_push(d, it.d)
+    }
+    DualVec.{v, d}
+}
+
+/// Gather a `DualVec` into an array of `Dual64`.
++dualvec_to(dv: DualVec) {
+    out = []
+    i = 0
+    while i < host.sys_arr_len(dv.v) {
+        out = host.sys_arr_push(out, Dual64.{v: dv.v[i], d: dv.d[i]})
+        i += 1
+    }
+    out
+}
+
+// --- ReverseTape --------------------------------------------------------------------------------------
+
+/// A recorded computation (a flat Wengert list). Build it with `input` and the `n_*` methods
+/// (each returns the node index), mark outputs with `out`, then evaluate with `value` / `values`,
+/// differentiate with `grad` (reverse), `grad_forward` / `jvp` / `jacobian` (forward), or
+/// `hessian` (hyper-dual).
++ReverseTape: Differentiable = {
+    /// Op code of each node.
+    ops: _ = []
+    /// First operand (node index) or input slot.
+    a: _ = []
+    /// Second operand (node index) or -1.
+    b: _ = []
+    /// Constant: the value for `AD_CONST`, the exponent for `AD_POWC`.
+    c: _ = []
+    /// Number of input variables.
+    n_in: i64 = 0
+    /// Output node indices.
+    outs: _ = []
+
+    /// An empty tape.
+    new() : ReverseTape => ReverseTape.{ops: [], a: [], b: [], c: [], n_in: 0, outs: []}
+
+    /// Number of nodes recorded.
+    size(self) : i64 => host.sys_arr_len(self.ops)
+
+    /// Append a node and return its index.
+    push_node(@self, op: i64, ia: i64, ib: i64, k: f64) : i64 {
+        id = host.sys_arr_len(self.ops)
+        self.ops = host.sys_arr_push(self.ops, op)
+        self.a = host.sys_arr_push(self.a, ia)
+        self.b = host.sys_arr_push(self.b, ib)
+        self.c = host.sys_arr_push(self.c, k)
+        id
+    }
+
+    /// Declare the next input variable.
+    input(@self) : i64 {
+        slot = self.n_in
+        self.n_in = slot + 1
+        @self.push_node(AD_INPUT, slot, -1, 0.0)
+    }
+
+    /// A constant node.
+    konst(@self, k: f64) : i64 => @self.push_node(AD_CONST, -1, -1, k)
+
+    /// Mark node `i` as an output.
+    out(@self, i: i64) : i64 {
+        self.outs = host.sys_arr_push(self.outs, i)
+        i
+    }
+
+    n_add(@self, i: i64, j: i64) : i64 => @self.push_node(AD_ADD, i, j, 0.0)
+    n_sub(@self, i: i64, j: i64) : i64 => @self.push_node(AD_SUB, i, j, 0.0)
+    n_mul(@self, i: i64, j: i64) : i64 => @self.push_node(AD_MUL, i, j, 0.0)
+    n_div(@self, i: i64, j: i64) : i64 => @self.push_node(AD_DIV, i, j, 0.0)
+    n_max(@self, i: i64, j: i64) : i64 => @self.push_node(AD_MAX, i, j, 0.0)
+    n_min(@self, i: i64, j: i64) : i64 => @self.push_node(AD_MIN, i, j, 0.0)
+    n_neg(@self, i: i64) : i64 => @self.push_node(AD_NEG, i, -1, 0.0)
+    n_sin(@self, i: i64) : i64 => @self.push_node(AD_SIN, i, -1, 0.0)
+    n_cos(@self, i: i64) : i64 => @self.push_node(AD_COS, i, -1, 0.0)
+    n_tan(@self, i: i64) : i64 => @self.push_node(AD_TAN, i, -1, 0.0)
+    n_exp(@self, i: i64) : i64 => @self.push_node(AD_EXP, i, -1, 0.0)
+    n_ln(@self, i: i64) : i64 => @self.push_node(AD_LN, i, -1, 0.0)
+    n_sqrt(@self, i: i64) : i64 => @self.push_node(AD_SQRT, i, -1, 0.0)
+    n_abs(@self, i: i64) : i64 => @self.push_node(AD_ABS, i, -1, 0.0)
+    n_tanh(@self, i: i64) : i64 => @self.push_node(AD_TANH, i, -1, 0.0)
+    n_atan(@self, i: i64) : i64 => @self.push_node(AD_ATAN, i, -1, 0.0)
+    n_sinh(@self, i: i64) : i64 => @self.push_node(AD_SINH, i, -1, 0.0)
+    n_cosh(@self, i: i64) : i64 => @self.push_node(AD_COSH, i, -1, 0.0)
+    n_erf(@self, i: i64) : i64 => @self.push_node(AD_ERF, i, -1, 0.0)
+    /// `node ^ k` for a constant exponent.
+    n_pow(@self, i: i64, k: f64) : i64 => @self.push_node(AD_POWC, i, -1, k)
+
+    /// `node * node`.
+    n_square(@self, i: i64) : i64 => @self.push_node(AD_MUL, i, i, 0.0)
+
+    /// `node + k` for a plain float `k`.
+    n_addc(@self, i: i64, k: f64) : i64 {
+        kc = @self.konst(k)
+        @self.n_add(i, kc)
+    }
+
+    /// `node * k` for a plain float `k`.
+    n_mulc(@self, i: i64, k: f64) : i64 {
+        kc = @self.konst(k)
+        @self.n_mul(i, kc)
+    }
+
+    /// Logistic sigmoid `1 / (1 + exp(-node))`.
+    n_sigmoid(@self, i: i64) : i64 {
+        ng = @self.n_neg(i)
+        e = @self.n_exp(ng)
+        den = @self.n_addc(e, 1.0)
+        one = @self.konst(1.0)
+        @self.n_div(one, den)
+    }
+
+    dim(self) : i64 => self.n_in
+
+    /// Values of every node for the inputs `x`.
+    node_values(self, x: _) {
+        vals = []
+        n = host.sys_arr_len(self.ops)
+        k = 0
+        while k < n {
+            op = self.ops[k]
+            y = 0.0
+            if op == AD_INPUT {
+                y = x[self.a[k]]
+            } else {
+                if op == AD_CONST {
+                    y = self.c[k]
+                } else {
+                    if ad_is_binary(op) {
+                        y = ad_apply2(op, vals[self.a[k]], vals[self.b[k]])
+                    } else {
+                        y = ad_apply1(op, vals[self.a[k]], self.c[k])
+                    }
+                }
+            }
+            vals = host.sys_arr_push(vals, y)
+            k += 1
+        }
+        vals
+    }
+
+    /// Every output for the inputs `x`.
+    values(self, x: _) {
+        vals = self.node_values(x)
+        out = []
+        for self.outs { out = host.sys_arr_push(out, vals[it]) }
+        out
+    }
+
+    /// The first output for the inputs `x`.
+    value(self, x: _) : f64 {
+        ensure host.sys_arr_len(self.outs) > 0 else { return 0.0 }
+        vals = self.node_values(x)
+        vals[self.outs[0]]
+    }
+
+    /// Forward mode (dual numbers): tangent of every output for input tangent `t`.
+    jvp(self, x: _, t: _) {
+        vals = self.node_values(x)
+        tans = []
+        n = host.sys_arr_len(self.ops)
+        k = 0
+        while k < n {
+            op = self.ops[k]
+            tk = 0.0
+            if op == AD_INPUT {
+                tk = t[self.a[k]]
+            } else {
+                if op != AD_CONST {
+                    ia = self.a[k]
+                    if ad_is_binary(op) {
+                        ib = self.b[k]
+                        tk = ad_bin_da(op, vals[ia], vals[ib]) * tans[ia] + ad_bin_db(op, vals[ia], vals[ib], vals[k]) * tans[ib]
+                    } else {
+                        tk = ad_d1(op, vals[ia], vals[k], self.c[k]) * tans[ia]
+                    }
+                }
+            }
+            tans = host.sys_arr_push(tans, tk)
+            k += 1
+        }
+        out = []
+        for self.outs { out = host.sys_arr_push(out, tans[it]) }
+        out
+    }
+
+    /// Directional derivative of the first output along `t`.
+    jvp1(self, x: _, t: _) : f64 {
+        r = self.jvp(x, t)
+        ensure host.sys_arr_len(r) > 0 else { return 0.0 }
+        r[0]
+    }
+
+    /// Unit vector of length `n_in` with a 1 at `k`.
+    unit(self, k: i64) {
+        e = []
+        i = 0
+        while i < self.n_in {
+            s = 0.0
+            if i == k { s = 1.0 }
+            e = host.sys_arr_push(e, s)
+            i += 1
+        }
+        e
+    }
+
+    /// Gradient of the first output by `n_in` forward-mode passes.
+    grad_forward(self, x: _) {
+        g = []
+        k = 0
+        while k < self.n_in {
+            g = host.sys_arr_push(g, self.jvp1(x, self.unit(k)))
+            k += 1
+        }
+        g
+    }
+
+    /// Reverse mode: `w`-weighted sum of the output adjoints pulled back to the inputs (vector-Jacobian product).
+    vjp(self, x: _, w: _) {
+        vals = self.node_values(x)
+        n = host.sys_arr_len(self.ops)
+        adj = host.sys_arr_new(n, 0.0)
+        j = 0
+        while j < host.sys_arr_len(self.outs) {
+            o = self.outs[j]
+            adj = host.sys_arr_set(adj, o, adj[o] + w[j])
+            j += 1
+        }
+        grad = host.sys_arr_new(self.n_in, 0.0)
+        k = n - 1
+        while k >= 0 {
+            g = adj[k]
+            op = self.ops[k]
+            if op == AD_INPUT {
+                slot = self.a[k]
+                grad = host.sys_arr_set(grad, slot, grad[slot] + g)
+            } else {
+                if op != AD_CONST {
+                    ia = self.a[k]
+                    if ad_is_binary(op) {
+                        ib = self.b[k]
+                        adj = host.sys_arr_set(adj, ia, adj[ia] + g * ad_bin_da(op, vals[ia], vals[ib]))
+                        adj = host.sys_arr_set(adj, ib, adj[ib] + g * ad_bin_db(op, vals[ia], vals[ib], vals[k]))
+                    } else {
+                        adj = host.sys_arr_set(adj, ia, adj[ia] + g * ad_d1(op, vals[ia], vals[k], self.c[k]))
+                    }
+                }
+            }
+            k -= 1
+        }
+        grad
+    }
+
+    /// Gradient of the first output (reverse mode, one backward sweep).
+    grad(self, x: _) {
+        self.vjp(x, [1.0])
+    }
+
+    /// Jacobian of all outputs, row-major `n_out x n_in`, by forward mode.
+    jacobian(self, x: _) {
+        m = host.sys_arr_len(self.outs)
+        cols = []
+        k = 0
+        while k < self.n_in {
+            cols = host.sys_arr_push(cols, self.jvp(x, self.unit(k)))
+            k += 1
+        }
+        out = []
+        r = 0
+        while r < m {
+            c = 0
+            while c < self.n_in {
+                col = cols[c]
+                out = host.sys_arr_push(out, col[r])
+                c += 1
+            }
+            r += 1
+        }
+        out
+    }
+
+    /// Hyper-dual pass: the `e12` of the first output with seeds along inputs `i` and `j` is `H[i][j]`.
+    hyper_pass(self, x: _, i: i64, j: i64) : f64 {
+        n = host.sys_arr_len(self.ops)
+        hs = []
+        k = 0
+        while k < n {
+            op = self.ops[k]
+            h = HyperDual64.{f: 0.0, e1: 0.0, e2: 0.0, e12: 0.0}
+            if op == AD_INPUT {
+                slot = self.a[k]
+                s1 = 0.0
+                s2 = 0.0
+                if slot == i { s1 = 1.0 }
+                if slot == j { s2 = 1.0 }
+                h = HyperDual64.{f: x[slot], e1: s1, e2: s2, e12: 0.0}
+            } else {
+                if op == AD_CONST {
+                    h = HyperDual64.{f: self.c[k], e1: 0.0, e2: 0.0, e12: 0.0}
+                } else {
+                    p: HyperDual64 = hs[self.a[k]]
+                    if ad_is_binary(op) {
+                        q: HyperDual64 = hs[self.b[k]]
+                        if op == AD_ADD { h = p.add(q) }
+                        if op == AD_SUB { h = p.sub(q) }
+                        if op == AD_MUL { h = p.mul(q) }
+                        if op == AD_DIV { h = p.div(q) }
+                        if op == AD_MAX {
+                            if p.f >= q.f { h = p } else { h = q }
+                        }
+                        if op == AD_MIN {
+                            if p.f <= q.f { h = p } else { h = q }
+                        }
+                    } else {
+                        h = p.apply(op, self.c[k])
+                    }
+                }
+            }
+            hs = host.sys_arr_push(hs, h)
+            k += 1
+        }
+        ensure host.sys_arr_len(self.outs) > 0 else { return 0.0 }
+        r: HyperDual64 = hs[self.outs[0]]
+        r.e12
+    }
+
+    /// Hessian of the first output, row-major `n_in x n_in`.
+    hessian(self, x: _) {
+        n = self.n_in
+        h = host.sys_arr_new(n * n, 0.0)
+        i = 0
+        while i < n {
+            j = i
+            while j < n {
+                v = self.hyper_pass(x, i, j)
+                h = host.sys_arr_set(h, i * n + j, v)
+                h = host.sys_arr_set(h, j * n + i, v)
+                j += 1
+            }
+            i += 1
+        }
+        h
+    }
+}
+
+/// An empty tape (same as `ReverseTape.new()`).
++tape_new() : ReverseTape => ReverseTape.new()
+
+/// Tape for `f(x) = sum_i coeffs[i] x^i` (one input, one output), Horner form.
++tape_poly(coeffs: _) : ReverseTape {
+    t = ReverseTape.new()
+    x = @t.input()
+    n = host.sys_arr_len(coeffs)
+    acc = @t.konst(0.0)
+    i = n - 1
+    while i >= 0 {
+        acc = @t.n_mul(acc, x)
+        acc = @t.n_addc(acc, coeffs[i])
+        i -= 1
+    }
+    @t.out(acc)
+    t
+}
+
+/// Tape for `f(x) = sum_i (x_i - center[i])^2` over `n` inputs.
++tape_sphere(center: _) : ReverseTape {
+    t = ReverseTape.new()
+    n = host.sys_arr_len(center)
+    acc = @t.konst(0.0)
+    i = 0
+    while i < n {
+        xi = @t.input()
+        d = @t.n_addc(xi, -center[i])
+        sq = @t.n_square(d)
+        acc = @t.n_add(acc, sq)
+        i += 1
+    }
+    @t.out(acc)
+    t
+}
+
+/// Tape for the `n`-dimensional Rosenbrock function `sum 100 (x_{i+1} - x_i^2)^2 + (1 - x_i)^2`.
++tape_rosenbrock(n: i64) : ReverseTape {
+    t = ReverseTape.new()
+    xs = []
+    i = 0
+    while i < n {
+        xs = host.sys_arr_push(xs, @t.input())
+        i += 1
+    }
+    acc = @t.konst(0.0)
+    i = 0
+    while i + 1 < n {
+        x0 = xs[i]
+        x1 = xs[i + 1]
+        sq = @t.n_square(x0)
+        diff = @t.n_sub(x1, sq)
+        term1 = @t.n_square(diff)
+        term1 = @t.n_mulc(term1, 100.0)
+        one_minus = @t.n_mulc(x0, -1.0)
+        one_minus = @t.n_addc(one_minus, 1.0)
+        term2 = @t.n_square(one_minus)
+        acc = @t.n_add(acc, term1)
+        acc = @t.n_add(acc, term2)
+        i += 1
+    }
+    @t.out(acc)
+    t
+}
+
+// --- tests -------------------------------------------------------------------------------------------
+
+/// Test the Dual64 arithmetic and elementary rules against closed forms.
+test "Dual64 rules" {
+    x = dual_var(1.5)
+    y = x.sin().mul(x.square())
+    // f = x^2 sin x, f' = 2x sin x + x^2 cos x
+    #assert(ad_close(y.v, 2.25 * host.sys_sin(1.5), 1.0e-14))
+    #assert(ad_close(y.d, 3.0 * host.sys_sin(1.5) + 2.25 * host.sys_cos(1.5), 1.0e-14))
+    q = x.div(x.square().shift(1.0))
+    #assert(ad_close(q.d, (1.0 - 2.25) / ((1.0 + 2.25) * (1.0 + 2.25)), 1.0e-14))
+    s = x + dual_const(2.0)
+    #assert(ad_close(s.v, 3.5, 1.0e-15))
+    #assert(ad_close(s.d, 1.0, 1.0e-15))
+    m = x * x
+    #assert(ad_close(m.d, 3.0, 1.0e-15))
+    n = -x
+    #assert(ad_close(n.d, -1.0, 1.0e-15))
+    z = x - x
+    #assert(ad_close(z.v, 0.0, 1.0e-15))
+    #assert(ad_close(x.exp().d, host.sys_exp(1.5), 1.0e-14))
+    #assert(ad_close(x.ln().d, 1.0 / 1.5, 1.0e-14))
+    #assert(ad_close(x.sqrt().d, 0.5 / host.sys_sqrt(1.5), 1.0e-14))
+    #assert(ad_close(x.tan().d, 1.0 + host.sys_tan(1.5) * host.sys_tan(1.5), 1.0e-13))
+    #assert(ad_close(x.tanh().d, 1.0 - host.sys_tanh(1.5) * host.sys_tanh(1.5), 1.0e-14))
+    #assert(ad_close(x.atan().d, 1.0 / (1.0 + 2.25), 1.0e-14))
+    #assert(ad_close(x.sinh().d, host.sys_cosh(1.5), 1.0e-14))
+    #assert(ad_close(x.cosh().d, host.sys_sinh(1.5), 1.0e-14))
+    #assert(ad_close(x.abs().d, 1.0, 1.0e-15))
+    #assert(ad_close(dual_var(-2.0).abs().d, -1.0, 1.0e-15))
+    #assert(ad_close(x.pow(3.0).d, 3.0 * 2.25, 1.0e-14))
+    #assert(ad_close(x.erf().d, 1.1283791670955126 * host.sys_exp(-2.25), 1.0e-13))
+    #assert(ad_close(x.recip().d, -1.0 / 2.25, 1.0e-14))
+    // x^x: d/dx = x^x (ln x + 1)
+    xx = x.powd(x)
+    #assert(ad_close(xx.d, host.sys_pow(1.5, 1.5) * (host.sys_ln(1.5) + 1.0), 1.0e-13))
+    #assert(ad_close(x.scale(4.0).d, 4.0, 1.0e-15))
+    txt = "{x}"
+    assert_eq(txt, "1.5 + 1e")
+    d = dual(2.0, 3.0)
+    #assert(ad_close(d.v + d.d, 5.0, 1.0e-15))
+}
+
+/// Test dual derivative against central finite differences for a composite function.
+test "Dual64 matches finite differences" {
+    xs = [0.3, 0.9, 1.4, 2.2]
+    for xs {
+        h = 0.000001
+        fp = ad_sample_dual(dual_const(it + h)).v
+        fm = ad_sample_dual(dual_const(it - h)).v
+        fd = (fp - fm) / (2.0 * h)
+        ad = ad_sample_dual(dual_var(it)).d
+        #assert(ad_close(ad, fd, 1.0e-6))
+    }
+}
+
+/// Test hyper-dual second derivatives.
+test "HyperDual64 second derivatives" {
+    h = hyper_var2(1.5)
+    #assert(ad_close(h.exp().e12, host.sys_exp(1.5), 1.0e-14))
+    #assert(ad_close(h.sin().e12, -host.sys_sin(1.5), 1.0e-14))
+    #assert(ad_close(h.cos().e12, -host.sys_cos(1.5), 1.0e-14))
+    #assert(ad_close(h.ln().e12, -1.0 / 2.25, 1.0e-14))
+    #assert(ad_close(h.sqrt().e12, -0.25 / (1.5 * host.sys_sqrt(1.5)), 1.0e-14))
+    #assert(ad_close(h.pow(4.0).e12, 12.0 * 2.25, 1.0e-13))
+    #assert(ad_close(h.tanh().e12, -2.0 * host.sys_tanh(1.5) * (1.0 - host.sys_tanh(1.5) * host.sys_tanh(1.5)), 1.0e-14))
+    // (x^3)'' = 6x via products
+    c = h.mul(h).mul(h)
+    #assert(ad_close(c.e12, 9.0, 1.0e-14))
+    #assert(ad_close(c.e1, 3.0 * 2.25, 1.0e-14))
+    // (1/x)'' = 2 / x^3, also through division
+    r = hyper_const(1.0).div(h)
+    #assert(ad_close(r.e12, 2.0 / 3.375, 1.0e-14))
+    // mixed partial of f(x, y) = x^2 y^3 at (2, 3): f_xy = 6 x y^2 = 108
+    x = hyper(2.0, 1.0, 0.0, 0.0)
+    y = hyper(3.0, 0.0, 1.0, 0.0)
+    f = x.square().mul(y.mul(y).mul(y))
+    #assert(ad_close(f.e12, 108.0, 1.0e-13))
+    s = h + h - h
+    #assert(ad_close(s.f, 1.5, 1.0e-15))
+    n = -h
+    #assert(ad_close(n.e1, -1.0, 1.0e-15))
+    k = h.scale(2.0).shift(1.0)
+    #assert(ad_close(k.f, 4.0, 1.0e-15))
+    hc = hyper_const(2.0)
+    txt = "{hc}"
+    assert_eq(txt, "2 + 0e1 + 0e2 + 0e12")
+}
+
+/// Test DualVec helpers.
+test "DualVec dot norm and conversion" {
+    a = DualVec.seed([3.0, 4.0], 0)
+    b = DualVec.constant([1.0, 2.0])
+    d = a.dot(b)
+    #assert(ad_close(d.v, 11.0, 1.0e-15))
+    #assert(ad_close(d.d, 1.0, 1.0e-15))
+    n = a.norm()
+    #assert(ad_close(n.v, 5.0, 1.0e-14))
+    #assert(ad_close(n.d, 3.0 / 5.0, 1.0e-14))
+    s = a + b
+    #assert(ad_close(s.v[1], 6.0, 1.0e-15))
+    #assert(ad_close(s.d[0], 1.0, 1.0e-15))
+    t = a - b
+    #assert(ad_close(t.v[0], 2.0, 1.0e-15))
+    k = a.scale(2.0)
+    #assert(ad_close(k.d[0], 2.0, 1.0e-15))
+    assert_eq(a.len(), 2)
+    e = a.at(1)
+    #assert(ad_close(e.v, 4.0, 1.0e-15))
+    #assert(ad_close(e.d, 0.0, 1.0e-15))
+    arr = dualvec_to(a)
+    assert_eq(host.sys_arr_len(arr), 2)
+    back = dualvec_from(arr)
+    #assert(ad_close(back.v[0], 3.0, 1.0e-15))
+    #assert(ad_close(back.d[0], 1.0, 1.0e-15))
+    dv = dualvec([1.0, 2.0], [0.5, 0.25])
+    #assert(ad_close(dv.norm2().d, 2.0 * (1.0 * 0.5 + 2.0 * 0.25), 1.0e-14))
+}
+
+/// Test tape evaluation, forward and reverse derivatives on f(a, b) = sin(a b) + a^2.
+test "ReverseTape grad jvp and jacobian" {
+    t = ReverseTape.new()
+    a = @t.input()
+    b = @t.input()
+    p = @t.n_mul(a, b)
+    q = @t.n_sin(p)
+    r = @t.n_square(a)
+    f = @t.n_add(q, r)
+    @t.out(f)
+    x = [1.0, 2.0]
+    assert_eq(t.dim(), 2)
+    #assert(t.size() > 4)
+    #assert(ad_close(t.value(x), host.sys_sin(2.0) + 1.0, 1.0e-14))
+    g = t.grad(x)
+    // df/da = b cos(ab) + 2a ; df/db = a cos(ab)
+    #assert(ad_close(g[0], 2.0 * host.sys_cos(2.0) + 2.0, 1.0e-14))
+    #assert(ad_close(g[1], host.sys_cos(2.0), 1.0e-14))
+    gf = t.grad_forward(x)
+    #assert(ad_close(gf[0], g[0], 1.0e-14))
+    #assert(ad_close(gf[1], g[1], 1.0e-14))
+    jv = t.jvp(x, [1.0, 1.0])
+    #assert(ad_close(jv[0], g[0] + g[1], 1.0e-14))
+    #assert(ad_close(t.jvp1(x, [0.0, 2.0]), 2.0 * g[1], 1.0e-14))
+    jac = t.jacobian(x)
+    assert_eq(host.sys_arr_len(jac), 2)
+    #assert(ad_close(jac[1], g[1], 1.0e-14))
+    vals = t.values(x)
+    assert_eq(host.sys_arr_len(vals), 1)
+    // Hessian: f_aa = -b^2 sin(ab) + 2, f_ab = cos(ab) - ab sin(ab), f_bb = -a^2 sin(ab)
+    h = t.hessian(x)
+    s2 = host.sys_sin(2.0)
+    #assert(ad_close(h[0], -4.0 * s2 + 2.0, 1.0e-13))
+    #assert(ad_close(h[1], host.sys_cos(2.0) - 2.0 * s2, 1.0e-13))
+    #assert(ad_close(h[2], h[1], 1.0e-15))
+    #assert(ad_close(h[3], -s2, 1.0e-13))
+}
+
+/// Test a multi-output tape: Jacobian, vjp and Hessian-free outputs.
+test "ReverseTape with several outputs" {
+    t = ReverseTape.new()
+    x = @t.input()
+    y = @t.input()
+    s = @t.n_add(x, y)
+    p = @t.n_mul(x, y)
+    e = @t.n_exp(x)
+    @t.out(s)
+    @t.out(p)
+    @t.out(e)
+    pt = [0.5, 3.0]
+    v = t.values(pt)
+    #assert(ad_close(v[0], 3.5, 1.0e-15))
+    #assert(ad_close(v[1], 1.5, 1.0e-15))
+    #assert(ad_close(v[2], host.sys_exp(0.5), 1.0e-14))
+    jac = t.jacobian(pt)
+    assert_eq(host.sys_arr_len(jac), 6)
+    // rows: [1, 1], [y, x], [e^x, 0]
+    #assert(ad_close(jac[0], 1.0, 1.0e-15))
+    #assert(ad_close(jac[2], 3.0, 1.0e-15))
+    #assert(ad_close(jac[3], 0.5, 1.0e-15))
+    #assert(ad_close(jac[4], host.sys_exp(0.5), 1.0e-14))
+    #assert(ad_close(jac[5], 0.0, 1.0e-15))
+    w = t.vjp(pt, [1.0, 2.0, 3.0])
+    // J^T w = [1 + 2*3 + 3 e^x, 1 + 2*0.5]
+    #assert(ad_close(w[0], 1.0 + 6.0 + 3.0 * host.sys_exp(0.5), 1.0e-13))
+    #assert(ad_close(w[1], 2.0, 1.0e-14))
+}
+
+/// Test every unary tape op against its Dual64 rule and a finite difference.
+test "tape unary ops match finite differences" {
+    ops = [AD_SIN, AD_COS, AD_TAN, AD_EXP, AD_LN, AD_SQRT, AD_ABS, AD_TANH, AD_ATAN, AD_SINH, AD_COSH, AD_ERF, AD_NEG]
+    for ops {
+        op = it
+        t = ReverseTape.new()
+        x = @t.input()
+        y = @t.push_node(op, x, -1, 0.0)
+        @t.out(y)
+        x0 = 0.7
+        g = t.grad([x0])
+        h = 0.000001
+        fd = (t.value([x0 + h]) - t.value([x0 - h])) / (2.0 * h)
+        #assert(ad_close(g[0], fd, 1.0e-6))
+        hess = t.hessian([x0])
+        fd2 = (t.grad([x0 + h])[0] - t.grad([x0 - h])[0]) / (2.0 * h)
+        #assert(ad_close(hess[0], fd2, 1.0e-5))
+    }
+    // constant exponent and binary ops
+    t = ReverseTape.new()
+    x = @t.input()
+    y = @t.input()
+    p = @t.n_pow(x, 2.5)
+    q = @t.n_div(p, y)
+    m = @t.n_max(q, x)
+    n = @t.n_min(m, y)
+    @t.out(n)
+    pt = [1.3, 0.9]
+    g = t.grad(pt)
+    gf = t.grad_forward(pt)
+    #assert(ad_close(g[0], gf[0], 1.0e-13))
+    #assert(ad_close(g[1], gf[1], 1.0e-13))
+    h = 0.000001
+    fd0 = (t.value([1.3 + h, 0.9]) - t.value([1.3 - h, 0.9])) / (2.0 * h)
+    #assert(ad_close(g[0], fd0, 1.0e-6))
+}
+
+/// Test the prebuilt tapes.
+test "tape_poly tape_sphere tape_rosenbrock" {
+    p = tape_poly([1.0, -3.0, 0.0, 2.0])
+    #assert(ad_close(p.value([2.0]), 1.0 - 6.0 + 16.0, 1.0e-14))
+    #assert(ad_close(p.grad([2.0])[0], -3.0 + 6.0 * 4.0, 1.0e-13))
+    #assert(ad_close(p.hessian([2.0])[0], 12.0 * 2.0, 1.0e-13))
+    s = tape_sphere([1.0, -2.0])
+    #assert(ad_close(s.value([1.0, -2.0]), 0.0, 1.0e-15))
+    #assert(ad_close(s.value([2.0, 0.0]), 1.0 + 4.0, 1.0e-14))
+    sg = s.grad([3.0, 1.0])
+    #assert(ad_close(sg[0], 4.0, 1.0e-14))
+    #assert(ad_close(sg[1], 6.0, 1.0e-14))
+    r = tape_rosenbrock(2)
+    #assert(ad_close(r.value([1.0, 1.0]), 0.0, 1.0e-15))
+    #assert(ad_close(r.value([0.0, 0.0]), 1.0, 1.0e-15))
+    rg = r.grad([-1.2, 1.0])
+    // f_x = -400 x (y - x^2) - 2 (1 - x), f_y = 200 (y - x^2)
+    #assert(ad_close(rg[0], -400.0 * -1.2 * (1.0 - 1.44) - 2.0 * (1.0 + 1.2), 1.0e-12))
+    #assert(ad_close(rg[1], 200.0 * (1.0 - 1.44), 1.0e-12))
+    rh = r.hessian([1.0, 1.0])
+    #assert(ad_close(rh[0], 802.0, 1.0e-12))
+    #assert(ad_close(rh[1], -400.0, 1.0e-12))
+    #assert(ad_close(rh[3], 200.0, 1.0e-12))
+    r4 = tape_rosenbrock(4)
+    #assert(ad_close(r4.value([1.0, 1.0, 1.0, 1.0]), 0.0, 1.0e-15))
+    assert_eq(host.sys_arr_len(r4.grad([0.0, 0.0, 0.0, 0.0])), 4)
+}
+
+/// Test sigmoid and erf nodes and the Differentiable witness.
+test "sigmoid erf and Differentiable" {
+    t = ReverseTape.new()
+    x = @t.input()
+    y = @t.n_sigmoid(x)
+    @t.out(y)
+    s = t.value([0.0])
+    #assert(ad_close(s, 0.5, 1.0e-15))
+    g = t.grad([0.0])
+    #assert(ad_close(g[0], 0.25, 1.0e-14))
+    #assert(ad_close(t.value([2.0]), 1.0 / (1.0 + host.sys_exp(-2.0)), 1.0e-14))
+    e = ReverseTape.new()
+    ex = @e.input()
+    ey = @e.n_erf(ex)
+    @e.out(ey)
+    #assert(ad_close(e.value([0.5]), 0.5204998778130465, 1.0e-13))
+    #assert(ad_close(e.grad([0.5])[0], 1.1283791670955126 * host.sys_exp(-0.25), 1.0e-13))
+    empty = ReverseTape.new()
+    assert_eq(empty.value([]), 0.0)
+    assert_eq(empty.dim(), 0)
+}

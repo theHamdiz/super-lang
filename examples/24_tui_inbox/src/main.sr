@@ -1,0 +1,79 @@
+// TUI — an inbox. A note knows its title; the screen asks the note.
+//
+// Run: super test examples/24_tui_inbox/
+
+use std.tui
+use std.sys.time
+
++Note = {
+    who: str
+    subject: str
+    body: str
+
+    title(self) : str => "{self.who}  {self.subject}"
+
+    preview(self) : str => self.body
+}
+
++Inbox = {
+    selected: i64 = 1
+
+    frame(self) : str {
+        ink = theme("accent")
+        view = Screen.new(52, 16)
+        @view.clear(7, 0)
+        @view.block(Rect.new(0, 0, 52, 16), " inbox ")
+        @view.tabs(Rect.new(2, 1, 46, 1), ["All", "Flagged", "Sent"], 0)
+        first = Note{who: "Noor", subject: "Ship notes", body: "The tag is canary-1.4.0."}
+        second = Note{who: "Amina", subject: "Ledger", body: "Discount the studio account by ten percent."}
+        third = Note{who: "Bo", subject: "Ops", body: "Worker lag is the one to watch."}
+        @view.list(Rect.new(2, 3, 46, 3), [first.title(), second.title(), third.title()], self.selected)
+        open = second
+        if self.selected == 0 { open = first }
+        if self.selected == 2 { open = third }
+        @view.align_in(Rect.new(2, 7, 46, 1), open.title(), "start", ink.fg, 0)
+        @view.words(Rect.new(2, 9, 44, 4), open.preview(), 7)
+        @view.scrollbar(Rect.new(50, 3, 1, 8), self.selected, 3, 8)
+        view.plain()
+    }
+}
+
++main() {
+    box = Inbox{selected: 1}
+    term = Term.open()
+    if term.raw == false {
+        print(box.frame())
+        return
+    }
+    quit = false
+    while quit == false {
+        term.write("\x1b[H")
+        term.write(box.frame())
+        key = term.poll()
+        if key.kind == "up" || key.ch == "k" {
+            if box.selected > 0 { box.selected = box.selected - 1 }
+        }
+        if key.kind == "down" || key.ch == "j" {
+            if box.selected < 2 { box.selected = box.selected + 1 }
+        }
+        if key.kind == "esc" || key.ch == "q" { quit = true }
+        if key.kind == "ctrl" && key.ch == "c" { quit = true }
+        if quit == false { sleep_ms(40) }
+    }
+    @term.close()
+}
+
+test "a note builds its own title" {
+    note = Note{who: "Amina", subject: "Ledger", body: "Discount the studio account by ten percent."}
+    assert_eq(note.title(), "Amina  Ledger")
+    assert_eq(note.preview(), "Discount the studio account by ten percent.")
+}
+
+test "the inbox shows the selected note" {
+    box = Inbox{selected: 1}
+    text = box.frame()
+    #assert(contains(text, "inbox"))
+    #assert(contains(text, "All"))
+    #assert(contains(text, "Amina  Ledger"))
+    #assert(contains(text, "ten percent"))
+}

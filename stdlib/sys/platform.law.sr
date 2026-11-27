@@ -1,0 +1,12 @@
+//! Laws for std.sys.platform.
+
+#law("readiness backend is selected")
+platform_backend_selected() {
+    #assert(readiness_backend() != "")
+}
+
+#law("has_io_uring matches readiness probe")
+platform_uring_matches_readiness() {
+    r = readiness_backend()
+    if r == "io_uring" { #assert(has_io_uring()) }
+}

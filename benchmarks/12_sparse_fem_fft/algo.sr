@@ -1,0 +1,222 @@
+// 12_sparse_fem_fft — 128×128 reaction-Poisson CSR, Jacobi-PCG ×20, 2D FFT low-pass bank.
+// inline matvec/dot + radix-2 FFT with precomputed twiddles (LAW-BENCH-001: no `host`).
+use std.math.core
+
++G = 128
++N = 16384
++ITERS = 20
++PI = 3.141592653589793
++NZMAX = 5 * N
+
+build_system(@indptr, @indices, @values, @diag) {
+    nz = 0
+    indptr[0] = 0
+    for i in 0..N {
+        row, col = i / G, i % G
+        d = 4.0 + (i * 37 % 11) * 0.25
+        diag[i] = d
+        if row > 0 {
+            indices[nz], values[nz] = i - G, 0.0 - 1.0
+            nz += 1
+        }
+        if col > 0 {
+            indices[nz], values[nz] = i - 1, 0.0 - 1.0
+            nz += 1
+        }
+        indices[nz], values[nz] = i, d
+        nz += 1
+        if col < G - 1 {
+            indices[nz], values[nz] = i + 1, 0.0 - 1.0
+            nz += 1
+        }
+        if row < G - 1 {
+            indices[nz], values[nz] = i + G, 0.0 - 1.0
+            nz += 1
+        }
+        indptr[i + 1] = nz
+    }
+}
+
+matvec(indptr, indices, values, x, @out) {
+    for r in 0..N {
+        s = 0.0
+        k = indptr[r]
+        while k < indptr[r + 1] {
+            s += values[k] * x[indices[k]]
+            k += 1
+        }
+        out[r] = s
+    }
+}
+
+dot(a, b) : f64 {
+    s = 0.0
+    for i in 0..N { s += a[i] * b[i] }
+    s
+}
+
+pcg(indptr, indices, values, diag, b, @x, @r, @z, @p, @ap) : f64 {
+    for i in 0..N {
+        x[i] = 0.0
+        r[i] = b[i]
+        z[i] = r[i] / diag[i]
+        p[i] = z[i]
+    }
+    rz = dot(r, z)
+    for 0..ITERS {
+        matvec(indptr, indices, values, p, @ap)
+        alpha = rz / dot(p, ap)
+        for i in 0..N {
+            x[i] += alpha * p[i]
+            r[i] -= alpha * ap[i]
+            z[i] = r[i] / diag[i]
+        }
+        rz_new = dot(r, z)
+        beta = rz_new / rz
+        for i in 0..N { p[i] = z[i] + beta * p[i] }
+        rz = rz_new
+    }
+    dot(r, r)
+}
+
+init_fft(@bitrev, @twr, @twi) {
+    for i in 0..G {
+        rv, v = 0, i
+        for 0..7 {
+            rv = (rv << 1) | (v & 1)
+            v = v >> 1
+        }
+        bitrev[i] = rv
+    }
+    span, lvl = 2, 0
+    while span <= G {
+        ang = 0.0 - 2.0 * PI / span
+        half = span / 2
+        for k in 0..half {
+            t = ang * k
+            twr[lvl * (G / 2) + k] = cos(t)
+            twi[lvl * (G / 2) + k] = sin(t)
+        }
+        span = span * 2
+        lvl += 1
+    }
+}
+
+fft1(@re, @im, inv: bool, bitrev, twr, twi, @tre, @tim) {
+    if inv {
+        for i in 0..G { im[i] = 0.0 - im[i] }
+    }
+    for i in 0..G {
+        s = bitrev[i]
+        tre[i] = re[s]
+        tim[i] = im[s]
+    }
+    span, lvl = 2, 0
+    while span <= G {
+        half = span / 2
+        start = 0
+        while start < G {
+            for k in 0..half {
+                wr = twr[lvl * (G / 2) + k]
+                wi = twi[lvl * (G / 2) + k]
+                a = start + k
+                b = a + half
+                tr = tre[b] * wr - tim[b] * wi
+                ti = tre[b] * wi + tim[b] * wr
+                tre[b] = tre[a] - tr
+                tim[b] = tim[a] - ti
+                tre[a] = tre[a] + tr
+                tim[a] = tim[a] + ti
+            }
+            start += span
+        }
+        span = span * 2
+        lvl += 1
+    }
+    if inv {
+        s = 1.0 / G
+        for i in 0..G {
+            re[i] = tre[i] * s
+            im[i] = (0.0 - tim[i]) * s
+        }
+    } else {
+        for i in 0..G {
+            re[i] = tre[i]
+            im[i] = tim[i]
+        }
+    }
+}
+
+fft2(@re, @im, inv: bool, bitrev, twr, twi, @lr, @li, @tre, @tim) {
+    for r in 0..G {
+        for c in 0..G {
+            lr[c] = re[r * G + c]
+            li[c] = im[r * G + c]
+        }
+        fft1(@lr, @li, inv, bitrev, twr, twi, @tre, @tim)
+        for c in 0..G {
+            re[r * G + c] = lr[c]
+            im[r * G + c] = li[c]
+        }
+    }
+    for c in 0..G {
+        for r in 0..G {
+            lr[r] = re[r * G + c]
+            li[r] = im[r * G + c]
+        }
+        fft1(@lr, @li, inv, bitrev, twr, twi, @tre, @tim)
+        for r in 0..G {
+            re[r * G + c] = lr[r]
+            im[r * G + c] = li[r]
+        }
+    }
+}
+
++main() {
+    indptr = [0; N + 1]
+    indices = [0; NZMAX]
+    values = [0.0; NZMAX]
+    diag = [0.0; N]
+    build_system(@indptr, @indices, @values, @diag)
+
+    b, x, r, z, p, ap = [0.0; N], [0.0; N], [0.0; N], [0.0; N], [0.0; N], [0.0; N]
+    for i in 0..N { b[i] = ((i * 7 + (i / G) * 13) % 17 - 8) / 8.0 }
+    rr = pcg(indptr, indices, values, diag, b, @x, @r, @z, @p, @ap)
+    res = sqrt(rr)
+
+    bitrev = [0; G]
+    twr = [0.0; 7 * (G / 2)]
+    twi = [0.0; 7 * (G / 2)]
+    init_fft(@bitrev, @twr, @twi)
+
+    sre, sim = [0.0; N], [0.0; N]
+    for i in 0..N { sre[i] = x[i] }
+    lr, li, tre, tim = [0.0; G], [0.0; G], [0.0; G], [0.0; G]
+    fft2(@sre, @sim, false, bitrev, twr, twi, @lr, @li, @tre, @tim)
+
+    cuts = [64, 256, 1024]
+    fre, fim = [0.0; N], [0.0; N]
+    energy, corner = 0.0, 0.0
+    for q in 0..3 {
+        for k in 0..N {
+            fre[k] = sre[k]
+            fim[k] = sim[k]
+        }
+        for k in 0..N {
+            ky, kx = k / G, k % G
+            fy = if ky <= G / 2 { ky } else { G - ky }
+            fx = if kx <= G / 2 { kx } else { G - kx }
+            if fx * fx + fy * fy > cuts[q] {
+                fre[k] = 0.0
+                fim[k] = 0.0
+            }
+        }
+        fft2(@fre, @fim, true, bitrev, twr, twi, @lr, @li, @tre, @tim)
+        for k in 0..N { energy += fre[k] * fre[k] }
+        corner += fre[0] + fre[N / 2 + G / 2] + fre[N - 1]
+    }
+
+    xs = dot(x, x)
+    cs = to_int(floor(sqrt(xs) * 1000000.0)) + to_int(floor(energy * 1000.0)) + to_int(floor(corner * 1000000.0)) + to_int(floor(res * 1000000000.0))
+    print("CHECKSUM={cs}")
+}

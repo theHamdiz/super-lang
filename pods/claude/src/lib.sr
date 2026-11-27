@@ -1,0 +1,148 @@
+//! claude — Anthropic Messages API
+//!
+//!   use claude
+//!   c = Claude.new("sk-ant-…")
+//!   res = @c.chat([ai_user("hi")], "claude-sonnet-4-5")
+//!   res = @c.chat_system("You are terse.", [ai_user("hi")], "claude-sonnet-4-5")
+
+use std.ai.client
+use std.core.str
+
++CLAUDE_BASE = "https://api.anthropic.com"
++CLAUDE_VERSION = "2023-06-01"
+
++Claude = {
+    client: AiClient = AiClient.new("claude", "", "")
+    api_version: str = "2023-06-01"
+
+    new(api_key: str) : Claude {
+        c = AiClient.with_auth("claude", CLAUDE_BASE, api_key, AI_AUTH_X_API_KEY)
+        @c.set_headers(["anthropic-version", CLAUDE_VERSION])
+        Claude.{client: c, api_version: CLAUDE_VERSION}
+    }
+
+    set_offline(@self, on: bool) : bool {
+        c = self.client
+        @c.set_offline(on)
+        self.client = c
+        on
+    }
+
+    set_timeout(@self, ms: i64) : i64 {
+        c = self.client
+        @c.set_timeout(ms)
+        self.client = c
+        ms
+    }
+
+    push_mock(@self, body: str) : i64 {
+        c = self.client
+        n = @c.push_mock(body)
+        self.client = c
+        n
+    }
+
+    -run(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        c = self.client
+        res = @c.request(path, req, body)
+        self.client = c
+        res
+    }
+
+    /// Anthropic Messages JSON (system is a top-level field, not a message role).
+    messages_body(_self, req: AiRequest) : str {
+        msgs = "["
+        ms = req.messages
+        for ms {
+            if index > 0 { msgs = msgs + "," }
+            role = it.role
+            if role == "system" { role = "user" }
+            msgs = msgs + "{\"role\":\"" + role + "\",\"content\":" + ai_json_str(it.content) + "}"
+        }
+        msgs = msgs + "]"
+        body = "{\"model\":" + ai_json_str(req.model) + ",\"max_tokens\":" + "{req.max_tokens}" + ",\"messages\":" + msgs
+        if req.system != "" { body = body + ",\"system\":" + ai_json_str(req.system) }
+        if req.temperature != 1.0 { body = body + ",\"temperature\":" + "{req.temperature}" }
+        if req.stream { body = body + ",\"stream\":true" }
+        tools = req.tools
+        if len(tools) > 0 {
+            body = body + ",\"tools\":["
+            for tools {
+                if index > 0 { body = body + "," }
+                body = body + "{\"name\":" + ai_json_str(it.name)
+                body = body + ",\"description\":" + ai_json_str(it.description)
+                body = body + ",\"input_schema\":" + it.parameters_json + "}"
+            }
+            body = body + "]"
+        }
+        if req.extra_json != "" { body = body + "," + req.extra_json }
+        body + "}"
+    }
+
+    chat_req(@self, req: AiRequest) : AiResponse {
+        body = self.messages_body(req)
+        @self.run("/v1/messages", req, body)
+    }
+
+    chat(@self, messages: _, model: str) : AiResponse {
+        @self.chat_req(ai_chat_req(model, messages, 1024))
+    }
+
+    chat_system(@self, system: str, messages: _, model: str) : AiResponse {
+        req = ai_chat_req(model, messages, 1024)
+        req.system = system
+        @self.chat_req(req)
+    }
+
+    complete(@self, prompt: str, model: str) : AiResponse {
+        @self.chat([ai_user(prompt)], model)
+    }
+
+    chat_tools(@self, messages: _, model: str, tools: _) : AiResponse {
+        req = ai_chat_req(model, messages, 2048)
+        req.tools = tools
+        @self.chat_req(req)
+    }
+
+    /// Vision: user text + image URL as a multimodal content block.
+    chat_image(@self, prompt: str, media_url: str, model: str) : AiResponse {
+        req = ai_chat_req(model, [ai_user(prompt)], 1024)
+        req.media_url = media_url
+        req.modality = AI_CHAT
+        // Anthropic image block via extra_json override of messages is heavy; send as content array.
+        body = "{\"model\":" + ai_json_str(model) + ",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":["
+        body = body + "{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":" + ai_json_str(media_url) + "}},"
+        body = body + "{\"type\":\"text\",\"text\":" + ai_json_str(prompt) + "}]}]}"
+        @self.run("/v1/messages", req, body)
+    }
+}
+
+test "claude messages offline" {
+    c = Claude.new("sk-ant-test")
+    @c.push_mock("{\"content\":[{\"type\":\"text\",\"text\":\"ok-claude\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}")
+    res = @c.chat([ai_user("hi")], "claude-sonnet-4-5")
+    #assert(res.ok)
+    assert_eq(res.text, "ok-claude")
+    #assert(contains(c.client.last_body, "messages"))
+    assert_eq(res.usage_in, 4)
+}
+
+test "claude system and tools in body" {
+    c = Claude.new("k")
+    @c.push_mock("{\"content\":[{\"type\":\"text\",\"text\":\"x\"}]}")
+    _ = @c.chat_system("brief", [ai_user("hi")], "claude-sonnet-4-5")
+    #assert(contains(c.client.last_body, "\"system\":"))
+    tools = [AiTool.{name: "lookup", description: "d", parameters_json: "{\"type\":\"object\"}"}]
+    @c.push_mock("{\"content\":[{\"type\":\"text\",\"text\":\"y\"}]}")
+    _ = @c.chat_tools([ai_user("go")], "claude-sonnet-4-5", tools)
+    #assert(contains(c.client.last_body, "input_schema"))
+}
+
+test "claude auth uses x-api-key" {
+    c = Claude.new("sk-ant")
+    hs = c.client.auth_headers()
+    joined = ""
+    for hs { joined = joined + it + "|" }
+    #assert(contains(joined, "x-api-key"))
+    #assert(contains(joined, "anthropic-version"))
+}

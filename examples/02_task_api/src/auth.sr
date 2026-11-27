@@ -1,0 +1,42 @@
++AuthToken = {
+    user_id: i64
+    token: str
+}
+
++authenticate(user: str, pass: str) : AuthToken! {
+    ensure user != "" else {
+        fail "empty user"
+        return
+    }
+    ensure pass != "" else {
+        fail "empty pass"
+        return
+    }
+    AuthToken.{user_id: 1, token: "tok_demo"}
+}
+
++require_token(token: str) : i64! {
+    ensure token != "" else {
+        fail "missing token"
+        return
+    }
+    1
+}
+
+test "authenticate ok" {
+    t = authenticate("amina", "secret") or .{user_id: 0, token: ""}
+    // Destructuring binding refinement
+    {user_id, token} = t
+    assert_eq(user_id, 1)
+    assert_eq(token, "tok_demo")
+}
+
+test "require_token rejects empty" {
+    v = require_token("") or 0
+    assert_eq(v, 0)
+}
+
+test "require_token accepts" {
+    v = require_token("tok") or 0
+    assert_eq(v, 1)
+}

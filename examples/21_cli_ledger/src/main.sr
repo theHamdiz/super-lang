@@ -1,0 +1,94 @@
+// CLI — a ledger you talk to through methods on the account and the book.
+//
+// Run: super test examples/21_cli_ledger/
+
+use std.cli.cmd
+use std.core.collections
+use std.diag.log
+
++Account = {
+    name: str
+    balance: f64 = 0.0
+
+    open(name: str, balance: f64) : Account => Account.{name, balance}
+
+    deposit(@self, amount: f64) : f64 {
+        self.balance += amount
+        self.balance
+    }
+
+    discount(@self, percent: f64) : f64 {
+        self.balance -= self.balance * percent / 100.0
+        self.balance
+    }
+
+    line(self) : str => "{self.name}  {self.balance}"
+}
+
++Ledger = {
+    title: str
+
+    command(self) : Command {
+        cmd = Command.new("ledger")
+        cmd = cmd.about(self.title)
+        cmd = cmd.version("1.0")
+        cmd = cmd.author("Super")
+        cmd = cmd.flag("verbose", "v", "prefix the book title")
+        cmd = cmd.opt("percent", "p", "PCT", "10", "discount percent", false)
+        cmd = cmd.as_float()
+        cmd = cmd.pos("name", false, "account name")
+        cmd = cmd.after_help("Balances live on the stack. The command only prints.")
+        cmd
+    }
+
+    apply(self, argv: _) : str {
+        cmd = self.command()
+        m = cmd.parse(argv) or err { return "ledger: bad args" }
+        pct = m.get_float("percent", 10.0)
+        name = m.pos(0, "Amina")
+        acct = Account.open(name, 200.0)
+        @acct.deposit(50.0)
+        @acct.discount(pct)
+        shown = acct.line()
+        if m.flag("verbose") {
+            return "{self.title}: {shown} after {pct}%"
+        }
+        "{shown} after {pct}%"
+    }
+}
+
++main() {
+    lg = Logger.console("ledger")
+    book = Ledger{title: "Studio books"}
+    argv = cli_args()
+    rest = []
+    n = len(argv)
+    for 1..n { rest = arr_push(rest, argv[it]) }
+    if len(rest) == 0 || rest[0] == "-h" || rest[0] == "--help" {
+        @lg.info(book.command().help())
+        return
+    }
+    @lg.info(book.apply(rest))
+}
+
+test "discount is a method on the account" {
+    acct = Account.open("Amina", 200.0)
+    assert_eq(@acct.deposit(50.0), 250.0)
+    assert_eq(@acct.discount(10.0), 225.0)
+    assert_eq(acct.line(), "Amina  225")
+}
+
+test "the ledger command applies the discount" {
+    book = Ledger{title: "Studio books"}
+    assert_eq(book.apply([]), "Amina  225 after 10%")
+    assert_eq(book.apply(["--percent", "20", "Noor"]), "Noor  200 after 20%")
+    assert_eq(book.apply(["-v", "Bo"]), "Studio books: Bo  225 after 10%")
+}
+
+test "help names the command, the option, and the epilogue" {
+    book = Ledger{title: "Studio books"}
+    text = book.command().help()
+    #assert(contains(text, "Usage: ledger"))
+    #assert(contains(text, "--percent"))
+    #assert(contains(text, "Balances live on the stack"))
+}

@@ -1,0 +1,87 @@
+// Authoritative multiplayer simulation skeleton with a fixed 60 Hz timestep.
+
+use std.math.core
+
++PLAYER_CAPACITY = 32
++SERVER_FRAMES = 120
++TICK_DT = 1.0 / 60.0
++MAX_CATCHUP_TICKS = 8
+
+// The single-element array is mutable accumulator state.
++accumulate_ticks(@clock, frame_dt: f64) : i64 {
+    clock[0] += frame_dt
+    ticks = 0
+    for 0..MAX_CATCHUP_TICKS {
+        if clock[0] >= TICK_DT {
+            clock[0] -= TICK_DT
+            ticks += 1
+        }
+    }
+    ticks
+}
+
++simulate_tick(@x, @y, vx, vy) {
+    for 0..PLAYER_CAPACITY {
+        x[it] += vx[it] * TICK_DT
+        y[it] += vy[it] * TICK_DT
+    }
+}
+
+// Represents the compact checksum an actual WebSocket broadcaster would enqueue.
++broadcast_checksum(tick: i64, x, y) : i64 {
+    checksum = tick * 97
+    for 0..PLAYER_CAPACITY {
+        checksum += (x[it] * 1000.0).to_int()
+        checksum += (y[it] * 1000.0).to_int() * 3
+    }
+    checksum
+}
+
++main() {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    for 0..PLAYER_CAPACITY {
+        x[it] = it * 1.0
+        y[it] = it * 0.5
+        vx[it] = 1.0 + (it % 4) * 0.1
+        vy[it] = -0.25
+    }
+
+    clock = [0.0]
+    tick = 0
+    broadcasts = [0; SERVER_FRAMES]
+    broadcast_count = 0
+    for 0..SERVER_FRAMES {
+        due = accumulate_ticks(@clock, TICK_DT / 2.0)
+        for 0..due {
+            simulate_tick(@x, @y, vx, vy)
+            tick += 1
+            broadcasts[broadcast_count] = broadcast_checksum(tick, x, y)
+            broadcast_count += 1
+        }
+    }
+    checksum = broadcasts[broadcast_count - 1]
+    print("CHECKSUM={checksum}")
+}
+
+test "accumulator preserves partial frame time" {
+    clock = [0.0]
+    assert_eq(accumulate_ticks(@clock, TICK_DT / 2.0), 0)
+    assert_eq(accumulate_ticks(@clock, TICK_DT / 2.0), 1)
+    #assert(clock[0] < TICK_DT)
+}
+
+test "accumulator catches up multiple ticks" {
+    clock = [0.0]
+    assert_eq(accumulate_ticks(@clock, TICK_DT * 3.0), 3)
+    #assert(clock[0] < TICK_DT)
+}
+
+test "tick simulation moves authoritative state" {
+    x, y = [0.0; PLAYER_CAPACITY], [0.0; PLAYER_CAPACITY]
+    vx, vy = [1.0; PLAYER_CAPACITY], [-1.0; PLAYER_CAPACITY]
+    simulate_tick(@x, @y, vx, vy)
+    #assert(x[0] > 0.0)
+    #assert(y[0] < 0.0)
+    #assert(broadcast_checksum(1, x, y) != 0)
+}

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/safety-claims/"/>
+<meta name="description" content="What Super 0.1.0 does and does not verify."/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="Super · Safety claims"/>
+<meta property="og:description" content="What Super 0.1.0 does and does not verify."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/safety-claims/"/>
+<link rel="stylesheet" href="../site.css"/>
+<title>Super · Safety claims</title>
+</head>
+<body>
+<header class="site-nav">
+  <a class="mark" href="../">Super</a>
+  <nav><a href="../">Home</a><a href="../quickstart/">Quickstart</a><a href="../docs-hub/" aria-current="page">Docs</a><a href="../spec/">Spec</a><a href="../benchmarks/">Benchmarks</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a></nav>
+  <a class="cta" href="../quickstart/">Quickstart</a>
+</header>
+<section class="section">
+<h1 id="safety-claims-010">Safety claims (0.1.0)</h1>
+<p>Independent review: <strong>none</strong>. Use the <strong>Security claim review</strong> GitHub issue template to challenge or extend this list.</p>
+<h2 id="claimed-with-evidence-in-tree">Claimed (with evidence in-tree)</h2>
+<div class="table-wrap"><table class="data"><thead><tr><th>Claim</th><th>Where tested / documented</th><th>Not verified</th></tr></thead><tbody><tr><td>Scoped stack references do not escape non-<code>@</code> borrows (E0402)</td><td><code>crates/super-frontend</code> sema lifetime suites</td><td>Formal proof of entire language</td></tr><tr><td><code>@</code> root lifetimes do not escape (E0401)</td><td>Same frontend suites</td><td>All dynamic patterns</td></tr><tr><td>Installer aborts on SHA256 mismatch</td><td><code>install.sh</code> / <code>install.ps1</code> tests, <code>install-security</code> doc</td><td>Supply-chain signing (per-archive attestations partial)</td></tr><tr><td>Stage-1 benchmark checksums frozen</td><td><code>benchmarks/REPRODUCE.md</code>, <code>scripts/check_numbers.py</code></td><td>Statistical significance across hardware</td></tr><tr><td>HTTP route arity checked before serve</td><td><code>examples/00_hello_api</code>, sema tests</td><td>Every host embedding</td></tr><tr><td>AOT hello-server allocation probe (<strong>3 alloc / 0 free</strong> per GET)</td><td><code>crates/super-cli/tests/alloc_probe.rs</code> (Linux)</td><td>Zero-alloc; VM reclaim</td></tr><tr><td>Flat-RSS AOT soak (±1% spread, near-0 slope)</td><td><code>scripts/soak_http.sh</code>, <code>benchmarks-memory/soak_aot_*.csv</code>, <code>docs/ROUND7_REPORT.md</code></td><td>CI tip soak job</td></tr><tr><td>Law mutation ≥70% on priority modules</td><td><code>scripts/mutate.py</code>, <code>docs/law-mutation-report.md</code> (93.5% local)</td><td>Every stdlib module</td></tr><tr><td>gnu + musl release archives byte-identical across two trees</td><td><code>scripts/repro_check.sh</code>, <code>docs/repro-*.txt</code>, <code>docs/REPRODUCE_BUILDS.md</code></td><td>macOS / Windows / FreeBSD</td></tr><tr><td><strong>Windows C23 AOT sockets: Winsock2 (WSAPoll) in 0.1.0.</strong></td><td><code>crates/super-runtime/src/aot_host/net_host_c.rs</code>, <code>-lws2_32</code>, <code>examples/aot_tcp_echo/main.sr</code>, <code>scripts/check_windows_aot_net.py</code></td><td>Windows CI green on tip (PARTIAL)</td></tr><tr><td>JIT SIMD baseline SSE2 on x86-64</td><td>SPEC §A6, README</td><td>AVX2/AVX-512 paths</td></tr></tbody></table></div>
+<h2 id="explicit-non-claims">Explicit non-claims</h2>
+<ul><li>Law/proof discharge is <strong>not</strong> a theorem prover; many <code>.law.sr</code> files remain sidecar models (<code>docs/LAWS_STATUS.md</code>).</li><li>Self-rolled TLS remains experimental (<code>docs/reports/C6-tls-verification.md</code>).</li><li>Memory axis leadership does <strong>not</strong> imply zero allocation on all server paths.</li><li>Benchmark composite <strong>89.2</strong> is one machine snapshot — not a universal speed ranking.</li><li>VM <code>sys_req_*</code> reclaim is <strong>not</strong> implemented (AOT only for long-running servers).</li><li>Epoll / io_uring / TLS / QUIC on Windows AOT are <strong>unsupported</strong>.</li></ul>
+<h2 id="known-limitations-round-7">Known limitations (Round 7)</h2>
+<ul><li>Windows AOT TCP CI job is wired but not yet cited green on the orphan tip.</li><li>Sidecar laws still dominate (28/40); real-body ≈ 12/40.</li><li>Release attestations: <code>SHA256SUMS</code> provenance only until per-archive attestations land.</li></ul>
+<h2 id="invite">Invite</h2>
+<p>If a public doc overstates safety or platform support, open <strong>Security claim review</strong> or a normal bug report with file paths and expected wording.</p><p><strong>Related:</strong> <a href="../platform/">Platform</a> · <a href="../install-security/">Install security</a></p>
+</section>
+<footer class="site-footer"><p>Super 0.1.0 · <a href="../">Home</a></p></footer>
+</body>
+</html>

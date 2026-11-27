@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>name</key><string>Super Ink</string>
+  <key>uuid</key><string>a1b2c3d4-e5f6-7890-abcd-ef1234567890</string>
+  <key>settings</key>
+  <array>
+    <dict>
+      <key>settings</key>
+      <dict>
+        <key>background</key><string>#0c1219</string>
+        <key>foreground</key><string>#e8eef5</string>
+        <key>caret</key><string>#e8eef5</string>
+        <key>lineHighlight</key><string>#15202b</string>
+        <key>selection</key><string>#1f3a44</string>
+        <key>gutterForeground</key><string>#6b7c8f</string>
+      </dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>comment, comment.line, comment.block</string>
+      <key>settings</key><dict><key>foreground</key><string>#8b9aab</string><key>fontStyle</key><string>italic</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>keyword, keyword.control, keyword.operator</string>
+      <key>settings</key><dict><key>foreground</key><string>#5eecc8</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>keyword.operator.mut</string>
+      <key>settings</key><dict><key>foreground</key><string>#ff8a65</string><key>fontStyle</key><string>bold</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>keyword.other.comptime</string>
+      <key>settings</key><dict><key>foreground</key><string>#d4a5ff</string><key>fontStyle</key><string>bold</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>storage, storage.type</string>
+      <key>settings</key><dict><key>foreground</key><string>#7ec8ff</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>string, string.quoted</string>
+      <key>settings</key><dict><key>foreground</key><string>#f0c674</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>constant.numeric, constant.language</string>
+      <key>settings</key><dict><key>foreground</key><string>#ffab70</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>entity.name.type, support.type</string>
+      <key>settings</key><dict><key>foreground</key><string>#9cdcfe</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>variable, variable.other</string>
+      <key>settings</key><dict><key>foreground</key><string>#e8eef5</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>constant.other.placeholder</string>
+      <key>settings</key><dict><key>foreground</key><string>#98e6d8</string></dict>
+    </dict>
+    <dict>
+      <key>scope</key><string>punctuation</string>
+      <key>settings</key><dict><key>foreground</key><string>#c5d0dc</string></dict>
+    </dict>
+  </array>
+</dict>
+</plist>

@@ -1,0 +1,430 @@
+//! std.net.url — URL / URI parse, build, and query-string helpers (RFC 3986 subset)
+//!
+//! Import with:
+//!   use std.net.url
+//!
+//!   u = Url.parse("https://api.example.com:8443/v1/users?id=7#top") or err { return }
+//!   assert_eq(u.host, "api.example.com")
+//!   assert_eq(u.query_get("id") or "", "7")
+
+use std.core.collections
+use std.core.str
+use std.sys.path
+
+/// `Url` is a parsed URL: scheme, host, port, path, query, and fragment.
++Url = {
+    /// URL scheme, without the `://`. Defaults to `""`.
+    scheme: str = ""
+    /// Userinfo before the host. Empty when absent. Defaults to `""`.
+    userinfo: str = ""
+    /// Hostname or address. Defaults to `""`.
+    host: str = ""
+    /// Explicit port, or 0 when the URL omitted it. Defaults to `-1`.
+    port: i64 = -1
+    /// Path, beginning with `/` for absolute URLs. Defaults to `"/"`.
+    path: str = "/"
+    /// Query string without the leading `?`. Defaults to `""`.
+    query: str = ""
+    /// Fragment without the leading `#`. Defaults to `""`.
+    fragment: str = ""
+
+    /// Empty on this `Url`. Returns `Url`.
+    empty() : Url => Url.{scheme: "", userinfo: "", host: "", port: -1, path: "/", query: "", fragment: ""}
+
+    /// Parse `raw` into a `Url`, or fail.
+    parse(raw: str) : Url! {
+        ensure byte_len(raw) > 0 else { fail "empty url" }
+        s = raw
+        fragment = ""
+        hash = url_index_of(s, "#")
+        if hash >= 0 {
+            fragment = s[(hash + 1)..byte_len(s)]
+            s = s[0..hash]
+        }
+        query = ""
+        q = url_index_of(s, "?")
+        if q >= 0 {
+            query = s[(q + 1)..byte_len(s)]
+            s = s[0..q]
+        }
+        scheme = ""
+        rest = s
+        colon = url_index_of(s, ":")
+        if colon >= 0 && url_starts_with(s[(colon + 1)..byte_len(s)], "//") {
+            scheme = s[0..colon]
+            rest = s[(colon + 3)..byte_len(s)]
+        }
+        path = "/"
+        authority = rest
+        slash = url_index_of(rest, "/")
+        if slash >= 0 {
+            authority = rest[0..slash]
+            path = rest[slash..byte_len(rest)]
+        } else {
+            if scheme == "" {
+                path = rest
+                authority = ""
+            } else {
+                path = "/"
+            }
+        }
+        userinfo = ""
+        host_port = authority
+        at = url_index_of(authority, "@")
+        if at >= 0 {
+            userinfo = authority[0..at]
+            host_port = authority[(at + 1)..byte_len(authority)]
+        }
+        host = host_port
+        port = -1
+        // IPv6 in brackets: [addr]:port
+        if url_starts_with(host_port, "[") {
+            rb = url_index_of(host_port, "]")
+            ensure rb > 0 else { fail "bad ipv6 host" }
+            host = host_port[1..rb]
+            tail = host_port[(rb + 1)..byte_len(host_port)]
+            if url_starts_with(tail, ":") {
+                port = url_parse_i64(tail[1..byte_len(tail)]) or -1
+            }
+        } else {
+            pc = url_last_index_of(host_port, ":")
+            if pc >= 0 {
+                host = host_port[0..pc]
+                port = url_parse_i64(host_port[(pc + 1)..byte_len(host_port)]) or -1
+            }
+        }
+        ensure host != "" || path != "" else { fail "missing host" }
+        Url.{scheme, userinfo, host, port, path, query, fragment}
+    }
+
+    /// Default port for common schemes when none was specified.
+    effective_port(self) : i64 {
+        if self.port >= 0 { return self.port }
+        if self.scheme == "http" { return 80 }
+        if self.scheme == "https" { return 443 }
+        if self.scheme == "ws" { return 80 }
+        if self.scheme == "wss" { return 443 }
+        -1
+    }
+
+    /// Query value for `key`, or `none` when the key is absent.
+    query_get(self, key: str) : str? {
+        pairs = query_pairs(self.query)
+        _i = 0
+        n = len(pairs) / 2
+        for 0..n {
+            if pairs[it * 2] == key { return pairs[it * 2 + 1] }
+        }
+        none
+    }
+
+    /// Copy of this URL with query key `key` set to `val`.
+    with_query(self, key: str, val: str) : Url {
+        q = query_set(self.query, key, val)
+        Url.{scheme: self.scheme, userinfo: self.userinfo, host: self.host, port: self.port, path: self.path, query: q, fragment: self.fragment}
+    }
+
+    /// Reconstruct a string form (does not re-encode).
+    stringify(self) : str {
+        out = ""
+        if self.scheme != "" { out = self.scheme + "://" }
+        if self.userinfo != "" { out = out + self.userinfo + "@" }
+        if self.host != "" {
+            if url_index_of(self.host, ":") >= 0 {
+                out = out + "[" + self.host + "]"
+            } else {
+                out = out + self.host
+            }
+        }
+        if self.port >= 0 { out = out + ":" + "{self.port}" }
+        out = out + self.path
+        if self.query != "" { out = out + "?" + self.query }
+        if self.fragment != "" { out = out + "#" + self.fragment }
+        out
+    }
+
+    /// True when this URL includes a scheme.
+    is_absolute(self) : bool => self.scheme != ""
+
+    /// `host` or `host:port` when port is non-default.
+    host_port(self) : str {
+        if self.host == "" { return "" }
+        def = -1
+        if self.scheme == "http" || self.scheme == "ws" { def = 80 }
+        if self.scheme == "https" || self.scheme == "wss" { def = 443 }
+        if self.port >= 0 && self.port != def { return self.host + ":{self.port}" }
+        if self.port >= 0 && def < 0 { return self.host + ":{self.port}" }
+        self.host
+    }
+
+    /// Resolve `ref` against this URL (RFC 3986 relative resolution subset).
+    resolve(self, ref: str) : Url! {
+        r = Url.parse(ref) or err { fail "{err}" }
+        if r.is_absolute() { return r }
+        base = Url.{scheme: self.scheme, userinfo: self.userinfo, host: self.host, port: self.port, path: self.path, query: self.query, fragment: r.fragment}
+        if r.host != "" {
+            base.host = r.host
+            base.port = r.port
+            base.userinfo = r.userinfo
+            if r.path != "" {
+                if url_starts_with(r.path, "/") {
+                    base.path = r.path
+                } else {
+                    base.path = url_resolve_path(self.path, r.path)
+                }
+            } else {
+                base.path = self.path
+            }
+            base.query = r.query
+            if base.query == "" { base.query = self.query }
+            return base
+        }
+        if r.path != "" {
+            if url_starts_with(r.path, "/") {
+                base.path = r.path
+            } else {
+                base.path = url_resolve_path(self.path, r.path)
+            }
+        }
+        if r.query != "" { base.query = r.query }
+        base
+    }
+
+    /// Copy of this URL with path `p`.
+    with_path(self, p: str) : Url {
+        Url.{scheme: self.scheme, userinfo: self.userinfo, host: self.host, port: self.port, path: p, query: self.query, fragment: self.fragment}
+    }
+}
+
+/// Merge a relative path onto `base`; a trailing `/` on `base` keeps the last segment as a directory.
++url_resolve_path(base: str, rel: str) : str {
+    merge_base = base
+    bn = byte_len(merge_base)
+    if bn == 0 || merge_base[(bn - 1)] != "/" {
+        merge_base = path_dirname(base)
+    }
+    path_normalize(path_join(merge_base, rel))
+}
+
+/// Url index of (`s`, `ch`). Returns `i64`.
++url_index_of(s: str, ch: str) : i64 {
+    n = byte_len(s)
+    pos = -1
+    for 0..n {
+        if pos < 0 && s[it] == ch { pos = it }
+    }
+    pos
+}
+
+/// Url last index of (`s`, `ch`). Returns `i64`.
++url_last_index_of(s: str, ch: str) : i64 {
+    n = byte_len(s)
+    pos = -1
+    for 0..n {
+        if s[it] == ch { pos = it }
+    }
+    pos
+}
+
+/// Url starts with (`s`, `prefix`).
++url_starts_with(s: str, prefix: str) : bool {
+    pn = byte_len(prefix)
+    ensure byte_len(s) >= pn else { return false }
+    s[0..pn] == prefix
+}
+
+/// Url parse i64 (`s`). Returns `i64`, or fails.
++url_parse_i64(s: str) : i64! {
+    n = byte_len(s)
+    ensure n > 0 else { fail "empty int" }
+    acc = 0
+    for 0..n {
+        c = s[it]
+        d = ord(c) - 48
+        ensure d >= 0 && d <= 9 else { fail "bad digit" }
+        acc = acc * 10 + d
+    }
+    acc
+}
+
+/// Percent-encode bytes that are not unreserved (RFC 3986).
++url_encode(s: str) : str {
+    out = ""
+    n = byte_len(s)
+    for 0..n {
+        c = s[it]
+        o = ord(c)
+        ok = (o >= 65 && o <= 90) || (o >= 97 && o <= 122) || (o >= 48 && o <= 57) || c == "-" || c == "_" || c == "." || c == "~"
+        if ok {
+            out = out + c
+        } else {
+            out = out + "%" + url_hex_byte(o)
+        }
+    }
+    out
+}
+
+/// Url hex byte (`v`). Returns `str`.
++url_hex_byte(v: i64) : str {
+    digits = "0123456789ABCDEF"
+    hi = (v / 16) % 16
+    lo = v % 16
+    digits[hi] + digits[lo]
+}
+
+/// Percent-decoded form of `s`, or fail.
++url_decode(s: str) : str! {
+    out = ""
+    n = byte_len(s)
+    i = 0
+    for 0..(n + 1) {
+        ensure i < n else { return out }
+        c = s[i]
+        if c == "%" {
+            ensure i + 2 < n else { fail "truncated escape" }
+            hi = url_hex_val(s[i + 1]) or err { fail "bad hex" }
+            lo = url_hex_val(s[i + 2]) or err { fail "bad hex" }
+            out = out + chr(hi * 16 + lo)
+            i += 3
+        } else {
+            if c == "+" { out = out + " " } else { out = out + c }
+            i += 1
+        }
+    }
+    out
+}
+
+/// Url hex val (`c`). Returns `i64`, or fails.
++url_hex_val(c: str) : i64! {
+    o = ord(c)
+    if o >= 48 && o <= 57 { return o - 48 }
+    if o >= 65 && o <= 70 { return o - 55 }
+    if o >= 97 && o <= 102 { return o - 87 }
+    fail "bad hex"
+}
+
+/// Flat [k0, v0, k1, v1, …] from `a=1&b=2`.
++query_pairs(q: str) {
+    out = []
+    ensure byte_len(q) > 0 else { return out }
+    start = 0
+    n = byte_len(q)
+    for 0..(n + 1) {
+        if it == n || q[it] == "&" {
+            piece = q[start..it]
+            eq = url_index_of(piece, "=")
+            if eq < 0 {
+                out = arr_push(out, piece)
+                out = arr_push(out, "")
+            } else {
+                out = arr_push(out, piece[0..eq])
+                out = arr_push(out, piece[(eq + 1)..byte_len(piece)])
+            }
+            start = it + 1
+        }
+    }
+    out
+}
+
+/// Query set (`q`, `key`, `val`). Returns `str`.
++query_set(q: str, key: str, val: str) : str {
+    pairs = query_pairs(q)
+    found = false
+    out = ""
+    n = len(pairs) / 2
+    for 0..n {
+        k = pairs[it * 2]
+        v = pairs[it * 2 + 1]
+        if k == key {
+            v = val
+            found = true
+        }
+        if out != "" { out = out + "&" }
+        out = out + k + "=" + v
+    }
+    if !found {
+        if out != "" { out = out + "&" }
+        out = out + key + "=" + val
+    }
+    out
+}
+
+/// Encode keys/values and build a query string (`a=1&b=2`).
++query_build(pairs: _) : str {
+    out = ""
+    n = len(pairs) / 2
+    for 0..n {
+        k = pairs[it * 2]
+        v = pairs[it * 2 + 1]
+        if out != "" { out = out + "&" }
+        out = out + url_encode(k) + "=" + url_encode(v)
+    }
+    out
+}
+
+/// Query parse (`q`).
++query_parse(q: str) {
+    raw = query_pairs(q)
+    out = []
+    n = len(raw) / 2
+    for 0..n {
+        k = url_decode(raw[it * 2]) or ""
+        v = url_decode(raw[it * 2 + 1]) or ""
+        out = arr_push(out, k)
+        out = arr_push(out, v)
+    }
+    out
+}
+
+/// Join path (`base`, `rel`). Returns `str`.
++join_path(base: str, rel: str) : str {
+    if url_starts_with(rel, "/") { return rel }
+    bn = byte_len(base)
+    if bn == 0 { return "/" + rel }
+    if base[bn - 1] == "/" { return base + rel }
+    base + "/" + rel
+}
+
+/// Test that parse https with port query fragment.
+test "parse https with port query fragment" {
+    u = Url.parse("https://user:pw@api.example.com:8443/v1/users?id=7&x=1#top") or err { assert_eq(0, 1)
+        return }
+    assert_eq(u.scheme, "https")
+    assert_eq(u.userinfo, "user:pw")
+    assert_eq(u.host, "api.example.com")
+    assert_eq(u.port, 8443)
+    assert_eq(u.effective_port(), 8443)
+    assert_eq(u.path, "/v1/users")
+    assert_eq(u.query_get("id") or "", "7")
+    assert_eq(u.fragment, "top")
+    assert_eq(Url.parse("http://h/") or err { return }.effective_port(), 80)
+}
+
+/// Test that encode decode query.
+test "encode decode query" {
+    assert_eq(url_encode("a b"), "a%20b")
+    assert_eq(url_decode("a%20b") or "", "a b")
+    assert_eq(url_decode("a+b") or "", "a b")
+    q = query_set("a=1", "b", "2")
+    assert_eq(q, "a=1&b=2")
+    assert_eq(join_path("/api", "v1"), "/api/v1")
+    assert_eq(join_path("/api/", "v1"), "/api/v1")
+}
+
+/// Test that resolve and host_port.
+test "resolve and host_port" {
+    base = Url.parse("https://api.example.com/v1/users/") or err { assert_eq(0, 1)
+        return }
+    assert_eq(base.host_port(), "api.example.com")
+    #assert(base.is_absolute())
+    rel = base.resolve("items?id=3") or err { assert_eq(0, 1)
+        return }
+    assert_eq(rel.path, "/v1/users/items")
+    assert_eq(rel.query_get("id") or "", "3")
+    assert_eq(rel.scheme, "https")
+    built = query_build(["q", "a b", "k", "v"])
+    #assert(byte_len(built) > 0)
+    p = query_parse("a%20b=1%2B2")
+    assert_eq(p[0], "a b")
+    assert_eq(p[1], "1+2")
+}

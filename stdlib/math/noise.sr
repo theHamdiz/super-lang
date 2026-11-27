@@ -1,0 +1,360 @@
+//! std.math.noise — coherent noise for terrain, textures and procedural content
+//!
+//! Import with:
+//!   use std.math.noise
+//!
+//! Then:  h = perlin2(x * 0.1, y * 0.1, seed)          // [-1, 1]
+//!        v = value2(x, y, seed)                        // [0, 1)
+//!        t = fbm2(x * 0.05, y * 0.05, seed, 5)         // layered detail, ~[-1, 1]
+//!        d = worley2(x, y, seed)                       // distance to nearest feature point
+//!
+//! Everything is deterministic in (coordinates, seed). The lattice hash is a
+//! chain of Lehmer steps modulo the prime 2^31 - 1, so every intermediate fits an
+//! i64 and no bitwise operators are needed. Floors come from the Tier-1 libm
+//! intrinsic `host.sys_floor` (negative coordinates floor correctly).
+
+/// `NZ_P` is `2147483647`.
++NZ_P = 2147483647
+/// `NZ_PERIOD` is `1048576`.
++NZ_PERIOD = 1048576
+
+/// Largest integer <= x.
++nz_floor(x: f64) : i64 => host.sys_to_int(host.sys_floor(x))
+
+/// Mathematical modulo (result in 0..m-1 even for negative n).
++nz_mod(n: i64, m: i64) : i64 {
+    r = n % m
+    if r < 0 { return r + m }
+    r
+}
+
+/// Lattice hash in [0, NZ_P).
++nz_hash2(ix: i64, iy: i64, seed: i64) : i64 {
+    h = nz_mod(seed, NZ_P) + 1
+    h = (h * 48271 + nz_mod(ix, NZ_PERIOD) * 7919 + 13) % NZ_P
+    h = (h * 48271 + nz_mod(iy, NZ_PERIOD) * 104729 + 17) % NZ_P
+    h = (h * 48271 + 101) % NZ_P
+    h = (h * 16807 + 7) % NZ_P
+    h
+}
+
+/// Same as `nz_hash2`.
++nz_hash1(ix: i64, seed: i64) : i64 => nz_hash2(ix, -7919, seed)
+
+/// Hash mapped to [0, 1).
++nz_unit2(ix: i64, iy: i64, seed: i64) : f64 => nz_hash2(ix, iy, seed) / 2147483647.0
+
+/// Perlin quintic fade: 6t^5 - 15t^4 + 10t^3.
++nz_fade(t: f64) : f64 => t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+
+/// Linear blend from `a` toward `b` by fraction `t`.
++nz_lerp(a: f64, b: f64, t: f64) : f64 => a + (b - a) * t
+
+/// Gradient components for hash class 0..7 (axes and diagonals).
++nz_gx(k: i64) : f64 {
+    if k == 0 || k == 2 || k == 4 { return 1.0 }
+    if k == 1 || k == 3 || k == 5 { return 0.0 - 1.0 }
+    0.0
+}
+
+/// Nz gy (`k`). Returns `f64`.
++nz_gy(k: i64) : f64 {
+    if k == 0 || k == 1 || k == 6 { return 1.0 }
+    if k == 2 || k == 3 || k == 7 { return 0.0 - 1.0 }
+    0.0
+}
+
+// --- 1D -----------------------------------------------------------------------------
+
+/// Smoothly interpolated value noise in [0, 1).
++value1(x: f64, seed: i64) : f64 {
+    x0 = nz_floor(x)
+    t = nz_fade(x - x0)
+    a = nz_hash1(x0, seed) / 2147483647.0
+    b = nz_hash1(x0 + 1, seed) / 2147483647.0
+    nz_lerp(a, b, t)
+}
+
+/// 1D gradient noise in [-1, 1]; zero at every integer.
++perlin1(x: f64, seed: i64) : f64 {
+    x0 = nz_floor(x)
+    fx = x - x0
+    g0 = nz_hash1(x0, seed) % 2
+    g1 = nz_hash1(x0 + 1, seed) % 2
+    s0 = 1.0
+    s1 = 1.0
+    if g0 == 0 { s0 = 0.0 - 1.0 }
+    if g1 == 0 { s1 = 0.0 - 1.0 }
+    n0 = s0 * fx
+    n1 = s1 * (fx - 1.0)
+    nz_lerp(n0, n1, nz_fade(fx)) * 2.0
+}
+
+// --- 2D -----------------------------------------------------------------------------
+
+/// Bilinear-smooth value noise in [0, 1).
++value2(x: f64, y: f64, seed: i64) : f64 {
+    x0 = nz_floor(x)
+    y0 = nz_floor(y)
+    tx = nz_fade(x - x0)
+    ty = nz_fade(y - y0)
+    a = nz_unit2(x0, y0, seed)
+    b = nz_unit2(x0 + 1, y0, seed)
+    c = nz_unit2(x0, y0 + 1, seed)
+    d = nz_unit2(x0 + 1, y0 + 1, seed)
+    nz_lerp(nz_lerp(a, b, tx), nz_lerp(c, d, tx), ty)
+}
+
+/// Nz corner (`ix`, `iy`, `dx`, `dy`, `seed`). Returns `f64`.
++nz_corner(ix: i64, iy: i64, dx: f64, dy: f64, seed: i64) : f64 {
+    k = nz_hash2(ix, iy, seed) % 8
+    nz_gx(k) * dx + nz_gy(k) * dy
+}
+
+/// Classic 2D gradient noise in [-1, 1]; exactly zero on integer lattice points.
++perlin2(x: f64, y: f64, seed: i64) : f64 {
+    x0 = nz_floor(x)
+    y0 = nz_floor(y)
+    fx = x - x0
+    fy = y - y0
+    n00 = nz_corner(x0, y0, fx, fy, seed)
+    n10 = nz_corner(x0 + 1, y0, fx - 1.0, fy, seed)
+    n01 = nz_corner(x0, y0 + 1, fx, fy - 1.0, seed)
+    n11 = nz_corner(x0 + 1, y0 + 1, fx - 1.0, fy - 1.0, seed)
+    u = nz_fade(fx)
+    v = nz_fade(fy)
+    nz_lerp(nz_lerp(n00, n10, u), nz_lerp(n01, n11, u), v)
+}
+
+/// Fractal Brownian motion: `octaves` layers of perlin2, lacunarity 2, gain 0.5,
+/// normalised by the total amplitude so the result stays in about [-1, 1].
++fbm2(x: f64, y: f64, seed: i64, octaves: i64) : f64 {
+    total = 0.0
+    amp = 1.0
+    freq = 1.0
+    norm = 0.0
+    for 0..octaves {
+        total += amp * perlin2(x * freq, y * freq, seed + it)
+        norm += amp
+        amp = amp * 0.5
+        freq = freq * 2.0
+    }
+    ensure norm > 0.0 else { return 0.0 }
+    total / norm
+}
+
+/// Ridged variant: 1 - |perlin|, layered (sharp mountain crests), in [0, 1].
++ridged2(x: f64, y: f64, seed: i64, octaves: i64) : f64 {
+    total = 0.0
+    amp = 1.0
+    freq = 1.0
+    norm = 0.0
+    for 0..octaves {
+        p = perlin2(x * freq, y * freq, seed + it)
+        if p < 0.0 { p = 0.0 - p }
+        total += amp * (1.0 - p)
+        norm += amp
+        amp = amp * 0.5
+        freq = freq * 2.0
+    }
+    ensure norm > 0.0 else { return 0.0 }
+    total / norm
+}
+
+/// Worley / cellular noise: distance from (x, y) to the nearest jittered feature
+/// point (one per cell), searched over the 3 x 3 neighbourhood. Range [0, ~1.5].
++worley2(x: f64, y: f64, seed: i64) : f64 {
+    cx = nz_floor(x)
+    cy = nz_floor(y)
+    best = 1000.0
+    for 0..9 {
+        ox = it % 3 - 1
+        oy = it / 3 - 1
+        px = cx + ox + nz_unit2(cx + ox, cy + oy, seed)
+        py = cy + oy + nz_unit2(cx + ox, cy + oy, seed + 1)
+        dx = px - x
+        dy = py - y
+        d = host.sys_sqrt(dx * dx + dy * dy)
+        if d < best { best = d }
+    }
+    best
+}
+
+/// Map a noise sample from [-1, 1] to [0, 1].
++nz_unit(v: f64) : f64 => (v + 1.0) * 0.5
+
+/// Quantise a [0, 1] height into `levels` discrete steps (terraces).
++nz_terrace(h: f64, levels: i64) : f64 {
+    ensure levels > 1 else { return h }
+    k = host.sys_to_int(h * levels)
+    if k >= levels { k = levels - 1 }
+    k / (levels - 1.0)
+}
+
+// --- tests ---------------------------------------------------------------------------
+
+/// Test that floor and positive modulo.
+test "floor and positive modulo" {
+    assert_eq(nz_floor(2.7), 2)
+    assert_eq(nz_floor(0.0 - 0.2), -1)
+    assert_eq(nz_floor(0.0 - 3.0), -3)
+    assert_eq(nz_floor(0.0), 0)
+    assert_eq(nz_mod(-1, 5), 4)
+    assert_eq(nz_mod(11, 5), 1)
+    assert_eq(nz_mod(-10, 5), 0)
+}
+
+/// Test that hash is deterministic, bounded and seed sensitive.
+test "hash is deterministic, bounded and seed sensitive" {
+    assert_eq(nz_hash2(3, 4, 5), nz_hash2(3, 4, 5))
+    #assert(nz_hash2(3, 4, 5) != nz_hash2(4, 3, 5))
+    #assert(nz_hash2(3, 4, 5) != nz_hash2(3, 4, 6))
+    ok = true
+    for 0..200 {
+        h = nz_hash2(it, it * 3 - 100, 9)
+        if h < 0 || h >= NZ_P { ok = false }
+    }
+    #assert(ok)
+    #assert(nz_hash2(-5, -5, 1) >= 0)
+    u = nz_unit2(10, 20, 30)
+    #assert(u >= 0.0 && u < 1.0)
+}
+
+/// Test that hash spreads across the unit interval.
+test "hash spreads across the unit interval" {
+    low = 0
+    for 0..400 {
+        if nz_unit2(it, 0, 3) < 0.5 { low += 1 }
+    }
+    #assert(low > 150 && low < 250)
+}
+
+/// Test that fade easing.
+test "fade easing" {
+    assert_eq(nz_fade(0.0), 0.0)
+    assert_eq(nz_fade(1.0), 1.0)
+    assert_eq(nz_fade(0.5), 0.5)
+    #assert(nz_fade(0.25) < 0.25)
+    #assert(nz_fade(0.75) > 0.75)
+}
+
+/// Test that value noise is deterministic, bounded and smooth.
+test "value noise is deterministic, bounded and smooth" {
+    assert_eq(value2(1.3, 2.7, 4), value2(1.3, 2.7, 4))
+    #assert(value2(1.3, 2.7, 4) != value2(1.3, 2.7, 5))
+    ok = true
+    smooth = true
+    prev = value2(0.0, 0.0, 7)
+    for 1..300 {
+        v = value2(it * 0.05, it * 0.03, 7)
+        if v < 0.0 || v >= 1.0 { ok = false }
+        d = v - prev
+        if d < 0.0 { d = 0.0 - d }
+        if d > 0.25 { smooth = false }
+        prev = v
+    }
+    #assert(ok)
+    #assert(smooth)
+}
+
+/// Test that value noise hits the lattice hash at integer points.
+test "value noise hits the lattice hash at integer points" {
+    assert_eq(value2(3.0, 4.0, 11), nz_unit2(3, 4, 11))
+    assert_eq(value1(5.0, 2), nz_hash1(5, 2) / 2147483647.0)
+}
+
+/// Test that perlin is zero on lattice points and bounded.
+test "perlin is zero on lattice points and bounded" {
+    assert_eq(perlin2(0.0, 0.0, 1), 0.0)
+    assert_eq(perlin2(7.0, 0.0 - 3.0, 9), 0.0)
+    assert_eq(perlin1(4.0, 3), 0.0)
+    ok = true
+    for 0..400 {
+        p = perlin2(it * 0.173, it * 0.291 - 20.0, 5)
+        if p < 0.0 - 1.0 || p > 1.0 { ok = false }
+        q = perlin1(it * 0.173 - 30.0, 5)
+        if q < 0.0 - 1.0 || q > 1.0 { ok = false }
+    }
+    #assert(ok)
+}
+
+/// Test that perlin is deterministic, seeded and continuous.
+test "perlin is deterministic, seeded and continuous" {
+    assert_eq(perlin2(2.5, 3.5, 8), perlin2(2.5, 3.5, 8))
+    differs = 0
+    for 0..20 {
+        if perlin2(it * 0.37 + 0.11, 1.9, 1) != perlin2(it * 0.37 + 0.11, 1.9, 2) { differs += 1 }
+    }
+    #assert(differs > 14)
+    smooth = true
+    prev = perlin2(0.5, 0.5, 3)
+    for 1..400 {
+        x = 0.5 + it * 0.01
+        v = perlin2(x, 0.5, 3)
+        d = v - prev
+        if d < 0.0 { d = 0.0 - d }
+        if d > 0.1 { smooth = false }
+        prev = v
+    }
+    #assert(smooth)
+}
+
+/// Test that perlin varies in sign over a large area.
+test "perlin varies in sign over a large area" {
+    pos = 0
+    neg = 0
+    for 0..300 {
+        p = perlin2(it * 0.31 + 0.2, it * 0.17 + 0.4, 21)
+        if p > 0.05 { pos += 1 }
+        if p < 0.0 - 0.05 { neg += 1 }
+    }
+    #assert(pos > 40)
+    #assert(neg > 40)
+}
+
+/// Test that fbm layers stay bounded and equal perlin at one octave.
+test "fbm layers stay bounded and equal perlin at one octave" {
+    assert_eq(fbm2(1.7, 2.3, 4, 1), perlin2(1.7, 2.3, 4))
+    ok = true
+    for 0..200 {
+        f = fbm2(it * 0.21, it * 0.13, 6, 5)
+        if f < 0.0 - 1.0 || f > 1.0 { ok = false }
+    }
+    #assert(ok)
+    assert_eq(fbm2(1.0, 1.0, 1, 0), 0.0)
+    #assert(fbm2(1.3, 0.7, 2, 4) != fbm2(1.3, 0.7, 2, 1))
+}
+
+/// Test that ridged noise is in the unit interval.
+test "ridged noise is in the unit interval" {
+    ok = true
+    for 0..200 {
+        r = ridged2(it * 0.19, it * 0.07, 3, 4)
+        if r < 0.0 || r > 1.0 { ok = false }
+    }
+    #assert(ok)
+    assert_eq(ridged2(0.0, 0.0, 1, 1), 1.0)
+}
+
+/// Test that worley distance is non-negative and zero-free of lattice artefacts.
+test "worley distance is non-negative and zero-free of lattice artefacts" {
+    ok = true
+    for 0..200 {
+        w = worley2(it * 0.37, it * 0.23, 2)
+        if w < 0.0 || w > 1.5 { ok = false }
+    }
+    #assert(ok)
+    assert_eq(worley2(1.5, 2.5, 3), worley2(1.5, 2.5, 3))
+    #assert(worley2(1.5, 2.5, 3) != worley2(1.5, 2.5, 4))
+}
+
+/// Test that unit mapping and terraces.
+test "unit mapping and terraces" {
+    assert_eq(nz_unit(0.0 - 1.0), 0.0)
+    assert_eq(nz_unit(1.0), 1.0)
+    assert_eq(nz_unit(0.0), 0.5)
+    assert_eq(nz_terrace(0.0, 4), 0.0)
+    assert_eq(nz_terrace(1.0, 4), 1.0)
+    assert_eq(nz_terrace(0.3, 4), 1.0 / 3.0)
+    assert_eq(nz_terrace(0.55, 1), 0.55)
+}

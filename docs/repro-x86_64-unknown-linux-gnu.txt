@@ -1,0 +1,6 @@
+target=x86_64-unknown-linux-gnu
+source_date_epoch=1795776879
+version=0.1.0
+build_A=86f5608570a5533241436ad898dd1c2892fe6ef7633a2b56413e563bd83e067c
+build_B=86f5608570a5533241436ad898dd1c2892fe6ef7633a2b56413e563bd83e067c
+result=PASS

@@ -1,0 +1,57 @@
+[pod]
+name = "02_task_api"
+version = "0.1.0"
+
+# Used by `super build` and `super run` when -d / -r / --profile is omitted.
+# `super test` always uses [profile.test].
+[build]
+profile = "dev"
+backend = "c23"
+mode = "aot"
+
+[profile.dev]
+opt = "0"
+lto = "off"
+debug-info = true
+fast-math = false
+
+[profile.test]
+opt = "2"
+lto = "off"
+debug-info = true
+fast-math = false
+target-cpu = "native"
+
+[profile.release]
+opt = "3"
+lto = "fat"
+strip = true
+fast-math = true
+target-cpu = "native"
+
+[profile.size]
+opt = "s"
+lto = "fat"
+strip = true
+gc-sections = true
+
+[profile.fast]
+opt = "3"
+lto = "fat"
+strip = true
+fast-math = true
+target-cpu = "native"
+
+[dependencies]
+
+[[lint.exception]]
+rule = "stutter"
+path = "src/auth.sr"
+item = "AuthToken"
+reason = "imported unqualified next to models.Task; `Token` alone would be ambiguous"
+
+[[lint.exception]]
+rule = "unused"
+path = "src/models.sr"
+item = "password_hash"
+reason = "models the stored credential column; shows a `-` private field the API never serializes"

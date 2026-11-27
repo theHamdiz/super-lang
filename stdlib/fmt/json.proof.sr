@@ -1,0 +1,10 @@
+#proof(json_is_ws_space)
+prove_json_is_ws_space() {
+    #assert(json_is_ws(" "))
+    #assert(json_is_ws("\n"))
+}
+
+#proof(json_is_ws_rejects_letter)
+prove_json_is_ws_rejects_letter() {
+    #assert(!json_is_ws("a"))
+}

@@ -1,0 +1,89 @@
+// 08_ecs — 2000 entities × 20 ticks; SoA + @restrict component arrays (parity with C)
+use std.math.core
+
++N = 2000
++TICKS = 20
++CELL = 10
++GRID = 64
++CELLS = 4096
++LCG_MOD = 2147483648
+
++lcg(@rng): i64 {
+    v = (rng[0] * 1103515245 + 12345) % LCG_MOD
+    rng[0] = v
+    v
+}
++next_f(@rng): f64 => lcg(@rng) / 2147483648.0
++clamp_cell(v: i64): i64 {
+    return 0 if v < 0
+    return GRID - 1 if v >= GRID
+    v
+}
+
+// Both axis checks at once: a tuple `when` over the two bounds tests.
++in_grid(nx: i64, ny: i64): bool {
+    when (nx >= 0 && ny >= 0, nx < GRID && ny < GRID) {
+        (true, true) => true
+        else => false
+    }
+}
+
+// Hot tick body: `@` SoA arrays lower to `T * restrict` with no per-iter bounds shims.
++integrate(@px, @py, @vx, @vy) {
+    for 0..N {
+        npx, npy, nvx, nvy = px[it] + vx[it], py[it] + vy[it], vx[it], vy[it]
+        nvx = -nvx if npx < 0.0 || npx > 600.0
+        nvy = -nvy if npy < 0.0 || npy > 600.0
+        px[it], py[it], vx[it], vy[it] = npx, npy, nvx, nvy
+    }
+}
+
++rebuild_grid(@px, @py, @heads, @next) {
+    for 0..CELLS { heads[it] = -1 }
+    for 0..N {
+        cx, cy = clamp_cell(to_int(px[it] / CELL)), clamp_cell(to_int(py[it] / CELL))
+        cell = cy * GRID + cx
+        next[it], heads[cell] = heads[cell], it
+    }
+}
+
++collide(@px, @py, @hp, heads, next) {
+    for 0..N {
+        i, cx, cy, hits = it, clamp_cell(to_int(px[it] / CELL)), clamp_cell(to_int(py[it] / CELL)), 0
+        for 0..9 {
+            ox, oy = it % 3 - 1, it / 3 - 1
+            nx, ny = cx + ox, cy + oy
+            if !in_grid(nx, ny) { continue }
+            id = heads[ny * GRID + nx]
+            while id >= 0 {
+                if id != i {
+                    dx, dy = px[i] - px[id], py[i] - py[id]
+                    hits += 1 if dx * dx + dy * dy < 4.0
+                }
+                id = next[id]
+            }
+        }
+        hp[i] -= 1 if hits > 3
+    }
+}
+
++main() {
+    rng = [15482888]
+    px, py, vx, vy, hp = [0.0; N], [0.0; N], [0.0; N], [0.0; N], [0; N]
+    for 0..N {
+        px[it], py[it] = next_f(@rng) * 600.0, next_f(@rng) * 600.0
+        vx[it], vy[it] = (next_f(@rng) - 0.5) * 2.0, (next_f(@rng) - 0.5) * 2.0
+        hp[it] = 10 + lcg(@rng) % 20
+    }
+    heads, next = [-1; CELLS], [-1; N]
+    for 0..TICKS {
+        integrate(@px, @py, @vx, @vy)
+        rebuild_grid(@px, @py, @heads, @next)
+        collide(@px, @py, @hp, heads, next)
+    }
+    cs = (0..N).map(
+        hp[it] + to_int(floor(px[it] * 10.0)) +
+            to_int(floor(py[it] * 10.0))
+    ).sum()
+    print("CHECKSUM={cs}")
+}

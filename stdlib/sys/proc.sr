@@ -1,0 +1,175 @@
+//! std.sys.proc — child processes and process control
+//!
+//! Import with:
+//!   use std.sys.proc
+//!
+//! Then:
+//!   r = proc_run("git", ["rev-parse", "HEAD"]) or err { return }
+//!   if proc_ok(r) { print(r.stdout) }
+//!
+//! `proc_run` calls the host intrinsic `sys_exec(cmd, args)`, which returns a
+//! record {code, stdout, stderr}. `proc_fake_run` is a deterministic in-process
+//! stand-in (echo / true / false) used by the tests and by dry-run tooling.
+
+/// `ProcResult` is a child process exit code plus captured stdout and stderr.
++ProcResult = {
+    /// Code on `ProcResult` (`i64`). Defaults to `0`.
+    code: i64 = 0
+    /// Stdout on `ProcResult` (`str`). Defaults to `""`.
+    stdout: str = ""
+    /// Stderr on `ProcResult` (`str`). Defaults to `""`.
+    stderr: str = ""
+}
+
+/// Process result with exit code `code` and the captured streams.
++proc_result(code: i64, stdout: str, stderr: str) : ProcResult => ProcResult.{code, stdout, stderr}
+
+/// Length of `s`.
++proc_len(s: str) : i64 => host.sys_str_len(s)
+
+/// True when the exit code is 0.
++proc_ok(r: ProcResult) : bool => r.code == 0
+
+// --- command line construction -----------------------------------------------------
+
+/// True when `arg` must be quoted to round-trip through a shell.
++proc_needs_quote(arg: str) : bool {
+    n = proc_len(arg)
+    ensure n > 0 else { return true }
+    plain = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:=@%+,"
+    bad = false
+    for 0..n {
+        c = arg[it]
+        known = false
+        for 0..proc_len(plain) {
+            if plain[it] == c { known = true }
+        }
+        if !known { bad = true }
+    }
+    bad
+}
+
+/// POSIX shell quoting: wrap in single quotes, rewriting embedded quotes.
++shell_quote(arg: str) : str {
+    ensure proc_needs_quote(arg) else { return arg }
+    out = "'"
+    for 0..proc_len(arg) {
+        c = arg[it]
+        if c == "'" { out = "{out}'\\''" } else { out = "{out}{c}" }
+    }
+    "{out}'"
+}
+
+/// Shell command line joined from `cmd`.
++command_line(cmd: str, args: _) : str {
+    out = shell_quote(cmd)
+    for args { out = "{out} {shell_quote(it)}" }
+    out
+}
+
+// --- execution --------------------------------------------------------------------------
+
+/// Run `cmd` and capture its exit code, stdout, and stderr, or fail.
++proc_run(cmd: str, args: _) : ProcResult! {
+    ensure cmd != "" else {
+        fail "proc: empty command"
+        return
+    }
+    r = host.sys_exec(cmd, args) or err {
+        fail "proc: cannot spawn {cmd}"
+        return
+    }
+    r
+}
+
+/// Like `proc_run` but a non-zero exit code is also a failure.
++proc_check(cmd: str, args: _) : ProcResult! {
+    r = proc_run(cmd, args) or err {
+        fail "proc: cannot spawn {cmd}"
+        return
+    }
+    ensure proc_ok(r) else {
+        fail "proc: {cmd} exited with code {r.code}"
+        return
+    }
+    r
+}
+
+/// Exit code of the last child.
++proc_exit(code: i64) : i64 {
+    host.sys_exit(code)
+    code
+}
+
+/// Process id of the last child.
++proc_pid() : i64 {
+    pid = host.sys_pid() or 0
+    pid
+}
+
+/// Sleep for `ms` milliseconds.
++proc_sleep_ms(ms: i64) : i64 {
+    host.sys_sleep_ms(ms)
+    ms
+}
+
+/// Deterministic fake: echo prints its args, true/false set the exit code,
+/// anything else is "command not found" (127).
++proc_fake_run(cmd: str, args: _) : ProcResult {
+    if cmd == "true" { return proc_result(0, "", "") }
+    if cmd == "false" { return proc_result(1, "", "") }
+    if cmd == "echo" {
+        out = ""
+        for args {
+            if index > 0 { out = "{out} " }
+            out = "{out}{it}"
+        }
+        proc_result(0, "{out}\n", "")
+    } else {
+        proc_result(127, "", "{cmd}: command not found")
+    }
+}
+
+// --- tests --------------------------------------------------------------------------------
+
+/// Test that shell_quote leaves safe words alone.
+test "shell_quote leaves safe words alone" {
+    assert_eq(shell_quote("ls"), "ls")
+    assert_eq(shell_quote("--flag=value"), "--flag=value")
+    assert_eq(shell_quote("src/main.sr"), "src/main.sr")
+}
+
+/// Test that shell_quote wraps unsafe words.
+test "shell_quote wraps unsafe words" {
+    assert_eq(shell_quote(""), "''")
+    assert_eq(shell_quote("hello world"), "'hello world'")
+    assert_eq(shell_quote("a;b"), "'a;b'")
+    assert_eq(shell_quote("it's"), "'it'\\''s'")
+}
+
+/// Test that command_line joins and quotes.
+test "command_line joins and quotes" {
+    assert_eq(command_line("git", ["commit", "-m", "first commit"]), "git commit -m 'first commit'")
+    assert_eq(command_line("ls", []), "ls")
+}
+
+/// Test that fake runner.
+test "fake runner" {
+    #assert(proc_ok(proc_fake_run("true", [])))
+    #assert(!(proc_ok(proc_fake_run("false", []))))
+    assert_eq(proc_fake_run("echo", ["a", "b"]).stdout, "a b\n")
+    nf = proc_fake_run("nope", [])
+    assert_eq(nf.code, 127)
+    assert_eq(nf.stderr, "nope: command not found")
+}
+
+/// Test that proc_run degrades without a host.
+test "proc_run degrades without a host" {
+    assert_eq(proc_run("", []) or proc_result(9, "", "").code, 9)
+    assert_eq(proc_check("ls", []) or proc_result(9, "", "").code, 9)
+}
+
+/// Test that proc_pid default.
+test "proc_pid default" {
+    assert_eq(proc_pid(), 0)
+}

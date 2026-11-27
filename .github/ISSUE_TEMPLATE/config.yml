@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discord
+    url: https://discord.gg/ZvgmreZsuY
+    about: Chat and quick questions (not security reports)
+  - name: Security advisories
+    url: https://github.com/theHamdiz/super-lang/security/advisories/new
+    about: Private vulnerability reports for 0.1.0

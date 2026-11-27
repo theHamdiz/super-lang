@@ -1,0 +1,13 @@
+//! Laws for std.fmt.toml — real-body (`toml_is_space` / `toml_digit`).
+//! `toml_trim` / parse loops need host strlen (docs/LAWS_STATUS.md).
+//! AI agents must not edit this file; put discharges in `toml.proof.sr`.
+
+#law("toml_is_space marks ASCII space")
+toml_is_space_space() {
+    #assert(toml_is_space(" "))
+}
+
+#law("toml_digit maps five")
+toml_digit_five() {
+    #assert(toml_digit("5") == 5)
+}

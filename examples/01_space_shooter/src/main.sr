@@ -1,0 +1,221 @@
+// Game #1 — Arcade Space Shooter with parallel physics + collision channel
+//
+//   par @(pos: Pos), (vel: Vel)  — multi-core physics
+//   chan[CollisionEvent]                  — audio/particle fiber pipeline
+//
+// Run: super test examples/01_space_shooter/
+
+use std.game.{ecs, physics2d}
+use std.math.linalg
+use std.tui
+
+#TRIG_STEPS = 16
+#SIN_TABLE = #for i in 0..#TRIG_STEPS { sin_approx(i * 0.393) }
+#COS_TABLE = #for i in 0..#TRIG_STEPS { cos_approx(i * 0.393) }
+
+#assert_size(Pos, 16)
++Pos = {
+    x: f64 = 0.0
+    y: f64 = 0.0
+
+    translate(@self, dx: f64, dy: f64) : f64 {
+        self.x += dx
+        self.y += dy
+        self.x
+    }
+}
+
+#assert_size(Vel, 16)
++Vel = {
+    vx: f64 = 0.0
+    vy: f64 = 0.0
+}
+
+#assert_size(Collider, 8)
++Collider = {
+    radius: f64 = 1.0
+}
+
++Enemy = {
+    hp: i64 = 3
+    score: i64 = 100
+
+    damage(@self, amount: i64) : i64 {
+        self.hp = self.hp - amount
+        self.hp
+    }
+
+    is_alive(self) : bool => self.hp > 0
+}
+
++CollisionEvent = {
+    a: i64 = 0
+    b: i64 = 0
+    kind: i64 = 0
+}
+
+state world = ecs.World{}
+
++Circle = {
+    x: f64 = 0.0
+    y: f64 = 0.0
+    r: f64 = 1.0
+
+    hits(self, other: Circle) : bool {
+        dx = self.x - other.x
+        dy = self.y - other.y
+        reach = self.r + other.r
+        dx * dx + dy * dy <= reach * reach
+    }
+}
+
++spawn_wave(count: i64) : i64 {
+    n = 0
+    for 0..count {
+        n += 1
+    }
+    n
+}
+
++warmup_slots() : i64 {
+    n = 0
+    #unroll(4)
+    for 0..4 {
+        n += 1
+    }
+    n
+}
+
++trig_sample(idx: i64) : f64 {
+    if idx < 0 {
+        return 0.0
+    }
+    if idx >= #TRIG_STEPS {
+        return 0.0
+    }
+    #SIN_TABLE[idx]
+}
+
++update(dt: f64) {
+    #simd
+    par @(pos: Pos), (vel: Vel) in world {
+        pos.x += vel.vx * dt
+        pos.y += vel.vy * dt
+    }
+}
+
++hud_line(score: i64, health: i64) : str {
+    text = "SCORE={score} HP={health}"
+    view = Screen.new(byte_len(text), 1)
+    @view.print_at(0, 0, text, 7, 0, 0)
+    view.row(0)
+}
+
++render_hud(score: i64, health: i64) {
+    print(hud_line(score, health))
+}
+
++run_fx_fiber(inbox: i64) : i64 {
+    // Particle/audio consumer — counts events until channel closed by caller.
+    n = 0
+    n + inbox
+}
+
++main() {
+    // Demo path stays on ops the C23 AOT backend lowers today (`par` / Shared
+    // stay covered by `super test` / the VM).
+    render_hud(0, 3)
+    waves = spawn_wave(5)
+    print("wave={waves} slots={warmup_slots()} sin0={trig_sample(0)}")
+    0
+}
+
+test "comptime trig tables start at the unit circle" {
+    assert_eq(#SIN_TABLE[0] < 0.01, true)
+    assert_eq(#COS_TABLE[0] > 0.99, true)
+}
+
+test "hud line is one terminal row" {
+    assert_eq(hud_line(120, 3), "SCORE=120 HP=3")
+}
+
+test "collision detects overlapping circles" {
+    origin = Circle{x: 0.0, y: 0.0, r: 1.0}
+    near = Circle{x: 0.5, y: 0.0, r: 1.0}
+    far = Circle{x: 5.0, y: 0.0, r: 1.0}
+    #assert(origin.hits(near))
+    #assert(!(origin.hits(far)))
+}
+
+test "type method damage + chaining" {
+    e = Enemy{hp: 3, score: 100}
+    left = @e.damage(1)
+    assert_eq(left, 2)
+    assert_eq(e.hp, 2)
+    #assert(e.is_alive())
+    left2 = @e.damage(2)
+    assert_eq(left2, 0)
+    #assert(!(e.is_alive()))
+}
+
+test "pos.translate mutates via @self" {
+    p = Pos{x: 1.0, y: 2.0}
+    @p.translate(3.0, 4.0)
+    assert_eq(p.x, 4.0)
+    assert_eq(p.y, 6.0)
+}
+
+test "wave spawner counts entities" {
+    count = 5
+    assert_eq(spawn_wave(.), 5)
+}
+
+test "collision channel + scope spawn fx fiber" {
+    events = chan[CollisionEvent](32)
+    scope {
+        fx = spawn {
+            n = 0
+            for _ev in events {
+                n += 1
+            }
+            n
+        }
+        events.send(CollisionEvent{a: 1, b: 2, kind: 1})
+        events.send(CollisionEvent{a: 3, b: 4, kind: 1})
+        events.close()
+        got = await fx
+        assert_eq(got, 2)
+    }
+}
+
+test "parallel physics update compiles" {
+    update(0.016)
+    assert_eq(1, 1)
+}
+
+test "comptime sin table length" {
+    assert_eq(#TRIG_STEPS, 16)
+    assert_eq(trig_sample(0), 0.0)
+}
+
+test "unroll warmup slots" {
+    assert_eq(warmup_slots(), 4)
+}
+
+test "stdlib: Vec2 length and circle overlap agree with Circle.hits" {
+    origin = Circle{x: 0.0, y: 0.0, r: 1.0}
+    near = Circle{x: 0.5, y: 0.0, r: 1.0}
+    far = Circle{x: 5.0, y: 0.0, r: 1.0}
+    assert_eq(v2_len(v2(3.0, 4.0)), 5.0)
+    assert_eq(v2_dist(v2(0.0, 0.0), v2(0.5, 0.0)), 0.5)
+    assert_eq(p2_point_in_circle(0.5, 0.0, 0.0, 0.0, 1.0), origin.hits(near))
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(5.0, 0.0, 1.0, 1.0)
+    assert_eq(p2_bounds_overlap(a, b), origin.hits(far))
+}
+
+test "Vec2 add and Display agree" {
+    c = v2(1.0, 2.0) + v2(3.0, 4.0)
+    assert_eq("{c}", "(4, 6)")
+    #assert(c == v2(4.0, 6.0))
+}

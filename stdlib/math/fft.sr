@@ -1,0 +1,639 @@
+//! std.math.fft — radix-2 + Bluestein FFT, naive DFT, inverse transform, real FFT, spectra and convolution
+//!
+//! Import with:
+//!   use std.math.fft
+//!
+//!   x   = FftBuf.from_real([1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0])
+//!   X   = fft_forward(x) or err { return }          // any length: radix-2 or Bluestein
+//!   y   = fft_inverse(X) or err { return }          // recovers x
+//!   h   = fft_rfft([1.0, 2.0, 3.0, 4.0, 5.0]) or FftBuf.new([], [])   // n/2+1 bins of a real signal
+//!   r   = fft_irfft(h, 5) or []                     // back to 5 real samples
+//!   mag = fft_magnitudes(X)
+//!   k   = fft_peak_bin(X)                           // dominant frequency bin (first half)
+//!   c   = fft_convolve([1.0, 2.0], [1.0, 1.0, 1.0]) or []
+//!
+//! Complex data is kept as a pair of parallel `f64` arrays (`FftBuf.re`, `FftBuf.im`) instead
+//! of an array of `Complex` structs, so the butterflies are plain array arithmetic and
+//! `std.math.complex` is not needed. Power-of-two lengths use the iterative in-place Cooley-Tukey
+//! algorithm (bit-reversal permutation, then log2(n) butterfly stages, O(n log n)); every other
+//! length goes through Bluestein's chirp-z transform, which rewrites the DFT as a convolution with
+//! the chirp e^(i pi n^2 / N) and evaluates it with three zero-padded radix-2 FFTs, so arbitrary
+//! lengths stay O(n log n). Both use the engineering convention X[k] = sum x[n] e^(-2 pi i k n / N).
+//! `fft_radix2` is the strict power-of-two entry point and `fft_bluestein` forces the chirp path
+//! for any length. `fft_inverse` conjugates,
+//! transforms and scales by 1/N, so `fft_inverse(fft_forward(x)) == x`. `fft_dft` is the
+//! O(n^2) definition for any length, used as the reference in tests. Parseval's theorem
+//! (sum |x|^2 == sum |X|^2 / N) holds and is asserted. Public helpers are prefixed `fft_`
+//! (modules merge flat).
+
+/// `FFT_PI` is pi.
++FFT_PI = 3.141592653589793
+/// `FFT_EPS` is `0.000001`.
++FFT_EPS = 0.000001
+
+/// True when `n` is a positive power of two.
++fft_is_pow2(n: i64) : bool {
+    ensure n > 0 else { return false }
+    m = n
+    while m % 2 == 0 { m = m / 2 }
+    m == 1
+}
+
+/// log2 of a power of two (floor of log2 for other positive values; 0 for `n < 2`).
++fft_log2(n: i64) : i64 {
+    bits = 0
+    m = n
+    while m > 1 {
+        m = m / 2
+        bits += 1
+    }
+    bits
+}
+
+/// Reverse the low `bits` bits of `i`.
++fft_bit_reverse(i: i64, bits: i64) : i64 {
+    r = 0
+    x = i
+    for 0..bits {
+        r = r * 2 + x % 2
+        x = x / 2
+    }
+    r
+}
+
+/// `FftBuf` is a complex signal: parallel real and imaginary arrays.
++FftBuf = {
+    /// Real parts. Defaults to `[]`.
+    re: _ = []
+    /// Imaginary parts. Defaults to `[]`.
+    im: _ = []
+
+    /// Signal from explicit real and imaginary arrays.
+    new(re: _, im: _) : FftBuf => FftBuf.{re, im}
+
+    /// Real signal (all imaginary parts zero).
+    from_real(xs: _) : FftBuf {
+        im = []
+        for xs { im = host.sys_arr_push(im, 0.0) }
+        FftBuf.{re: xs, im}
+    }
+
+    /// Number of samples.
+    size(self) : i64 => host.sys_arr_len(self.re)
+
+    /// True when the real and imaginary arrays have the same length.
+    is_valid(self) : bool => host.sys_arr_len(self.re) == host.sys_arr_len(self.im)
+
+    /// Complex conjugate.
+    conj(self) : FftBuf {
+        out = []
+        ims = self.im
+        for ims { out = host.sys_arr_push(out, 0.0 - it) }
+        FftBuf.{re: self.re, im: out}
+    }
+
+    /// Every sample multiplied by the real scalar `k`.
+    scale(self, k: f64) : FftBuf {
+        r = []
+        i = []
+        res = self.re
+        ims = self.im
+        for res { r = host.sys_arr_push(r, it * k) }
+        for ims { i = host.sys_arr_push(i, it * k) }
+        FftBuf.{re: r, im: i}
+    }
+}
+
+/// Radix-2 butterflies on `x`; the caller guarantees equal-length arrays and a power-of-two size.
+fft_core(x: FftBuf) : FftBuf {
+    n = x.size()
+    bits = fft_log2(n)
+    re = []
+    im = []
+    for 0..n {
+        src = fft_bit_reverse(it, bits)
+        re = host.sys_arr_push(re, x.re[src])
+        im = host.sys_arr_push(im, x.im[src])
+    }
+    span = 2
+    while span <= n {
+        half = span / 2
+        ang = 0.0 - 2.0 * FFT_PI / host.sys_to_float(span)
+        start = 0
+        while start < n {
+            k = 0
+            while k < half {
+                wr = host.sys_cos(ang * host.sys_to_float(k))
+                wi = host.sys_sin(ang * host.sys_to_float(k))
+                a = start + k
+                b = a + half
+                tr = re[b] * wr - im[b] * wi
+                ti = re[b] * wi + im[b] * wr
+                re = host.sys_arr_set(re, b, re[a] - tr)
+                im = host.sys_arr_set(im, b, im[a] - ti)
+                re = host.sys_arr_set(re, a, re[a] + tr)
+                im = host.sys_arr_set(im, a, im[a] + ti)
+                k += 1
+            }
+            start += span
+        }
+        span = span * 2
+    }
+    FftBuf.{re, im}
+}
+
+/// Strict radix-2 FFT of `x`; fails when the length is not a power of two or the arrays disagree.
++fft_radix2(x: FftBuf) : FftBuf! {
+    n = x.size()
+    ensure x.is_valid() else {
+        fail "fft: real and imaginary lengths differ"
+        return
+    }
+    ensure fft_is_pow2(n) else {
+        fail "fft: length must be a power of two"
+        return
+    }
+    fft_core(x)
+}
+
+/// Chirp factor e^(-i pi k^2 / n) as `(cos, sin)`; `k^2` is reduced mod `2n` to keep the angle exact.
+fft_chirp(k: i64, n: i64) {
+    red = (k * k) % (2 * n)
+    ang = 0.0 - FFT_PI * host.sys_to_float(red) / host.sys_to_float(n)
+    cs = [host.sys_cos(ang), host.sys_sin(ang)]
+    cs
+}
+
+/// Bluestein chirp-z FFT of `x` for any non-zero length (power-of-two lengths work too).
+/// X[k] = c[k] * sum_n (x[n] c[n]) conj(c[k-n]) with c[n] = e^(-i pi n^2 / N); the sum is a
+/// circular convolution evaluated with radix-2 FFTs of size >= 2N-1.
++fft_bluestein(x: FftBuf) : FftBuf! {
+    n = x.size()
+    ensure x.is_valid() else {
+        fail "fft: real and imaginary lengths differ"
+        return
+    }
+    ensure n > 0 else {
+        fail "fft: input must be non-empty"
+        return
+    }
+    m = fft_next_pow2(2 * n - 1)
+    cr = []
+    ci = []
+    for 0..n {
+        cs = fft_chirp(it, n)
+        cr = host.sys_arr_push(cr, cs[0])
+        ci = host.sys_arr_push(ci, cs[1])
+    }
+    ar = host.sys_arr_new(m, 0.0)
+    ai = host.sys_arr_new(m, 0.0)
+    br = host.sys_arr_new(m, 0.0)
+    bi = host.sys_arr_new(m, 0.0)
+    for 0..n {
+        ar = host.sys_arr_set(ar, it, x.re[it] * cr[it] - x.im[it] * ci[it])
+        ai = host.sys_arr_set(ai, it, x.re[it] * ci[it] + x.im[it] * cr[it])
+        br = host.sys_arr_set(br, it, cr[it])
+        bi = host.sys_arr_set(bi, it, 0.0 - ci[it])
+        if it > 0 {
+            br = host.sys_arr_set(br, m - it, cr[it])
+            bi = host.sys_arr_set(bi, m - it, 0.0 - ci[it])
+        }
+    }
+    fa = fft_core(FftBuf.{re: ar, im: ai})
+    fb = fft_core(FftBuf.{re: br, im: bi})
+    pr = []
+    pim = []
+    for 0..m {
+        pr = host.sys_arr_push(pr, fa.re[it] * fb.re[it] - fa.im[it] * fb.im[it])
+        pim = host.sys_arr_push(pim, fa.re[it] * fb.im[it] + fa.im[it] * fb.re[it])
+    }
+    conv = fft_core(FftBuf.{re: pr, im: pim}.conj()).conj().scale(1.0 / host.sys_to_float(m))
+    re = []
+    im = []
+    for 0..n {
+        re = host.sys_arr_push(re, conv.re[it] * cr[it] - conv.im[it] * ci[it])
+        im = host.sys_arr_push(im, conv.re[it] * ci[it] + conv.im[it] * cr[it])
+    }
+    FftBuf.{re, im}
+}
+
+/// FFT of `x` for any non-zero length: radix-2 for powers of two, Bluestein otherwise.
+/// Fails on an empty input or when the real and imaginary arrays disagree.
++fft_forward(x: FftBuf) : FftBuf! {
+    n = x.size()
+    ensure x.is_valid() else {
+        fail "fft: real and imaginary lengths differ"
+        return
+    }
+    ensure n > 0 else {
+        fail "fft: input must be non-empty"
+        return
+    }
+    if fft_is_pow2(n) { return fft_core(x) }
+    fft_bluestein(x)
+}
+
+/// Inverse FFT (conjugate, forward, conjugate, divide by N) for any non-zero length.
++fft_inverse(x: FftBuf) : FftBuf! {
+    n = x.size()
+    spec = fft_forward(x.conj()) or err {
+        fail "{err}"
+        return
+    }
+    spec.conj().scale(1.0 / host.sys_to_float(n))
+}
+
+/// Direct O(n^2) DFT for any length (reference implementation).
++fft_dft(x: FftBuf) : FftBuf {
+    n = x.size()
+    re = []
+    im = []
+    for 0..n {
+        k = it
+        sr = 0.0
+        si = 0.0
+        for 0..n {
+            ang = 0.0 - 2.0 * FFT_PI * host.sys_to_float((k * it) % n) / host.sys_to_float(n)
+            c = host.sys_cos(ang)
+            s = host.sys_sin(ang)
+            sr += x.re[it] * c - x.im[it] * s
+            si += x.re[it] * s + x.im[it] * c
+        }
+        re = host.sys_arr_push(re, sr)
+        im = host.sys_arr_push(im, si)
+    }
+    FftBuf.{re, im}
+}
+
+/// FFT of a real signal of any non-zero length, keeping only the non-redundant bins
+/// `0 ..= n/2` (the rest are conjugate mirrors). Returns `n/2 + 1` bins.
++fft_rfft(xs: _) : FftBuf! {
+    n = host.sys_arr_len(xs)
+    ensure n > 0 else {
+        fail "fft: input must be non-empty"
+        return
+    }
+    full = fft_forward(FftBuf.from_real(xs)) or err {
+        fail "{err}"
+        return
+    }
+    keep = n / 2 + 1
+    re = []
+    im = []
+    for 0..keep {
+        re = host.sys_arr_push(re, full.re[it])
+        im = host.sys_arr_push(im, full.im[it])
+    }
+    FftBuf.{re, im}
+}
+
+/// Inverse of `fft_rfft`: rebuild the `n` real samples from the `n/2 + 1` half-spectrum bins.
+/// Fails when `n < 1` or the spectrum does not have exactly `n/2 + 1` bins.
++fft_irfft(half: FftBuf, n: i64) : _! {
+    ensure n > 0 else {
+        fail "fft: output length must be positive"
+        return
+    }
+    ensure half.is_valid() && half.size() == n / 2 + 1 else {
+        fail "fft: half spectrum must have n/2 + 1 bins"
+        return
+    }
+    re = []
+    im = []
+    for 0..n {
+        if it <= n / 2 {
+            re = host.sys_arr_push(re, half.re[it])
+            im = host.sys_arr_push(im, half.im[it])
+        } else {
+            re = host.sys_arr_push(re, half.re[n - it])
+            im = host.sys_arr_push(im, 0.0 - half.im[n - it])
+        }
+    }
+    back = fft_inverse(FftBuf.{re, im}) or err {
+        fail "{err}"
+        return
+    }
+    back.re
+}
+
+/// Magnitude |X[k]| of every bin.
++fft_magnitudes(x: FftBuf) {
+    out = []
+    for 0..x.size() { out = host.sys_arr_push(out, host.sys_hypot(x.re[it], x.im[it])) }
+    out
+}
+
+/// Sum of squared magnitudes of the samples (time-domain energy).
++fft_energy(x: FftBuf) : f64 {
+    e = 0.0
+    for 0..x.size() { e += x.re[it] * x.re[it] + x.im[it] * x.im[it] }
+    e
+}
+
+/// Frequency-domain energy: sum |X[k]|^2 divided by N. Equals `fft_energy` of the signal (Parseval).
++fft_spectral_energy(spec: FftBuf) : f64 {
+    n = spec.size()
+    ensure n > 0 else { return 0.0 }
+    fft_energy(spec) / host.sys_to_float(n)
+}
+
+/// Bin (0 .. N/2) with the largest magnitude; the lowest bin wins ties. 0 for an empty spectrum.
++fft_peak_bin(spec: FftBuf) : i64 {
+    n = spec.size()
+    ensure n > 0 else { return 0 }
+    mags = fft_magnitudes(spec)
+    best = 0
+    top = n / 2
+    for 0..(top + 1) {
+        if it < n && mags[it] > mags[best] + FFT_EPS { best = it }
+    }
+    best
+}
+
+/// Frequency in Hz of bin `k` for a transform of `n` samples taken at `rate` Hz.
++fft_bin_freq(k: i64, n: i64, rate: f64) : f64 {
+    ensure n > 0 else { return 0.0 }
+    rate * host.sys_to_float(k) / host.sys_to_float(n)
+}
+
+/// Smallest power of two that is at least `n` (1 for `n <= 1`).
++fft_next_pow2(n: i64) : i64 {
+    p = 1
+    while p < n { p = p * 2 }
+    p
+}
+
+/// Linear convolution of two real arrays via zero-padded FFTs; length `len(a) + len(b) - 1`.
++fft_convolve(a: _, b: _) : _! {
+    na = host.sys_arr_len(a)
+    nb = host.sys_arr_len(b)
+    ensure na > 0 && nb > 0 else {
+        fail "fft: convolution needs non-empty inputs"
+        return
+    }
+    out_len = na + nb - 1
+    size = fft_next_pow2(out_len)
+    pa = []
+    pb = []
+    for 0..size {
+        if it < na { pa = host.sys_arr_push(pa, a[it]) } else { pa = host.sys_arr_push(pa, 0.0) }
+        if it < nb { pb = host.sys_arr_push(pb, b[it]) } else { pb = host.sys_arr_push(pb, 0.0) }
+    }
+    fa = fft_forward(FftBuf.from_real(pa)) or err {
+        fail "{err}"
+        return
+    }
+    fb = fft_forward(FftBuf.from_real(pb)) or err {
+        fail "{err}"
+        return
+    }
+    pr = []
+    pim = []
+    for 0..size {
+        pr = host.sys_arr_push(pr, fa.re[it] * fb.re[it] - fa.im[it] * fb.im[it])
+        pim = host.sys_arr_push(pim, fa.re[it] * fb.im[it] + fa.im[it] * fb.re[it])
+    }
+    prod = fft_inverse(FftBuf.{re: pr, im: pim}) or err {
+        fail "{err}"
+        return
+    }
+    out = []
+    for 0..out_len { out = host.sys_arr_push(out, prod.re[it]) }
+    out
+}
+
+/// True when `a` and `b` have equal length and every component differs by at most `tol`.
++fft_close(a: FftBuf, b: FftBuf, tol: f64) : bool {
+    ensure a.size() == b.size() else { return false }
+    ok = true
+    for 0..a.size() {
+        if host.sys_abs(a.re[it] - b.re[it]) > tol { ok = false }
+        if host.sys_abs(a.im[it] - b.im[it]) > tol { ok = false }
+    }
+    ok
+}
+
+// --- tests ---------------------------------------------------------------------------------------
+
+/// Test that power-of-two helpers and bit reversal are correct.
+test "power-of-two helpers and bit reversal are correct" {
+    #assert(fft_is_pow2(1))
+    #assert(fft_is_pow2(8))
+    #assert(fft_is_pow2(1024))
+    #assert(!(fft_is_pow2(0)))
+    #assert(!(fft_is_pow2(6)))
+    #assert(!(fft_is_pow2(-4)))
+    assert_eq(fft_log2(1), 0)
+    assert_eq(fft_log2(8), 3)
+    assert_eq(fft_log2(1024), 10)
+    assert_eq(fft_bit_reverse(1, 3), 4)
+    assert_eq(fft_bit_reverse(6, 3), 3)
+    assert_eq(fft_bit_reverse(0, 3), 0)
+    assert_eq(fft_bit_reverse(5, 3), 5)
+    assert_eq(fft_next_pow2(5), 8)
+    assert_eq(fft_next_pow2(8), 8)
+    assert_eq(fft_next_pow2(0), 1)
+}
+
+/// Test that known small transforms match.
+test "known small transforms match" {
+    x = FftBuf.from_real([1.0, 0.0, 0.0, 0.0])
+    spec = fft_forward(x) or FftBuf.new([], [])
+    assert_eq(spec.size(), 4)
+    #assert(fft_close(spec, FftBuf.new([1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0]), 0.000001))
+    dc = fft_forward(FftBuf.from_real([2.0, 2.0, 2.0, 2.0])) or FftBuf.new([], [])
+    #assert(host.sys_abs(dc.re[0] - 8.0) < 0.000001)
+    #assert(host.sys_abs(dc.re[1]) < 0.000001)
+    #assert(host.sys_abs(dc.re[3]) < 0.000001)
+    ramp = fft_forward(FftBuf.from_real([1.0, 2.0, 3.0, 4.0])) or FftBuf.new([], [])
+    #assert(host.sys_abs(ramp.re[0] - 10.0) < 0.000001)
+    #assert(host.sys_abs(ramp.re[1] + 2.0) < 0.000001)
+    #assert(host.sys_abs(ramp.im[1] - 2.0) < 0.000001)
+    #assert(host.sys_abs(ramp.re[2] + 2.0) < 0.000001)
+    #assert(host.sys_abs(ramp.im[2]) < 0.000001)
+    #assert(host.sys_abs(ramp.im[3] + 2.0) < 0.000001)
+    one = fft_forward(FftBuf.from_real([5.0])) or FftBuf.new([], [])
+    assert_eq(one.re[0], 5.0)
+}
+
+/// Test that the FFT agrees with the direct DFT.
+test "the FFT agrees with the direct DFT" {
+    xs = [0.5, -1.0, 2.0, 0.25, 3.5, -2.0, 1.0, 0.0, 4.0, -0.5, 0.75, 2.5, -3.0, 1.5, 0.0, 1.0]
+    im = [0.0, 1.0, 0.0, -1.0, 0.5, 0.0, 2.0, 0.0, -0.5, 0.0, 1.0, 0.0, 0.25, 0.0, -2.0, 0.0]
+    x = FftBuf.new(xs, im)
+    fast = fft_forward(x) or FftBuf.new([], [])
+    slow = fft_dft(x)
+    assert_eq(fast.size(), 16)
+    #assert(fft_close(fast, slow, 0.00001))
+    #assert(!(fft_close(fast, FftBuf.from_real(xs), 0.00001)))
+}
+
+/// Test that the inverse recovers the signal.
+test "the inverse recovers the signal" {
+    xs = [3.0, -1.0, 4.0, 1.0, -5.0, 9.0, 2.0, -6.0]
+    x = FftBuf.from_real(xs)
+    spec = fft_forward(x) or FftBuf.new([], [])
+    back = fft_inverse(spec) or FftBuf.new([], [])
+    #assert(fft_close(back, x, 0.00001))
+    wide = FftBuf.new([1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0])
+    rt = fft_inverse(fft_forward(wide) or FftBuf.new([], [])) or FftBuf.new([], [])
+    #assert(fft_close(rt, wide, 0.00001))
+}
+
+/// Test that energy is conserved (Parseval).
+test "energy is conserved (Parseval)" {
+    xs = [0.3, -1.2, 2.5, 0.8, -0.7, 1.9, -2.2, 0.1, 1.4, -0.6, 0.0, 2.0, -1.1, 0.9, 0.4, -1.5]
+    x = FftBuf.from_real(xs)
+    spec = fft_forward(x) or FftBuf.new([], [])
+    time_e = fft_energy(x)
+    freq_e = fft_spectral_energy(spec)
+    #assert(time_e > 1.0)
+    #assert(host.sys_abs(time_e - freq_e) < 0.00001)
+    tone = []
+    for 0..64 { tone = host.sys_arr_push(tone, host.sys_sin(2.0 * FFT_PI * 7.0 * host.sys_to_float(it) / 64.0)) }
+    tx = FftBuf.from_real(tone)
+    ts = fft_forward(tx) or FftBuf.new([], [])
+    #assert(host.sys_abs(fft_energy(tx) - fft_spectral_energy(ts)) < 0.00001)
+    assert_eq(fft_spectral_energy(FftBuf.new([], [])), 0.0)
+}
+
+/// Test that a pure tone peaks in its own bin.
+test "a pure tone peaks in its own bin" {
+    tone = []
+    for 0..64 { tone = host.sys_arr_push(tone, host.sys_sin(2.0 * FFT_PI * 5.0 * host.sys_to_float(it) / 64.0)) }
+    spec = fft_forward(FftBuf.from_real(tone)) or FftBuf.new([], [])
+    assert_eq(fft_peak_bin(spec), 5)
+    mags = fft_magnitudes(spec)
+    #assert(host.sys_abs(mags[5] - 32.0) < 0.0001)
+    #assert(host.sys_abs(mags[59] - 32.0) < 0.0001)
+    #assert(mags[10] < 0.0001)
+    #assert(host.sys_abs(fft_bin_freq(5, 64, 8000.0) - 625.0) < 0.0001)
+    assert_eq(fft_bin_freq(1, 0, 8000.0), 0.0)
+    assert_eq(fft_peak_bin(FftBuf.new([], [])), 0)
+}
+
+/// Test that convolution matches the direct sum.
+test "convolution matches the direct sum" {
+    c = fft_convolve([1.0, 2.0, 3.0], [0.0, 1.0, 0.5]) or []
+    assert_eq(host.sys_arr_len(c), 5)
+    expected = [0.0, 1.0, 2.5, 4.0, 1.5]
+    for 0..5 { #assert(host.sys_abs(c[it] - expected[it]) < 0.00001) }
+    one = fft_convolve([2.0], [3.0]) or []
+    assert_eq(host.sys_arr_len(one), 1)
+    #assert(host.sys_abs(one[0] - 6.0) < 0.00001)
+    assert_eq(host.sys_arr_len(fft_convolve([], [1.0]) or [9]), 1)
+    assert_eq((fft_convolve([], [1.0]) or [9])[0], 9)
+}
+
+/// Test that invalid input is rejected.
+test "invalid input is rejected" {
+    assert_eq((fft_radix2(FftBuf.from_real([1.0, 2.0, 3.0])) or FftBuf.from_real([9.0])).re[0], 9.0)
+    assert_eq((fft_forward(FftBuf.from_real([])) or FftBuf.from_real([9.0])).re[0], 9.0)
+    assert_eq((fft_bluestein(FftBuf.from_real([])) or FftBuf.from_real([9.0])).re[0], 9.0)
+    assert_eq((fft_forward(FftBuf.new([1.0, 2.0], [0.0])) or FftBuf.from_real([9.0])).re[0], 9.0)
+    assert_eq((fft_inverse(FftBuf.new([1.0, 2.0, 3.0], [0.0, 0.0])) or FftBuf.from_real([9.0])).re[0], 9.0)
+    assert_eq((fft_rfft([]) or FftBuf.from_real([9.0])).re[0], 9.0)
+    assert_eq((fft_irfft(FftBuf.from_real([1.0, 2.0]), 8) or [9.0])[0], 9.0)
+    assert_eq((fft_irfft(FftBuf.from_real([1.0, 2.0]), 0) or [9.0])[0], 9.0)
+    #assert(FftBuf.new([1.0], [2.0]).is_valid())
+    #assert(!(FftBuf.new([1.0], []).is_valid()))
+    c = FftBuf.new([1.0, 2.0], [3.0, -4.0]).conj()
+    assert_eq(c.im[0], -3.0)
+    assert_eq(c.im[1], 4.0)
+}
+
+/// Test that a larger transform stays accurate.
+test "a larger transform stays accurate" {
+    xs = []
+    for 0..256 { xs = host.sys_arr_push(xs, host.sys_sin(0.3 * host.sys_to_float(it)) + 0.5 * host.sys_cos(1.1 * host.sys_to_float(it))) }
+    x = FftBuf.from_real(xs)
+    spec = fft_forward(x) or FftBuf.new([], [])
+    back = fft_inverse(spec) or FftBuf.new([], [])
+    #assert(fft_close(x, back, 0.0001))
+    #assert(host.sys_abs(fft_energy(x) - fft_spectral_energy(spec)) < 0.001)
+}
+
+/// Test that Bluestein matches the direct DFT for non-power-of-two lengths.
+test "Bluestein matches the direct DFT for non-power-of-two lengths" {
+    for [1, 2, 3, 5, 6, 7, 9, 12, 15, 17, 31, 100] {
+        n = it
+        re = []
+        im = []
+        for 0..n {
+            t = host.sys_to_float(it)
+            re = host.sys_arr_push(re, host.sys_sin(0.7 * t) + 0.25 * t - 1.0)
+            im = host.sys_arr_push(im, host.sys_cos(1.3 * t) * 0.5)
+        }
+        x = FftBuf.new(re, im)
+        slow = fft_dft(x)
+        fast = fft_forward(x) or FftBuf.new([], [])
+        forced = fft_bluestein(x) or FftBuf.new([], [])
+        assert_eq(fast.size(), n)
+        #assert(fft_close(fast, slow, 0.000001))
+        #assert(fft_close(forced, slow, 0.000001))
+    }
+}
+
+/// Test that Bluestein agrees with radix-2 on power-of-two sizes.
+test "Bluestein agrees with radix-2 on power-of-two sizes" {
+    xs = [0.5, -1.0, 2.0, 0.25, 3.5, -2.0, 1.0, 0.0, 4.0, -0.5, 0.75, 2.5, -3.0, 1.5, 0.0, 1.0]
+    x = FftBuf.from_real(xs)
+    a = fft_radix2(x) or FftBuf.new([], [])
+    b = fft_bluestein(x) or FftBuf.new([], [])
+    assert_eq(a.size(), 16)
+    #assert(fft_close(a, b, 0.000001))
+}
+
+/// Test that the inverse and Parseval hold for odd and composite lengths.
+test "inverse and Parseval hold for odd and composite lengths" {
+    for [3, 7, 10, 45, 97, 120] {
+        n = it
+        xs = []
+        for 0..n { xs = host.sys_arr_push(xs, host.sys_sin(0.37 * host.sys_to_float(it) * host.sys_to_float(it)) + 0.1 * host.sys_to_float(it)) }
+        x = FftBuf.from_real(xs)
+        spec = fft_forward(x) or FftBuf.new([], [])
+        back = fft_inverse(spec) or FftBuf.new([], [])
+        #assert(fft_close(back, x, 0.000001))
+        #assert(host.sys_abs(fft_energy(x) - fft_spectral_energy(spec)) < 0.000001 * (1.0 + fft_energy(x)))
+    }
+}
+
+/// Test that known non-power-of-two transforms match closed forms.
+test "known non-power-of-two transforms match closed forms" {
+    imp = fft_forward(FftBuf.from_real([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])) or FftBuf.new([], [])
+    #assert(fft_close(imp, FftBuf.new([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), 0.000001))
+    dc = fft_forward(FftBuf.from_real([2.0, 2.0, 2.0, 2.0, 2.0])) or FftBuf.new([], [])
+    #assert(host.sys_abs(dc.re[0] - 10.0) < 0.000001)
+    for 1..5 {
+        #assert(host.sys_abs(dc.re[it]) < 0.000001)
+        #assert(host.sys_abs(dc.im[it]) < 0.000001)
+    }
+    tone = []
+    for 0..30 { tone = host.sys_arr_push(tone, host.sys_cos(2.0 * FFT_PI * 4.0 * host.sys_to_float(it) / 30.0)) }
+    spec = fft_forward(FftBuf.from_real(tone)) or FftBuf.new([], [])
+    assert_eq(fft_peak_bin(spec), 4)
+    #assert(host.sys_abs(spec.re[4] - 15.0) < 0.00001)
+    #assert(host.sys_abs(spec.re[26] - 15.0) < 0.00001)
+    #assert(host.sys_abs(spec.re[7]) < 0.00001)
+    one = fft_bluestein(FftBuf.from_real([5.0])) or FftBuf.new([], [])
+    #assert(host.sys_abs(one.re[0] - 5.0) < 0.000001)
+}
+
+/// Test that rfft and irfft round-trip for even and odd lengths.
+test "rfft and irfft round-trip for even and odd lengths" {
+    for [1, 2, 5, 8, 9, 12, 30] {
+        n = it
+        xs = []
+        for 0..n { xs = host.sys_arr_push(xs, host.sys_cos(0.9 * host.sys_to_float(it)) * 3.0 - 0.2 * host.sys_to_float(it)) }
+        half = fft_rfft(xs) or FftBuf.new([], [])
+        full = fft_forward(FftBuf.from_real(xs)) or FftBuf.new([], [])
+        assert_eq(half.size(), n / 2 + 1)
+        for 0..half.size() {
+            #assert(host.sys_abs(half.re[it] - full.re[it]) < 0.000001)
+            #assert(host.sys_abs(half.im[it] - full.im[it]) < 0.000001)
+        }
+        back = fft_irfft(half, n) or []
+        assert_eq(host.sys_arr_len(back), n)
+        for 0..n { #assert(host.sys_abs(back[it] - xs[it]) < 0.000001) }
+    }
+}

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/install-security/"/>
+<meta name="description" content="curl|sh safety and manual install."/>
+<meta property="og:type" content="website"/>
+<meta property="og:title" content="Super · Install security"/>
+<meta property="og:description" content="curl|sh safety and manual install."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/install-security/"/>
+<link rel="stylesheet" href="../site.css"/>
+<title>Super · Install security</title>
+</head>
+<body>
+<header class="site-nav">
+  <a class="mark" href="../">Super</a>
+  <nav><a href="../">Home</a><a href="../quickstart/">Quickstart</a><a href="../docs-hub/" aria-current="page">Docs</a><a href="../spec/">Spec</a><a href="../benchmarks/">Benchmarks</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a></nav>
+  <a class="cta" href="../quickstart/">Quickstart</a>
+</header>
+<section class="section">
+<h1>Installer security</h1>
+<ol>
+<li>Download and read first: <code>curl -fsSL https://thehamdiz.github.io/super-lang/install.sh -o install.sh && less install.sh</code></li>
+<li>Release SHA256: verify <code>SHA256SUMS</code> on GitHub release <code>v0.1.0</code> (see release assets).</li>
+<li>Manual path: download <code>super-0.1.0-*.tar.gz</code>, extract <code>bin/super</code> and <code>stdlib/</code> under <code>~/.super/</code>.</li>
+<li>Installer touches: <code>~/.super/bin</code>, <code>~/.super/lib/stdlib</code>, optional registry/cache dirs — never <code>~/.cargo</code>.</li>
+</ol>
+<p><strong>Next:</strong> <a href="../install/">Install</a> · <strong>Related:</strong> <a href="../quickstart/">Quickstart</a></p>
+</section>
+<footer class="site-footer"><p>Super 0.1.0 · <a href="../">Home</a></p></footer>
+</body>
+</html>

@@ -1,0 +1,210 @@
+//! std.io.socket — lowest-level TCP/UDP/DNS socket host bindings
+//!
+//! Import with:
+//!   use std.io.socket
+//!
+//! Mid-level modules (`std.net.tcp`, `std.net.udp`, `std.net.dns`, `std.io.poll`) call these
+//! instead of `host.sys_*` directly.
+
+use std.core.collections
+
+/// Listen for TCP connections on `addr`. Returns the socket descriptor, or fail.
++socket_tcp_listen(addr: str) : i64! => host.sys_tcp_listen(addr)
+/// Accept one connection on the listener `listener`, or fail.
++socket_tcp_accept(listener: i64) : i64! => host.sys_tcp_accept(listener)
+/// Open a TCP connection to `addr`, or fail.
++socket_tcp_connect(addr: str) : i64! => host.sys_tcp_connect(addr)
+/// Open a TLS connection to `addr`, or fail.
++socket_tls_connect(addr: str) : i64! => host.sys_tls_connect(addr)
+/// Read up to `n` bytes from socket `fd`, or fail.
++socket_tcp_read(fd: i64, n: i64) : _! => host.sys_tcp_read(fd, n)
+/// Enter request-scoped allocation (HTTP server loop); returns rewind mark.
++socket_req_enter() : i64 => host.sys_req_enter()
+/// Leave request scope and reclaim transient allocations (pass mark from enter).
++socket_req_leave(mark: i64) => host.sys_req_leave(mark)
+/// Copy `s` out of the request arena when keep-alive must retain it across requests.
++socket_req_keep_str(s: _) : _ => host.sys_req_keep_str(s)
+/// Deep-promote a value that must cross the request boundary into the durable heap.
++socket_req_promote(v: _) : _ => host.sys_req_promote(v)
+/// Request-arena diagnostics: `{arena_bytes, promoted_objs, stay_objs}`.
++socket_req_stats() : _ => host.sys_req_stats()
+/// Enter connection-scoped allocation (around accept…close); returns rewind mark.
++socket_conn_enter() : i64 => host.sys_conn_enter()
+/// Leave connection scope and reclaim Conn-lifetime bump bytes (pass mark from enter).
+/// Returns bytes reclaimed (AOT mmap rewind; VM bump rewind).
++socket_conn_leave(mark: i64) : i64 => host.sys_conn_leave(mark)
+/// Connection-arena diagnostics: `{arena_bytes, reclaimed_bytes, enter_count, leave_count}`.
++socket_conn_stats() : _ => host.sys_conn_stats()
+/// Write `data` to socket `fd`, or fail.
++socket_tcp_write(fd: i64, data: _) : i64! => host.sys_tcp_write(fd, data)
+
+/// Bind a UDP socket to `addr`, or fail.
++socket_udp_bind(addr: str) : i64! => host.sys_udp_bind(addr)
+/// Send `data` to `addr` from socket `fd`, or fail.
++socket_udp_send_to(fd: i64, data: _, addr: str) : i64! => host.sys_udp_send_to(fd, data, addr)
+/// Read one datagram from socket `fd`, or fail.
++socket_udp_recv_from(fd: i64, max: i64) : _! => host.sys_udp_recv_from(fd, max)
+
+/// Resolve the hostname `hostport`, or fail.
++socket_dns_lookup(hostport: str) : _! => host.sys_dns_lookup(hostport)
+/// Fd close (`fd`).
++socket_fd_close(fd: i64)  => host.sys_fd_close(fd)
+
+/// Deadlines and connection metadata. `ms <= 0` clears that direction's deadline; a read or
+/// write that exceeds it returns an error value.
++socket_set_timeout(fd: i64, read_ms: i64, write_ms: i64) : bool! => host.sys_socket_set_timeout(fd, read_ms, write_ms)
+/// Put socket `fd` into non-blocking mode, or fail.
++socket_set_nonblock(fd: i64, enabled: bool) : bool! => host.sys_socket_set_nonblock(fd, enabled)
+/// how: 0 = read half, 1 = write half, 2 = both.
++socket_shutdown(fd: i64, how: i64) : bool! => host.sys_tcp_shutdown(fd, how)
+/// Local addr (`fd`). Returns `str`, or fails.
++socket_local_addr(fd: i64) : str! => host.sys_fd_local_addr(fd)
+/// Peer addr (`fd`). Returns `str`, or fails.
++socket_peer_addr(fd: i64) : str! => host.sys_fd_peer_addr(fd)
+
+/// Wire buffers: reads arrive as raw bytes and a message can straddle reads, so protocols
+/// frame on bytes first and decode text only for complete messages.
++socket_buf_concat(a: _, b: _) : _ => host.sys_bytes_concat(a, b)
+/// Buf find (`buf`, `needle`, `from`). Returns `i64`.
++socket_buf_find(buf: _, needle: str, from: i64) : i64 => host.sys_bytes_find(buf, needle, from)
+/// Buf slice (`buf`, `lo`, `hi`).
++socket_buf_slice(buf: _, lo: i64, hi: i64) : _ => host.sys_bytes_slice(buf, lo, hi)
+/// Buf len (`buf`). Returns `i64`.
++socket_buf_len(buf: _) : i64 => buf.len
+/// Buf text (`buf`). Returns `str`.
++socket_buf_text(buf: _) : str => host.sys_bytes_to_str(buf)
+/// Text len (`s`). Returns `i64`.
++socket_text_len(s: str) : i64 => s.len
+/// UTF-8 octets of `s` as an indexable i64 array (Bytes values are opaque, arrays are indexable).
++socket_octets(s: str) : _ => host.sys_str_to_bytes(s)
+
+// --- tests -------------------------------------------------------------------------
+
+/// Test that wire buffer helpers are byte based, not character based.
+test "wire buffer helpers are byte based, not character based" {
+    a = socket_buf_concat("GET / HT", "TP/1.1\r\n\r\nbody")
+    assert_eq(socket_buf_text(a), "GET / HTTP/1.1\r\n\r\nbody")
+    assert_eq(socket_buf_len(a), 22)
+    assert_eq(socket_buf_find(a, "\r\n\r\n", 0), 14)
+    assert_eq(socket_buf_find(a, "\r\n\r\n", 15), -1)
+    assert_eq(socket_buf_find(a, "zzz", 0), -1)
+    assert_eq(socket_buf_find(a, "", 0), -1)
+    assert_eq(socket_buf_text(socket_buf_slice(a, 18, 99)), "body")
+    assert_eq(socket_buf_text(socket_buf_slice(a, 5, 2)), "")
+    assert_eq(socket_buf_text(socket_buf_slice(a, 0, 3)), "GET")
+    assert_eq(socket_buf_len(socket_buf_slice(a, 0, 0)), 0)
+}
+
+/// Test that multi-byte text is framed on byte offsets.
+test "multi-byte text is framed on byte offsets" {
+    u = socket_buf_concat("é", "!")
+    assert_eq(socket_buf_len(u), 3)
+    assert_eq(socket_text_len("日本"), 6)
+    assert_eq(socket_text_len(""), 0)
+    assert_eq(socket_buf_find(u, "!", 0), 2)
+    assert_eq(socket_buf_text(socket_buf_slice(u, 0, 2)), "é")
+    assert_eq(socket_buf_text(socket_buf_slice(u, 2, 3)), "!")
+    cat = socket_buf_concat(socket_buf_slice("héllo", 0, 3), socket_buf_slice("héllo", 3, 6))
+    assert_eq(socket_buf_text(cat), "héllo")
+}
+
+/// Test that octets expose UTF-8 bytes as an indexable array.
+test "octets expose UTF-8 bytes as an indexable array" {
+    o = socket_octets("é!")
+    assert_eq(len(o), 3)
+    assert_eq(o[0], 195)
+    assert_eq(o[1], 169)
+    assert_eq(o[2], 33)
+    assert_eq(len(socket_octets("")), 0)
+    assert_eq(len(socket_octets("abc")), 3)
+}
+
+/// Test that empty buffers are neutral for concat and find.
+test "empty buffers are neutral for concat and find" {
+    e = socket_buf_concat("", "")
+    assert_eq(socket_buf_len(e), 0)
+    assert_eq(socket_buf_text(socket_buf_concat(e, "x")), "x")
+    assert_eq(socket_buf_text(socket_buf_concat("x", e)), "x")
+    assert_eq(socket_buf_find(e, "a", 0), -1)
+    assert_eq(socket_buf_len(socket_buf_slice(e, 0, 10)), 0)
+}
+
+/// Test that tcp wrappers: listen, connect, accept, addresses, timeouts, shutdown.
+test "tcp wrappers: listen, connect, accept, addresses, timeouts, shutdown" {
+    ln = socket_tcp_listen("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    laddr = socket_local_addr(ln) or "?"
+    #assert(laddr != "?")
+    c = socket_tcp_connect(laddr) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    s = socket_tcp_accept(ln) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_peer_addr(c) or "?", laddr)
+    assert_eq(socket_peer_addr(s) or "?", socket_local_addr(c) or "!")
+    assert_eq(socket_tcp_write(c, "hello") or -1, 5)
+    assert_eq(socket_buf_text(socket_tcp_read(s, 16) or ""), "hello")
+    #assert(socket_set_timeout(s, 25, 0) or false)
+    assert_eq(socket_tcp_read(s, 16) or "timeout", "timeout")
+    assert_eq(socket_tcp_write(c, [1, 2, 3]) or -1, 3)
+    assert_eq(socket_buf_len(socket_tcp_read(s, 16) or ""), 3)
+    #assert(socket_set_timeout(s, 0, 0) or false)
+    assert_eq(socket_tcp_write(c, "bye") or -1, 3)
+    #assert(socket_shutdown(c, 1) or false)
+    assert_eq(socket_buf_text(socket_tcp_read(s, 16) or "?"), "bye")
+    assert_eq(socket_buf_len(socket_tcp_read(s, 16) or "?"), 0)
+    #assert(socket_set_nonblock(s, false) or false)
+    socket_fd_close(c)
+    socket_fd_close(s)
+    socket_fd_close(ln)
+}
+
+/// Test that socket wrappers reject bad descriptors.
+test "socket wrappers reject bad descriptors" {
+    assert_eq(socket_tcp_read(987654, 8) or "bad", "bad")
+    assert_eq(socket_tcp_write(987654, "x") or -1, -1)
+    #assert(!(socket_set_timeout(987654, 1, 1) or false))
+    #assert(!(socket_shutdown(987654, 2) or false))
+    assert_eq(socket_peer_addr(987654) or "bad", "bad")
+    assert_eq(socket_local_addr(987654) or "bad", "bad")
+    assert_eq(socket_tcp_connect("127.0.0.1:1") or "refused", "refused")
+}
+
+/// Test that udp wrappers: bind, send, recv, timeout.
+test "udp wrappers: bind, send, recv, timeout" {
+    a = socket_udp_bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    b = socket_udp_bind("127.0.0.1:0") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    baddr = socket_local_addr(b) or "?"
+    assert_eq(socket_udp_send_to(a, "ping", baddr) or -1, 4)
+    got = socket_udp_recv_from(b, 64) or err {
+        assert_eq("{err}", "")
+        return
+    }
+    assert_eq(socket_buf_text(got.data), "ping")
+    assert_eq(got.addr, socket_local_addr(a) or "!")
+    #assert(socket_set_timeout(b, 25, 0) or false)
+    assert_eq(socket_udp_recv_from(b, 64) or "timeout", "timeout")
+    socket_fd_close(a)
+    socket_fd_close(b)
+}
+
+/// Test that dns lookup resolves literal addresses without a network.
+test "dns lookup resolves literal addresses without a network" {
+    r = socket_dns_lookup("127.0.0.1:80") or err {
+        assert_eq("{err}", "")
+        return
+    }
+    #assert(len(r) >= 1)
+    assert_eq(r[0], "127.0.0.1:80")
+}

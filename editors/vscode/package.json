@@ -1,0 +1,131 @@
+{
+  "name": "super",
+  "displayName": "Super",
+  "description": "Super (.sr) — syntax, snippets, tasks, and super-lsp",
+  "version": "0.1.0",
+  "publisher": "theHamdiz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/theHamdiz/super-lang.git"
+  },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:super"],
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "super",
+        "aliases": ["Super", "super"],
+        "extensions": [".sr", ".law.sr", ".proof.sr"],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/super.png",
+          "dark": "./icons/super.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "super",
+        "scopeName": "source.sr",
+        "path": "./syntaxes/super.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "super",
+        "path": "./snippets/super.json"
+      }
+    ],
+    "configuration": {
+      "title": "Super",
+      "properties": {
+        "super.languageServerPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `super` CLI (empty = search `super-lsp`, then `super` on PATH)."
+        },
+        "super.languageServerArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["lsp"],
+          "description": "Arguments passed to the language server binary."
+        },
+        "super.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Traces communication between VS Code and super-lsp."
+        }
+      }
+    },
+    "taskDefinitions": [
+      {
+        "type": "super",
+        "required": ["task"],
+        "properties": {
+          "task": {
+            "type": "string",
+            "enum": ["run", "build", "test", "check"],
+            "description": "super CLI subcommand"
+          },
+          "file": {
+            "type": "string",
+            "description": "Target .sr file (defaults to the active editor file)"
+          }
+        }
+      }
+    ],
+    "iconThemes": [
+      {
+        "id": "super-icons",
+        "label": "Super Icons",
+        "path": "./super-icon-theme.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "super.runCurrentFile",
+        "title": "Super: Run Current File",
+        "icon": "$(play)"
+      },
+      {
+        "command": "super.checkCurrentFile",
+        "title": "Super: Check Current File"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "super.runCurrentFile",
+          "when": "resourceLangId == super",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configurationDefaults": {
+      "[super]": {
+        "editor.semanticHighlighting.enabled": true,
+        "editor.quickSuggestions": {
+          "strings": true
+        }
+      }
+    }
+  }
+}

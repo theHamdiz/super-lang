@@ -1,0 +1,134 @@
+// 14_tcp_message_broker — length-prefixed binary frames and topic fanout.
+
+use std.core.collections
+use std.diag.log
+
++MAX_FRAME = 64
++TOPIC_COUNT = 4
++SUBSCRIBER_COUNT = 8
++MESSAGE_COUNT = 2000
+
+FrameKind = {
+    Publish
+    Subscribe
+    Unsubscribe
+    Ping
+}
+
++Frame = {
+    wire_len: i64 = 0
+    kind: i64 = 0
+    topic: i64 = 0
+    sequence: i64 = 0
+    payload_sum: i64 = 0
+}
+
++encode_frame(@wire, kind: i64, topic: i64, sequence: i64, payload) : i64 {
+    payload_len = payload.len()
+    frame_len = payload_len + 3
+    wire[0] = frame_len / 256
+    wire[1] = frame_len % 256
+    wire[2] = kind
+    wire[3] = topic
+    wire[4] = sequence / 256
+    wire[5] = sequence % 256
+    for i in 0..payload_len {
+        wire[6 + i] = payload[i]
+    }
+    payload_len + 6
+}
+
++decode_frame(wire) : Frame {
+    declared = wire[0] * 256 + wire[1]
+    payload_len = declared - 3
+    payload_sum = 0
+    for i in 0..payload_len {
+        payload_sum += wire[6 + i]
+    }
+    Frame{
+        wire_len: declared,
+        kind: wire[2],
+        topic: wire[3],
+        sequence: wire[4] * 256 + wire[5],
+        payload_sum,
+    }
+}
+
++subscribe(@subscriptions, subscriber: i64, topic: i64) {
+    subscriptions[subscriber * TOPIC_COUNT + topic] = 1
+}
+
++unsubscribe(@subscriptions, subscriber: i64, topic: i64) {
+    subscriptions[subscriber * TOPIC_COUNT + topic] = 0
+}
+
++fanout(subscriptions, topic: i64, payload_sum: i64, @mailboxes) : i64 {
+    delivered = 0
+    for subscriber in 0..SUBSCRIBER_COUNT {
+        if subscriptions[subscriber * TOPIC_COUNT + topic] == 1 {
+            mailboxes[subscriber] += payload_sum
+            delivered += 1
+        }
+    }
+    delivered
+}
+
++run_broker(messages: i64) : i64 {
+    subscriptions = [0; SUBSCRIBER_COUNT * TOPIC_COUNT]
+    mailboxes = [0; SUBSCRIBER_COUNT]
+    for subscriber in 0..SUBSCRIBER_COUNT {
+        subscribe(@subscriptions, subscriber, subscriber % TOPIC_COUNT)
+        subscribe(@subscriptions, subscriber, (subscriber + 1) % TOPIC_COUNT)
+    }
+
+    wire = [0; MAX_FRAME]
+    deliveries = 0
+    sequence_sum = 0
+    for sequence in 0..messages {
+        topic = sequence % TOPIC_COUNT
+        payload = [sequence % 251, topic + 17, 9]
+        _written = encode_frame(@wire, 0, topic, sequence, payload)
+        frame = decode_frame(wire)
+        deliveries += fanout(subscriptions, frame.topic, frame.payload_sum, @mailboxes)
+        sequence_sum += frame.sequence
+    }
+    (mailboxes.sum()) + deliveries * 31 + sequence_sum
+}
+
++main() {
+    lg = Logger.console("tcp_broker")
+    checksum = run_broker(MESSAGE_COUNT)
+    @lg.info("CHECKSUM={checksum}")
+}
+
+test "binary frame round trip" {
+    wire = [0; MAX_FRAME]
+    assert_eq(encode_frame(@wire, 0, 2, 513, [10, 20, 30]), 9)
+    frame = decode_frame(wire)
+    assert_eq(frame.wire_len, 6)
+    assert_eq(frame.topic, 2)
+    assert_eq(frame.sequence, 513)
+    assert_eq(frame.payload_sum, 60)
+}
+
+test "topic subscriptions fan out" {
+    subscriptions = [0; SUBSCRIBER_COUNT * TOPIC_COUNT]
+    mailboxes = [0; SUBSCRIBER_COUNT]
+    subscribe(@subscriptions, 1, 3)
+    subscribe(@subscriptions, 5, 3)
+    assert_eq(fanout(subscriptions, 3, 41, @mailboxes), 2)
+    assert_eq(mailboxes[1] + mailboxes[5], 82)
+}
+
+test "unsubscribe stops delivery" {
+    subscriptions = [0; SUBSCRIBER_COUNT * TOPIC_COUNT]
+    mailboxes = [0; SUBSCRIBER_COUNT]
+    subscribe(@subscriptions, 0, 1)
+    unsubscribe(@subscriptions, 0, 1)
+    assert_eq(fanout(subscriptions, 1, 10, @mailboxes), 0)
+}
+
+test "broker workload is deterministic" {
+    assert_eq(run_broker(20), run_broker(20))
+    #assert(run_broker(20) > 0)
+}

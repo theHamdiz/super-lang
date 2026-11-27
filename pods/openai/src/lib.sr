@@ -1,0 +1,159 @@
+//! openai — OpenAI chat, embeddings, images, audio
+//!
+//!   use openai
+//!   oa = OpenAI.new("sk-…")
+//!   @oa.set_offline(false)          // live HTTP via std.net.http
+//!   res = @oa.chat([ai_user("hi")], "gpt-4o-mini")
+//!   res = @oa.chat_req(AiRequest.{…})
+
+use std.ai.client
+use std.core.str
+use std.sec.vault
+
++OPENAI_BASE = "https://api.openai.com"
+
++OpenAI = {
+    client: AiClient = AiClient.new("openai", "", "")
+
+    new(api_key: str) : OpenAI {
+        OpenAI.{client: AiClient.new("openai", OPENAI_BASE, api_key)}
+    }
+
+    from_vault(v: Vault, token: str, mount: str, path: str, key: str) : OpenAI {
+        OpenAI.{client: AiClient.from_vault("openai", OPENAI_BASE, v, token, mount, path, key)}
+    }
+
+    set_offline(@self, on: bool) : bool {
+        c = self.client
+        @c.set_offline(on)
+        self.client = c
+        on
+    }
+
+    set_timeout(@self, ms: i64) : i64 {
+        c = self.client
+        @c.set_timeout(ms)
+        self.client = c
+        ms
+    }
+
+    push_mock(@self, body: str) : i64 {
+        c = self.client
+        n = @c.push_mock(body)
+        self.client = c
+        n
+    }
+
+    -run(@self, path: str, req: AiRequest, body: str) : AiResponse {
+        c = self.client
+        res = @c.request(path, req, body)
+        self.client = c
+        res
+    }
+
+    /// Full request object (system, tools, temperature, stream flag, …).
+    chat_req(@self, req: AiRequest) : AiResponse {
+        body = self.client.chat_body(req)
+        @self.run("/v1/chat/completions", req, body)
+    }
+
+    chat(@self, messages: _, model: str) : AiResponse {
+        @self.chat_req(ai_chat_req(model, messages, 1024))
+    }
+
+    chat_system(@self, system: str, messages: _, model: str) : AiResponse {
+        req = ai_chat_req(model, messages, 1024)
+        req.system = system
+        @self.chat_req(req)
+    }
+
+    complete(@self, prompt: str, model: str) : AiResponse {
+        @self.chat([ai_user(prompt)], model)
+    }
+
+    embed(@self, text: str, model: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_EMBED, messages: [], prompt: text, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: "", size: "", duration_s: 0, stop: []
+        }
+        body = "{\"model\":" + ai_json_str(model) + ",\"input\":" + ai_json_str(text) + "}"
+        @self.run("/v1/embeddings", req, body)
+    }
+
+    image(@self, prompt: str, model: str, size: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_IMAGE, messages: [], prompt, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice: "", size, duration_s: 0, stop: []
+        }
+        body = "{\"model\":" + ai_json_str(model) + ",\"prompt\":" + ai_json_str(prompt) + ",\"size\":" + ai_json_str(size) + ",\"response_format\":\"b64_json\"}"
+        @self.run("/v1/images/generations", req, body)
+    }
+
+    tts(@self, text: str, model: str, voice: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_TTS, messages: [], prompt: text, system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url: "",
+            voice, size: "", duration_s: 0, stop: []
+        }
+        body = "{\"model\":" + ai_json_str(model) + ",\"input\":" + ai_json_str(text) + ",\"voice\":" + ai_json_str(voice) + "}"
+        @self.run("/v1/audio/speech", req, body)
+    }
+
+    stt(@self, media_url: str, model: str) : AiResponse {
+        req = AiRequest.{
+            model, modality: AI_STT, messages: [], prompt: "", system: "", temperature: 0.0,
+            max_tokens: 0, top_p: 1.0, stream: false, tools: [], extra_json: "", media_url,
+            voice: "", size: "", duration_s: 0, stop: []
+        }
+        body = "{\"model\":" + ai_json_str(model) + ",\"file\":" + ai_json_str(media_url) + "}"
+        @self.run("/v1/audio/transcriptions", req, body)
+    }
+
+    /// Responses API-style tool round: attach `tools` on `AiRequest`.
+    chat_tools(@self, messages: _, model: str, tools: _) : AiResponse {
+        req = ai_chat_req(model, messages, 2048)
+        req.tools = tools
+        @self.chat_req(req)
+    }
+}
+
+test "openai chat offline parses choices" {
+    oa = OpenAI.new("sk-test")
+    @oa.set_offline(true)
+    @oa.push_mock("{\"choices\":[{\"message\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}")
+    res = @oa.chat([ai_user("ping")], "gpt-4o-mini")
+    #assert(res.ok)
+    assert_eq(res.text, "pong")
+    #assert(contains(oa.client.last_url, "/v1/chat/completions"))
+    assert_eq(res.finish, "stop")
+}
+
+test "openai image and tts bodies" {
+    oa = OpenAI.new("k")
+    @oa.push_mock("{\"data\":[{\"b64_json\":\"abc\"}]}")
+    r = @oa.image("a cat", "dall-e-3", "1024x1024")
+    #assert(r.ok)
+    assert_eq(r.media_b64, "abc")
+    @oa.push_mock("{\"text\":\"wav\"}")
+    t = @oa.tts("hi", "tts-1", "alloy")
+    assert_eq(t.modality, AI_TTS)
+}
+
+test "openai chat_system injects system message" {
+    oa = OpenAI.new("k")
+    @oa.push_mock("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}")
+    _ = @oa.chat_system("be brief", [ai_user("hi")], "gpt-4o-mini")
+    #assert(contains(oa.client.last_body, "\"role\":\"system\""))
+    #assert(contains(oa.client.last_body, "be brief"))
+}
+
+test "openai tools array in body" {
+    oa = OpenAI.new("k")
+    @oa.push_mock("{\"choices\":[{\"message\":{\"content\":\"\",\"tool_calls\":[{\"id\":\"1\"}]}}]}")
+    tools = [AiTool.{name: "get_weather", description: "weather", parameters_json: "{\"type\":\"object\"}"}]
+    res = @oa.chat_tools([ai_user("weather?")], "gpt-4o-mini", tools)
+    #assert(contains(oa.client.last_body, "get_weather"))
+    #assert(contains(res.tool_calls, "tool_calls"))
+}

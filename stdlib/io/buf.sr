@@ -1,0 +1,523 @@
+//! std.io.buf — ring-buffered I/O on std.sys.io_uring with vectored readv / writev
+//!
+//! Import with:
+//!   use std.io.buf
+//!
+//! `RingWriter` / `RingReader` are fixed-capacity circular byte buffers (host side, so no
+//! per-byte copying). Their free / readable regions are at most two contiguous segments,
+//! which is exactly what one `readv` (scatter) or `writev` (gather) operation takes:
+//!
+//!   ring = IoUring.new() or err { return }
+//!   w = RingWriter.new(4096)
+//!   @w.write_str("hello ")
+//!   @w.write_str("world")
+//!   n = @w.flush(ring, file, 0, 1) or err { return }   // ONE gathered writev
+//!
+//!   r = RingReader.new(4096)
+//!   got = @r.fill(ring, file, 0, 2) or err { return }  // ONE scattered readv
+//!   text = @r.read_str(got)
+//!
+//! `flush` / `fill` / `readv` / `writev` wait on their own completion, so give buffered I/O
+//! a ring of its own. Offsets are file offsets; pass IORING_CUR_POS (-1) for sockets.
+
+use std.sys.io_uring
+
+/// Total patience for one buffered operation: 15 waits of 2 s.
++BUF_WAIT_ROUNDS = 15
+/// `BUF_WAIT_MS` is `2000`.
++BUF_WAIT_MS = 2000
+
+/// Wait for the completion carrying `token`.
+buf_await(ring: IoUring, token: i64) : _! {
+    for 0..BUF_WAIT_ROUNDS {
+        done = ring.wait(16, BUF_WAIT_MS) or false
+        for done {
+            if it.token == token { return it }
+        }
+    }
+    fail "io.buf: timed out waiting for completion {token}"
+}
+
+/// Gather-write `parts` (a list of byte/str chunks) with a single writev; returns bytes written.
++writev(ring: IoUring, file: i64, parts: _, offset: i64) : i64! {
+    _queued = @ring.prep_writev(file, parts, offset, 1) or err {
+        fail "{err}"
+        return
+    }
+    done = buf_await(ring, 1) or err {
+        fail "{err}"
+        return
+    }
+    ensure done.result >= 0 else {
+        fail "io.buf: writev failed (errno {0 - done.result})"
+        return
+    }
+    done.result
+}
+
+/// Scatter-read into buffers of `lens` with a single readv; returns the bytes that arrived.
++readv(ring: IoUring, file: i64, lens: _, offset: i64) : _! {
+    _queued = @ring.prep_readv(file, lens, offset, 1) or err {
+        fail "{err}"
+        return
+    }
+    done = buf_await(ring, 1) or err {
+        fail "{err}"
+        return
+    }
+    ensure done.result >= 0 else {
+        fail "io.buf: readv failed (errno {0 - done.result})"
+        return
+    }
+    done.data
+}
+
+/// `RingWriter` pushes bytes into a fixed ring.
++RingWriter = {
+    /// Rb on `RingWriter` (`i64`). Defaults to `-1`.
+    rb: i64 = -1
+    /// Cap on `RingWriter` (`i64`). Defaults to `0`.
+    cap: i64 = 0
+
+    /// Create a fresh `RingWriter`.
+    new(cap: i64) : RingWriter {
+        n = cap
+        if n < 1 { n = 1 }
+        RingWriter.{rb: host.sys_rbuf_new(n), cap: n}
+    }
+
+    /// Bytes waiting to be flushed.
+    len(self) : i64 => host.sys_rbuf_len(self.rb) or 0
+
+    /// Remaining on this `RingWriter`. Returns `i64`.
+    remaining(self) : i64 => host.sys_rbuf_free(self.rb) or 0
+
+    /// Is empty on this `RingWriter`.
+    is_empty(self) : bool => self.len() == 0
+
+    /// Push on this `RingWriter` (`byte`).
+    push(@self, byte: i64) : bool {
+        host.sys_rbuf_put(self.rb, [byte & 255]) == 1
+    }
+
+    /// Append as much of `data` (bytes, byte array or str) as fits; returns bytes accepted.
+    write(@self, data: _) : i64 => host.sys_rbuf_put(self.rb, data) or 0
+
+    /// Write str on this `RingWriter` (`s`). Returns `i64`.
+    write_str(@self, s: str) : i64 => host.sys_rbuf_put(self.rb, s) or 0
+
+    /// Pop on this `RingWriter`. Returns `i64`.
+    pop(@self) : i64 {
+        ensure self.len() > 0 else { return -1 }
+        host.sys_io_bytes_to_array(host.sys_rbuf_take(self.rb, 1))[0]
+    }
+
+    /// Take on this `RingWriter` (`n`).
+    take(@self, n: i64) : _ => host.sys_rbuf_take(self.rb, n)
+
+    /// Peek on this `RingWriter` (`n`).
+    peek(self, n: i64) : _ => host.sys_rbuf_peek(self.rb, n)
+
+    /// The pending bytes as one or two contiguous chunks, ready for `prep_writev`.
+    segments(self) : _ => host.sys_rbuf_segments(self.rb)
+
+    /// Gather-write everything pending with one writev and drop what was written.
+    /// Returns the bytes written (possibly fewer than pending on a short write).
+    flush(@self, ring: IoUring, file: i64, offset: i64, token: i64) : i64! {
+        ensure self.len() > 0 else { return 0 }
+        _queued = @ring.prep_writev(file, self.segments(), offset, token) or err {
+            fail "{err}"
+            return
+        }
+        done = buf_await(ring, token) or err {
+            fail "{err}"
+            return
+        }
+        ensure done.result >= 0 else {
+            fail "io.buf: flush failed (errno {0 - done.result})"
+            return
+        }
+        host.sys_rbuf_consume(self.rb, done.result)
+        done.result
+    }
+
+    /// Flush until empty (file offsets advance by what was written).
+    flush_all(@self, ring: IoUring, file: i64, offset: i64) : i64! {
+        total = 0
+        for 0..1024 {
+            if self.len() == 0 { break }
+            at = offset
+            if offset >= 0 { at = offset + total }
+            wrote = @self.flush(ring, file, at, 1) or err {
+                fail "{err}"
+                return
+            }
+            ensure wrote > 0 else {
+                fail "io.buf: flush made no progress"
+                return
+            }
+            total += wrote
+        }
+        total
+    }
+
+    /// Clear on this `RingWriter`.
+    clear(@self) : bool => host.sys_rbuf_clear(self.rb) or false
+
+    /// Close this `RingWriter` and release the underlying resource.
+    close(@self) : bool {
+        ensure self.rb >= 0 else { return false }
+        old = self.rb
+        self.rb = -1
+        host.sys_rbuf_close(old)
+    }
+}
+
+/// `RingReader` pulls bytes and lines out of a fixed ring.
++RingReader = {
+    /// Rb on `RingReader` (`i64`). Defaults to `-1`.
+    rb: i64 = -1
+    /// Cap on `RingReader` (`i64`). Defaults to `0`.
+    cap: i64 = 0
+    /// Eof on `RingReader` (`bool`). Defaults to `false`.
+    eof: bool = false
+
+    /// Create a fresh `RingReader`.
+    new(cap: i64) : RingReader {
+        n = cap
+        if n < 1 { n = 1 }
+        RingReader.{rb: host.sys_rbuf_new(n), cap: n, eof: false}
+    }
+
+    /// A reader pre-loaded with `bytes` (byte array, bytes or str), already at EOF.
+    from_bytes(bytes: _) : RingReader {
+        n = host.sys_arr_len(bytes)
+        if n < 1 { n = 1 }
+        r = RingReader.{rb: host.sys_rbuf_new(n), cap: n, eof: true}
+        host.sys_rbuf_put(r.rb, bytes)
+        r
+    }
+
+    /// Buffered, unread bytes.
+    available(self) : i64 => host.sys_rbuf_len(self.rb) or 0
+
+    /// Free on this `RingReader`. Returns `i64`.
+    free(self) : i64 => host.sys_rbuf_free(self.rb) or 0
+
+    /// At eof on this `RingReader`.
+    at_eof(self) : bool => self.eof && self.available() == 0
+
+    /// Read byte on this `RingReader`. Returns `i64`.
+    read_byte(@self) : i64 {
+        ensure self.available() > 0 else { return -1 }
+        host.sys_io_bytes_to_array(host.sys_rbuf_take(self.rb, 1))[0]
+    }
+
+    /// Read on this `RingReader` (`n`).
+    read(@self, n: i64) : _ => host.sys_rbuf_take(self.rb, n)
+
+    /// Read str on this `RingReader` (`n`). Returns `str`.
+    read_str(@self, n: i64) : str => host.sys_bytes_to_str(host.sys_rbuf_take(self.rb, n))
+
+    /// Peek on this `RingReader` (`n`).
+    peek(self, n: i64) : _ => host.sys_rbuf_peek(self.rb, n)
+
+    /// Offset of the first newline in the buffer, or -1.
+    line_end(self) : i64 => host.sys_rbuf_find(self.rb, 10) or -1
+
+    /// Has line on this `RingReader`.
+    has_line(self) : bool => self.line_end() >= 0
+
+    /// The next complete line without its newline ("" when none is buffered yet).
+    read_line(@self) : str {
+        end = self.line_end()
+        ensure end >= 0 else { return "" }
+        line = host.sys_bytes_to_str(host.sys_rbuf_take(self.rb, end))
+        host.sys_rbuf_consume(self.rb, 1)
+        line
+    }
+
+    /// Scatter-read into the free space with one readv. Returns the bytes added; 0 means
+    /// EOF (or a full buffer — check `free()`).
+    fill(@self, ring: IoUring, file: i64, offset: i64, token: i64) : i64! {
+        ensure self.free() > 0 else { return 0 }
+        lens = host.sys_rbuf_free_segments(self.rb)
+        _queued = @ring.prep_readv(file, lens, offset, token) or err {
+            fail "{err}"
+            return
+        }
+        done = buf_await(ring, token) or err {
+            fail "{err}"
+            return
+        }
+        ensure done.result >= 0 else {
+            fail "io.buf: fill failed (errno {0 - done.result})"
+            return
+        }
+        if done.result == 0 { self.eof = true }
+        host.sys_rbuf_put(self.rb, done.data)
+        done.result
+    }
+
+    /// Clear on this `RingReader`.
+    clear(@self) : bool => host.sys_rbuf_clear(self.rb) or false
+
+    /// Close this `RingReader` and release the underlying resource.
+    close(@self) : bool {
+        ensure self.rb >= 0 else { return false }
+        old = self.rb
+        self.rb = -1
+        host.sys_rbuf_close(old)
+    }
+}
+
+/// Test that writer accepts up to capacity and drains in order across the wrap.
+test "writer accepts up to capacity and drains in order across the wrap" {
+    w = RingWriter.new(4)
+    assert_eq(w.cap, 4)
+    #assert(w.is_empty())
+    #assert(@w.push(1))
+    #assert(@w.push(2))
+    #assert(@w.push(3))
+    #assert(@w.push(4))
+    #assert(!(@w.push(5)))
+    assert_eq(w.len(), 4)
+    assert_eq(w.remaining(), 0)
+    assert_eq(@w.pop(), 1)
+    assert_eq(@w.pop(), 2)
+    #assert(@w.push(6))
+    #assert(@w.push(7))
+    // 3, 4, 6, 7 now wrap around the end of the storage
+    assert_eq(host.sys_arr_len(w.segments()), 2)
+    assert_eq(@w.pop(), 3)
+    assert_eq(@w.pop(), 4)
+    assert_eq(@w.pop(), 6)
+    assert_eq(@w.pop(), 7)
+    assert_eq(@w.pop(), -1)
+    #assert(@w.close())
+    #assert(!(@w.close()))
+}
+
+/// Test that writer write is partial when full.
+test "writer write is partial when full" {
+    w = RingWriter.new(5)
+    assert_eq(@w.write_str("abc"), 3)
+    assert_eq(@w.write_str("defg"), 2)
+    assert_eq(@w.write_str("x"), 0)
+    assert_eq(host.sys_bytes_to_str(w.peek(10)), "abcde")
+    assert_eq(host.sys_bytes_to_str(@w.take(2)), "ab")
+    assert_eq(w.len(), 3)
+    #assert(@w.clear())
+    assert_eq(w.len(), 0)
+}
+
+/// Test that reader drains bytes and tracks eof.
+test "reader drains bytes and tracks eof" {
+    r = RingReader.from_bytes([10, 20, 30])
+    assert_eq(r.available(), 3)
+    #assert(!(r.at_eof()))
+    assert_eq(@r.read_byte(), 10)
+    assert_eq(@r.read_byte(), 20)
+    assert_eq(@r.read_byte(), 30)
+    assert_eq(@r.read_byte(), -1)
+    #assert(r.at_eof())
+}
+
+/// Test that reader splits lines.
+test "reader splits lines" {
+    r = RingReader.from_bytes("alpha\nbeta\ngamma")
+    #assert(r.has_line())
+    assert_eq(@r.read_line(), "alpha")
+    assert_eq(@r.read_line(), "beta")
+    // "gamma" has no newline yet
+    #assert(!(r.has_line()))
+    assert_eq(@r.read_line(), "")
+    assert_eq(@r.read_str(100), "gamma")
+}
+
+/// Test that writer flush gathers segments into one writev on both backends.
+test "writer flush gathers segments into one writev on both backends" {
+    for [0, 2] {
+        ring = IoUring.with_flags(16, it) or err {
+            assert_eq(1, 0)
+            return
+        }
+        path = "/tmp/super-io-buf-flush.txt"
+        file = host.sys_fd_open(path, "w+") or err {
+            assert_eq(1, 0)
+            return
+        }
+        w = RingWriter.new(8)
+        // make the content wrap inside the ring buffer
+        @w.write_str("123456")
+        @w.take(4)
+        @w.write_str("abcdef")
+        assert_eq(host.sys_arr_len(w.segments()), 2)
+        n = @w.flush(ring, file, 0, 1) or err {
+            assert_eq(1, 0)
+            return
+        }
+        assert_eq(n, 8)
+        assert_eq(w.len(), 0)
+        assert_eq(host.sys_bytes_to_str(host.sys_fd_read(file, 64, 0)), "56abcdef")
+        host.sys_fd_close(file)
+        host.sys_remove(path)
+        #assert(@ring.close())
+    }
+}
+
+/// Test that flush_all pushes everything and advances offsets.
+test "flush_all pushes everything and advances offsets" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    path = "/tmp/super-io-buf-flushall.txt"
+    file = host.sys_fd_open(path, "w+") or err {
+        assert_eq(1, 0)
+        return
+    }
+    w = RingWriter.new(64)
+    @w.write_str("line one\nline two\n")
+    total = @w.flush_all(ring, file, 0) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(total, 18)
+    assert_eq(host.sys_bytes_to_str(host.sys_fd_read(file, 64, 0)), "line one\nline two\n")
+    host.sys_fd_close(file)
+    host.sys_remove(path)
+    #assert(@ring.close())
+}
+
+/// Test that reader fill scatters across the wrap and reassembles a file.
+test "reader fill scatters across the wrap and reassembles a file" {
+    for [0, 2] {
+        ring = IoUring.with_flags(16, it) or err {
+            assert_eq(1, 0)
+            return
+        }
+        path = "/tmp/super-io-buf-fill.txt"
+        body = "0123456789abcdefghij\nsecond line\n"
+        #assert(host.sys_write_str(path, body) or false)
+        file = host.sys_fd_open(path, "r") or err {
+            assert_eq(1, 0)
+            return
+        }
+        r = RingReader.new(8)
+        offset = 0
+        out = ""
+        for 0..32 {
+            got = @r.fill(ring, file, offset, 1) or err {
+                assert_eq(1, 0)
+                return
+            }
+            offset += got
+            out = out + @r.read_str(5)
+            if r.at_eof() { break }
+        }
+        out = out + @r.read_str(100)
+        assert_eq(out, body)
+        #assert(r.eof)
+        host.sys_fd_close(file)
+        host.sys_remove(path)
+        #assert(@ring.close())
+    }
+}
+
+/// Test that reader reads lines from a file through the ring.
+test "reader reads lines from a file through the ring" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    path = "/tmp/super-io-buf-lines.txt"
+    #assert(host.sys_write_str(path, "one\ntwo\nthree\n") or false)
+    file = host.sys_fd_open(path, "r") or err {
+        assert_eq(1, 0)
+        return
+    }
+    r = RingReader.new(32)
+    @r.fill(ring, file, 0, 1) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(@r.read_line(), "one")
+    assert_eq(@r.read_line(), "two")
+    assert_eq(@r.read_line(), "three")
+    #assert(!(r.has_line()))
+    host.sys_fd_close(file)
+    host.sys_remove(path)
+    #assert(@ring.close())
+}
+
+/// Test that standalone writev and readv.
+test "standalone writev and readv" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    path = "/tmp/super-io-buf-vec.txt"
+    file = host.sys_fd_open(path, "w+") or err {
+        assert_eq(1, 0)
+        return
+    }
+    n = writev(ring, file, ["head-", "body-", "tail"], 0) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(n, 14)
+    data = readv(ring, file, [5, 5, 4], 0) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(host.sys_bytes_to_str(data), "head-body-tail")
+    // a bad descriptor surfaces as an error
+    assert_eq(writev(ring, 424242, ["x"], 0) or -1, -1)
+    host.sys_fd_close(file)
+    host.sys_remove(path)
+    #assert(@ring.close())
+}
+
+/// Test that buffered socket round trip through two rings.
+test "buffered socket round trip through two rings" {
+    ring = IoUring.new() or err {
+        assert_eq(1, 0)
+        return
+    }
+    listener = host.sys_tcp_listen("127.0.0.1:0") or err {
+        assert_eq(1, 0)
+        return
+    }
+    addr = host.sys_fd_local_addr(listener) or err {
+        assert_eq(1, 0)
+        return
+    }
+    client = host.sys_tcp_connect(addr) or err {
+        assert_eq(1, 0)
+        return
+    }
+    conn = host.sys_tcp_accept(listener) or err {
+        assert_eq(1, 0)
+        return
+    }
+    w = RingWriter.new(64)
+    @w.write_str("GET / ")
+    @w.write_str("HTTP/1.1\n")
+    sent = @w.flush(ring, client, IORING_CUR_POS, 1) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(sent, 15)
+    r = RingReader.new(64)
+    got = @r.fill(ring, conn, IORING_CUR_POS, 2) or err {
+        assert_eq(1, 0)
+        return
+    }
+    assert_eq(got, 15)
+    assert_eq(@r.read_line(), "GET / HTTP/1.1")
+    host.sys_fd_close(conn)
+    host.sys_fd_close(client)
+    host.sys_fd_close(listener)
+    #assert(@ring.close())
+}

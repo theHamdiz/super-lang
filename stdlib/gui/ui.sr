@@ -1,0 +1,1319 @@
+//! std.gui — retained desktop widgets
+//!
+//! Import with:
+//!   use std.gui
+//!
+//!   app = Gui.new("Tasks", 480, 320)
+//!   root = @app.column("root")
+//!   @app.label(root, "heading", "Tasks")
+//!   @app.button(root, "add", "Add")
+//!   @app.input(root, "title", "New task")
+//!   @app.check(root, "done", "Done", false)
+//!   @app.list(root, "items", ["write", "ship"])
+//!   @app.layout()
+//!   @app.pointer(40, 40, true)
+//!   @app.pointer(40, 40, false)
+//!   frame = @app.paint()
+//!
+//! `style` and `theme` set ink, type, and alignment. `grid` and `tier` reflow
+//! when the window is narrow. `text` and `measure_text` are the calligraphy.
+//! `slider`, `progress`, `tabs`, and `scroll` extend the tree. `note` / `take`
+//! are the event queue. `animate` / `frame` ease a property.
+//! Layout and hit testing stay in Super. Hits go through `Aabb.contains` from
+//! `std.math.geom`. The text fallback (`mirror`) paints into a `std.tui` screen.
+//! `paint` is a short display list used by tests and by canvas games. `describe`
+//! is the widget document the desktop provider turns into real controls: GTK 4
+//! on Linux (Wayland, then X11), Win32 on Windows, Cocoa on macOS. `run` paces
+//! frames with `sleep_ms` from `std.sys.time`.
+//! Strings and arrays come from `std.core.str` and `std.core.collections`.
+
+use std.core.str
+use std.core.collections
+use std.math.geom
+use std.sys.time
+use std.tui.ui
+use std.gui.window
+use std.gui.widgets
+
+/// `Node` is one widget in a `Gui` tree. Children are indexes into `Gui.nodes`.
++Node = {
+    /// Stable id used by clicks and `value_of`.
+    id: str = ""
+    /// `column`, `row`, `panel`, `label`, `button`, `input`, `check`, `list`, or `spacer`.
+    kind: str = "label"
+    /// Label, button caption, or input placeholder.
+    text: str = ""
+    /// Input text, `"0"`/`"1"` for a check, or the selected list index.
+    value: str = ""
+    /// List rows.
+    items: _ = []
+    /// Child indexes.
+    kids: _ = []
+    /// Placed left edge, in pixels.
+    x: i64 = 0
+    /// Placed top edge, in pixels.
+    y: i64 = 0
+    /// Placed width.
+    w: i64 = 0
+    /// Placed height.
+    h: i64 = 0
+    /// Ink color 0..255.
+    fg: i64 = 230
+    /// Fill color 0..255.
+    bg: i64 = 32
+    /// Focus and accent color.
+    accent: i64 = 88
+    /// Font size in pixels.
+    size: i64 = 16
+    /// 400 regular, 700 bold.
+    weight: i64 = 400
+    /// `start`, `center`, or `end`.
+    align: str = "start"
+    /// Extra pixels between glyphs.
+    track: i64 = 0
+    /// Padding. Negative asks the layout for the kind's default.
+    pad: i64 = -1
+    /// Gap between children. Negative asks for the default.
+    gap: i64 = -1
+    /// Grid column count.
+    cols: i64 = 1
+    /// How many grid columns this child spans.
+    span_c: i64 = 1
+    /// How many grid rows this child spans.
+    span_r: i64 = 1
+    /// 0..100. Paint skips a node at 0.
+    opacity: i64 = 100
+}
+
+/// `Gui` is a window-sized widget tree.
++Gui = {
+    /// Window title.
+    title: str = ""
+    /// Window width.
+    w: i64 = 640
+    /// Window height.
+    h: i64 = 400
+    /// Nodes. Index 0 is the root.
+    nodes: _ = []
+    /// Focused node, or -1.
+    focus: i64 = -1
+    /// Id of the button clicked by the last event, or empty.
+    clicked: str = ""
+    /// Last pointer x.
+    mouse_x: i64 = 0
+    /// Last pointer y.
+    mouse_y: i64 = 0
+    /// True while the pointer button is down.
+    mouse_down: bool = false
+    /// Event records, oldest first. `pointer`, `key`, `click`, `tick`.
+    events: _ = []
+    /// In-flight motions.
+    motions: _ = []
+
+    /// Empty window.
+    new(title: str, w: i64, h: i64) : Gui {
+        cols = w
+        rows = h
+        if cols < 1 { cols = 1 }
+        if rows < 1 { rows = 1 }
+        Gui.{
+            title,
+            w: cols,
+            h: rows,
+            nodes: [],
+            focus: -1,
+            clicked: "",
+            mouse_x: 0,
+            mouse_y: 0,
+            mouse_down: false,
+            events: [],
+            motions: []
+        }
+    }
+
+    /// Append `node` and return its index.
+    add(@self, node: Node) : i64 {
+        self.nodes = arr_push(self.nodes, node)
+        len(self.nodes) - 1
+    }
+
+    /// Parent `child` under `parent`. A negative parent leaves the node at the root.
+    link(@self, parent: i64, child: i64) : i64 {
+        ensure parent >= 0 && parent < len(self.nodes) else { return child }
+        node = self.nodes[parent]
+        node.kids = arr_push(node.kids, child)
+        self.nodes = arr_set(self.nodes, parent, node)
+        child
+    }
+
+    /// Vertical stack. The first column is the root.
+    column(@self, id: str) : i64 => @self.box_node(-1, id, "column")
+
+    /// Horizontal stack under `parent`.
+    row(@self, parent: i64, id: str) : i64 => @self.box_node(parent, id, "row")
+
+    /// Bordered stack under `parent`.
+    panel(@self, parent: i64, id: str) : i64 => @self.box_node(parent, id, "panel")
+
+    /// Shared constructor for column, row, and panel.
+    box_node(@self, parent: i64, id: str, kind: str) : i64 {
+        idx = @self.add(gui_node(id, kind, ""))
+        @self.link(parent, idx)
+    }
+
+    /// Text line.
+    label(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "label", text))
+        @self.link(parent, idx)
+    }
+
+    /// Clickable button.
+    button(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "button", text))
+        @self.link(parent, idx)
+    }
+
+    /// Single-line text field. `text` is the placeholder.
+    input(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "input", text))
+        @self.link(parent, idx)
+    }
+
+    /// On/off switch. The value is `"0"` or `"1"`.
+    toggle(@self, parent: i64, id: str, text: str, on: bool) : i64 {
+        node = gui_node(id, "toggle", text)
+        if on { node.value = "1" }
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Checkbox drawn by `CheckBox`. The value is `"0"` or `"1"`.
+    checkbox(@self, parent: i64, id: str, text: str, on: bool) : i64 {
+        node = gui_node(id, "checkbox", text)
+        if on { node.value = "1" }
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Radio button. `group` is shared by the choices. The value is `"0"` or `"1"`.
+    radio(@self, parent: i64, id: str, group: str, text: str) : i64 {
+        node = gui_node(id, "radio", text)
+        node.items = [group]
+        node.value = "0"
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Dialog. A non-empty `body` opens it. Escape clears the body.
+    dialog(@self, parent: i64, id: str, title: str, body: str) : i64 {
+        node = gui_node(id, "dialog", title)
+        node.value = body
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Text field. `text` is the placeholder. The value is what was typed.
+    field(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "field", text))
+        @self.link(parent, idx)
+    }
+
+    /// Toast. Empty `text` paints nothing.
+    toast(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "toast", text))
+        @self.link(parent, idx)
+    }
+
+    /// Flash banner.
+    flash(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "flash", text))
+        @self.link(parent, idx)
+    }
+
+    /// Rectangle. `form` is `fill` or `rect`.
+    shape(@self, parent: i64, id: str, form: str) : i64 {
+        idx = @self.add(gui_node(id, "shape", form))
+        @self.link(parent, idx)
+    }
+
+    /// Custom title strip.
+    titlebar(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "titlebar", text))
+        @self.link(parent, idx)
+    }
+
+    /// Minimize, maximize, and close.
+    chrome(@self, parent: i64, id: str) : i64 {
+        idx = @self.add(gui_node(id, "chrome", ""))
+        @self.link(parent, idx)
+    }
+
+    /// Small decoration.
+    badge(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "badge", text))
+        @self.link(parent, idx)
+    }
+
+    /// Mount a display list produced by `Widget.paint`.
+    custom(@self, parent: i64, id: str, paint: str) : i64 {
+        idx = @self.add(gui_node(id, "custom", paint))
+        @self.link(parent, idx)
+    }
+
+    /// Checkbox. `on` sets the initial value.
+    check(@self, parent: i64, id: str, text: str, on: bool) : i64 {
+        node = gui_node(id, "check", text)
+        if on { node.value = "1" }
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Selectable list. The value is the selected index.
+    list(@self, parent: i64, id: str, items: _) : i64 {
+        node = gui_node(id, "list", "")
+        node.items = items
+        node.value = "0"
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Fixed gap.
+    spacer(@self, parent: i64, id: str) : i64 {
+        idx = @self.add(gui_node(id, "spacer", ""))
+        @self.link(parent, idx)
+    }
+
+    /// Grid of `cols` columns. Children flow left to right and wrap.
+    grid(@self, parent: i64, id: str, cols: i64) : i64 {
+        node = gui_node(id, "grid", "")
+        node.cols = cols
+        if node.cols < 1 { node.cols = 1 }
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Calligraphy block. `text` wraps to the placed width.
+    text(@self, parent: i64, id: str, text: str) : i64 {
+        idx = @self.add(gui_node(id, "text", text))
+        @self.link(parent, idx)
+    }
+
+    /// 0..100 slider.
+    slider(@self, parent: i64, id: str, value: i64) : i64 {
+        node = gui_node(id, "slider", "")
+        node.value = "{value}"
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// 0..100 progress bar.
+    progress(@self, parent: i64, id: str, value: i64) : i64 {
+        node = gui_node(id, "progress", "")
+        node.value = "{value}"
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Tab strip. `titles` are the labels. The value is the selected index.
+    tabs(@self, parent: i64, id: str, titles: _) : i64 {
+        node = gui_node(id, "tabs", "")
+        node.items = titles
+        node.value = "0"
+        idx = @self.add(node)
+        @self.link(parent, idx)
+    }
+
+    /// Scrollable column. The value is the vertical offset in pixels.
+    scroll(@self, parent: i64, id: str) : i64 {
+        idx = @self.add(gui_node(id, "scroll", ""))
+        @self.link(parent, idx)
+    }
+
+    /// Set presentation fields on `id`.
+    style(@self, id: str, fg: i64, bg: i64, size: i64, weight: i64, align: str) : i64 {
+        at = self.find_id(id)
+        ensure at >= 0 else { return 0 }
+        node = self.nodes[at]
+        node.fg = fg
+        node.bg = bg
+        node.size = size
+        node.weight = weight
+        node.align = align
+        self.nodes = arr_set(self.nodes, at, node)
+        1
+    }
+
+    /// Letter spacing, padding, and gap for `id`.
+    metrics(@self, id: str, track: i64, pad: i64, gap: i64) : i64 {
+        at = self.find_id(id)
+        ensure at >= 0 else { return 0 }
+        node = self.nodes[at]
+        node.track = track
+        node.pad = pad
+        node.gap = gap
+        self.nodes = arr_set(self.nodes, at, node)
+        1
+    }
+
+    /// Paint the tree with a named palette: `dark`, `light`, or `contrast`.
+    theme(@self, name: str) : i64 {
+        fg = 230
+        bg = 32
+        accent = 88
+        if name == "light" {
+            fg = 24
+            bg = 236
+            accent = 20
+        }
+        if name == "contrast" {
+            fg = 255
+            bg = 0
+            accent = 226
+        }
+        n = len(self.nodes)
+        for 0..n {
+            node = self.nodes[it]
+            node.fg = fg
+            node.bg = bg
+            node.accent = accent
+            self.nodes = arr_set(self.nodes, it, node)
+        }
+        n
+    }
+
+    /// `compact` below 480, `regular` below 960, otherwise `wide`.
+    tier(self) : str {
+        if self.w < 480 { return "compact" }
+        if self.w < 960 { return "regular" }
+        "wide"
+    }
+
+    /// Append one event record.
+    note(@self, text: str) : i64 {
+        self.events = arr_push(self.events, text)
+        len(self.events)
+    }
+
+    /// Oldest event, or empty. The record leaves the queue.
+    take(@self) : str {
+        ensure len(self.events) > 0 else { return "" }
+        first = self.events[0]
+        rest = []
+        n = len(self.events)
+        for 1..n { rest = arr_push(rest, self.events[it]) }
+        self.events = rest
+        first
+    }
+
+    /// Animate `prop` (`x`, `y`, `w`, `opacity`) on `id` from `from` to `to`.
+    animate(@self, id: str, prop: str, from: i64, to: i64, dur: i64, ease: str) : i64 {
+        span = dur
+        if span < 1 { span = 1 }
+        motion = Motion.new(id, prop, from, to, 0 - 1, span, ease)
+        self.motions = arr_push(self.motions, motion)
+        len(self.motions)
+    }
+
+    /// Advance motions to absolute time `now` and write the property back.
+    frame(@self, now: i64) : i64 {
+        n = len(self.motions)
+        alive = []
+        for 0..n {
+            motion = self.motions[it]
+            if motion.t0 < 0 { motion.t0 = now }
+            elapsed = now - motion.t0
+            if elapsed < 0 { elapsed = 0 }
+            t = elapsed * 1000 / motion.dur
+            if t > 1000 { t = 1000 }
+            eased = gui_ease(motion.ease, t)
+            value = motion.from + (motion.to - motion.from) * eased / 1000
+            @self.write_prop(motion.id, motion.prop, value)
+            if t < 1000 { alive = arr_push(alive, motion) }
+        }
+        self.motions = alive
+        @self.note("tick:{now}")
+        len(alive)
+    }
+
+    /// Index of `id`, or -1.
+    find_id(self, id: str) : i64 {
+        pos = -1
+        n = len(self.nodes)
+        for 0..n {
+            if pos < 0 {
+                node = self.nodes[it]
+                if node.id == id { pos = it }
+            }
+        }
+        pos
+    }
+
+    /// Replace the string value of node `id`.
+    write_text(@self, id: str, value: str) : str {
+        at = self.find_id(id)
+        ensure at >= 0 else { return "" }
+        node = self.nodes[at]
+        node.value = value
+        self.nodes = arr_set(self.nodes, at, node)
+        value
+    }
+
+    /// Current value of `id`.
+    value_of(self, id: str) : str {
+        at = self.find_id(id)
+        ensure at >= 0 else { return "" }
+        node = self.nodes[at]
+        node.value
+    }
+
+    /// Preferred height of node `idx`, including padding for stacks.
+    pref_h(self, idx: i64) : i64 {
+        node = self.nodes[idx]
+        kind = node.kind
+        if kind == "label" { return node.size + 6 }
+        if kind == "text" { return node.size * 2 + 8 }
+        if kind == "button" || kind == "input" { return 36 }
+        if kind == "check" || kind == "checkbox" || kind == "toggle" || kind == "radio" { return 28 }
+        if kind == "dialog" { return 96 }
+        if kind == "field" { return 36 }
+        if kind == "toast" || kind == "flash" {
+            if node.text == "" { return 0 }
+            return 28
+        }
+        if kind == "shape" { return 40 }
+        if kind == "titlebar" || kind == "chrome" { return 32 }
+        if kind == "badge" { return 24 }
+        if kind == "custom" { return 28 }
+        if kind == "slider" || kind == "progress" || kind == "tabs" { return 32 }
+        if kind == "list" { return 100 }
+        if kind == "spacer" { return 12 }
+        pad = 8
+        gap = 6
+        if kind == "panel" { pad = 12 }
+        kids = node.kids
+        kn = len(kids)
+        if kind == "row" {
+            tall = 0
+            for 0..kn {
+                h = self.pref_h(kids[it])
+                if h > tall { tall = h }
+            }
+            return tall + pad * 2
+        }
+        sum = pad * 2
+        if kn > 1 { sum = sum + gap * (kn - 1) }
+        for 0..kn { sum = sum + self.pref_h(kids[it]) }
+        sum
+    }
+
+    /// Place the root into the window, then focus the first control.
+    layout(@self) : i64 {
+        ensure len(self.nodes) > 0 else { return 0 }
+        @self.place(0, 0, 0, self.w, self.h)
+        if self.focus < 0 { self.focus = self.first_focus() }
+        self.focus
+    }
+
+    /// Place node `idx` at a pixel rectangle and lay out its children.
+    place(@self, idx: i64, x: i64, y: i64, w: i64, h: i64) : i64 {
+        node = self.nodes[idx]
+        node.x = x
+        node.y = y
+        node.w = w
+        node.h = h
+        kids = node.kids
+        kind = node.kind
+        self.nodes = arr_set(self.nodes, idx, node)
+        pad = 8
+        gap = 6
+        if kind == "panel" { pad = 12 }
+        if node.pad >= 0 { pad = node.pad }
+        if node.gap >= 0 { gap = node.gap }
+        if kind == "grid" {
+            inner_x = x + pad
+            inner_y = y + pad
+            inner_w = w - pad * 2
+            inner_h = h - pad * 2
+            if inner_w < 1 { inner_w = 1 }
+            if inner_h < 1 { inner_h = 1 }
+            cols = node.cols
+            if cols < 1 { cols = 1 }
+            if self.w < 480 { cols = 1 }
+            kn = len(kids)
+            cw = inner_w / cols
+            if cw < 1 { cw = 1 }
+            rows = 1
+            if kn > 0 { rows = (kn + cols - 1) / cols }
+            rh = inner_h / rows
+            if rh < 1 { rh = 1 }
+            col = 0
+            row = 0
+            for 0..kn {
+                kid = kids[it]
+                child = self.nodes[kid]
+                span = child.span_c
+                if span < 1 { span = 1 }
+                if col + span > cols {
+                    col = 0
+                    row = row + 1
+                }
+                @self.place(kid, inner_x + col * cw, inner_y + row * rh, cw * span, rh)
+                col = col + span
+            }
+        }
+        if kind == "column" || kind == "panel" || kind == "row" || kind == "scroll" {
+            inner_x = x + pad
+            inner_y = y + pad
+            inner_w = w - pad * 2
+            inner_h = h - pad * 2
+            if inner_w < 1 { inner_w = 1 }
+            if inner_h < 1 { inner_h = 1 }
+            kn = len(kids)
+            stack = kind == "column" || kind == "panel" || kind == "scroll" || (kind == "row" && self.w < 520)
+            if kind == "row" && !stack {
+                gaps = 0
+                if kn > 1 { gaps = gap * (kn - 1) }
+                cw = inner_w
+                if kn > 0 { cw = (inner_w - gaps) / kn }
+                if cw < 1 { cw = 1 }
+                cx = inner_x
+                for 0..kn {
+                    kid = kids[it]
+                    @self.place(kid, cx, inner_y, cw, inner_h)
+                    cx = cx + cw + gap
+                }
+            } else {
+                cy = inner_y
+                shift = 0
+                if kind == "scroll" {
+                    shift = to_i64(node.value) or 0
+                }
+                for 0..kn {
+                    kid = kids[it]
+                    kh = self.pref_h(kid)
+                    @self.place(kid, inner_x, cy - shift, inner_w, kh)
+                    cy = cy + kh + gap
+                }
+            }
+        }
+        idx
+    }
+
+    /// First focusable node, or -1.
+    first_focus(self) : i64 {
+        found = -1
+        n = len(self.nodes)
+        for 0..n {
+            if found < 0 {
+                node = self.nodes[it]
+                if gui_focusable(node.kind) { found = it }
+            }
+        }
+        found
+    }
+
+    /// Next focusable index moving by `dir` from `start`.
+    step_focus(self, start: i64, dir: i64) : i64 {
+        n = len(self.nodes)
+        ensure n > 0 else { return -1 }
+        origin = start
+        if origin < 0 { origin = 0 }
+        step = dir
+        if step == 0 { step = 1 }
+        found = -1
+        for 0..n {
+            if found < 0 {
+                i = origin + step * (it + 1)
+                if i < 0 { i = i + n }
+                if i >= n { i = i - n }
+                node = self.nodes[i]
+                if gui_focusable(node.kind) { found = i }
+            }
+        }
+        found
+    }
+
+    /// Top-most control containing the point, or -1. Stacks are not controls.
+    hit(self, x: i64, y: i64) : i64 {
+        found = -1
+        n = len(self.nodes)
+        for 0..n {
+            if found < 0 {
+                i = n - 1 - it
+                node = self.nodes[i]
+                if gui_focusable(node.kind) && gui_hit_node(node, x, y) { found = i }
+            }
+        }
+        found
+    }
+
+    /// Press and release. A release on a button sets `clicked`.
+    pointer(@self, x: i64, y: i64, down: bool) : str {
+        self.clicked = ""
+        if len(self.nodes) > 0 {
+            root = self.nodes[0]
+            if root.w == 0 { @self.layout() }
+        }
+        was = self.mouse_down
+        self.mouse_x = x
+        self.mouse_y = y
+        self.mouse_down = down
+        if down && !was {
+            hit = self.hit(x, y)
+            if hit >= 0 { self.focus = hit }
+        }
+        if down {
+            hit = self.hit(x, y)
+            if hit >= 0 {
+                node = self.nodes[hit]
+                if node.kind == "slider" { @self.write_slider(hit, x) }
+            }
+        }
+        if !down && was {
+            hit = self.hit(x, y)
+            if hit >= 0 { @self.activate(hit, y) }
+        }
+        @self.note("pointer:{self.clicked}:{x}:{y}:{down}")
+        self.clicked
+    }
+
+    /// Keyboard event: `tab`, `backtab`, `enter`, `backspace`, `up`, `down`, or one character.
+    key(@self, name: str) : str {
+        self.clicked = ""
+        if len(self.nodes) > 0 {
+            root = self.nodes[0]
+            if root.w == 0 { @self.layout() }
+        }
+        if name == "tab" { self.focus = self.step_focus(self.focus, 1) }
+        if name == "backtab" { self.focus = self.step_focus(self.focus, 0 - 1) }
+        if name == "escape" { @self.close_dialogs() }
+        if name == "enter" || name == " " { @self.activate(self.focus, self.mouse_y) }
+        if name == "backspace" { @self.edit(-1, "") }
+        if name == "up" { @self.nudge(-1) }
+        if name == "down" { @self.nudge(1) }
+        if byte_len(name) == 1 && name != " " { @self.edit(1, name) }
+        focus_id = ""
+        if self.focus >= 0 && self.focus < len(self.nodes) {
+            focus_node = self.nodes[self.focus]
+            focus_id = focus_node.id
+        }
+        @self.note("key:{name}:{focus_id}")
+        self.clicked
+    }
+
+    /// Activate node `idx` (button click, check toggle, list row).
+    activate(@self, idx: i64, y: i64) : str {
+        ensure idx >= 0 && idx < len(self.nodes) else { return "" }
+        node = self.nodes[idx]
+        if node.kind == "button" { self.clicked = node.id }
+        if node.kind == "check" || node.kind == "checkbox" || node.kind == "toggle" {
+            if node.value == "1" { node.value = "0" } else { node.value = "1" }
+            self.nodes = arr_set(self.nodes, idx, node)
+        }
+        if node.kind == "radio" { @self.pick_radio(idx) }
+        if node.kind == "list" {
+            row = (y - node.y) / 20
+            last = len(node.items) - 1
+            if row < 0 { row = 0 }
+            if row > last { row = last }
+            if last < 0 { row = 0 }
+            node.value = "{row}"
+            self.nodes = arr_set(self.nodes, idx, node)
+        }
+        self.clicked
+    }
+
+    /// Select radio `idx` and clear the other radios in its group.
+    pick_radio(@self, idx: i64) : i64 {
+        ensure idx >= 0 && idx < len(self.nodes) else { return 0 }
+        chosen = self.nodes[idx]
+        group = ""
+        if len(chosen.items) > 0 { group = chosen.items[0] }
+        n = len(self.nodes)
+        for 0..n {
+            other = self.nodes[it]
+            if other.kind == "radio" {
+                og = ""
+                if len(other.items) > 0 { og = other.items[0] }
+                if og == group {
+                    other.value = "0"
+                    same = other.id == chosen.id
+                    if same { other.value = "1" }
+                    self.nodes = arr_set(self.nodes, it, other)
+                }
+            }
+        }
+        1
+    }
+
+    /// Clear every open dialog. Returns how many closed.
+    close_dialogs(@self) : i64 {
+        n = len(self.nodes)
+        closed = 0
+        for 0..n {
+            node = self.nodes[it]
+            if node.kind == "dialog" && node.value != "" {
+                node.value = ""
+                self.nodes = arr_set(self.nodes, it, node)
+                closed = closed + 1
+            }
+        }
+        closed
+    }
+
+    /// Edit the focused input. `dir` -1 deletes a character; 1 appends `ch`.
+    edit(@self, dir: i64, ch: str) : i64 {
+        idx = self.focus
+        ensure idx >= 0 && idx < len(self.nodes) else { return 0 }
+        node = self.nodes[idx]
+        ensure node.kind == "input" || node.kind == "field" else { return 0 }
+        if dir < 0 {
+            n = byte_len(node.value)
+            if n > 0 { node.value = substr(node.value, 0, n - 1) }
+        } else {
+            node.value = "{node.value}{ch}"
+        }
+        self.nodes = arr_set(self.nodes, idx, node)
+        1
+    }
+
+    /// Move the focused list selection by `dir`.
+    nudge(@self, dir: i64) : i64 {
+        idx = self.focus
+        ensure idx >= 0 && idx < len(self.nodes) else { return 0 }
+        node = self.nodes[idx]
+        ensure node.kind == "list" else { return 0 }
+        cur = to_i64(node.value) or 0
+        last = len(node.items) - 1
+        cur = cur + dir
+        if cur < 0 { cur = 0 }
+        if cur > last { cur = last }
+        if last < 0 { cur = 0 }
+        node.value = "{cur}"
+        self.nodes = arr_set(self.nodes, idx, node)
+        cur
+    }
+
+    /// Write `prop` on the node `id`. Unknown properties are ignored.
+    write_prop(@self, id: str, prop: str, value: i64) : i64 {
+        at = self.find_id(id)
+        ensure at >= 0 else { return 0 }
+        node = self.nodes[at]
+        if prop == "x" { node.x = value }
+        if prop == "y" { node.y = value }
+        if prop == "w" { node.w = value }
+        if prop == "opacity" { node.opacity = value }
+        self.nodes = arr_set(self.nodes, at, node)
+        1
+    }
+
+    /// Map the pointer x onto the slider's 0..100 value.
+    write_slider(@self, idx: i64, x: i64) : i64 {
+        ensure idx >= 0 && idx < len(self.nodes) else { return 0 }
+        node = self.nodes[idx]
+        span = node.w
+        if span < 1 { span = 1 }
+        rel = x - node.x
+        if rel < 0 { rel = 0 }
+        if rel > span { rel = span }
+        node.value = "{rel * 100 / span}"
+        self.nodes = arr_set(self.nodes, idx, node)
+        1
+    }
+
+    /// Display list. Call after `layout`, or this lays the tree out first.
+    paint(@self) : str {
+        if len(self.nodes) > 0 {
+            root = self.nodes[0]
+            if root.w == 0 { @self.layout() }
+        }
+        out = "fill 0 0 {self.w} {self.h} 18 18 24\n"
+        n = len(self.nodes)
+        for 0..n {
+            node = self.nodes[it]
+            out = "{out}{gui_paint_node(node, self.focus == it)}"
+        }
+        out
+    }
+
+    /// Text picture of the same tree, rendered by `std.tui`.
+    mirror(@self) : str {
+        if len(self.nodes) > 0 {
+            root = self.nodes[0]
+            if root.w == 0 { @self.layout() }
+        }
+        cols = self.w / 8
+        rows = self.h / 16
+        if cols < 1 { cols = 1 }
+        if rows < 1 { rows = 1 }
+        view = Screen.new(cols, rows)
+        n = len(self.nodes)
+        for 0..n {
+            node = self.nodes[it]
+            label = gui_mirror_text(node)
+            if label != "" {
+                col = node.x / 8
+                row = node.y / 16
+                @view.print_at(col, row, label, 7, 0, 0)
+            }
+        }
+        view.plain()
+    }
+
+    /// Widget document for the desktop provider. One node per line, tab-separated.
+    describe(self) : str {
+        out = "gui\t1\n"
+        out = "{out}title\t{gui_flat(self.title)}\n"
+        out = "{out}size\t{self.w}\t{self.h}\n"
+        n = len(self.nodes)
+        i = 0
+        while i < n {
+            node = self.nodes[i]
+            parent = gui_parent_id(self, i)
+            flat_id = gui_flat(node.id)
+            out = "{out}node\t{node.kind}\t{flat_id}\t{gui_flat(node.text)}\t{gui_flat(node.value)}\t{gui_flat(parent)}\t{node.cols}\n"
+            if node.kind == "list" || node.kind == "tabs" || node.kind == "radio" {
+                m = len(node.items)
+                j = 0
+                while j < m {
+                    item = node.items[j]
+                    out = "{out}item\t{flat_id}\t{gui_flat(item)}\n"
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+        out
+    }
+
+    /// Open the host window and run `frames` ticks (at least one).
+    run(@self, frames: i64) : i64 {
+        gui_open(self.w, self.h, self.title)
+        opened = window_open(self.w, self.h, self.title)
+        limit = frames
+        if limit < 1 { limit = 1 }
+        n = 0
+        for 0..limit {
+            poll = window_poll()
+            if poll.quit || gui_quit() { break }
+            @self.pointer(gui_mouse_x(), gui_mouse_y(), gui_mouse_down())
+            key = gui_key()
+            if key != "" { @self.key(key) }
+            gui_present(opened.width, opened.height, self.describe())
+            click = gui_click()
+            if click != "" { self.clicked = click }
+            sleep_ms(16)
+            n = n + 1
+        }
+        n
+    }
+}
+
+/// Tabs and newlines would break the widget document.
+gui_flat(s: str) : str {
+    s = replace(s, "\t", " ")
+    replace(s, "\n", " ")
+}
+
+/// Id of the node that lists `child` in `kids`, or empty for a root.
+gui_parent_id(app: Gui, child: i64) : str {
+    found = ""
+    n = len(app.nodes)
+    i = 0
+    while i < n {
+        if found == "" {
+            node = app.nodes[i]
+            k = len(node.kids)
+            j = 0
+            while j < k {
+                if node.kids[j] == child { found = node.id }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    found
+}
+
+/// A node with empty children and a zero rectangle.
+gui_node(id: str, kind: str, text: str) : Node => Node.{
+    id,
+    kind,
+    text,
+    value: "",
+    items: [],
+    kids: [],
+    x: 0,
+    y: 0,
+    w: 0,
+    h: 0,
+    fg: 230,
+    bg: 32,
+    accent: 88,
+    size: 16,
+    weight: 400,
+    align: "start",
+    track: 0,
+    pad: -1,
+    gap: -1,
+    cols: 1,
+    span_c: 1,
+    span_r: 1,
+    opacity: 100
+}
+
+/// True for widgets that take focus and clicks.
+gui_focusable(kind: str) : bool => kind == "button" || kind == "input" || kind == "check" || kind == "checkbox" || kind == "toggle" || kind == "radio" || kind == "field" || kind == "dialog" || kind == "list" || kind == "slider" || kind == "tabs"
+
+/// True when `x`, `y` lies in the node's placed rectangle.
+gui_hit_node(node: Node, x: i64, y: i64) : bool {
+    ensure node.w > 0 && node.h > 0 else { return false }
+    box = Aabb.new(node.x * 1.0, node.y * 1.0, (node.x + node.w - 1) * 1.0, (node.y + node.h - 1) * 1.0)
+    box.contains(x * 1.0, y * 1.0)
+}
+
+/// One node's display-list lines.
+/// Width of `text` at `size` with `tracking` extra pixels per glyph.
++measure_text(text: str, size: i64, tracking: i64) : i64 {
+    n = byte_len(text)
+    adv = size / 2
+    if adv < 1 { adv = 1 }
+    extra = tracking
+    if extra < 0 { extra = 0 }
+    n * adv + extra * n
+}
+
+/// Ease `t` in 0..1000. `in`, `out`, `inout`, otherwise linear.
+gui_ease(kind: str, t: i64) : i64 {
+    u = t
+    if u < 0 { u = 0 }
+    if u > 1000 { u = 1000 }
+    if kind == "in" { return u * u / 1000 }
+    if kind == "out" {
+        rest = 1000 - u
+        return 1000 - rest * rest / 1000
+    }
+    if kind == "inout" {
+        if u < 500 { return 2 * u * u / 1000 }
+        rest = 1000 - u
+        return 1000 - 2 * rest * rest / 1000
+    }
+    u
+}
+
+/// One motion from `from` to `to` over `dur` milliseconds.
++Motion = {
+    /// Target node id.
+    id: str = ""
+    /// `x`, `y`, `w`, or `opacity`.
+    prop: str = "x"
+    /// Value at t = 0.
+    from: i64 = 0
+    /// Value at t = 1.
+    to: i64 = 0
+    /// Start time. Zero until the first frame.
+    t0: i64 = 0
+    /// Duration in milliseconds.
+    dur: i64 = 1
+    /// `linear`, `in`, `out`, or `inout`.
+    ease: str = "linear"
+
+    /// Motion that starts on the first `frame` call.
+    new(id: str, prop: str, from: i64, to: i64, t0: i64, dur: i64, ease: str) : Motion => Motion.{
+        id, prop, from, to, t0, dur, ease
+    }
+}
+
+gui_paint_node(node: Node, hot: bool) : str {
+    if node.opacity <= 0 { return "" }
+    if node.kind == "column" || node.kind == "row" || node.kind == "spacer" || node.kind == "grid" || node.kind == "scroll" { return "" }
+    if node.w <= 0 || node.h <= 0 { return "" }
+    line = ""
+    if node.kind == "panel" {
+        line = "fill {node.x} {node.y} {node.w} {node.h} 32 32 40\n"
+        line = "{line}rect {node.x} {node.y} {node.w} {node.h} 70 70 84\n"
+    }
+    if node.kind == "button" {
+        line = "fill {node.x} {node.y} {node.w} {node.h} 48 56 78\n"
+        line = "{line}text {node.x + 8} {node.y + 8} 230 230 236 |{node.text}\n"
+    }
+    if node.kind == "label" || node.kind == "text" {
+        shown = node.text
+        width = measure_text(shown, node.size, node.track)
+        lead = 8
+        if (node.align == "center" && width < node.w) { lead = (node.w - width) / 2 }
+        if (node.align == "end" && width < node.w) { lead = node.w - width - 8 }
+        if lead < 0 { lead = 0 }
+        line = "text {node.x + lead} {node.y + 4} {node.fg} {node.fg} {node.fg} |{shown}\n"
+    }
+    if node.kind == "slider" || node.kind == "progress" {
+        amount = to_i64(node.value) or 0
+        if amount < 0 { amount = 0 }
+        if amount > 100 { amount = 100 }
+        fill_w = node.w * amount / 100
+        line = "fill {node.x} {node.y} {node.w} {node.h} {node.bg} {node.bg} {node.bg}\n"
+        line = "{line}fill {node.x} {node.y} {fill_w} {node.h} {node.accent} {node.accent} {node.accent}\n"
+    }
+    if node.kind == "tabs" {
+        line = ""
+        n = len(node.items)
+        x = node.x
+        sel = to_i64(node.value) or 0
+        for 0..n {
+            title = node.items[it]
+            mark = " "
+            if it == sel { mark = ">" }
+            piece = "{mark}{title} "
+            line = "{line}text {x} {node.y + 8} {node.fg} {node.fg} {node.fg} |{piece}\n"
+            x = x + measure_text(piece, node.size, node.track)
+        }
+    }
+    if node.kind == "input" {
+        shown = node.value
+        if shown == "" { shown = node.text }
+        line = "fill {node.x} {node.y} {node.w} {node.h} 24 24 32\n"
+        line = "{line}rect {node.x} {node.y} {node.w} {node.h} 90 90 110\n"
+        line = "{line}text {node.x + 8} {node.y + 8} 230 230 236 |{shown}\n"
+    }
+    if node.kind == "check" {
+        mark = " "
+        if node.value == "1" { mark = "x" }
+        line = "text {node.x + 8} {node.y + 6} 230 230 236 |[{mark}] {node.text}\n"
+    }
+    if node.kind == "toggle" {
+        on = node.value == "1"
+        sw = Toggle{label: node.text, on, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = sw.paint()
+    }
+    if node.kind == "checkbox" {
+        on = node.value == "1"
+        box = CheckBox{label: node.text, on, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = box.paint()
+    }
+    if node.kind == "radio" {
+        on = node.value == "1"
+        group = ""
+        if len(node.items) > 0 { group = node.items[0] }
+        choice = Radio{label: node.text, group, on, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = choice.paint()
+    }
+    if node.kind == "dialog" {
+        open = node.value != ""
+        card = Dialog{title: node.text, body: node.value, open, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = card.paint()
+    }
+    if node.kind == "field" {
+        entry = Field{hint: node.text, value: node.value, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = entry.paint()
+    }
+    if node.kind == "toast" {
+        note = Toast{text: node.text, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = note.paint()
+    }
+    if node.kind == "flash" {
+        banner = Flash{text: node.text, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = banner.paint()
+    }
+    if node.kind == "shape" {
+        block = Shape{form: node.text, r: node.fg, g: node.bg, b: node.accent, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = block.paint()
+    }
+    if node.kind == "titlebar" {
+        bar = TitleBar{title: node.text, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = bar.paint()
+    }
+    if node.kind == "chrome" {
+        buttons = WindowButtons{x: node.x, y: node.y, w: node.w, h: node.h}
+        line = buttons.paint()
+    }
+    if node.kind == "badge" {
+        pin = Badge{label: node.text, x: node.x, y: node.y, w: node.w, h: node.h}
+        line = pin.paint()
+    }
+    if node.kind == "custom" { line = node.text }
+    if node.kind == "list" {
+        line = "fill {node.x} {node.y} {node.w} {node.h} 24 24 32\n"
+        n = len(node.items)
+        shown = n
+        if shown > 5 { shown = 5 }
+        sel = to_i64(node.value) or 0
+        for 0..shown {
+            item = node.items[it]
+            prefix = " "
+            if it == sel { prefix = ">" }
+            yy = node.y + 4 + it * 20
+            line = "{line}text {node.x + 8} {yy} 230 230 236 |{prefix} {item}\n"
+        }
+    }
+    if hot && gui_focusable(node.kind) {
+        line = "{line}rect {node.x} {node.y} {node.w} {node.h} 88 140 230\n"
+    }
+    line
+}
+
+/// Caption used by the text fallback.
+gui_mirror_text(node: Node) : str {
+    if node.kind == "label" || node.kind == "button" { return node.text }
+    if node.kind == "input" {
+        if node.value != "" { return node.value }
+        return node.text
+    }
+    if node.kind == "check" { return node.text }
+    ""
+}
+
+/// Test that a column stacks a button under its label.
+test "a column stacks a button under its label" {
+    app = Gui.new("Tasks", 200, 160)
+    root = @app.column("root")
+    @app.label(root, "heading", "Tasks")
+    @app.button(root, "add", "Add")
+    @app.layout()
+    label = app.nodes[app.find_id("heading")]
+    button = app.nodes[app.find_id("add")]
+    #assert(label.y < button.y)
+    assert_eq(button.x, 8)
+    #assert(contains(@app.paint(), "Add"))
+    #assert(contains(@app.mirror(), "Tasks"))
+    doc = app.describe()
+    #assert(contains(doc, "gui\t1"))
+    #assert(contains(doc, "node\tbutton\tadd\tAdd"))
+    #assert(contains(doc, "title\tTasks"))
+}
+
+/// Test that a click sets the button id and a miss does not.
+test "a click sets the button id and a miss does not" {
+    app = Gui.new("Tasks", 200, 100)
+    root = @app.column("root")
+    @app.button(root, "add", "Add")
+    assert_eq(@app.pointer(20, 20, true), "")
+    assert_eq(@app.pointer(20, 20, false), "add")
+    assert_eq(@app.pointer(0, 0, true), "")
+    assert_eq(@app.pointer(0, 0, false), "")
+}
+
+/// Test that typing, backspace, checks, lists, and tab use the widget under the pointer.
+test "typing, checks, lists, and tab" {
+    app = Gui.new("Tasks", 240, 280)
+    root = @app.column("root")
+    @app.input(root, "title", "name")
+    @app.check(root, "done", "Done", false)
+    @app.list(root, "items", ["write", "ship"])
+    @app.button(root, "add", "Add")
+    @app.layout()
+    @app.pointer(20, 16, true)
+    @app.pointer(20, 16, false)
+    @app.key("a")
+    @app.key("b")
+    assert_eq(app.value_of("title"), "ab")
+    @app.key("backspace")
+    assert_eq(app.value_of("title"), "a")
+    @app.key("tab")
+    @app.key(" ")
+    assert_eq(app.value_of("done"), "1")
+    @app.key("tab")
+    @app.key("down")
+    assert_eq(app.value_of("items"), "1")
+    @app.key("tab")
+    assert_eq(@app.key("enter"), "add")
+}
+
+/// Test that the host raster keeps a red pixel from a fill.
+test "the host raster keeps a red pixel from a fill" {
+    gui_reset()
+    gui_present(8, 8, "fill 0 0 4 4 255 0 0\n")
+    assert_eq(gui_pixel(1, 1), 16711680)
+    #assert(contains(gui_last(), "fill 0 0 4 4"))
+    gui_reset()
+}
+
+/// Test that a fed pointer click round-trips through the host queue.
+test "a fed pointer click round-trips through the host queue" {
+    gui_reset()
+    app = Gui.new("Tasks", 200, 100)
+    root = @app.column("root")
+    @app.button(root, "add", "Add")
+    gui_feed_mouse(20, 20, 1)
+    assert_eq(@app.pointer(gui_mouse_x(), gui_mouse_y(), gui_mouse_down()), "")
+    gui_feed_mouse(20, 20, 0)
+    assert_eq(@app.pointer(gui_mouse_x(), gui_mouse_y(), gui_mouse_down()), "add")
+    gui_feed_key("enter")
+    assert_eq(gui_key(), "enter")
+    gui_reset()
+}
+
+/// Test that style, grid, events, motion, and responsive tier drive the tree.
+test "style, grid, events, motion, and tier drive the tree" {
+    app = Gui.new("Studio", 800, 600)
+    assert_eq(app.tier(), "regular")
+    narrow = Gui.new("Phone", 360, 640)
+    assert_eq(narrow.tier(), "compact")
+    root = @app.column("root")
+    board = @app.grid(root, "board", 2)
+    @app.text(board, "hello", "Hello")
+    @app.slider(board, "gain", 40)
+    @app.progress(board, "load", 25)
+    @app.tabs(board, "mode", ["draw", "type"])
+    @app.style("hello", 10, 240, 20, 700, "center")
+    @app.theme("light")
+    @app.layout()
+    hello = app.nodes[app.find_id("hello")]
+    gain = app.nodes[app.find_id("gain")]
+    assert_eq(hello.fg, 24)
+    assert_eq(hello.weight, 700)
+    #assert(hello.x < gain.x)
+    assert_eq(measure_text("Hello", 20, 0), 50)
+    #assert(contains(@app.paint(), "Hello"))
+    wide = Gui.new("Desk", 1000, 400)
+    row = @wide.row(-1, "tools")
+    @wide.button(row, "a", "A")
+    @wide.button(row, "b", "B")
+    @wide.layout()
+    a = wide.nodes[wide.find_id("a")]
+    b = wide.nodes[wide.find_id("b")]
+    assert_eq(a.y, b.y)
+    #assert(a.x < b.x)
+    @app.pointer(gain.x + 10, gain.y + 4, true)
+    #assert(app.value_of("gain") != "")
+    #assert(starts_with(@app.take(), "pointer:"))
+    @app.animate("hello", "opacity", 0, 100, 100, "linear")
+    @app.frame(10)
+    mid = app.nodes[app.find_id("hello")]
+    assert_eq(mid.opacity, 0)
+    @app.frame(110)
+    done = app.nodes[app.find_id("hello")]
+    assert_eq(done.opacity, 100)
+    #assert(gui_ease("in", 500) < 500)
+    #assert(starts_with(@app.take(), "tick:"))
+}
+
+/// Test that a toggle flips, a radio group clears its siblings, and escape closes a dialog.
+test "toggle, radio, dialog, and custom paint go through Widget" {
+    app = Gui.new("Kit", 240, 200)
+    root = @app.column("root")
+    @app.toggle(root, "sound", "Sound", false)
+    @app.radio(root, "open", "filter", "Open")
+    @app.radio(root, "done", "filter", "Done")
+    @app.dialog(root, "ask", "Delete", "Remove it?")
+    pin = Badge{label: "new", x: 0, y: 0, w: 48, h: 22}
+    @app.custom(root, "pin", pin.paint())
+    @app.layout()
+    sound = app.nodes[app.find_id("sound")]
+    @app.pointer(sound.x + 4, sound.y + 4, true)
+    @app.pointer(sound.x + 4, sound.y + 4, false)
+    assert_eq(app.value_of("sound"), "1")
+    #assert(contains(@app.paint(), "(o) Sound"))
+    open = app.nodes[app.find_id("open")]
+    @app.pointer(open.x + 4, open.y + 4, true)
+    @app.pointer(open.x + 4, open.y + 4, false)
+    assert_eq(app.value_of("open"), "1")
+    done = app.nodes[app.find_id("done")]
+    @app.pointer(done.x + 4, done.y + 4, true)
+    @app.pointer(done.x + 4, done.y + 4, false)
+    assert_eq(app.value_of("done"), "1")
+    assert_eq(app.value_of("open"), "0")
+    #assert(contains(@app.paint(), "Remove it?"))
+    @app.key("escape")
+    assert_eq(app.value_of("ask"), "")
+    #assert(contains(@app.paint(), "new"))
+}

@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<link rel="canonical" href="https://thehamdiz.github.io/super-lang/book/"/>
+<link rel="icon" href="../assets/favicon.ico" sizes="any"/>
+<link rel="icon" type="image/png" sizes="32x32" href="../assets/favicon-32.png"/>
+<link rel="icon" type="image/png" href="../assets/icons/super.png"/>
+<link rel="apple-touch-icon" href="../assets/icons/super.png"/>
+<meta name="description" content="The Super Programming Language book — read online or download the PDF."/>
+<meta name="theme-color" content="#ff7a1f"/>
+<meta property="og:type" content="website"/>
+<meta property="og:site_name" content="Super"/>
+<meta property="og:locale" content="en_US"/>
+<meta property="og:title" content="Super · Book"/>
+<meta property="og:description" content="The Super Programming Language book — read online or download the PDF."/>
+<meta property="og:url" content="https://thehamdiz.github.io/super-lang/book/"/>
+<meta property="og:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<meta property="og:image:width" content="1200"/>
+<meta property="og:image:height" content="630"/>
+<meta property="og:image:alt" content="Super language"/>
+<meta name="twitter:card" content="summary_large_image"/>
+<meta name="twitter:title" content="Super · Book"/>
+<meta name="twitter:description" content="The Super Programming Language book — read online or download the PDF."/>
+<meta name="twitter:image" content="https://thehamdiz.github.io/super-lang/assets/og-image.png"/>
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "SoftwareApplication", "name": "Super", "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux, macOS, FreeBSD, Windows", "softwareVersion": "0.1.0", "license": "https://opensource.org/licenses/MIT", "url": "https://thehamdiz.github.io/super-lang/", "description": "The Super Programming Language book — read online or download the PDF.", "downloadUrl": "https://thehamdiz.github.io/super-lang/install/", "author": {"@type": "Person", "name": "Ahmad Hamdi"}}</script>
+<title>Super · Book</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600&display=swap" rel="stylesheet"/>
+<link rel="stylesheet" href="../site.css"/>
+<script src="../super-highlight.js" defer></script>
+
+</head>
+<body>
+
+<header class="site-nav">
+  <a class="mark" href="./">Super</a>
+  <nav><a href="../">Home</a><a href="../benchmarks/">Benchmarks</a><a href="../winners/">Winners</a><a href="../charts/">Charts</a><a href="../spec/">Spec</a><a href="./">Book</a><a href="../examples/">Examples</a><a href="../install/">Install</a><a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a><a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a><a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a></nav>
+  <a class="cta" href="../downloads/SUPER_BOOK.pdf" download>Download book</a>
+</header>
+<section class="books-shelf" id="books-shelf">
+  <h1>Super Book</h1>
+  <p style="max-width:34ch;margin:0;color:var(--muted)">Open the cover. Click either page, use the buttons, or press the arrow keys.</p>
+  <div class="shelf-row">
+    <button type="button" class="cover-card" data-open-book data-ui aria-label="Open Super Book">
+      <strong>The Super Programming Language</strong>
+      <span>Ahmad Hamdi · 0.1.0</span>
+    </button>
+  </div>
+  <div class="hero-actions">
+    <button type="button" class="cta" id="open-book">Open book</button>
+    <a class="cta-ghost" href="../downloads/SUPER_BOOK.pdf" download>Download PDF</a>
+  </div>
+</section>
+
+<div class="reader" id="reader" role="dialog" aria-modal="true" aria-label="Super Book reader">
+  <div class="reader-bar">
+    <button type="button" id="close-reader">Close</button>
+    <span id="page-label">1 / 1</span>
+    <div>
+      <button type="button" id="prev-page">Prev</button>
+      <button type="button" id="next-page">Next</button>
+      <a href="../downloads/SUPER_BOOK.pdf" download>PDF</a>
+    </div>
+  </div>
+  <div class="reader-progress"><i id="reader-progress"></i></div>
+  <div class="reader-stage">
+    <div class="book-spread" id="book-spread" data-ui>
+      <div class="sheet under left" id="under-left">
+        <div class="page-inner"></div>
+        <span class="page-num"></span>
+      </div>
+      <div class="sheet under right" id="under-right">
+        <div class="page-inner"></div>
+        <span class="page-num"></span>
+      </div>
+      <div class="sheet hard left page" id="page-left">
+        <div class="face front">
+          <div class="page-inner"></div>
+          <span class="page-num"></span>
+        </div>
+        <div class="face back">
+          <div class="page-inner"></div>
+          <span class="page-num"></span>
+        </div>
+        <div class="page-edge" aria-hidden="true"></div>
+        <div class="page-curl" aria-hidden="true"></div>
+      </div>
+      <div class="sheet hard right page" id="page-right">
+        <div class="face front">
+          <div class="page-inner"></div>
+          <span class="page-num"></span>
+        </div>
+        <div class="face back">
+          <div class="page-inner"></div>
+          <span class="page-num"></span>
+        </div>
+        <div class="page-edge" aria-hidden="true"></div>
+        <div class="page-curl" aria-hidden="true"></div>
+      </div>
+    </div>
+  </div>
+  <p class="reader-hint">Click left / right · arrows · space · esc</p>
+</div>
+
+<footer class="site-footer">
+  <div class="footer-links">
+    <a href="../benchmarks/">Benchmarks</a>
+    <a href="../winners/">Winners</a>
+    <a href="../charts/">Charts</a>
+    <a href="./">Book</a>
+    <a href="../install/">Install</a>
+    <a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a>
+    <a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a>
+    <a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a>
+  </div>
+  <div class="footer-mark" aria-hidden="true">
+    <span>S</span><span>u</span><span>p</span><span>e</span><span>r</span>
+  </div>
+  <div class="footer-legal">
+    <span>Super language</span>
+  </div>
+</footer>
+<script src="../book-flip.js"></script>
+</body>
+</html>

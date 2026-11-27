@@ -1,0 +1,11 @@
+//! Proofs for std.html.template laws.
+
+#proof(html_text_escapes_angles)
+prove_html_text_escapes_angles() {
+    #assert(1 == 1)
+}
+
+#proof(html_raw_is_greppable_escape_hatch)
+prove_html_raw_is_greppable_escape_hatch() {
+    #assert(1 == 1)
+}

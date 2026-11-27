@@ -1,0 +1,18 @@
+{% assign active = page.nav | default: page.permalink | default: page.url %}
+<header class="site-nav">
+  <a class="mark" href="{{ '/' | relative_url }}">Super</a>
+  <nav>
+    <a href="{{ '/' | relative_url }}"{% if active == 'home' or active == 'index' %} aria-current="page"{% endif %}>Home</a>
+    <a href="{{ '/benchmarks/' | relative_url }}"{% if active == 'benchmarks' %} aria-current="page"{% endif %}>Benchmarks</a>
+    <a href="{{ '/winners/' | relative_url }}"{% if active == 'winners' %} aria-current="page"{% endif %}>Winners</a>
+    <a href="{{ '/charts/' | relative_url }}"{% if active == 'charts' %} aria-current="page"{% endif %}>Charts</a>
+    <a href="{{ '/spec/' | relative_url }}"{% if active == 'spec' %} aria-current="page"{% endif %}>Spec</a>
+    <a href="{{ '/book/' | relative_url }}"{% if active == 'book' %} aria-current="page"{% endif %}>Book</a>
+    <a href="{{ '/examples/' | relative_url }}"{% if active == 'examples' %} aria-current="page"{% endif %}>Examples</a>
+    <a href="{{ '/install/' | relative_url }}"{% if active == 'install' %} aria-current="page"{% endif %}>Install</a>
+    <a href="https://github.com/theHamdiz/super-lang" rel="noopener noreferrer">GitHub</a>
+    <a href="https://discord.gg/ZvgmreZsuY" rel="noopener noreferrer">Discord</a>
+    <a href="https://ko-fi.com/thehamdiz" rel="noopener noreferrer">Donate</a>
+  </nav>
+  <a class="cta" href="{{ '/downloads/SUPER_BOOK.pdf' | relative_url }}" download>Download book</a>
+</header>

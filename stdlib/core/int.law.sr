@@ -1,0 +1,22 @@
+//! Laws for std.core.int — fixed-width integer helpers (pure u32 model).
+//! Implementation: `is_u32` / `as_u32` in `int.sr`.
+
+law_as_u32(v: i64) : i64 {
+    if v < 0 { return 0 }
+    if v > U32_MAX { return U32_MAX }
+    v
+}
+
+#law("is_u32 accepts top of range")
+int_is_u32_range() {
+    #assert(is_u32(U32_MAX))
+    #assert(!is_u32(U32_MAX + 1))
+}
+
+#law("u32 clamp is identity in range")
+int_as_u32_in_range(v: i64) {
+    ensure v >= 0 && v <= U32_MAX else { return }
+    x = law_as_u32(v)
+    #assert(x == v)
+    #assert(law_as_u32(x) == x)
+}

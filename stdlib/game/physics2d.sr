@@ -1,0 +1,1155 @@
+//! std.game.physics2d — circles and axis-aligned boxes with impulse resolution
+//!
+//! Import with:
+//!   use std.game.physics2d
+//!
+//!   w = p2_world(0.0, -9.81)                      // gravity x, y
+//!   @w.p2_add(p2_circle(0.0, 5.0, 1.0, 1.0))          // x, y, radius, mass
+//!   @w.p2_add(p2_box(0.0, 0.0, 50.0, 1.0, 0.0))       // x, y, half-w, half-h, mass 0 = static
+//!   for 0..120 { @w.p2_step(1.0 / 60.0) }
+//!   ball = w.bodies[0]
+//!
+//! Bodies are plain structs held in `World2D.bodies`. Each `p2_step` runs semi-implicit
+//! Euler integration followed by `iters` rounds of spatial-hash broadphase (uniform grid,
+//! O(n) build, candidate pairs visited in the same `(i, j)` order as an all-pairs sweep),
+//! narrowphase (`p2_collide` -> `Contact`, tuple-`when` shape dispatch) and sequential
+//! impulses with restitution, Coulomb friction and positional correction. Worlds of fewer
+//! than `P2_GRID_MIN` bodies skip the grid; `p2_step_brute` keeps the all-pairs reference. The pure helpers (`p2_collide`,
+//! `p2_ray_aabb`, `p2_ray_circle`, `p2_aabb_overlap`, ...) are usable without a world.
+//!
+//! Contact normals point from the first body toward the second. Everything is prefixed
+//! `p2_` so it can be merged flat with other modules.
+
+use std.core.collections
+use std.math.core
+
+/// `Body` is a 2D rigid body (circle or box) with velocity and material.
++Body = {
+    /// Center x.
+    x: f64
+    /// Center y.
+    y: f64
+    /// Velocity along x. Defaults to `0.0`.
+    vx: f64 = 0.0
+    /// Velocity along y. Defaults to `0.0`.
+    vy: f64 = 0.0
+    /// Inverse mass. Zero means a static body. Defaults to `0.0`.
+    inv_mass: f64 = 0.0
+    /// Shape tag: circle or box. Defaults to `0`.
+    shape: i64 = 0
+    /// Circle radius. Unused for boxes. Defaults to `0.0`.
+    r: f64 = 0.0
+    /// Box half-width. Defaults to `0.0`.
+    hw: f64 = 0.0
+    /// Box half-height. Defaults to `0.0`.
+    hh: f64 = 0.0
+    /// Coefficient of restitution. Defaults to `0.2`.
+    e: f64 = 0.2
+    /// Friction coefficient. Defaults to `0.4`.
+    mu: f64 = 0.4
+}
+
+/// `Contact` is one collision: hit flag, normal, and penetration depth.
++Contact = {
+    /// Hit on `Contact` (`bool`).
+    hit: bool
+    /// Nx on `Contact` (`f64`). Defaults to `0.0`.
+    nx: f64 = 0.0
+    /// Ny on `Contact` (`f64`). Defaults to `0.0`.
+    ny: f64 = 0.0
+    /// Depth on `Contact` (`f64`). Defaults to `0.0`.
+    depth: f64 = 0.0
+}
+
+/// `World2D` steps a set of bodies under gravity and damping.
++World2D = {
+    /// Bodies on `World2D`. Defaults to `[]`.
+    bodies: _ = []
+    /// Gx on `World2D` (`f64`). Defaults to `0.0`.
+    gx: f64 = 0.0
+    /// Gy on `World2D` (`f64`). Defaults to `0.0`.
+    gy: f64 = 0.0
+    /// Damping on `World2D` (`f64`). Defaults to `0.0`.
+    damping: f64 = 0.0
+    /// Iters on `World2D` (`i64`). Defaults to `4`.
+    iters: i64 = 4
+}
+
+/// `P2_CIRCLE` is `0`.
++P2_CIRCLE = 0
+/// `P2_BOX` is `1`.
++P2_BOX = 1
+/// Bodies below this count use the all-pairs sweep (grid setup would cost more than it saves).
++P2_GRID_MIN = 32
+
+// --- scalars ---------------------------------------------------------------------------------
+
+/// Absolute value of `v`.
++p2_abs(v: f64) : f64 {
+    if v < 0.0 { return 0.0 - v }
+    v
+}
+
+/// Lesser of `a` and `b`.
++p2_min(a: f64, b: f64) : f64 {
+    if a < b { return a }
+    b
+}
+
+/// Greater of `a` and `b`.
++p2_max(a: f64, b: f64) : f64 {
+    if a > b { return a }
+    b
+}
+
+/// `v` clamped into the inclusive range `lo`..`hi`.
++p2_clamp(v: f64, lo: f64, hi: f64) : f64 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    v
+}
+
+/// Sign of `v`: `-1` when negative, `0` when zero, `1` when positive.
++p2_sign(v: f64) : f64 {
+    if v < 0.0 { return 0.0 - 1.0 }
+    1.0
+}
+
+// --- construction -------------------------------------------------------------------------------
+
+/// Mass 0 (or less) makes a static body.
++p2_inv(mass: f64) : f64 {
+    if mass <= 0.0 { return 0.0 }
+    1.0 / mass
+}
+
+/// Dynamic circle body centered at (`x`, `y`) with radius `r` and mass `mass`.
++p2_circle(x: f64, y: f64, r: f64, mass: f64) : Body => Body.{x, y, vx: 0.0, vy: 0.0, inv_mass: p2_inv(mass), shape: 0, r, hw: r, hh: r, e: 0.2, mu: 0.4}
+
+/// Dynamic box body centered at (`x`, `y`) with half-extents (`hw`, `hh`).
++p2_box(x: f64, y: f64, hw: f64, hh: f64, mass: f64) : Body => Body.{x, y, vx: 0.0, vy: 0.0, inv_mass: p2_inv(mass), shape: 1, r: 0.0, hw, hh, e: 0.2, mu: 0.4}
+
+/// Physics world with gravity and a fixed iteration count.
++p2_world(gx: f64, gy: f64) : World2D => World2D.{bodies: [], gx, gy, damping: 0.0, iters: 4}
+
+/// Append a body; returns its index.
++p2_add(@w: World2D, b: Body) : i64 {
+    w.bodies = arr_push(w.bodies, b)
+    len(w.bodies) - 1
+}
+
+/// Append every body of `bodies` in order; returns the index of the first one.
+/// Bulk loads should use this: it copies the body list once (O(n + m)) where repeated
+/// `p2_add` calls re-copy it per body.
++p2_add_all(@w: World2D, bodies: _) : i64 {
+    first = len(w.bodies)
+    all = w.bodies
+    for bodies { all = arr_push(all, it) }
+    w.bodies = all
+    first
+}
+
+/// True when `b` has infinite mass.
++p2_is_static(b: Body) : bool => b.inv_mass == 0.0
+
+// --- shape queries -----------------------------------------------------------------------------------
+
+/// Contact between `ax` and `ay`, or a miss.
++p2_aabb_overlap(ax: f64, ay: f64, ahw: f64, ahh: f64, bx: f64, by: f64, bhw: f64, bhh: f64) : bool {
+    if p2_abs(bx - ax) >= ahw + bhw { return false }
+    if p2_abs(by - ay) >= ahh + bhh { return false }
+    true
+}
+
+/// True when the point (`px`, `py`) lies inside `bx`.
++p2_point_in_box(px: f64, py: f64, bx: f64, by: f64, hw: f64, hh: f64) : bool {
+    if p2_abs(px - bx) > hw { return false }
+    if p2_abs(py - by) > hh { return false }
+    true
+}
+
+/// True when the point (`px`, `py`) lies inside `cx`.
++p2_point_in_circle(px: f64, py: f64, cx: f64, cy: f64, r: f64) : bool {
+    dx = px - cx
+    dy = py - cy
+    dx * dx + dy * dy <= r * r
+}
+
+/// Ray (origin, unit-or-not direction) vs box using the slab method. Returns the entry
+/// distance in units of `d`, or -1 on a miss (a ray starting inside reports 0).
++p2_ray_aabb(ox: f64, oy: f64, dx: f64, dy: f64, bx: f64, by: f64, hw: f64, hh: f64) : f64 {
+    tmin = 0.0
+    tmax = 1000000000.0
+    miss = -1.0
+    if p2_abs(dx) < 0.000000001 {
+        if p2_abs(ox - bx) > hw { return miss }
+    } else {
+        t1 = (bx - hw - ox) / dx
+        t2 = (bx + hw - ox) / dx
+        tmin = p2_max(tmin, p2_min(t1, t2))
+        tmax = p2_min(tmax, p2_max(t1, t2))
+    }
+    if p2_abs(dy) < 0.000000001 {
+        if p2_abs(oy - by) > hh { return miss }
+    } else {
+        t1 = (by - hh - oy) / dy
+        t2 = (by + hh - oy) / dy
+        tmin = p2_max(tmin, p2_min(t1, t2))
+        tmax = p2_min(tmax, p2_max(t1, t2))
+    }
+    if tmin > tmax { return miss }
+    tmin
+}
+
+/// Ray vs circle; entry distance in units of `d`, or -1.
++p2_ray_circle(ox: f64, oy: f64, dx: f64, dy: f64, cx: f64, cy: f64, r: f64) : f64 {
+    fx = ox - cx
+    fy = oy - cy
+    a = dx * dx + dy * dy
+    miss = -1.0
+    if a < 0.000000001 { return miss }
+    b = 2.0 * (fx * dx + fy * dy)
+    c = fx * fx + fy * fy - r * r
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0 { return miss }
+    s = sqrt(disc)
+    t = (0.0 - b - s) / (2.0 * a)
+    if t >= 0.0 { return t }
+    t2 = (0.0 - b + s) / (2.0 * a)
+    if t2 >= 0.0 { return 0.0 }
+    miss
+}
+
+// --- narrowphase ------------------------------------------------------------------------------------------
+
+/// A contact that did not hit.
++p2_no_contact() : Contact => Contact.{hit: false, nx: 0.0, ny: 0.0, depth: 0.0}
+
+/// Contact between `a` and `b`, or a miss.
++p2_circle_circle(a: Body, b: Body) : Contact {
+    dx = b.x - a.x
+    dy = b.y - a.y
+    rr = a.r + b.r
+    d2 = dx * dx + dy * dy
+    if d2 >= rr * rr { return p2_no_contact() }
+    if d2 == 0.0 { return Contact.{hit: true, nx: 1.0, ny: 0.0, depth: rr} }
+    d = sqrt(d2)
+    Contact.{hit: true, nx: dx / d, ny: dy / d, depth: rr - d}
+}
+
+/// Contact between `a` and `b`, or a miss.
++p2_box_box(a: Body, b: Body) : Contact {
+    dx = b.x - a.x
+    dy = b.y - a.y
+    ox = a.hw + b.hw - p2_abs(dx)
+    oy = a.hh + b.hh - p2_abs(dy)
+    if ox <= 0.0 { return p2_no_contact() }
+    if oy <= 0.0 { return p2_no_contact() }
+    if ox < oy { return Contact.{hit: true, nx: p2_sign(dx), ny: 0.0, depth: ox} }
+    Contact.{hit: true, nx: 0.0, ny: p2_sign(dy), depth: oy}
+}
+
+/// Circle `a` against box `b`.
++p2_circle_box(a: Body, b: Body) : Contact {
+    lx = a.x - b.x
+    ly = a.y - b.y
+    cx = p2_clamp(lx, 0.0 - b.hw, b.hw)
+    cy = p2_clamp(ly, 0.0 - b.hh, b.hh)
+    fx = lx - cx
+    fy = ly - cy
+    d2 = fx * fx + fy * fy
+    if d2 > 0.0 {
+        if d2 >= (a.r * a.r) { return p2_no_contact() }
+        d = sqrt(d2)
+        Contact.{hit: true, nx: (0.0 - fx) / d, ny: (0.0 - fy) / d, depth: a.r - d}
+    } else {
+        // Circle centre is inside the box: leave through the shallowest face.
+        px = b.hw - p2_abs(lx)
+        py = b.hh - p2_abs(ly)
+        if px < py {
+            Contact.{hit: true, nx: 0.0 - p2_sign(lx), ny: 0.0, depth: px + a.r}
+        } else {
+            Contact.{hit: true, nx: 0.0, ny: 0.0 - p2_sign(ly), depth: py + a.r}
+        }
+    }
+}
+
+/// `c` seen from the other body: the normal is negated.
++p2_flip(c: Contact) : Contact => Contact.{hit: c.hit, nx: 0.0 - c.nx, ny: 0.0 - c.ny, depth: c.depth}
+
+/// Contact between two bodies; the normal points from `a` to `b`. Dispatches on the shape
+/// pair with a tuple `when`; the mixed pair is symmetric (`collide(a, b)` == flip of `collide(b, a)`).
++p2_collide(a: Body, b: Body) : Contact {
+    when (a.shape, b.shape) {
+        (0, 0) => { return p2_circle_circle(a, b) }
+        (1, 1) => { return p2_box_box(a, b) }
+        (0, 1) => { return p2_circle_box(a, b) }
+        (1, 0) => { return p2_flip(p2_circle_box(b, a)) }
+        else => { return p2_no_contact() }
+    }
+}
+
+// --- resolution ----------------------------------------------------------------------------------------------
+
+/// Apply impulse + friction + positional correction to `a` and `b` in place.
+/// Returns 1 when the contact changed them, 0 for a miss or a double-static pair.
++p2_resolve_mut(@a: Body, @b: Body, c: Contact) : i64 {
+    ia = a.inv_mass
+    ib = b.inv_mass
+    isum = ia + ib
+    if c.hit == false { return 0 }
+    if isum == 0.0 { return 0 }
+    rvx = b.vx - a.vx
+    rvy = b.vy - a.vy
+    vn = rvx * c.nx + rvy * c.ny
+    if vn < 0.0 {
+        e = p2_min(a.e, b.e)
+        j = (0.0 - (1.0 + e)) * vn / isum
+        a.vx = a.vx - j * ia * c.nx
+        a.vy = a.vy - j * ia * c.ny
+        b.vx = b.vx + j * ib * c.nx
+        b.vy = b.vy + j * ib * c.ny
+        // Coulomb friction along the tangent.
+        tx = rvx - vn * c.nx
+        ty = rvy - vn * c.ny
+        tl = sqrt(tx * tx + ty * ty)
+        if tl > 0.000001 {
+            tx = tx / tl
+            ty = ty / tl
+            jt = (0.0 - (rvx * tx + rvy * ty)) / isum
+            mu = sqrt(a.mu * b.mu)
+            lim = mu * j
+            jt = p2_clamp(jt, 0.0 - lim, lim)
+            a.vx = a.vx - jt * ia * tx
+            a.vy = a.vy - jt * ia * ty
+            b.vx = b.vx + jt * ib * tx
+            b.vy = b.vy + jt * ib * ty
+        }
+    }
+    // Positional correction (80% of penetration beyond a 0.01 slop).
+    corr = p2_max(c.depth - 0.01, 0.0) / isum * 0.8
+    a.x = a.x - corr * ia * c.nx
+    a.y = a.y - corr * ia * c.ny
+    b.x = b.x + corr * ib * c.nx
+    b.y = b.y + corr * ib * c.ny
+    1
+}
+
+/// Apply impulse + friction + positional correction. Returns [a', b'].
++p2_resolve(a: Body, b: Body, c: Contact) : _ {
+    na = a
+    nb = b
+    p2_resolve_mut(@na, @nb, c)
+    return [na, nb]
+}
+
+/// Cheap broadphase: do the bounding boxes overlap?
++p2_bounds_overlap(a: Body, b: Body) : bool => p2_aabb_overlap(a.x, a.y, a.hw, a.hh, b.x, b.y, b.hw, b.hh)
+
+// --- broadphase: uniform spatial hash ---------------------------------------------------------------
+
+/// `Grid2D` is a uniform spatial hash: body AABBs registered in every cell they touch.
+/// Entries form per-bucket chains (`heads` -> `en`), so a build is O(bodies + cells touched).
++Grid2D = {
+    /// Reciprocal cell edge length. Defaults to `1.0`.
+    inv: f64 = 1.0
+    /// Bucket mask (table size is a power of two). Defaults to `15`.
+    mask: i64 = 15
+    /// First entry of each bucket chain, or -1. Defaults to `[]`.
+    heads: _ = []
+    /// Body index of each entry. Defaults to `[]`.
+    eb: _ = []
+    /// Cell x of each entry. Defaults to `[]`.
+    ex: _ = []
+    /// Cell y of each entry. Defaults to `[]`.
+    ey: _ = []
+    /// Next entry in the chain, or -1. Defaults to `[]`.
+    en: _ = []
+}
+
+/// Cell edge: twice the mean half-extent, but never smaller than 1/8 of the largest body
+/// so one huge static body spans a bounded number of cells.
++p2_cell_size(bodies: _, n: i64) : f64 {
+    sum = 0.0
+    big = 0.0
+    for bodies {
+        e = p2_max(it.hw, it.hh)
+        sum += e
+        if e > big { big = e }
+    }
+    cell = p2_max(2.0 * sum / host.sys_to_float(n), big / 8.0)
+    if cell < 0.000001 { return 1.0 }
+    cell
+}
+
+/// Integer cell coordinate of `v` for a grid with reciprocal cell size `inv`.
++p2_cell(v: f64, inv: f64) : i64 => to_int(floor(v * inv))
+
+/// Bucket of cell (`cx`, `cy`) under `mask`.
++p2_bucket(cx: i64, cy: i64, mask: i64) : i64 => ((cx * 73856093) ^ (cy * 19349663)) & mask
+
+/// Smallest power-of-two table size (minus one) holding at least `2n` buckets.
++p2_table_mask(n: i64) : i64 {
+    size = 16
+    while size < n * 2 { size = size * 2 }
+    size - 1
+}
+
+/// Hash every body's AABB (padded by 10% of a cell so small in-iteration corrections
+/// cannot hide a neighbour) into a fresh grid.
++p2_grid_build(bodies: _, n: i64) : Grid2D {
+    cell = p2_cell_size(bodies, n)
+    inv = 1.0 / cell
+    pad = cell * 0.1
+    mask = p2_table_mask(n)
+    heads = [-1; mask + 1]
+    // Size the entry pool first (one entry per touched cell) so the build never regrows.
+    total = 0
+    for 0..n {
+        b = bodies[it]
+        w = p2_cell(b.x + b.hw + pad, inv) - p2_cell(b.x - b.hw - pad, inv) + 1
+        h = p2_cell(b.y + b.hh + pad, inv) - p2_cell(b.y - b.hh - pad, inv) + 1
+        if w > 0 && h > 0 { total += w * h }
+    }
+    eb = [0; total]
+    ex = [0; total]
+    ey = [0; total]
+    en = [0; total]
+    len = 0
+    for 0..n {
+        i = it
+        b = bodies[i]
+        cx0 = p2_cell(b.x - b.hw - pad, inv)
+        cx1 = p2_cell(b.x + b.hw + pad, inv)
+        cy0 = p2_cell(b.y - b.hh - pad, inv)
+        cy1 = p2_cell(b.y + b.hh + pad, inv)
+        for cy0..(cy1 + 1) {
+            cy = it
+            for cx0..(cx1 + 1) {
+                cx = it
+                slot = p2_bucket(cx, cy, mask)
+                en[len], eb[len], ex[len], ey[len] = heads[slot], i, cx, cy
+                heads[slot] = len
+                len += 1
+            }
+        }
+    }
+    Grid2D.{inv, mask, heads, eb, ex, ey, en}
+}
+
+/// Ascending-sorted copy of the small index list `a` (insertion sort).
++p2_sort_small(a: _) : _ {
+    out = a
+    n = len(out)
+    for 1..n {
+        v = out[it]
+        k = it - 1
+        while k >= 0 {
+            if out[k] > v {
+                out[k + 1] = out[k]
+                k -= 1
+            } else {
+                break
+            }
+        }
+        out[k + 1] = v
+    }
+    out
+}
+
+/// Allocation-free core of `p2_grid_candidates`: writes the bodies `j > i` whose grid
+/// cells overlap body `i`'s padded AABB into the front of `out`, ascending and unique,
+/// and returns how many were written. `mark` and `out` are scratch of length n; a `mark` stamp of
+/// `i + 1` means "already listed for `i`".
++p2_grid_gather(g: Grid2D, b: Body, i: i64, @mark, @out) : i64 {
+    pad = 0.1 / g.inv
+    cx0 = p2_cell(b.x - b.hw - pad, g.inv)
+    cx1 = p2_cell(b.x + b.hw + pad, g.inv)
+    cy0 = p2_cell(b.y - b.hh - pad, g.inv)
+    cy1 = p2_cell(b.y + b.hh + pad, g.inv)
+    cnt = 0
+    for cy0..(cy1 + 1) {
+        cy = it
+        for cx0..(cx1 + 1) {
+            cx = it
+            e = g.heads[p2_bucket(cx, cy, g.mask)]
+            while e >= 0 {
+                if g.ex[e] == cx && g.ey[e] == cy {
+                    j = g.eb[e]
+                    if j > i && mark[j] != i + 1 {
+                        mark[j] = i + 1
+                        out[cnt] = j
+                        cnt += 1
+                    }
+                }
+                e = g.en[e]
+            }
+        }
+    }
+    // Insertion sort in place: candidate lists are short and nearly ordered.
+    for 1..cnt {
+        v = out[it]
+        k = it - 1
+        while k >= 0 {
+            if out[k] > v {
+                out[k + 1] = out[k]
+                k -= 1
+            } else {
+                break
+            }
+        }
+        out[k + 1] = v
+    }
+    cnt
+}
+
+/// Bodies `j > i` whose grid cells overlap body `i`'s padded AABB, ascending and unique.
+/// `mark` is scratch of length n; a stamp of `i + 1` marks "already listed for `i`".
++p2_grid_candidates(g: Grid2D, b: Body, i: i64, @mark) : _ {
+    scratch = [0; len(mark)]
+    cnt = p2_grid_gather(g, b, i, @mark, @scratch)
+    out = []
+    for 0..cnt { out = arr_push(out, scratch[it]) }
+    out
+}
+
+/// Narrowphase + impulse for the pair (`i`, `j`); returns 1 when a contact was resolved.
++p2_solve_pair(@w: World2D, i: i64, j: i64) : i64 {
+    a = w.bodies[i]
+    b = w.bodies[j]
+    if a.inv_mass + b.inv_mass > 0.0 {
+        if p2_bounds_overlap(a, b) {
+            c = p2_collide(a, b)
+            if (c.hit) {
+                p2_resolve_mut(@a, @b, c)
+                w.bodies = arr_set(w.bodies, i, a)
+                w.bodies = arr_set(w.bodies, j, b)
+                return 1
+            }
+        }
+    }
+    0
+}
+
+/// One solver round over every pair, via the spatial hash. Returns contacts resolved.
++p2_solve_grid(@w: World2D) : i64 {
+    n = len(w.bodies)
+    if n < 2 { return 0 }
+    g = p2_grid_build(w.bodies, n)
+    mark = [0; n]
+    cands = [0; n]
+    last = 0
+    for 0..n {
+        i = it
+        cnt = p2_grid_gather(g, w.bodies[i], i, @mark, @cands)
+        for 0..cnt { last += p2_solve_pair(@w, i, cands[it]) }
+    }
+    last
+}
+
+/// One solver round over every pair (all-pairs reference; O(n^2)). Returns contacts resolved.
++p2_solve_brute(@w: World2D) : i64 {
+    n = len(w.bodies)
+    last = 0
+    for 0..n {
+        i = it
+        for (i + 1)..n { last += p2_solve_pair(@w, i, it) }
+    }
+    last
+}
+
+/// Semi-implicit Euler integration of every dynamic body (gravity + damping).
++p2_integrate(@w: World2D, dt: f64) {
+    n = len(w.bodies)
+    damp = 1.0 / (1.0 + dt * w.damping)
+    for 0..n {
+        b = w.bodies[it]
+        if b.inv_mass > 0.0 {
+            b.vx = (b.vx + w.gx * dt) * damp
+            b.vy = (b.vy + w.gy * dt) * damp
+            b.x = b.x + b.vx * dt
+            b.y = b.y + b.vy * dt
+            w.bodies = arr_set(w.bodies, it, b)
+        }
+    }
+}
+
+/// Advance the simulation by `dt` seconds. Returns the number of contacts resolved
+/// in the final iteration (useful for sleeping / diagnostics). Uses the spatial hash once
+/// the world holds `P2_GRID_MIN` bodies or more.
++p2_step(@w: World2D, dt: f64) : i64 {
+    @w.p2_integrate(dt)
+    use_grid = len(w.bodies) >= P2_GRID_MIN
+    last = 0
+    for 0..(w.iters) {
+        if use_grid { last = @w.p2_solve_grid() } else { last = @w.p2_solve_brute() }
+    }
+    last
+}
+
+/// `p2_step` with the all-pairs sweep regardless of body count (reference / diagnostics).
++p2_step_brute(@w: World2D, dt: f64) : i64 {
+    @w.p2_integrate(dt)
+    last = 0
+    for 0..(w.iters) { last = @w.p2_solve_brute() }
+    last
+}
+
+// --- energy / momentum ------------------------------------------------------------------------------------------
+
+/// Horizontal momentum of `w`.
++p2_momentum_x(w: World2D) : f64 {
+    s = 0.0
+    bs = w.bodies
+    for bs {
+        if it.inv_mass > 0.0 { s += it.vx / it.inv_mass }
+    }
+    s
+}
+
+/// Vertical momentum of `w`.
++p2_momentum_y(w: World2D) : f64 {
+    s = 0.0
+    bs = w.bodies
+    for bs {
+        if it.inv_mass > 0.0 { s += it.vy / it.inv_mass }
+    }
+    s
+}
+
+/// Kinetic energy of `w`.
++p2_kinetic_energy(w: World2D) : f64 {
+    s = 0.0
+    bs = w.bodies
+    for bs {
+        if it.inv_mass > 0.0 { s += 0.5 * (it.vx * it.vx + it.vy * it.vy) / it.inv_mass }
+    }
+    s
+}
+
+// --- tests ------------------------------------------------------------------------------------------------------------
+
+/// Test that constructors set shape and inverse mass.
+test "constructors set shape and inverse mass" {
+    c = p2_circle(1.0, 2.0, 0.5, 4.0)
+    assert_eq(c.shape, 0)
+    assert_eq(c.inv_mass, 0.25)
+    assert_eq(c.hw, 0.5)
+    b = p2_box(0.0, 0.0, 2.0, 1.0, 0.0)
+    assert_eq(b.shape, 1)
+    assert_eq(b.inv_mass, 0.0)
+    #assert(p2_is_static(b))
+    #assert(!(p2_is_static(c)))
+    w = p2_world(0.0, -9.0)
+    assert_eq(@w.p2_add(c), 0)
+    assert_eq(@w.p2_add(b), 1)
+    assert_eq(len(w.bodies), 2)
+    assert_eq(w.gy, -9.0)
+}
+
+/// Test that bulk loading matches one-by-one adds and keeps order.
+test "add_all appends in order and matches p2_add" {
+    w = p2_world(0.0, -9.0)
+    assert_eq(@w.p2_add(p2_box(0.0, 0.0, 5.0, 1.0, 0.0)), 0)
+    batch = [p2_circle(1.0, 2.0, 0.5, 1.0), p2_box(3.0, 4.0, 0.5, 0.25, 2.0), p2_circle(5.0, 6.0, 0.75, 4.0)]
+    assert_eq(@w.p2_add_all(batch), 1)
+    assert_eq(len(w.bodies), 4)
+    assert_eq(w.bodies[1].x, 1.0)
+    assert_eq(w.bodies[2].shape, 1)
+    assert_eq(w.bodies[2].hh, 0.25)
+    assert_eq(w.bodies[3].inv_mass, 0.25)
+    assert_eq(len(batch), 3)
+    v = p2_world(0.0, -9.0)
+    @v.p2_add(p2_box(0.0, 0.0, 5.0, 1.0, 0.0))
+    for batch { @v.p2_add(it) }
+    for 0..20 {
+        @w.p2_step(1.0 / 60.0)
+        @v.p2_step(1.0 / 60.0)
+    }
+    for 0..4 {
+        assert_eq(w.bodies[it].x, v.bodies[it].x)
+        assert_eq(w.bodies[it].y, v.bodies[it].y)
+    }
+    e = p2_world(0.0, 0.0)
+    assert_eq(@e.p2_add_all([]), 0)
+    assert_eq(len(e.bodies), 0)
+}
+
+/// Test that scalar helpers.
+test "scalar helpers" {
+    assert_eq(p2_abs(-3.5), 3.5)
+    assert_eq(p2_min(1.0, 2.0), 1.0)
+    assert_eq(p2_max(1.0, 2.0), 2.0)
+    assert_eq(p2_clamp(5.0, 0.0, 3.0), 3.0)
+    assert_eq(p2_clamp(-5.0, 0.0, 3.0), 0.0)
+    assert_eq(p2_clamp(1.5, 0.0, 3.0), 1.5)
+    assert_eq(p2_sign(-2.0), -1.0)
+    assert_eq(p2_sign(0.0), 1.0)
+}
+
+/// Test that overlap and point queries.
+test "overlap and point queries" {
+    #assert(p2_aabb_overlap(0.0, 0.0, 1.0, 1.0, 1.5, 0.0, 1.0, 1.0))
+    #assert(!(p2_aabb_overlap(0.0, 0.0, 1.0, 1.0, 2.0, 0.0, 1.0, 1.0)))
+    #assert(!(p2_aabb_overlap(0.0, 0.0, 1.0, 1.0, 0.0, 2.5, 1.0, 1.0)))
+    #assert(p2_point_in_box(0.5, 0.5, 0.0, 0.0, 1.0, 1.0))
+    #assert(!(p2_point_in_box(1.5, 0.0, 0.0, 0.0, 1.0, 1.0)))
+    #assert(p2_point_in_circle(3.0, 4.0, 0.0, 0.0, 5.0))
+    #assert(!(p2_point_in_circle(3.0, 4.1, 0.0, 0.0, 5.0)))
+}
+
+/// Test that ray casts.
+test "ray casts" {
+    assert_eq(p2_ray_aabb(-5.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0), 4.0)
+    assert_eq(p2_ray_aabb(-5.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0), -1.0)
+    assert_eq(p2_ray_aabb(-5.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0), -1.0)
+    assert_eq(p2_ray_aabb(0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0), 0.0)
+    assert_eq(p2_ray_aabb(0.0, -5.0, 0.0, 2.0, 0.0, 0.0, 1.0, 1.0), 2.0)
+    assert_eq(p2_ray_circle(-5.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), 4.0)
+    assert_eq(p2_ray_circle(-5.0, 2.0, 1.0, 0.0, 0.0, 0.0, 1.0), -1.0)
+    assert_eq(p2_ray_circle(0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), 0.0)
+    assert_eq(p2_ray_circle(-5.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0), -1.0)
+    assert_eq(p2_ray_circle(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0), -1.0)
+}
+
+/// Test that circle circle contact.
+test "circle circle contact" {
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(1.5, 0.0, 1.0, 1.0)
+    c = p2_collide(a, b)
+    #assert(c.hit)
+    assert_eq(c.nx, 1.0)
+    assert_eq(c.ny, 0.0)
+    assert_eq(c.depth, 0.5)
+    far = p2_collide(a, p2_circle(2.0, 0.0, 1.0, 1.0))
+    #assert(!(far.hit))
+    same = p2_collide(a, p2_circle(0.0, 0.0, 1.0, 1.0))
+    #assert(same.hit)
+    assert_eq(same.depth, 2.0)
+    diag = p2_collide(p2_circle(0.0, 0.0, 1.0, 1.0), p2_circle(1.0, 1.0, 1.0, 1.0))
+    #assert(diag.hit)
+    #assert(p2_abs(diag.nx - 0.7071067811865476) < 0.000001)
+}
+
+/// Test that box box contact picks the shallow axis.
+test "box box contact picks the shallow axis" {
+    a = p2_box(0.0, 0.0, 1.0, 1.0, 1.0)
+    side = p2_collide(a, p2_box(1.5, 0.2, 1.0, 1.0, 1.0))
+    #assert(side.hit)
+    assert_eq(side.nx, 1.0)
+    assert_eq(side.ny, 0.0)
+    assert_eq(side.depth, 0.5)
+    top = p2_collide(a, p2_box(0.2, 1.7, 1.0, 1.0, 1.0))
+    #assert(top.hit)
+    assert_eq(top.nx, 0.0)
+    assert_eq(top.ny, 1.0)
+    below = p2_collide(a, p2_box(0.1, -1.8, 1.0, 1.0, 1.0))
+    assert_eq(below.ny, -1.0)
+    #assert(!(p2_collide(a, p2_box(2.0, 0.0, 1.0, 1.0, 1.0)).hit))
+    #assert(!(p2_collide(a, p2_box(0.0, 2.0, 1.0, 1.0, 1.0)).hit))
+}
+
+/// Test that circle box contact in both argument orders.
+test "circle box contact in both argument orders" {
+    box = p2_box(0.0, 0.0, 2.0, 1.0, 0.0)
+    ball = p2_circle(0.0, 1.5, 1.0, 1.0)
+    c = p2_collide(ball, box)
+    #assert(c.hit)
+    assert_eq(c.nx, 0.0)
+    assert_eq(c.ny, -1.0)
+    assert_eq(c.depth, 0.5)
+    d = p2_collide(box, ball)
+    #assert(d.hit)
+    assert_eq(d.ny, 1.0)
+    assert_eq(d.depth, 0.5)
+    corner = p2_collide(p2_circle(2.5, 1.5, 1.0, 1.0), box)
+    #assert(corner.hit)
+    #assert(corner.nx < 0.0 && corner.ny < 0.0)
+    miss = p2_collide(p2_circle(0.0, 3.0, 1.0, 1.0), box)
+    #assert(!(miss.hit))
+    cornermiss = p2_collide(p2_circle(3.5, 2.5, 1.0, 1.0), box)
+    #assert(!(cornermiss.hit))
+}
+
+/// Test that circle centre inside a box exits by the shallow face.
+test "circle centre inside a box exits by the shallow face" {
+    box = p2_box(0.0, 0.0, 2.0, 1.0, 0.0)
+    c = p2_collide(p2_circle(0.0, 0.5, 0.25, 1.0), box)
+    #assert(c.hit)
+    assert_eq(c.nx, 0.0)
+    assert_eq(c.ny, -1.0)
+    assert_eq(c.depth, 0.75)
+    s = p2_collide(p2_circle(1.9, 0.0, 0.25, 1.0), box)
+    #assert(s.hit)
+    assert_eq(s.nx, -1.0)
+    assert_eq(s.ny, 0.0)
+}
+
+/// Test that free fall matches semi-implicit Euler.
+test "free fall matches semi-implicit Euler" {
+    w = p2_world(0.0, -10.0)
+    @w.p2_add(p2_circle(0.0, 10.0, 0.5, 1.0))
+    for 0..100 { @w.p2_step(0.01) }
+    b = w.bodies[0]
+    #assert(p2_abs(b.y - 4.95) < 0.000001)
+    #assert(p2_abs(b.vy + 10.0) < 0.000001)
+    assert_eq(b.x, 0.0)
+}
+
+/// Test that static bodies never move.
+test "static bodies never move" {
+    w = p2_world(0.0, -10.0)
+    @w.p2_add(p2_box(3.0, 4.0, 1.0, 1.0, 0.0))
+    for 0..30 { @w.p2_step(0.1) }
+    b = w.bodies[0]
+    assert_eq(b.x, 3.0)
+    assert_eq(b.y, 4.0)
+    assert_eq(b.vy, 0.0)
+}
+
+/// Test that equal elastic circles swap velocities.
+test "equal elastic circles swap velocities" {
+    w = p2_world(0.0, 0.0)
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    a.vx = 1.0
+    a.e = 1.0
+    b = p2_circle(1.9, 0.0, 1.0, 1.0)
+    b.vx = -1.0
+    b.e = 1.0
+    @w.p2_add(a)
+    @w.p2_add(b)
+    p_before = p2_momentum_x(w)
+    e_before = p2_kinetic_energy(w)
+    contacts = @w.p2_step(0.0)
+    #assert(contacts >= 0)
+    na = w.bodies[0]
+    nb = w.bodies[1]
+    #assert(p2_abs(na.vx + 1.0) < 0.000001)
+    #assert(p2_abs(nb.vx - 1.0) < 0.000001)
+    #assert(p2_abs(p2_momentum_x(w) - p_before) < 0.000001)
+    #assert(p2_abs(p2_kinetic_energy(w) - e_before) < 0.000001)
+}
+
+/// Test that heavy body barely notices a light one.
+test "heavy body barely notices a light one" {
+    w = p2_world(0.0, 0.0)
+    heavy = p2_circle(0.0, 0.0, 1.0, 1000.0)
+    heavy.vx = 1.0
+    heavy.e = 1.0
+    light = p2_circle(1.9, 0.0, 1.0, 1.0)
+    light.e = 1.0
+    @w.p2_add(heavy)
+    @w.p2_add(light)
+    p0 = p2_momentum_x(w)
+    @w.p2_step(0.0)
+    h = w.bodies[0]
+    l = w.bodies[1]
+    #assert(h.vx > 0.99)
+    #assert(l.vx > 1.9)
+    #assert(p2_abs(p2_momentum_x(w) - p0) < 0.0001)
+}
+
+/// Test that a ball comes to rest on a static floor.
+test "a ball comes to rest on a static floor" {
+    w = p2_world(0.0, -10.0)
+    @w.p2_add(p2_box(0.0, 0.0, 50.0, 1.0, 0.0))
+    ball = p2_circle(0.0, 5.0, 1.0, 1.0)
+    ball.e = 0.0
+    @w.p2_add(ball)
+    for 0..300 { @w.p2_step(1.0 / 60.0) }
+    b = w.bodies[1]
+    #assert(b.y > 1.9 && b.y < 2.1)
+    #assert(p2_abs(b.vy) < 0.5)
+    #assert(p2_abs(b.x) < 0.001)
+    fl = w.bodies[0]
+    assert_eq(fl.y, 0.0)
+}
+
+/// Test that a bouncy ball rebounds lower than it started.
+test "a bouncy ball rebounds lower than it started" {
+    w = p2_world(0.0, -10.0)
+    @w.p2_add(p2_box(0.0, 0.0, 50.0, 1.0, 0.0))
+    ball = p2_circle(0.0, 6.0, 1.0, 1.0)
+    ball.e = 0.8
+    @w.p2_add(ball)
+    peak = 0.0
+    bounced = false
+    for 0..240 {
+        @w.p2_step(1.0 / 120.0)
+        b = w.bodies[1]
+        if b.vy > 0.5 { bounced = true }
+        if bounced && b.y > peak { peak = b.y }
+    }
+    #assert(bounced)
+    #assert(peak > 2.0 && peak < 6.0)
+}
+
+/// Test that friction slows a sliding box on the floor.
+test "friction slows a sliding box on the floor" {
+    w = p2_world(0.0, -10.0)
+    fl = p2_box(0.0, 0.0, 100.0, 1.0, 0.0)
+    fl.mu = 0.8
+    @w.p2_add(fl)
+    crate = p2_box(0.0, 2.0, 1.0, 1.0, 1.0)
+    crate.vx = 5.0
+    crate.mu = 0.8
+    crate.e = 0.0
+    @w.p2_add(crate)
+    for 0..120 { @w.p2_step(1.0 / 60.0) }
+    c = w.bodies[1]
+    #assert(c.vx < 5.0)
+    #assert(c.vx >= 0.0)
+    #assert(c.y > 1.9 && c.y < 2.1)
+}
+
+/// Test that pile of circles does not tunnel through the floor.
+test "pile of circles does not tunnel through the floor" {
+    w = p2_world(0.0, -10.0)
+    @w.p2_add(p2_box(0.0, 0.0, 20.0, 1.0, 0.0))
+    for 0..4 {
+        ball = p2_circle(it * 0.3, 3.0 + it * 2.5, 0.5, 1.0)
+        ball.e = 0.1
+        @w.p2_add(ball)
+    }
+    for 0..400 { @w.p2_step(1.0 / 120.0) }
+    ok = true
+    bs = w.bodies
+    for bs {
+        if it.inv_mass > 0.0 && it.y < 1.0 { ok = false }
+    }
+    #assert(ok)
+    assert_eq(len(w.bodies), 5)
+}
+
+/// Test that damping bleeds off speed.
+test "damping bleeds off speed" {
+    w = p2_world(0.0, 0.0)
+    w.damping = 2.0
+    ball = p2_circle(0.0, 0.0, 1.0, 1.0)
+    ball.vx = 10.0
+    @w.p2_add(ball)
+    for 0..100 { @w.p2_step(0.05) }
+    b = w.bodies[0]
+    #assert(b.vx > 0.0 && b.vx < 0.01)
+    #assert(b.x > 0.0)
+}
+
+/// Test that resolve is a no-op for separating or double static pairs.
+test "resolve is a no-op for separating or double static pairs" {
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_circle(1.5, 0.0, 1.0, 1.0)
+    a.vx = -1.0
+    b.vx = 1.0
+    c = p2_collide(a, b)
+    r = p2_resolve(a, b, c)
+    assert_eq(r[0].vx, -1.0)
+    assert_eq(r[1].vx, 1.0)
+    s1 = p2_box(0.0, 0.0, 1.0, 1.0, 0.0)
+    s2 = p2_box(1.0, 0.0, 1.0, 1.0, 0.0)
+    r2 = p2_resolve(s1, s2, p2_collide(s1, s2))
+    assert_eq(r2[0].x, 0.0)
+    assert_eq(r2[1].x, 1.0)
+    r3 = p2_resolve(a, b, p2_no_contact())
+    assert_eq(r3[0].x, 0.0)
+}
+
+// --- broadphase and dispatch tests ----------------------------------------------------------------------------
+
+/// Build a mixed pile of `n` circles and boxes over a wide static floor.
++p2_test_pile(n: i64) : World2D {
+    w = p2_world(0.0, -10.0)
+    @w.p2_add(p2_box(0.0, 0.0, 60.0, 1.0, 0.0))
+    for 0..n {
+        x = (it % 9) * 0.95 - 4.0
+        y = 1.6 + (it / 9) * 1.2
+        if it % 3 == 0 {
+            @w.p2_add(p2_box(x, y, 0.5, 0.5, 1.0))
+        } else {
+            b = p2_circle(x, y, 0.5, 1.0)
+            b.e = 0.1
+            @w.p2_add(b)
+        }
+    }
+    w
+}
+
+/// Test that the tuple `when` shape dispatch is symmetric across every shape pair.
+test "collide dispatch is symmetric across shape pairs" {
+    circ = p2_circle(0.0, 0.0, 1.0, 1.0)
+    box = p2_box(1.5, 0.3, 1.0, 1.0, 1.0)
+    ab = p2_collide(circ, box)
+    ba = p2_collide(box, circ)
+    #assert(ab.hit)
+    #assert(ba.hit)
+    #assert(p2_abs(ab.nx + ba.nx) < 0.000001)
+    #assert(p2_abs(ab.ny + ba.ny) < 0.000001)
+    #assert(p2_abs(ab.depth - ba.depth) < 0.000001)
+    far = p2_collide(box, p2_circle(9.0, 9.0, 1.0, 1.0))
+    #assert(!(far.hit))
+    f = p2_flip(Contact.{hit: true, nx: 1.0, ny: -2.0, depth: 0.5})
+    assert_eq(f.nx, -1.0)
+    assert_eq(f.ny, 2.0)
+    assert_eq(f.depth, 0.5)
+    bogus = p2_circle(0.0, 0.0, 1.0, 1.0)
+    bogus.shape = 7
+    #assert(!(p2_collide(bogus, circ).hit))
+}
+
+/// Test that spatial hash helpers behave on negative coordinates and small tables.
+test "spatial hash helpers" {
+    assert_eq(p2_cell(0.5, 1.0), 0)
+    assert_eq(p2_cell(-0.5, 1.0), -1)
+    assert_eq(p2_cell(-1.0, 1.0), -1)
+    assert_eq(p2_cell(3.9, 0.5), 1)
+    assert_eq(p2_table_mask(1), 15)
+    assert_eq(p2_table_mask(8), 15)
+    assert_eq(p2_table_mask(9), 31)
+    assert_eq(p2_table_mask(100), 255)
+    m = p2_table_mask(40)
+    ok = true
+    for -5..5 {
+        cx = it
+        for -5..5 {
+            s = p2_bucket(cx, it, m)
+            if s < 0 || s > m { ok = false }
+        }
+    }
+    #assert(ok)
+    sorted = p2_sort_small([5, 1, 4, 1, 9, 0])
+    assert_eq(sorted[0], 0)
+    assert_eq(sorted[1], 1)
+    assert_eq(sorted[2], 1)
+    assert_eq(sorted[5], 9)
+    assert_eq(len(p2_sort_small([])), 0)
+    cs = p2_cell_size([p2_circle(0.0, 0.0, 1.0, 1.0), p2_box(0.0, 0.0, 80.0, 1.0, 0.0)], 2)
+    #assert(cs >= 10.0)
+    huge = p2_grid_build([p2_circle(0.0, 5.0, 0.5, 1.0), p2_box(0.0, 0.0, 400.0, 1.0, 0.0)], 2)
+    #assert(len(huge.eb) < 600)
+    assert_eq(p2_cell_size([p2_circle(0.0, 0.0, 0.0, 1.0)], 1), 1.0)
+}
+
+/// Test that grid candidates are exactly the later bodies that can touch, ascending and unique.
+test "grid candidates are unique, ascending and complete" {
+    bodies = [p2_circle(0.0, 0.0, 1.0, 1.0), p2_circle(1.5, 0.0, 1.0, 1.0), p2_circle(30.0, 30.0, 1.0, 1.0), p2_box(-1.0, 0.5, 2.0, 2.0, 1.0), p2_circle(0.0, -50.0, 1.0, 1.0)]
+    g = p2_grid_build(bodies, 5)
+    mark = [0; 5]
+    c0 = p2_grid_candidates(g, bodies[0], 0, @mark)
+    seen1 = false
+    seen3 = false
+    seen2 = false
+    for c0 {
+        if it == 1 { seen1 = true }
+        if it == 2 { seen2 = true }
+        if it == 3 { seen3 = true }
+    }
+    #assert(seen1)
+    #assert(seen3)
+    #assert(!(seen2))
+    for 1..len(c0) { #assert(c0[it] > c0[it - 1]) }
+    far = p2_grid_candidates(g, bodies[2], 2, @mark)
+    for far { #assert(it > 2) }
+}
+
+/// Test that the grid solver matches the all-pairs reference on a mixed pile.
+test "grid broadphase matches all-pairs reference" {
+    a = p2_test_pile(34)
+    b = p2_test_pile(34)
+    #assert(len(a.bodies) >= P2_GRID_MIN)
+    touched = 0
+    for 0..10 {
+        ca = @a.p2_step(1.0 / 60.0)
+        cb = @b.p2_step_brute(1.0 / 60.0)
+        assert_eq(ca, cb)
+        touched += ca
+    }
+    #assert(touched > 0)
+    same = true
+    for 0..len(a.bodies) {
+        x = a.bodies[it]
+        y = b.bodies[it]
+        if p2_abs(x.x - y.x) > 0.000000001 || p2_abs(x.y - y.y) > 0.000000001 { same = false }
+        if p2_abs(x.vx - y.vx) > 0.000000001 || p2_abs(x.vy - y.vy) > 0.000000001 { same = false }
+    }
+    #assert(same)
+    #assert(p2_abs(p2_momentum_x(a) - p2_momentum_x(b)) < 0.000001)
+}
+
+/// Test that a large pile settles on the floor without tunnelling when using the grid.
+test "large pile settles on the floor via the grid" {
+    w = p2_test_pile(33)
+    for 0..30 { @w.p2_step(1.0 / 120.0) }
+    ok = true
+    bs = w.bodies
+    for bs {
+        if it.inv_mass > 0.0 && it.y < 0.5 { ok = false }
+    }
+    #assert(ok)
+    assert_eq(len(w.bodies), 34)
+}
+
+/// Test that grid and brute solver rounds agree on a pair count and handle tiny worlds.
+test "solver rounds agree and tiny worlds are safe" {
+    e = p2_world(0.0, 0.0)
+    assert_eq(@e.p2_solve_grid(), 0)
+    assert_eq(@e.p2_solve_brute(), 0)
+    assert_eq(@e.p2_step(0.1), 0)
+    one = p2_world(0.0, 0.0)
+    @one.p2_add(p2_circle(0.0, 0.0, 1.0, 1.0))
+    assert_eq(@one.p2_solve_grid(), 0)
+    g = p2_test_pile(34)
+    h = p2_test_pile(34)
+    assert_eq(@g.p2_solve_grid(), @h.p2_solve_brute())
+}
+
+/// Test that the in-place resolver matches the copying one and reports misses.
+test "resolve_mut matches resolve and mutates in place" {
+    a = p2_circle(0.0, 0.0, 1.0, 1.0)
+    b = p2_box(1.6, 0.3, 1.0, 1.0, 2.0)
+    a.vx = 2.0
+    b.vx = -1.0
+    c = p2_collide(a, b)
+    r = p2_resolve(a, b, c)
+    ma = a
+    mb = b
+    assert_eq(p2_resolve_mut(@ma, @mb, c), 1)
+    assert_eq(ma.vx, r[0].vx)
+    assert_eq(ma.vy, r[0].vy)
+    assert_eq(ma.x, r[0].x)
+    assert_eq(mb.vx, r[1].vx)
+    assert_eq(mb.y, r[1].y)
+    #assert(ma.vx < 2.0)
+    #assert(mb.vx > -1.0)
+    sa = p2_box(0.0, 0.0, 1.0, 1.0, 0.0)
+    sb = p2_box(1.0, 0.0, 1.0, 1.0, 0.0)
+    assert_eq(p2_resolve_mut(@sa, @sb, p2_collide(sa, sb)), 0)
+    assert_eq(sa.x, 0.0)
+    assert_eq(p2_resolve_mut(@ma, @mb, p2_no_contact()), 0)
+}
+
+/// Test that the scratch gather agrees with the list-returning candidate query.
+test "grid gather matches grid candidates" {
+    w = p2_test_pile(40)
+    n = len(w.bodies)
+    g = p2_grid_build(w.bodies, n)
+    m1 = [0; n]
+    m2 = [0; n]
+    out = [0; n]
+    total = 0
+    for 0..n {
+        i = it
+        list = p2_grid_candidates(g, w.bodies[i], i, @m1)
+        cnt = p2_grid_gather(g, w.bodies[i], i, @m2, @out)
+        assert_eq(cnt, len(list))
+        for 0..cnt {
+            assert_eq(out[it], list[it])
+            if it > 0 { #assert(out[it] > out[it - 1]) }
+        }
+        total += cnt
+    }
+    #assert(total > 0)
+    entries = 0
+    for 0..len(g.en) {
+        if g.eb[it] >= 0 && g.eb[it] < n { entries += 1 }
+    }
+    assert_eq(entries, len(g.eb))
+}

@@ -1,0 +1,34 @@
+//! Windows / cross-platform AOT TCP loopback smoke (Round 7 Item 5).
+use std.io.socket
+
++main() {
+    listener = socket_tcp_listen("127.0.0.1:0") or err {
+        print("listen fail: {err}")
+        return 1
+    }
+    addr = host.sys_fd_local_addr(listener) or "127.0.0.1:0"
+    client = socket_tcp_connect(addr) or err {
+        print("connect fail: {err}")
+        return 2
+    }
+    server = socket_tcp_accept(listener) or err {
+        print("accept fail: {err}")
+        return 3
+    }
+    n = host.sys_tcp_write(client, "ping") or 0
+    ensure n == 4 else {
+        print("write {n}")
+        return 4
+    }
+    got = host.sys_tcp_read(server, 16) or ""
+    ensure got == "ping" else {
+        print("read '{got}'")
+        return 5
+    }
+    host.sys_tcp_shutdown(client, 2)
+    host.sys_fd_close(server)
+    host.sys_fd_close(client)
+    host.sys_fd_close(listener)
+    print("aot_tcp_echo: ok")
+    0
+}

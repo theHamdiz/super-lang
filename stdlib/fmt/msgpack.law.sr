@@ -1,0 +1,16 @@
+//! Laws for std.fmt.msgpack — real-body (`mp_payload`).
+//! Pack/unpack byte loops remain host-heavy (docs/LAWS_STATUS.md).
+//! AI agents must not edit this file; put discharges in `msgpack.proof.sr`.
+
+#law("mp_payload default kind yields zero")
+mp_payload_default_zero() {
+    #assert(mp_payload(MpHead.{kind: 0, n: 0, pos: 0}) == 0)
+    #assert(mp_payload(MpHead.{kind: 1, n: 9, pos: 0}) == 0)
+}
+
+#law("mp_payload kinds 3/4/8 use n")
+mp_payload_kind3() {
+    #assert(mp_payload(MpHead.{kind: 3, n: 7, pos: 1}) == 7)
+    #assert(mp_payload(MpHead.{kind: 4, n: 5, pos: 0}) == 5)
+    #assert(mp_payload(MpHead.{kind: 8, n: 2, pos: 0}) == 2)
+}

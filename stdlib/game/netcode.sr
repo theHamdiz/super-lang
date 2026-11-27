@@ -1,0 +1,423 @@
+//! std.game.netcode — sequence numbers and ACK bitfields for unreliable UDP
+//!
+//! Import with:
+//!   use std.game.netcode
+//!
+//! Implements the classic "reliable ACKs over UDP" scheme: every datagram carries
+//! its own 16-bit sequence number, the newest remote sequence seen (`ack`), and a
+//! 32-bit field whose bit i says whether remote sequence `ack - 1 - i` arrived.
+//! All arithmetic is wraparound-safe and stays inside i64 range.
+//!
+//!   ep = net_endpoint()
+//!   h = net_header(ep)              // header for the next outgoing packet
+//!   ep = net_sent(ep)               // advance local sequence
+//!   ep = net_on_receive(ep, h.seq)  // record an incoming packet
+//!   was_it_acked = net_acked(incoming_header, my_seq)
+
+use std.core.collections
+
+/// `NET_SEQ_MOD` is `65536`.
++NET_SEQ_MOD = 65536
+/// `NET_SEQ_HALF` is `32768`.
++NET_SEQ_HALF = 32768
+/// `NET_ACK_WINDOW` is `32`.
++NET_ACK_WINDOW = 32
+/// `NET_HEADER_BYTES` is `12`.
++NET_HEADER_BYTES = 12
+
+/// `PacketHeader` is a sequenced UDP game packet header (seq, ack, ack bits).
++PacketHeader = {
+    /// Seq on `PacketHeader` (`i64`). Defaults to `0`.
+    seq: i64 = 0
+    /// Ack on `PacketHeader` (`i64`). Defaults to `0`.
+    ack: i64 = 0
+    /// Ack bits on `PacketHeader` (`i64`). Defaults to `0`.
+    ack_bits: i64 = 0
+}
+
+/// `NetEndpoint` tracks sequence numbers, acks, and RTT for one remote peer.
++NetEndpoint = {
+    /// Local seq on `NetEndpoint` (`i64`). Defaults to `0`.
+    local_seq: i64 = 0
+    /// Remote seq on `NetEndpoint` (`i64`). Defaults to `0`.
+    remote_seq: i64 = 0
+    /// Ack bits on `NetEndpoint` (`i64`). Defaults to `0`.
+    ack_bits: i64 = 0
+    /// Received on `NetEndpoint` (`i64`). Defaults to `0`.
+    received: i64 = 0
+    /// Sent on `NetEndpoint` (`i64`). Defaults to `0`.
+    sent: i64 = 0
+    /// Rtt ms on `NetEndpoint` (`f64`). Defaults to `0.0`.
+    rtt_ms: f64 = 0.0
+}
+
+/// Net pow2 (`n`). Returns `i64`.
++net_pow2(n: i64) : i64 {
+    acc = 1
+    for 0..n { acc = acc * 2 }
+    acc
+}
+
+/// A netcode endpoint with sequence numbers reset to zero.
++net_endpoint() : NetEndpoint => NetEndpoint.{local_seq: 0, remote_seq: 0, ack_bits: 0, received: 0, sent: 0, rtt_ms: 0.0}
+
+// --- sequence arithmetic ---------------------------------------------------------------------
+
+/// Seq next (`s`). Returns `i64`.
++seq_next(s: i64) : i64 => (s + 1) % NET_SEQ_MOD
+
+/// Seq prev (`s`). Returns `i64`.
++seq_prev(s: i64) : i64 => (s + NET_SEQ_MOD - 1) % NET_SEQ_MOD
+
+/// Seq more recent (`a`, `b`).
++seq_more_recent(a: i64, b: i64) : bool {
+    if a > b { return a - b <= NET_SEQ_HALF }
+    if b > a { return b - a > NET_SEQ_HALF }
+    false
+}
+
+/// Signed shortest distance a - b on the circle, in -32767..32768.
++seq_diff(a: i64, b: i64) : i64 {
+    d = a - b
+    if d > NET_SEQ_HALF { return d - NET_SEQ_MOD }
+    if d < -NET_SEQ_HALF { return d + NET_SEQ_MOD }
+    d
+}
+
+/// Bit set at (`bits`, `i`).
++bit_set_at(bits: i64, i: i64) : bool {
+    ensure i >= 0 && i < 32 else { return false }
+    (bits / net_pow2(i)) % 2 == 1
+}
+
+// --- receive / ack bookkeeping --------------------------------------------------------------
+
+/// Fold an incoming sequence number into the endpoint. First packet ever
+/// (received == 0) simply adopts that sequence. Duplicates and packets more
+/// than 32 behind the newest are ignored.
++net_on_receive(ep: NetEndpoint, seq: i64) : NetEndpoint {
+    if ep.received == 0 {
+        return NetEndpoint.{local_seq: ep.local_seq, remote_seq: seq, ack_bits: 0, received: 1, sent: ep.sent, rtt_ms: ep.rtt_ms}
+    }
+    rs = ep.remote_seq
+    if seq == rs { return ep }
+    bits = ep.ack_bits
+    top = rs
+    if seq_more_recent(seq, rs) {
+        d = seq_diff(seq, rs)
+        top = seq
+        bits = 0
+        if d <= 32 {
+            keep = 32 - d
+            shifted = (ep.ack_bits % net_pow2(keep)) * net_pow2(d)
+            bits = net_pow2(d - 1) + shifted
+        }
+    } else {
+        d = seq_diff(rs, seq)
+        ensure d <= 32 else { return ep }
+        if bit_set_at(bits, d - 1) { return ep }
+        bits += net_pow2(d - 1)
+    }
+    NetEndpoint.{local_seq: ep.local_seq, remote_seq: top, ack_bits: bits, received: ep.received + 1, sent: ep.sent, rtt_ms: ep.rtt_ms}
+}
+
+/// Header for the next packet we send.
++net_header(ep: NetEndpoint) : PacketHeader => PacketHeader.{seq: ep.local_seq, ack: ep.remote_seq, ack_bits: ep.ack_bits}
+
+/// Record that one packet went out: advance the local sequence.
++net_sent(ep: NetEndpoint) : NetEndpoint {
+    next = seq_next(ep.local_seq)
+    NetEndpoint.{local_seq: next, remote_seq: ep.remote_seq, ack_bits: ep.ack_bits, received: ep.received, sent: ep.sent + 1, rtt_ms: ep.rtt_ms}
+}
+
+/// Did the peer's header acknowledge our packet `seq`?
++net_acked(h: PacketHeader, seq: i64) : bool {
+    if (seq == h.ack) { return true }
+    ensure seq_more_recent(h.ack, seq) else { return false }
+    d = seq_diff(h.ack, seq)
+    ensure d <= 32 else { return false }
+    bit_set_at(h.ack_bits, d - 1)
+}
+
+/// Of our last `min(sent, 32)` packets (ending at local_seq - 1), how many has
+/// the peer's header NOT acknowledged?
++net_unacked(local_seq: i64, sent: i64, h: PacketHeader) : i64 {
+    n = sent
+    if n > NET_ACK_WINDOW { n = NET_ACK_WINDOW }
+    missing = 0
+    seq = local_seq
+    for 0..n {
+        seq = seq_prev(seq)
+        if !net_acked(h, seq) { missing += 1 }
+    }
+    missing
+}
+
+// --- statistics ---------------------------------------------------------------------------------------
+
+/// Exponentially weighted RTT: first sample seeds the average, then 1/8 gain.
++net_rtt_update(rtt: f64, sample: f64) : f64 {
+    if rtt <= 0.0 { return sample }
+    rtt + (sample - rtt) * 0.125
+}
+
+/// Net loss pct (`sent`, `acked`). Returns `f64`.
++net_loss_pct(sent: i64, acked: i64) : f64 {
+    if sent <= 0 { return 0.0 }
+    lost = sent - acked
+    lost * 100.0 / sent
+}
+
+// --- wire format ------------------------------------------------------------------------------------------
+
+/// Adler-32 over a byte array (matches RFC 1950; kept local so this module is self-contained).
++net_adler32(data: _) : i64 {
+    a = 1
+    b = 0
+    for data {
+        a = (a + it) % 65521
+        b = (b + a) % 65521
+    }
+    b * 65536 + a
+}
+
+/// Net put u16 (`out`, `v`).
++net_put_u16(out: _, v: i64) : _ {
+    r = arr_push(out, v / 256)
+    arr_push(r, v % 256)
+}
+
+/// Net put u32 (`out`, `v`).
++net_put_u32(out: _, v: i64) : _ {
+    r = net_put_u16(out, v / 65536)
+    net_put_u16(r, v % 65536)
+}
+
+/// 12 bytes: seq(2) ack(2) ack_bits(4) checksum(4, adler32 of the first 8).
++net_pack(h: PacketHeader) : _ {
+    body = []
+    body = net_put_u16(body, h.seq)
+    body = net_put_u16(body, h.ack)
+    body = net_put_u32(body, h.ack_bits)
+    sum = net_adler32(body)
+    net_put_u32(body, sum)
+}
+
+/// Net unpack (`wire`). Returns `PacketHeader`, or fails.
++net_unpack(wire: _) : PacketHeader! {
+    n = 0
+    for wire { n += 1 }
+    ensure n >= NET_HEADER_BYTES else {
+        fail "netcode: short header"
+        return
+    }
+    body = []
+    for 0..8 { body = arr_push(body, wire[it]) }
+    want = net_adler32(body)
+    got = ((wire[8] * 256 + wire[9]) * 256 + wire[10]) * 256 + wire[11]
+    ensure want == got else {
+        fail "netcode: bad checksum"
+        return
+    }
+    seq = wire[0] * 256 + wire[1]
+    ack = wire[2] * 256 + wire[3]
+    bits = ((wire[4] * 256 + wire[5]) * 256 + wire[6]) * 256 + wire[7]
+    PacketHeader.{seq, ack, ack_bits: bits}
+}
+
+// --- tests -----------------------------------------------------------------------------------------------------
+
+/// Test that sequence wraparound ordering.
+test "sequence wraparound ordering" {
+    #assert(seq_more_recent(2, 1))
+    #assert(!(seq_more_recent(1, 2)))
+    #assert(!(seq_more_recent(5, 5)))
+    #assert(seq_more_recent(0, 65535))
+    #assert(!(seq_more_recent(65535, 0)))
+    #assert(seq_more_recent(100, 65500))
+    #assert(!(seq_more_recent(40000, 1)))
+}
+
+/// Test that sequence diff is signed and wraps.
+test "sequence diff is signed and wraps" {
+    assert_eq(seq_diff(10, 7), 3)
+    assert_eq(seq_diff(7, 10), -3)
+    assert_eq(seq_diff(0, 65535), 1)
+    assert_eq(seq_diff(65535, 0), -1)
+    assert_eq(seq_diff(3, 3), 0)
+    assert_eq(seq_next(65535), 0)
+    assert_eq(seq_prev(0), 65535)
+}
+
+/// Test that first receive adopts the sequence.
+test "first receive adopts the sequence" {
+    ep = net_on_receive(net_endpoint(), 500)
+    assert_eq(ep.remote_seq, 500)
+    assert_eq(ep.ack_bits, 0)
+    assert_eq(ep.received, 1)
+}
+
+/// Test that consecutive packets fill ack bits.
+test "consecutive packets fill ack bits" {
+    ep = net_on_receive(net_endpoint(), 10)
+    ep = net_on_receive(ep, 11)
+    ep = net_on_receive(ep, 12)
+    assert_eq(ep.remote_seq, 12)
+    assert_eq(ep.ack_bits, 3)
+    ep = net_on_receive(ep, 13)
+    assert_eq(ep.ack_bits, 7)
+    assert_eq(ep.received, 4)
+}
+
+/// Test that gaps leave zero bits, late arrivals fill them.
+test "gaps leave zero bits, late arrivals fill them" {
+    ep = net_on_receive(net_endpoint(), 10)
+    ep = net_on_receive(ep, 13)
+    assert_eq(ep.remote_seq, 13)
+    assert_eq(ep.ack_bits, 4)
+    ep = net_on_receive(ep, 12)
+    assert_eq(ep.ack_bits, 5)
+    ep = net_on_receive(ep, 11)
+    assert_eq(ep.ack_bits, 7)
+}
+
+/// Test that duplicates and ancient packets are ignored.
+test "duplicates and ancient packets are ignored" {
+    ep = net_on_receive(net_endpoint(), 100)
+    ep = net_on_receive(ep, 101)
+    again = net_on_receive(ep, 101)
+    assert_eq(again.received, ep.received)
+    old = net_on_receive(ep, 100)
+    assert_eq(old.received, ep.received)
+    assert_eq(old.ack_bits, 1)
+    far = net_on_receive(ep, 40)
+    assert_eq(far.ack_bits, ep.ack_bits)
+    assert_eq(far.remote_seq, 101)
+}
+
+/// Test that big jumps clear the window.
+test "big jumps clear the window" {
+    ep = net_on_receive(net_endpoint(), 10)
+    ep = net_on_receive(ep, 11)
+    jumped = net_on_receive(ep, 80)
+    assert_eq(jumped.remote_seq, 80)
+    assert_eq(jumped.ack_bits, 0)
+    edge = net_on_receive(ep, 43)
+    assert_eq(edge.ack_bits, 2147483648)
+}
+
+/// Test that ack bits survive wraparound.
+test "ack bits survive wraparound" {
+    ep = net_on_receive(net_endpoint(), 65534)
+    ep = net_on_receive(ep, 65535)
+    ep = net_on_receive(ep, 0)
+    assert_eq(ep.remote_seq, 0)
+    assert_eq(ep.ack_bits, 3)
+    ep = net_on_receive(ep, 1)
+    assert_eq(ep.ack_bits, 7)
+}
+
+/// Test that net_acked reads the bitfield.
+test "net_acked reads the bitfield" {
+    h = PacketHeader.{seq: 0, ack: 20, ack_bits: 5}
+    #assert(net_acked(h, 20))
+    #assert(net_acked(h, 19))
+    #assert(!(net_acked(h, 18)))
+    #assert(net_acked(h, 17))
+    #assert(!(net_acked(h, 16)))
+    #assert(!(net_acked(h, 21)))
+    #assert(!(net_acked(h, 100)))
+    #assert(!(net_acked(h, 20 - 33)))
+}
+
+/// Test that net_acked across the wrap.
+test "net_acked across the wrap" {
+    h = PacketHeader.{seq: 0, ack: 1, ack_bits: 3}
+    #assert(net_acked(h, 0))
+    #assert(net_acked(h, 65535))
+    #assert(!(net_acked(h, 65534)))
+}
+
+/// Test that sending advances the local sequence.
+test "sending advances the local sequence" {
+    ep = net_endpoint()
+    ep = net_sent(ep)
+    ep = net_sent(ep)
+    assert_eq(ep.local_seq, 2)
+    assert_eq(ep.sent, 2)
+    h = net_header(ep)
+    assert_eq(h.seq, 2)
+    wrapped = NetEndpoint.{local_seq: 65535, remote_seq: 0, ack_bits: 0, received: 0, sent: 0, rtt_ms: 0.0}
+    assert_eq(net_sent(wrapped).local_seq, 0)
+}
+
+/// Test that unacked count over the recent window.
+test "unacked count over the recent window" {
+    h = PacketHeader.{seq: 0, ack: 4, ack_bits: 1}
+    // we sent 0..4 (local_seq is 5); peer acks 4 and 3 only
+    assert_eq(net_unacked(5, 5, h), 3)
+    full = PacketHeader.{seq: 0, ack: 4, ack_bits: 15}
+    assert_eq(net_unacked(5, 5, full), 0)
+    assert_eq(net_unacked(0, 0, h), 0)
+}
+
+/// Test that rtt ewma and loss.
+test "rtt ewma and loss" {
+    assert_eq(net_rtt_update(0.0, 80.0), 80.0)
+    assert_eq(net_rtt_update(80.0, 160.0), 90.0)
+    assert_eq(net_rtt_update(90.0, 90.0), 90.0)
+    assert_eq(net_loss_pct(0, 0), 0.0)
+    assert_eq(net_loss_pct(100, 90), 10.0)
+    assert_eq(net_loss_pct(4, 4), 0.0)
+}
+
+/// Test that header pack / unpack round trip.
+test "header pack / unpack round trip" {
+    h = PacketHeader.{seq: 513, ack: 65535, ack_bits: 3735928559}
+    wire = net_pack(h)
+    assert_eq(wire[0], 2)
+    assert_eq(wire[1], 1)
+    assert_eq(wire[2], 255)
+    assert_eq(wire[4], 222)
+    assert_eq(wire[7], 239)
+    back = net_unpack(wire) or PacketHeader.{seq: -1, ack: 0, ack_bits: 0}
+    assert_eq(back.seq, 513)
+    assert_eq(back.ack, 65535)
+    assert_eq(back.ack_bits, 3735928559)
+}
+
+/// Test that unpack rejects corruption and truncation.
+test "unpack rejects corruption and truncation" {
+    bad = PacketHeader.{seq: -1, ack: 0, ack_bits: 0}
+    wire = net_pack(PacketHeader.{seq: 7, ack: 6, ack_bits: 1})
+    flipped = arr_set(wire, 1, 99)
+    assert_eq((net_unpack(flipped) or bad).seq, -1)
+    assert_eq((net_unpack([1, 2, 3]) or bad).seq, -1)
+    assert_eq((net_unpack(wire) or bad).seq, 7)
+}
+
+/// Test that adler32 reference vector.
+test "adler32 reference vector" {
+    assert_eq(net_adler32([87, 105, 107, 105, 112, 101, 100, 105, 97]), 300286872)
+    assert_eq(net_adler32([]), 1)
+}
+
+/// Test that end to end exchange between two endpoints.
+test "end to end exchange between two endpoints" {
+    a = net_endpoint()
+    b = net_endpoint()
+    // a sends 3 packets, packet 1 is lost
+    ha0 = net_header(a)
+    a = net_sent(a)
+    ha1 = net_header(a)
+    a = net_sent(a)
+    ha2 = net_header(a)
+    a = net_sent(a)
+    b = net_on_receive(b, ha0.seq)
+    b = net_on_receive(b, ha2.seq)
+    reply = net_header(b)
+    #assert(net_acked(reply, ha0.seq))
+    #assert(!(net_acked(reply, ha1.seq)))
+    #assert(net_acked(reply, ha2.seq))
+    assert_eq(net_unacked(a.local_seq, a.sent, reply), 1)
+}

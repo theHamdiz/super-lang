@@ -1,0 +1,1350 @@
+//! std.fmt.json — JSON encoding and zero-tree decoding
+//!
+//! Import with:
+//!   use std.fmt.json
+//!
+//! Encode a Super value directly:
+//!
+//!   json_encode(.{id: 7, name: "Amina"})   // {"id":7,"name":"Amina"}
+//!   json_encode([1, 2, 3])                 // [1,2,3]
+//!
+//! Or compose already-encoded fragments (no allocation beyond the output string):
+//!
+//!   o = JsonObj.new()
+//!   @o.str("name", "Amina")
+//!   @o.int("id", 7)
+//!   @o.raw("tags", json_array([json_quote("a"), json_quote("b")]))
+//!   body = o.end()             // {"name":"Amina","id":7,"tags":["a","b"]}
+//!
+//! Decode by *path extraction* — the scanner never builds a tree:
+//!
+//!   name = json_get_str(body, "name") or "guest"
+//!   id = json_get_int(body, "id") or 0
+//!   first = json_array_at(json_get_raw(body, "tags") or "[]", 0) or none
+//!
+//! `json_valid` is a full RFC 8259 structural validator (strings, numbers,
+//! literals, nesting).
+
+use std.core.str
+use std.core.collections
+
+/// `JSON_LB` is `"{"`.
++JSON_LB = "{"
+/// `JSON_RB` is `"}"`.
++JSON_RB = "}"
+/// `JSON_NULL` is `"null"`.
++JSON_NULL = "null"
+
+/// Encode any Super value as RFC JSON text (records, maps, arrays, scalars, `none` → `null`).
++json_encode(value) : str => host.sys_json_encode(value)
+
+/// HTTP dual-mode body: a `str` is returned as-is; anything else is `json_encode`d.
++json_body(value) : str => host.sys_json_body(value)
+
+/// `JsonObj` builds a JSON object by appending already-encoded fields, then wrapping them in braces.
++JsonObj = {
+    /// Encoded object fields so far, without the surrounding braces. Defaults to `""`.
+    body: str = ""
+    /// How many fields have been appended. Used to insert commas. Defaults to `0`.
+    count: i64 = 0
+
+    /// Empty `JsonObj` with no fields.
+    new() : JsonObj => JsonObj.{body: "", count: 0}
+
+    /// Append an already-encoded JSON value `encoded` under the key `key`. Returns the new field count.
+    raw(@self, key: str, encoded: str) : i64 {
+        sep = ""
+        if self.count > 0 { sep = "," }
+        self.body = "{self.body}{sep}{json_quote(key)}:{encoded}"
+        self.count += 1
+        self.count
+    }
+
+    /// Append `key` as a JSON string whose value is `v`. Returns the new field count.
+    str(@self, key: str, v: str) : i64 => @self.raw(key, json_quote(v))
+    /// Append `key` as a JSON integer `v`. Returns the new field count.
+    int(@self, key: str, v: i64) : i64 => @self.raw(key, json_int(v))
+    /// Append `key` as a JSON number `v`. Returns the new field count.
+    float(@self, key: str, v: f64) : i64 => @self.raw(key, json_float(v))
+    /// Append `key` as a JSON boolean `v`. Returns the new field count.
+    bool(@self, key: str, v: bool) : i64 => @self.raw(key, json_bool(v))
+    /// Append `key` as JSON `null`. Returns the new field count.
+    null(@self, key: str) : i64 => @self.raw(key, JSON_NULL)
+
+    /// Finish the object: `{` + the fields + `}`.
+    end(self) : str => "{JSON_LB}{self.body}{JSON_RB}"
+}
+
+/// Byte length of the JSON text `s` (structural scan is code-unit / `byte_at` based).
++json_len(s: str) : i64 => host.sys_byte_len(s)
+
+// --- encoding ------------------------------------------------------------------
+
+/// Control characters below U+0020 have no literal form in a JSON string.
++json_ctl(code: i64) : str {
+    if code == 8 { return "\\b" }
+    if code == 9 { return "\\t" }
+    if code == 10 { return "\\n" }
+    if code == 12 { return "\\f" }
+    if code == 13 { return "\\r" }
+    hex = "0123456789abcdef"
+    hi = code / 16
+    lo = code % 16
+    "\\u00{hex[hi]}{hex[lo]}"
+}
+
+/// `s` with JSON string escapes applied, without surrounding quotes.
+/// Uses character indices (`len` / `s[i]` / `ord`) so UTF-8 payload text is preserved;
+/// structural scanners stay on `json_len` + `byte_at`.
++json_escape(s: str) : str {
+    out = ""
+    n = char_count(s)
+    start = 0
+    for 0..n {
+        at = it
+        c = s[at]
+        code = ord(c)
+        if code < 32 || c == "\"" || c == "\\" {
+            if at > start { out = "{out}{s[start..at]}" }
+            piece = json_ctl(code)
+            if c == "\"" { piece = "\\\"" }
+            if c == "\\" { piece = "\\\\" }
+            out = "{out}{piece}"
+            start = at + 1
+        }
+    }
+    if start == 0 { return s }
+    if n > start { out = "{out}{s[start..n]}" }
+    out
+}
+
+/// JSON string literal for `s`, including quotes.
++json_quote(s: str) : str => "\"{json_escape(s)}\""
+/// Decimal JSON text for the integer `n`.
++json_int(n: i64) : str => "{n}"
+/// NaN and the infinities have no JSON form; they encode as `null` (JSON has no NaN/infinity literals).
++json_float(x: f64) : str {
+    if x != x { return "null" }
+    if x > 1.7976931348623157e308 || x < -1.7976931348623157e308 { return "null" }
+    "{x}"
+}
+
+/// `true` or `false` for `b`.
++json_bool(b: bool) : str {
+    if b { return "true" }
+    "false"
+}
+
+/// `items` are already-encoded JSON fragments.
++json_array(items: _) : str {
+    out = ""
+    for items {
+        if index > 0 { out = "{out}," }
+        out = "{out}{it}"
+    }
+    "[{out}]"
+}
+
+/// Parallel arrays of keys (plain strings) and already-encoded values.
++json_object(keys: _, vals: _) : str {
+    out = ""
+    for keys {
+        if index > 0 { out = "{out}," }
+        v = vals[index]
+        out = "{out}{json_quote(it)}:{v}"
+    }
+    "{JSON_LB}{out}{JSON_RB}"
+}
+
+// --- scanning --------------------------------------------------------------------
+
+/// True when `c` is JSON whitespace.
++json_is_ws(c: str) : bool => c == " " || c == "\n" || c == "\t" || c == "\r"
+
+/// True when byte `b` is JSON whitespace (space / LF / tab / CR).
++json_is_ws_b(b: i64) : bool => b == 32 || b == 10 || b == 9 || b == 13
+
+/// Index of the first non-whitespace character in `s` at or after `i`.
+/// Uses `byte_at` (O(1) code units) — JSON text is ASCII in the structural alphabet.
++json_skip_ws(s: str, i: i64, n: i64) : i64 {
+    pos = i
+    for i..n {
+        if !json_is_ws_b(byte_at(s, it)) { break }
+        pos = it + 1
+    }
+    pos
+}
+
+/// Index just past the string literal starting at `i` (s[i] == '"'), or -1.
++json_is_digit(c: str) : bool {
+    code = ord(c)
+    code >= 48 && code <= 57
+}
+
+/// True when byte `b` is an ASCII digit.
++json_is_digit_b(b: i64) : bool => b >= 48 && b <= 57
+
+/// Index just past the digit run starting at `i` (== i when there is none).
++json_digits_end(s: str, i: i64, n: i64) : i64 {
+    pos = i
+    for i..n {
+        if !json_is_digit_b(byte_at(s, it)) { break }
+        pos = it + 1
+    }
+    pos
+}
+
+/// Index just past the string literal starting at `i` (s[i] == '"'), or -1. Raw control
+/// characters, unknown escapes and malformed `\uXXXX` escapes are rejected (RFC 8259).
++json_string_end(s: str, i: i64, n: i64) : i64 {
+    p = i + 1
+    while p < n {
+        b = byte_at(s, p)
+        if b == 34 { return p + 1 }
+        if b < 32 { return -1 }
+        if b != 92 {
+            p += 1
+        } else {
+            if p + 1 >= n { return -1 }
+            e = byte_at(s, p + 1)
+            if e == 117 {
+                if p + 5 >= n { return -1 }
+                for 2..6 {
+                    if json_hex_val_b(byte_at(s, p + it)) < 0 { return -1 }
+                }
+                p += 6
+            } else {
+                // " \ / b f n r t
+                if e != 34 && e != 92 && e != 47 && e != 98 && e != 102 && e != 110 && e != 114 && e != 116 { return -1 }
+                p += 2
+            }
+        }
+    }
+    -1
+}
+
+/// RFC 8259 number: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?  Returns the index past it, or -1.
++json_number_end(s: str, i: i64, n: i64) : i64 {
+    p = i
+    if p < n && byte_at(s, p) == 45 { p += 1 }
+    ensure p < n && json_is_digit_b(byte_at(s, p)) else { return -1 }
+    if byte_at(s, p) == 48 {
+        p += 1
+    } else {
+        p = json_digits_end(s, p, n)
+    }
+    if p < n && byte_at(s, p) == 46 {
+        q = json_digits_end(s, p + 1, n)
+        ensure q > p + 1 else { return -1 }
+        p = q
+    }
+    b = if p < n { byte_at(s, p) } else { -1 }
+    if b == 101 || b == 69 {
+        p += 1
+        b2 = if p < n { byte_at(s, p) } else { -1 }
+        if b2 == 43 || b2 == 45 { p += 1 }
+        q = json_digits_end(s, p, n)
+        ensure q > p else { return -1 }
+        p = q
+    }
+    p
+}
+
+/// Index just past the JSON literal that starts at `i` in `s`.
++json_literal_end(s: str, i: i64, n: i64, word: str) : i64 {
+    w = json_len(word)
+    ensure i + w <= n else { return -1 }
+    for 0..w {
+        if byte_at(s, i + it) != byte_at(word, it) { return -1 }
+    }
+    i + w
+}
+
+/// Documents nested deeper than this are refused so hostile input cannot exhaust the stack.
++JSON_MAX_DEPTH = 256
+
+/// Index just past the JSON value starting at or after `i`, or -1 if malformed.
+/// Nesting depth is capped at `JSON_MAX_DEPTH` (checked on each `[` / `{`).
++json_value_end(s: str, i: i64, n: i64) : i64 => json_value_end_at(s, i, n, 0)
+
+json_value_end_at(s: str, i: i64, n: i64, depth: i64) : i64 {
+    j = json_skip_ws(s, i, n)
+    ensure j < n else { return -1 }
+    b = byte_at(s, j)
+    if b == 34 { return json_string_end(s, j, n) }
+    if b == 116 { return json_literal_end(s, j, n, "true") }
+    if b == 102 { return json_literal_end(s, j, n, "false") }
+    if b == 110 { return json_literal_end(s, j, n, "null") }
+    if b == 91 { return json_array_end_at(s, j, n, depth) }
+    if b == 123 { return json_object_end_at(s, j, n, depth) }
+    json_number_end(s, j, n)
+}
+
+/// Index just past the JSON array that starts at `i` in `s`.
++json_array_end(s: str, i: i64, n: i64) : i64 => json_array_end_at(s, i, n, 0)
+
+json_array_end_at(s: str, i: i64, n: i64, depth: i64) : i64 {
+    ensure depth < JSON_MAX_DEPTH else { return -1 }
+    k = json_skip_ws(s, i + 1, n)
+    if k < n && byte_at(s, k) == 93 { return k + 1 }
+    pos = k
+    for 0..n {
+        e = json_value_end_at(s, pos, n, depth + 1)
+        if e < 0 { return -1 }
+        m = json_skip_ws(s, e, n)
+        if m >= n { return -1 }
+        mb = byte_at(s, m)
+        if mb == 93 { return m + 1 }
+        if mb != 44 { return -1 }
+        pos = m + 1
+    }
+    -1
+}
+
+/// Index just past the JSON object that starts at `i` in `s`.
++json_object_end(s: str, i: i64, n: i64) : i64 => json_object_end_at(s, i, n, 0)
+
+json_object_end_at(s: str, i: i64, n: i64, depth: i64) : i64 {
+    ensure depth < JSON_MAX_DEPTH else { return -1 }
+    k = json_skip_ws(s, i + 1, n)
+    if k < n && byte_at(s, k) == 125 { return k + 1 }
+    pos = k
+    for 0..n {
+        ks = json_skip_ws(s, pos, n)
+        if ks >= n || byte_at(s, ks) != 34 { return -1 }
+        ke = json_string_end(s, ks, n)
+        if ke < 0 { return -1 }
+        colon = json_skip_ws(s, ke, n)
+        if colon >= n || byte_at(s, colon) != 58 { return -1 }
+        e = json_value_end_at(s, colon + 1, n, depth + 1)
+        if e < 0 { return -1 }
+        m = json_skip_ws(s, e, n)
+        if m >= n { return -1 }
+        mb = byte_at(s, m)
+        if mb == 125 { return m + 1 }
+        if mb != 44 { return -1 }
+        pos = m + 1
+    }
+    -1
+}
+
+/// Deepest `[` / `{` nesting of `text`, or -1 when a string literal is malformed.
++json_depth(text: str) : i64 {
+    n = json_len(text)
+    depth = 0
+    deepest = 0
+    p = 0
+    while p < n {
+        b = byte_at(text, p)
+        if b == 34 {
+            e = json_string_end(text, p, n)
+            if e < 0 { return -1 }
+            p = e
+        } else {
+            if b == 91 || b == 123 {
+                depth += 1
+                if depth > deepest { deepest = depth }
+            }
+            if b == 93 || b == 125 { depth -= 1 }
+            p += 1
+        }
+    }
+    deepest
+}
+
+/// True when `text` is structurally valid JSON (single pass; depth capped in `json_value_end`).
++json_valid(text: str) : bool {
+    n = json_len(text)
+    e = json_value_end(text, 0, n)
+    ensure e >= 0 else { return false }
+    json_skip_ws(text, e, n) == n
+}
+
+// --- decoding ---------------------------------------------------------------------
+
+/// Value of the hex digit `c`, or -1 when it is not hex.
++json_hex_val(c: str) : i64 {
+    digits = "0123456789abcdef"
+    pos = -1
+    for 0..16 {
+        if digits[it] == c { pos = it }
+    }
+    if pos >= 0 { return pos }
+    upper = "ABCDEF"
+    for 0..6 {
+        if upper[it] == c { pos = 10 + it }
+    }
+    pos
+}
+
+/// Hex digit value of ASCII byte `b`, or -1 (byte-span scanners).
++json_hex_val_b(b: i64) : i64 {
+    if b >= 48 && b <= 57 { return b - 48 }
+    if b >= 97 && b <= 102 { return b - 87 }
+    if b >= 65 && b <= 70 { return b - 55 }
+    -1
+}
+
+/// Decode the contents of a JSON string literal (without the quotes).
+/// Decode the contents of a JSON string literal (without the quotes): all RFC 8259 escapes,
+/// including `\uXXXX` surrogate pairs. A lone surrogate becomes U+FFFD; an unknown escape keeps
+/// the escaped character.
++json_unescape(s: str) : str {
+    // Character walk: escape sequences and UTF-8 payload share `s[i]` indices.
+    n = char_count(s)
+    out = ""
+    p = 0
+    run = 0
+    while p < n {
+        c = s[p]
+        if c != "\\" || p + 1 >= n {
+            p += 1
+        } else {
+            if p > run { out = "{out}{s[run..p]}" }
+            e = s[p + 1]
+            piece = e
+            width = 2
+            if e == "n" { piece = "\n" }
+            if e == "t" { piece = "\t" }
+            if e == "r" { piece = "\r" }
+            if e == "b" { piece = chr(8) }
+            if e == "f" { piece = chr(12) }
+            if e == "u" && p + 5 < n {
+                code = json_hex4(s, p + 2)
+                width = 6
+                if code >= 55296 && code <= 56319 {
+                    low = -1
+                    if p + 11 < n && s[p + 6] == "\\" && s[p + 7] == "u" { low = json_hex4(s, p + 8) }
+                    if low >= 56320 && low <= 57343 {
+                        code = 65536 + (code - 55296) * 1024 + (low - 56320)
+                        width = 12
+                    } else {
+                        code = 65533
+                    }
+                } else {
+                    if code >= 56320 && code <= 57343 { code = 65533 }
+                }
+                if code < 0 { code = 65533 }
+                piece = chr(code)
+            }
+            out = "{out}{piece}"
+            p += width
+            run = p
+        }
+    }
+    if run == 0 { return s }
+    if n > run { out = "{out}{s[run..n]}" }
+    out
+}
+
+/// Value of the four hex digits at `s[at..at+4]`, or -1.
++json_hex4(s: str, at: i64) : i64 {
+    code = 0
+    for 0..4 {
+        d = json_hex_val(s[at + it])
+        if d < 0 { return -1 }
+        code = code * 16 + d
+    }
+    code
+}
+
+/// Byte span `lo..hi` of a value inside a JSON text; `lo < 0` when absent.
+JsonSpan = {
+    lo: i64 = -1
+    hi: i64 = -1
+}
+
+/// Raw JSON text of `key` in the top-level object of `text`, or none.
++json_get_raw(text: str, key: str) : str? {
+    sp = json_key_span(text, key)
+    ensure sp.lo >= 0 else { return none }
+    byte_slice(text, sp.lo, sp.hi)
+}
+
+/// Raw JSON text of `key` in the top-level object of `text`, or `fallback` when absent.
+/// Non-optional twin of `json_get_raw` for hot paths.
++json_get_raw_or(text: str, key: str, fallback: str) : str {
+    sp = json_key_span(text, key)
+    if sp.lo < 0 { fallback } else { byte_slice(text, sp.lo, sp.hi) }
+}
+
+/// One-pass extract of several top-level keys: returns an array of raw value texts parallel to
+/// `names` (empty string when a key is absent). Prefer this over N× `json_get_raw` on hot paths.
++json_fields(text: str, names) {
+    nnames = names.len
+    out = [""; nnames]
+    hit = [0; nnames]
+    left = nnames
+    n = json_len(text)
+    k = json_skip_ws(text, 0, n)
+    ensure k < n && byte_at(text, k) == 123 else { return out }
+    pos = json_skip_ws(text, k + 1, n)
+    done = false
+    for 0..n {
+        if !done && left > 0 {
+            ks = json_skip_ws(text, pos, n)
+            ke = -1
+            if ks < n && byte_at(text, ks) == 34 { ke = json_string_end(text, ks, n) }
+            if ke < 0 {
+                done = true
+            } else {
+                name = json_unescape(byte_slice(text, ks + 1, ke - 1))
+                colon = json_skip_ws(text, ke, n)
+                vs = json_skip_ws(text, colon + 1, n)
+                ve = json_value_end(text, vs, n)
+                if ve < 0 {
+                    done = true
+                } else {
+                    for i in 0..nnames {
+                        if hit[i] == 0 && names[i] == name {
+                            out[i] = byte_slice(text, vs, ve)
+                            hit[i] = 1
+                            left -= 1
+                        }
+                    }
+                    if left == 0 {
+                        done = true
+                    } else {
+                        m = json_skip_ws(text, ve, n)
+                        if m < n && byte_at(text, m) == 44 { pos = m + 1 } else { done = true }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Span of the first `key` member's value in the top-level object of `text`.
+json_key_span(text: str, key: str) : JsonSpan {
+    n = json_len(text)
+    k = json_skip_ws(text, 0, n)
+    ensure k < n && byte_at(text, k) == 123 else { return JsonSpan.{} }
+    pos = json_skip_ws(text, k + 1, n)
+    found = JsonSpan.{}
+    done = false
+    for 0..n {
+        if !done {
+            ks = json_skip_ws(text, pos, n)
+            ke = -1
+            if ks < n && byte_at(text, ks) == 34 { ke = json_string_end(text, ks, n) }
+            if ke < 0 {
+                done = true
+            } else {
+                name = json_unescape(byte_slice(text, ks + 1, ke - 1))
+                colon = json_skip_ws(text, ke, n)
+                vs = json_skip_ws(text, colon + 1, n)
+                ve = json_value_end(text, vs, n)
+                if ve < 0 {
+                    done = true
+                } else {
+                    // First match wins — stop walking the rest of the object.
+                    if name == key && found.lo < 0 {
+                        found = JsonSpan.{lo: vs, hi: ve}
+                        done = true
+                    } else {
+                        m = json_skip_ws(text, ve, n)
+                        if m < n && byte_at(text, m) == 44 { pos = m + 1 } else { done = true }
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+/// JSON string at key `key` inside `text`, or `none` when absent.
++json_get_str(text: str, key: str) : str? {
+    raw = json_get_raw(text, key) or none
+    ensure raw != none else { return none }
+    n = json_len(raw)
+    ensure n >= 2 && byte_at(raw, 0) == 34 else { return none }
+    json_unescape(byte_slice(raw, 1, n - 1))
+}
+
+/// Whole number of up to 19 digits that fits in an i64 (no fraction or exponent), or none.
++json_parse_int(raw: str) : i64? {
+    n = json_len(raw)
+    ensure n > 0 else { return none }
+    from = 0
+    neg = false
+    if raw[0] == "-" {
+        neg = true
+        from = 1
+    }
+    ensure from < n else { return none }
+    // Accumulate negatively so i64::MIN is representable; refuse anything that would overflow.
+    limit = 9223372036854775807
+    acc = 0
+    for from..n {
+        c = raw[it]
+        ensure json_is_digit(c) else { return none }
+        d = ord(c) - 48
+        ensure acc >= (-limit - 1 + d) / 10 else { return none }
+        acc = acc * 10 - d
+    }
+    if neg { return acc }
+    ensure acc != -limit - 1 else { return none }
+    0 - acc
+}
+
+/// JSON integer at key `key` inside `text`, or `none` when absent.
++json_get_int(text: str, key: str) : i64? {
+    raw = json_get_raw(text, key) or none
+    ensure raw != none else { return none }
+    json_parse_int(raw)
+}
+
+/// JSON boolean at key `key` inside `text`, or `none` when absent.
++json_get_bool(text: str, key: str) : bool? {
+    raw = json_get_raw(text, key) or none
+    ensure raw != none else { return none }
+    if raw == "true" { return true }
+    if raw == "false" { return false }
+    none
+}
+
+/// Decimal number with optional fraction and exponent (`-1.5e3`), or none. Digits are gathered as
+/// one mantissa and scaled once by a power of ten, so `0.1`, `1.5e-2` and `2e5` are the nearest
+/// doubles rather than the sum of accumulated rounding errors.
++json_parse_float(raw: str) : f64? {
+    n = json_len(raw)
+    ensure n > 0 else { return none }
+    ensure json_number_end(raw, 0, n) == n else { return none }
+    p = 0
+    neg = false
+    if raw[0] == "-" {
+        neg = true
+        p = 1
+    }
+    mant = 0.0
+    decimals = 0
+    seen_dot = false
+    exp = 0
+    exp_neg = false
+    while p < n {
+        c = raw[p]
+        if c == "." {
+            seen_dot = true
+            p += 1
+        } else {
+            if c == "e" || c == "E" {
+                p += 1
+                if raw[p] == "-" { exp_neg = true }
+                if raw[p] == "-" || raw[p] == "+" { p += 1 }
+                while p < n {
+                    exp = exp * 10 + (ord(raw[p]) - 48)
+                    if exp > 100000 { exp = 100000 }
+                    p += 1
+                }
+            } else {
+                mant = mant * 10.0 + (ord(c) - 48)
+                if seen_dot { decimals += 1 }
+                p += 1
+            }
+        }
+    }
+    shift = exp
+    if exp_neg { shift = 0 - exp }
+    shift = shift - decimals
+    scale = 1.0
+    mag = shift
+    if mag < 0 { mag = 0 - mag }
+    if mag > 400 { mag = 400 }
+    for 0..mag { scale = scale * 10.0 }
+    v = mant * scale
+    if shift < 0 { v = mant / scale }
+    if neg { v = 0.0 - v }
+    v
+}
+
+/// JSON number at key `key` inside `text`, as `f64`, or `none` when absent.
++json_get_float(text: str, key: str) : f64? {
+    raw = json_get_raw(text, key) or none
+    ensure raw != none else { return none }
+    json_parse_float(raw)
+}
+
+/// Number of elements of a raw JSON array, or -1 when `raw` is not an array.
++json_array_len(raw: str) : i64 {
+    n = json_len(raw)
+    k = json_skip_ws(raw, 0, n)
+    ensure k < n && byte_at(raw, k) == 91 else { return -1 }
+    ensure json_array_end(raw, k, n) >= 0 else { return -1 }
+    p = json_skip_ws(raw, k + 1, n)
+    ensure byte_at(raw, p) != 93 else { return 0 }
+    n_elems = 0
+    pos = p
+    done = false
+    for 0..n {
+        if !done {
+            e = json_value_end(raw, pos, n)
+            n_elems += 1
+            m = json_skip_ws(raw, e, n)
+            if byte_at(raw, m) == 44 { pos = m + 1 } else { done = true }
+        }
+    }
+    n_elems
+}
+
+/// Raw JSON text of the i-th element, or none.
++json_array_at(raw: str, i: i64) : str? {
+    n = json_len(raw)
+    k = json_skip_ws(raw, 0, n)
+    ensure k < n && byte_at(raw, k) == 91 else { return none }
+    ensure i >= 0 && i < json_array_len(raw) else { return none }
+    pos = json_skip_ws(raw, k + 1, n)
+    found = none
+    for 0..(i + 1) {
+        vs = json_skip_ws(raw, pos, n)
+        ve = json_value_end(raw, vs, n)
+        if it == i { found = byte_slice(raw, vs, ve) }
+        m = json_skip_ws(raw, ve, n)
+        pos = m + 1
+    }
+    found
+}
+
+// --- structure helpers -----------------------------------------------------------
+
+/// Kind of a raw JSON value: "object", "array", "string", "number", "bool", "null" or "invalid".
++json_type(raw: str) : str {
+    n = json_len(raw)
+    k = json_skip_ws(raw, 0, n)
+    ensure k < n else { return "invalid" }
+    ensure json_value_end(raw, k, n) >= 0 else { return "invalid" }
+    b = byte_at(raw, k)
+    if b == 123 { return "object" }
+    if b == 91 { return "array" }
+    if b == 34 { return "string" }
+    if b == 116 || b == 102 { return "bool" }
+    if b == 110 { return "null" }
+    "number"
+}
+
+/// Raw text of every element of a JSON array in one pass (O(n); `json_array_at` in a loop is
+/// O(n^2)). Empty when `raw` is not a well-formed array.
++json_array_items(raw: str) {
+    items = []
+    n = json_len(raw)
+    k = json_skip_ws(raw, 0, n)
+    ensure k < n && byte_at(raw, k) == 91 else { return items }
+    ensure json_array_end(raw, k, n) >= 0 else { return items }
+    pos = json_skip_ws(raw, k + 1, n)
+    if pos < n && byte_at(raw, pos) == 93 { return items }
+    while pos < n {
+        vs = json_skip_ws(raw, pos, n)
+        ve = json_value_end(raw, vs, n)
+        items = arr_push(items, byte_slice(raw, vs, ve))
+        m = json_skip_ws(raw, ve, n)
+        if byte_at(raw, m) != 44 { break }
+        pos = m + 1
+    }
+    items
+}
+
+/// Decoded top-level keys of a JSON object in document order (duplicates included).
++json_object_keys(text: str) {
+    keys = []
+    n = json_len(text)
+    k = json_skip_ws(text, 0, n)
+    ensure k < n && byte_at(text, k) == 123 else { return keys }
+    ensure json_object_end(text, k, n) >= 0 else { return keys }
+    pos = json_skip_ws(text, k + 1, n)
+    if pos < n && byte_at(text, pos) == 125 { return keys }
+    while pos < n {
+        ks = json_skip_ws(text, pos, n)
+        ke = json_string_end(text, ks, n)
+        keys = arr_push(keys, json_unescape(byte_slice(text, ks + 1, ke - 1)))
+        colon = json_skip_ws(text, ke, n)
+        ve = json_value_end(text, colon + 1, n)
+        m = json_skip_ws(text, ve, n)
+        if byte_at(text, m) != 44 { break }
+        pos = m + 1
+    }
+    keys
+}
+
+/// Follow a dotted path through objects and arrays: `json_get_path(doc, "a.items.0.name")`. A
+/// numeric segment indexes an array; any other segment is an object key (keys that contain a
+/// dot need `json_get_raw` one level at a time). Returns the raw value text, or none.
++json_get_path(text: str, path: str) : str? {
+    ensure path != "" else { return text }
+    cur = text
+    for split(path, ".") {
+        seg = it
+        kind = json_type(cur)
+        if kind == "object" {
+            nxt = json_get_raw(cur, seg) or none
+            ensure nxt != none else { return none }
+            cur = nxt
+        } else {
+            ensure kind == "array" else { return none }
+            idx = json_parse_int(seg) or -1
+            nxt = json_array_at(cur, idx) or none
+            ensure nxt != none else { return none }
+            cur = nxt
+        }
+    }
+    cur
+}
+
+/// `text` without insignificant whitespace, or none when it is not valid JSON.
++json_compact(text: str) : str? {
+    ensure json_valid(text) else { return none }
+    n = json_len(text)
+    out = ""
+    p = 0
+    run = 0
+    while p < n {
+        b = byte_at(text, p)
+        if b == 34 {
+            p = json_string_end(text, p, n)
+        } else {
+            if json_is_ws_b(b) {
+                if p > run { out = "{out}{byte_slice(text, run, p)}" }
+                p += 1
+                run = p
+            } else {
+                p += 1
+            }
+        }
+    }
+    if run < n { out = "{out}{byte_slice(text, run, n)}" }
+    out
+}
+
+/// Re-indent valid JSON with `indent` spaces per level (`{"a":[1,2]}` becomes a block with one
+/// member per line). Empty arrays and objects stay `[]` / `{}`. none when `text` is not valid.
++json_pretty(text: str, indent: i64) : str? {
+    packed = json_compact(text) or none
+    ensure packed != none else { return none }
+    n = json_len(packed)
+    out = ""
+    depth = 0
+    p = 0
+    run = 0
+    while p < n {
+        b = byte_at(packed, p)
+        if b == 34 {
+            p = json_string_end(packed, p, n)
+        } else {
+            if b == 123 || b == 91 || b == 125 || b == 93 || b == 44 || b == 58 {
+                if p > run { out = "{out}{byte_slice(packed, run, p)}" }
+                ch = byte_slice(packed, p, p + 1)
+                close_b = 93
+                if b == 123 { close_b = 125 }
+                if (b == 123 || b == 91) && p + 1 < n && byte_at(packed, p + 1) == close_b {
+                    out = "{out}{byte_slice(packed, p, p + 2)}"
+                    p += 2
+                } else {
+                    if b == 123 || b == 91 {
+                        depth += 1
+                        pad = repeat(" ", depth * indent)
+                        out = "{out}{ch}\n{pad}"
+                    }
+                    if b == 125 || b == 93 {
+                        depth -= 1
+                        pad = repeat(" ", depth * indent)
+                        out = "{out}\n{pad}{ch}"
+                    }
+                    if b == 44 {
+                        pad = repeat(" ", depth * indent)
+                        out = "{out},\n{pad}"
+                    }
+                    if b == 58 { out = "{out}: " }
+                    p += 1
+                }
+                run = p
+            } else {
+                p += 1
+            }
+        }
+    }
+    if run < n { out = "{out}{byte_slice(packed, run, n)}" }
+    out
+}
+
+// --- tests -------------------------------------------------------------------------
+
+/// Test that quote and escape.
+test "quote and escape" {
+    assert_eq(json_quote("hi"), "\"hi\"")
+    assert_eq(json_quote("a\"b"), "\"a\\\"b\"")
+    assert_eq(json_quote("a\\b"), "\"a\\\\b\"")
+    assert_eq(json_quote("l1\nl2"), "\"l1\\nl2\"")
+    assert_eq(json_escape("tab\there"), "tab\\there")
+}
+
+/// Test that primitive encoders.
+test "primitive encoders" {
+    assert_eq(json_int(42), "42")
+    assert_eq(json_int(-7), "-7")
+    assert_eq(json_bool(true), "true")
+    assert_eq(json_bool(false), "false")
+    assert_eq(json_float(1.5), "1.5")
+    assert_eq(JSON_NULL, "null")
+}
+
+/// Test that value→JSON encode covers scalars, records, arrays, and dual-mode body.
+test "json_encode values and json_body dual mode" {
+    assert_eq(json_encode(none), "null")
+    assert_eq(json_encode(true), "true")
+    assert_eq(json_encode(42), "42")
+    assert_eq(json_encode("hi"), "\"hi\"")
+    assert_eq(json_encode("a\"b"), "\"a\\\"b\"")
+    assert_eq(json_encode([1, 2, 3]), "[1,2,3]")
+    rec = {id: 7, name: "Amina"}
+    assert_eq(json_encode(rec), "{\"id\":7,\"name\":\"Amina\"}")
+    nested = {error: "empty body"}
+    assert_eq(json_encode(nested), "{\"error\":\"empty body\"}")
+    assert_eq(json_body("raw wire"), "raw wire")
+    assert_eq(json_body({ok: true}), "{\"ok\":true}")
+}
+
+/// Test that arrays and objects.
+test "arrays and objects" {
+    assert_eq(json_array([]), "[]")
+    assert_eq(json_array(["1", "2", "3"]), "[1,2,3]")
+    assert_eq(json_array([json_quote("a"), json_quote("b")]), "[\"a\",\"b\"]")
+    assert_eq(json_object(["a", "b"], ["1", json_quote("x")]), "{\"a\":1,\"b\":\"x\"}")
+    assert_eq(json_object([], []), "{}")
+}
+
+/// Test that object builder.
+test "object builder" {
+    o = JsonObj.new()
+    @o.str("name", "Amina")
+    @o.int("id", 7)
+    @o.bool("active", true)
+    @o.null("gone")
+    @o.raw("tags", json_array([json_quote("a")]))
+    assert_eq(o.end(), "{\"name\":\"Amina\",\"id\":7,\"active\":true,\"gone\":null,\"tags\":[\"a\"]}")
+    assert_eq(JsonObj.new().end(), "{}")
+}
+
+/// Test that validator accepts well-formed documents.
+test "validator accepts well-formed documents" {
+    #assert(json_valid("{}"))
+    #assert(json_valid("[]"))
+    #assert(json_valid("  [1, 2.5, -3e2, true, false, null, \"s\"]  "))
+    #assert(json_valid("{\"a\": {\"b\": [1, {\"c\": []}]}, \"d\": \"x\"}"))
+    #assert(json_valid("\"just a string\""))
+    #assert(json_valid("42"))
+}
+
+/// Test that validator rejects malformed documents.
+test "validator rejects malformed documents" {
+    #assert(!(json_valid("")))
+    #assert(!(json_valid("{")))
+    #assert(!(json_valid("[1,]")))
+    #assert(!(json_valid("{\"a\" 1}")))
+    #assert(!(json_valid("{\"a\":1,}")))
+    #assert(!(json_valid("[1 2]")))
+    #assert(!(json_valid("\"unterminated")))
+    #assert(!(json_valid("tru")))
+    #assert(!(json_valid("{} extra")))
+}
+
+/// Test that get_raw returns nested values verbatim.
+test "get_raw returns nested values verbatim" {
+    doc = "{\"a\": 1, \"b\": {\"c\": [1, 2]}, \"d\": \"x\"}"
+    assert_eq(json_get_raw(doc, "a") or "?", "1")
+    assert_eq(json_get_raw(doc, "b") or "?", "{\"c\": [1, 2]}")
+    assert_eq(json_get_raw(doc, "d") or "?", "\"x\"")
+    assert_eq(json_get_raw(doc, "zzz") or "absent", "absent")
+    assert_eq(json_get_raw("[1]", "a") or "absent", "absent")
+}
+
+/// Test that typed getters.
+test "typed getters" {
+    doc = "{\"name\": \"Amina\", \"id\": 7, \"neg\": -12, \"ok\": true, \"pi\": 3.25, \"bad\": \"x\"}"
+    assert_eq(json_get_str(doc, "name") or "?", "Amina")
+    assert_eq(json_get_int(doc, "id") or -1, 7)
+    assert_eq(json_get_int(doc, "neg") or 0, -12)
+    #assert(json_get_bool(doc, "ok") or false)
+    assert_eq(json_get_float(doc, "pi") or 0.0, 3.25)
+    assert_eq(json_get_int(doc, "bad") or 99, 99)
+    assert_eq(json_get_str(doc, "id") or "not-a-string", "not-a-string")
+    assert_eq(json_get_int(doc, "missing") or 99, 99)
+}
+
+/// Test that string values are unescaped.
+test "string values are unescaped" {
+    doc = "{\"msg\": \"say \\\"hi\\\"\\nbye\", \"k\\\"ey\": 1}"
+    assert_eq(json_get_str(doc, "msg") or "?", "say \"hi\"\nbye")
+    assert_eq(json_get_int(doc, "k\"ey") or 0, 1)
+    assert_eq(json_unescape("a\\\\b"), "a\\b")
+}
+
+/// Test that arrays: len and at.
+test "arrays: len and at" {
+    raw = "[10, {\"k\": 2}, \"s\", [1, 2]]"
+    assert_eq(json_array_len(raw), 4)
+    assert_eq(json_array_at(raw, 0) or "?", "10")
+    assert_eq(json_array_at(raw, 1) or "?", "{\"k\": 2}")
+    assert_eq(json_array_at(raw, 2) or "?", "\"s\"")
+    assert_eq(json_array_at(raw, 3) or "?", "[1, 2]")
+    assert_eq(json_array_at(raw, 4) or "none", "none")
+    assert_eq(json_array_len("[]"), 0)
+    assert_eq(json_array_len("{}"), -1)
+    assert_eq(json_array_len("[1,"), -1)
+}
+
+/// Test that encode then decode round trip.
+test "encode then decode round trip" {
+    o = JsonObj.new()
+    @o.str("user", "a\"b")
+    @o.int("n", 5)
+    body = o.end()
+    #assert(json_valid(body))
+    assert_eq(json_get_str(body, "user") or "?", "a\"b")
+    assert_eq(json_get_int(body, "n") or 0, 5)
+}
+
+/// Test that escape: control characters, quotes, backslashes and passthrough.
+test "escape: control characters, quotes, backslashes and passthrough" {
+    assert_eq(json_escape(""), "")
+    assert_eq(json_escape("plain é 日本"), "plain é 日本")
+    assert_eq(json_escape("a\"b\\c"), "a\\\"b\\\\c")
+    assert_eq(json_escape("\x01\x1f"), "\\u0001\\u001f")
+    assert_eq(json_escape("\x08\x0c\n\r\t"), "\\b\\f\\n\\r\\t")
+    assert_eq(json_escape("x\x00y"), "x\\u0000y")
+    assert_eq(json_escape("/ and \x7f"), "/ and \x7f")
+    assert_eq(json_quote("é\n"), "\"é\\n\"")
+    #assert(json_valid(json_quote("\x01\x02 raw \x1f ctl")))
+}
+
+/// Test that escape then unescape is the identity for every control character.
+test "escape then unescape is the identity for every control character" {
+    for 0..32 {
+        s = "a{chr(it)}z"
+        assert_eq(json_unescape(json_escape(s)), s)
+    }
+    for ["", "\"", "\\", "\\\\\"", "é日本😀", "tab\there", "mixed \"q\" \\ \n end"] {
+        assert_eq(json_unescape(json_escape(it)), it)
+        #assert(json_valid(json_quote(it)))
+    }
+}
+
+/// Test that float encoder refuses what JSON cannot represent.
+test "float encoder refuses what JSON cannot represent" {
+    assert_eq(json_float(0.0 / 0.0), "null")
+    assert_eq(json_float(1.0 / 0.0), "null")
+    assert_eq(json_float(-1.0 / 0.0), "null")
+    assert_eq(json_float(1.5), "1.5")
+    assert_eq(json_float(-0.25), "-0.25")
+    #assert(json_valid(json_float(0.1)))
+    #assert(json_valid(json_float(123456789.125)))
+}
+
+/// Test that number grammar is strict RFC 8259.
+test "number grammar is strict RFC 8259" {
+    for ["0", "-0", "7", "-7", "10", "0.5", "-0.5", "1.25", "1e3", "1E3", "1e+3", "1e-3", "-1.5e+10", "0e0", "123456789012345678901234567890"] {
+        #assert(json_valid(it))
+    }
+    for ["01", "00", "-01", "1.", ".5", "-", "+1", "1e", "1e+", "1.e3", "--1", "1-2", "0x10", "1_000", "Infinity", "NaN", "- 1", "1 .5", "1.5.5", "1ee3"] {
+        #assert(!(json_valid(it)))
+    }
+    #assert(json_valid("[1,-2,3.5,4e2]"))
+    #assert(!(json_valid("[01]")))
+    #assert(!(json_valid("{\"a\":1.}")))
+    #assert(!(json_valid("[1.5e]")))
+}
+
+/// Test that string grammar: control characters, escapes and unicode.
+test "string grammar: control characters, escapes and unicode" {
+    #assert(json_valid("\"plain\""))
+    #assert(json_valid("\"\""))
+    #assert(json_valid("\"a\\nb\\tc\\\\d\\/e\\\"f\\b\\f\\r\""))
+    #assert(json_valid("\"\\u00e9\\u0041\\uD83D\\uDE00\""))
+    #assert(json_valid("\"é日本😀\""))
+    #assert(!(json_valid("\"raw\nnewline\"")))
+    #assert(!(json_valid("\"raw\ttab\"")))
+    #assert(!(json_valid("\"bad \\x escape\"")))
+    #assert(!(json_valid("\"bad \\u12G4 hex\"")))
+    #assert(!(json_valid("\"short \\u12\"")))
+    #assert(!(json_valid("\"trailing backslash\\\"")))
+    #assert(!(json_valid("\"unterminated")))
+    #assert(!(json_valid("'single'")))
+}
+
+/// Test that structure grammar: commas, colons, nesting, trailing text.
+test "structure grammar: commas, colons, nesting, trailing text" {
+    for ["[]", "{}", "[[]]", "[{}]", "{\"a\":[]}", "[1,[2,[3,[4]]]]", "{\"a\":{\"b\":{\"c\":null}}}", " \t\r\n[ 1 , 2 ] \n", "[true,false,null]"] {
+        #assert(json_valid(it))
+    }
+    for ["[", "]", "{", "}", "[,]", "[1,,2]", "[,1]", "[1,]", "{,}", "{\"a\"}", "{\"a\":}", "{\"a\":1,}", "{\"a\":1 \"b\":2}", "{1:2}", "{\"a\":1}}", "[]]", "[] []", "{} {}", "nul", "truee", "falsey", "[1 2]", "{\"a\" 1}", "{\"a\"::1}", "[\"a\" \"b\"]", ""] {
+        #assert(!(json_valid(it)))
+    }
+}
+
+/// Test that nesting depth is capped so hostile input cannot exhaust the stack.
+test "nesting depth is capped so hostile input cannot exhaust the stack" {
+    ok = repeat("[", 200) + repeat("]", 200)
+    #assert(json_valid(ok))
+    assert_eq(json_depth(ok), 200)
+    deep = repeat("[", 400) + repeat("]", 400)
+    #assert(!(json_valid(deep)))
+    assert_eq(json_depth(deep), 400)
+    assert_eq(json_depth("[\"[[[[\"]"), 1)
+    assert_eq(json_depth("{\"a\":{\"b\":[1]}}"), 3)
+    assert_eq(json_depth("\"open"), -1)
+    assert_eq(json_depth("42"), 0)
+}
+
+/// Test that unescape: every RFC escape, surrogate pairs and bad input.
+test "unescape: every RFC escape, surrogate pairs and bad input" {
+    assert_eq(json_unescape("plain"), "plain")
+    assert_eq(json_unescape(""), "")
+    assert_eq(json_unescape("a\\nb\\tc\\rd"), "a\nb\tc\rd")
+    assert_eq(json_unescape("\\b\\f"), "{chr(8)}{chr(12)}")
+    assert_eq(json_unescape("\\\"q\\\" \\\\ \\/"), "\"q\" \\ /")
+    assert_eq(json_unescape("\\u0041\\u00e9\\u65e5"), "Aé日")
+    assert_eq(json_unescape("\\uD83D\\uDE00"), "😀")
+    assert_eq(json_unescape("x\\uD83D\\uDE00y"), "x😀y")
+    assert_eq(json_unescape("\\uD83Dx"), "{chr(65533)}x")
+    assert_eq(json_unescape("\\uDE00"), "{chr(65533)}")
+    assert_eq(json_unescape("\\u12"), "u12")
+    assert_eq(json_unescape("trailing\\"), "trailing\\")
+    assert_eq(json_unescape("é\\u00e9日"), "éé日")
+}
+
+/// Test that integers: bounds, overflow and rejects.
+test "integers: bounds, overflow and rejects" {
+    assert_eq(json_parse_int("0") or -1, 0)
+    assert_eq(json_parse_int("-0") or -1, 0)
+    assert_eq(json_parse_int("42") or -1, 42)
+    assert_eq(json_parse_int("-42") or 0, -42)
+    assert_eq(json_parse_int("9223372036854775807") or 0, 9223372036854775807)
+    assert_eq(json_parse_int("-9223372036854775807") or 0, -9223372036854775807)
+    assert_eq(json_parse_int("-9223372036854775808") or 0, -9223372036854775807 - 1)
+    assert_eq(json_parse_int("9223372036854775808") or 77, 77)
+    assert_eq(json_parse_int("99999999999999999999") or 77, 77)
+    assert_eq(json_parse_int("-9223372036854775809") or 77, 77)
+    for ["", "-", "1.5", "1e3", "+1", "0x1", "1 2", " 1", "abc", "--1"] {
+        assert_eq(json_parse_int(it) or 77, 77)
+    }
+}
+
+/// Test that floats: fractions, exponents, signs and rejects.
+test "floats: fractions, exponents, signs and rejects" {
+    assert_eq(json_parse_float("0") or -9.0, 0.0)
+    assert_eq(json_parse_float("1") or -9.0, 1.0)
+    assert_eq(json_parse_float("-1") or 9.0, -1.0)
+    assert_eq(json_parse_float("3.25") or -9.0, 3.25)
+    assert_eq(json_parse_float("-0.5") or 9.0, -0.5)
+    assert_eq(json_parse_float("0.1") or -9.0, 0.1)
+    assert_eq(json_parse_float("1e3") or -9.0, 1000.0)
+    assert_eq(json_parse_float("1E3") or -9.0, 1000.0)
+    assert_eq(json_parse_float("1e+3") or -9.0, 1000.0)
+    assert_eq(json_parse_float("1.5e-2") or -9.0, 0.015)
+    assert_eq(json_parse_float("2.5E2") or -9.0, 250.0)
+    assert_eq(json_parse_float("-1.25e1") or 9.0, -12.5)
+    assert_eq(json_parse_float("123456.789") or -9.0, 123456.789)
+    assert_eq(json_parse_float("0.000001") or -9.0, 0.000001)
+    for ["", "-", ".5", "1.", "1e", "abc", "1.5.5", "+1", "NaN", "1e+"] {
+        assert_eq(json_parse_float(it) or 77.0, 77.0)
+    }
+    doc = "{\"a\":1e3,\"b\":1.5E-2,\"c\":-7,\"d\":\"x\"}"
+    assert_eq(json_get_float(doc, "a") or -1.0, 1000.0)
+    assert_eq(json_get_float(doc, "b") or -1.0, 0.015)
+    assert_eq(json_get_float(doc, "c") or 0.0, -7.0)
+    assert_eq(json_get_float(doc, "d") or 55.0, 55.0)
+    assert_eq(json_get_float(doc, "zz") or 55.0, 55.0)
+}
+
+/// Test that json_fields one-pass multi-get.
+test "json_fields one-pass multi-get" {
+    fs = json_fields("{\"user\":7,\"qty\":3,\"sku\":\"abcd\"}", ["user", "qty", "sku", "nope"])
+    assert_eq(fs[0], "7")
+    assert_eq(fs[1], "3")
+    assert_eq(fs[2], "\"abcd\"")
+    assert_eq(fs[3], "")
+    early = json_fields("{\"a\":1,\"b\":2,\"c\":3}", ["a"])
+    assert_eq(early[0], "1")
+}
+
+/// Test that decoding: duplicates, nesting, strings that look like keys, whitespace, unicode keys.
+test "decoding: duplicates, nesting, strings that look like keys, whitespace, unicode keys" {
+    assert_eq(json_get_raw("{\"a\":1,\"a\":2}", "a") or "?", "1")
+    assert_eq(json_get_raw("{\"x\":{\"a\":5},\"a\":6}", "a") or "?", "6")
+    assert_eq(json_get_raw("{\"s\":\"\\\"a\\\":1\",\"a\":7}", "a") or "?", "7")
+    assert_eq(json_get_int("  {  \"a\"  :  42  ,  \"b\" : 1 }  ", "a") or -1, 42)
+    assert_eq(json_get_int("  {  \"a\"  :  42  ,  \"b\" : 1 }  ", "b") or -1, 1)
+    assert_eq(json_get_str("{\"é\":\"ü\"}", "é") or "?", "ü")
+    assert_eq(json_get_str("{\"\\u00e9\":\"ok\"}", "é") or "?", "ok")
+    assert_eq(json_get_raw("{\"\":0}", "") or "?", "0")
+    assert_eq(json_get_raw("{}", "a") or "none", "none")
+    assert_eq(json_get_raw("", "a") or "none", "none")
+    assert_eq(json_get_raw("null", "a") or "none", "none")
+    assert_eq(json_get_raw("{\"a\":[1,{\"b\":2}]}", "a") or "?", "[1,{\"b\":2}]")
+    assert_eq(json_get_raw_or("{\"a\":1,\"a\":2}", "a", "?"), "1")
+    assert_eq(json_get_raw_or("{\"x\":{\"a\":5},\"a\":6}", "a", "?"), "6")
+    assert_eq(json_get_raw_or("{\"s\":\"\\\"a\\\":1\",\"a\":7}", "a", "?"), "7")
+    assert_eq(json_get_raw_or(" { \"k\" : \"v w\" } ", "k", "?"), "\"v w\"")
+    assert_eq(json_get_raw_or("{\"a\":1}", "b", "absent"), "absent")
+    assert_eq(json_get_raw_or("{}", "a", ""), "")
+    assert_eq(json_get_raw_or("[1]", "a", "none"), "none")
+    assert_eq(json_get_raw_or("{\"a\":1", "a", "bad"), "1")
+    assert_eq(json_type(json_get_raw_or("{\"q\":3}", "note", "")), "invalid")
+    #assert(json_get_bool("{\"t\":true,\"f\":false,\"n\":null}", "t") or false)
+    #assert(!(json_get_bool("{\"t\":true,\"f\":false,\"n\":null}", "f") or true))
+    assert_eq(json_get_bool("{\"n\":null}", "n") or "none", "none")
+    assert_eq(json_get_str("{\"n\":null}", "n") or "none", "none")
+    assert_eq(json_get_str("{\"s\":\"\"}", "s") or "none", "")
+    assert_eq(json_get_str("{\"s\":\"line1\\nline2\\u0021\"}", "s") or "?", "line1\nline2!")
+}
+
+/// Test that types of raw values.
+test "types of raw values" {
+    assert_eq(json_type("{}"), "object")
+    assert_eq(json_type(" [1] "), "array")
+    assert_eq(json_type("\"s\""), "string")
+    assert_eq(json_type("-1.5e3"), "number")
+    assert_eq(json_type("0"), "number")
+    assert_eq(json_type("true"), "bool")
+    assert_eq(json_type("false"), "bool")
+    assert_eq(json_type("null"), "null")
+    assert_eq(json_type(""), "invalid")
+    assert_eq(json_type("{"), "invalid")
+    assert_eq(json_type("tru"), "invalid")
+    assert_eq(json_type("01"), "number")
+}
+
+/// Test that array_items walks an array in one pass.
+test "array_items walks an array in one pass" {
+    items = json_array_items("[10, {\"k\": [1, 2]}, \"a,b\", [], null, true, -1.5]")
+    assert_eq(len(items), 7)
+    assert_eq(items[0], "10")
+    assert_eq(items[1], "{\"k\": [1, 2]}")
+    assert_eq(items[2], "\"a,b\"")
+    assert_eq(items[3], "[]")
+    assert_eq(items[4], "null")
+    assert_eq(items[5], "true")
+    assert_eq(items[6], "-1.5")
+    assert_eq(len(json_array_items("[]")), 0)
+    assert_eq(len(json_array_items("  [ ]  ")), 0)
+    assert_eq(len(json_array_items("[1,")), 0)
+    assert_eq(len(json_array_items("{}")), 0)
+    assert_eq(len(json_array_items("")), 0)
+    assert_eq(len(json_array_items("[1]")), 1)
+    big = "["
+    for 0..500 {
+        if it > 0 { big = big + "," }
+        big = big + "{it}"
+    }
+    big = big + "]"
+    all = json_array_items(big)
+    assert_eq(len(all), 500)
+    assert_eq(all[0], "0")
+    assert_eq(all[499], "499")
+    assert_eq(json_array_len(big), 500)
+    assert_eq(json_array_at(big, 250) or "?", "250")
+}
+
+/// Test that object_keys lists decoded keys in order.
+test "object_keys lists decoded keys in order" {
+    keys = json_object_keys("{\"b\":1,\"a\":{\"x\":2},\"\\u00e9\":[1,2],\"a\":3}")
+    assert_eq(len(keys), 4)
+    assert_eq(keys[0], "b")
+    assert_eq(keys[1], "a")
+    assert_eq(keys[2], "é")
+    assert_eq(keys[3], "a")
+    assert_eq(len(json_object_keys("{}")), 0)
+    assert_eq(len(json_object_keys(" { } ")), 0)
+    assert_eq(len(json_object_keys("[1]")), 0)
+    assert_eq(len(json_object_keys("{\"a\":")), 0)
+    assert_eq(len(json_object_keys("")), 0)
+    assert_eq(len(json_object_keys("{\"only\":null}")), 1)
+}
+
+/// Test that get_path follows objects and arrays.
+test "get_path follows objects and arrays" {
+    doc = "{\"user\":{\"name\":\"Amina\",\"tags\":[\"a\",\"b\",{\"deep\":[10,20]}]},\"n\":5}"
+    assert_eq(json_get_path(doc, "n") or "?", "5")
+    assert_eq(json_get_path(doc, "user.name") or "?", "\"Amina\"")
+    assert_eq(json_get_path(doc, "user.tags.1") or "?", "\"b\"")
+    assert_eq(json_get_path(doc, "user.tags.2.deep.1") or "?", "20")
+    assert_eq(json_get_path(doc, "user.tags.2.deep") or "?", "[10,20]")
+    assert_eq(json_get_path(doc, "user.tags.9") or "none", "none")
+    assert_eq(json_get_path(doc, "user.tags.x") or "none", "none")
+    assert_eq(json_get_path(doc, "user.missing") or "none", "none")
+    assert_eq(json_get_path(doc, "n.deeper") or "none", "none")
+    assert_eq(json_get_path(doc, "user.tags.-1") or "none", "none")
+    assert_eq(json_get_path(doc, "") or "none", doc)
+    assert_eq(json_get_path("[[1,2],[3,4]]", "1.0") or "?", "3")
+    assert_eq(json_get_path("not json", "a") or "none", "none")
+}
+
+/// Test that compact strips whitespace but never touches strings.
+test "compact strips whitespace but never touches strings" {
+    assert_eq(json_compact("{ \"a\" : 1 , \"b\" : [ 1 , 2 ] }") or "?", "{\"a\":1,\"b\":[1,2]}")
+    assert_eq(json_compact("[ \"a b\" , \" x \" ]") or "?", "[\"a b\",\" x \"]")
+    assert_eq(json_compact("\n\t[ ]\n") or "?", "[]")
+    assert_eq(json_compact("  42  ") or "?", "42")
+    assert_eq(json_compact("[1,]") or "none", "none")
+    assert_eq(json_compact("") or "none", "none")
+    assert_eq(json_compact("{\"k\\\" \":\"v \\\" \"}") or "?", "{\"k\\\" \":\"v \\\" \"}")
+    already = "{\"a\":[1,2,{\"b\":null}]}"
+    assert_eq(json_compact(already) or "?", already)
+}
+
+/// Test that pretty prints with the requested indent and round trips through compact.
+test "pretty prints with the requested indent and round trips through compact" {
+    flat = "{\"a\":1,\"b\":[1,2],\"c\":{},\"d\":[],\"e\":{\"f\":\"x y\"}}"
+    want = "{\n  \"a\": 1,\n  \"b\": [\n    1,\n    2\n  ],\n  \"c\": {},\n  \"d\": [],\n  \"e\": {\n    \"f\": \"x y\"\n  }\n}"
+    assert_eq(json_pretty(flat, 2) or "?", want)
+    assert_eq(json_compact(want) or "?", flat)
+    assert_eq(json_pretty("[1]", 4) or "?", "[\n    1\n]")
+    assert_eq(json_pretty("[]", 2) or "?", "[]")
+    assert_eq(json_pretty("{}", 2) or "?", "{}")
+    assert_eq(json_pretty("7", 2) or "?", "7")
+    assert_eq(json_pretty("\"a, b: \{c\}\"", 2) or "?", "\"a, b: \{c\}\"")
+    assert_eq(json_pretty("{\"a\":1}", 0) or "?", "{\n\"a\": 1\n}")
+    assert_eq(json_pretty("[1,", 2) or "none", "none")
+    messy = "  {\"k\" :[ 1,{\"z\":null} ] }  "
+    assert_eq(json_compact(json_pretty(messy, 3) or "") or "?", json_compact(messy) or "!")
+}
+
+/// Test that encoders compose into documents the decoders read back.
+test "encoders compose into documents the decoders read back" {
+    o = JsonObj.new()
+    @o.str("msg", "tab\there \"quoted\" \\ \x01")
+    @o.int("n", -9223372036854775807)
+    @o.float("f", 0.5)
+    @o.float("nan", 0.0 / 0.0)
+    @o.bool("ok", false)
+    @o.null("none")
+    @o.raw("list", json_array([json_int(1), json_quote("é"), json_array([])]))
+    body = o.end()
+    #assert(json_valid(body))
+    assert_eq(json_get_str(body, "msg") or "?", "tab\there \"quoted\" \\ \x01")
+    assert_eq(json_get_int(body, "n") or 0, -9223372036854775807)
+    assert_eq(json_get_float(body, "f") or 0.0, 0.5)
+    assert_eq(json_get_raw(body, "nan") or "?", "null")
+    #assert(!(json_get_bool(body, "ok") or true))
+    assert_eq(json_type(json_get_raw(body, "none") or ""), "null")
+    assert_eq(json_get_path(body, "list.1") or "?", "\"é\"")
+    assert_eq(len(json_object_keys(body)), 7)
+    assert_eq(json_array_len(json_get_raw(body, "list") or ""), 3)
+}
+
+/// Test that a large document scans correctly.
+test "a large document scans correctly" {
+    doc = "{\"rows\":["
+    for 0..300 {
+        if it > 0 { doc = doc + "," }
+        doc = doc + "\{\"id\":{it},\"name\":\"row {it}\",\"tags\":[\"a\",\"b\"],\"ok\":true\}"
+    }
+    doc = doc + "],\"total\":300}"
+    #assert(json_valid(doc))
+    assert_eq(json_get_int(doc, "total") or 0, 300)
+    rows = json_get_raw(doc, "rows") or ""
+    assert_eq(json_array_len(rows), 300)
+    assert_eq(json_get_int(json_array_at(rows, 299) or "", "id") or -1, 299)
+    assert_eq(json_get_str(json_array_at(rows, 150) or "", "name") or "?", "row 150")
+    assert_eq(json_get_path(doc, "rows.42.tags.1") or "?", "\"b\"")
+    assert_eq(len(json_array_items(rows)), 300)
+    assert_eq(json_compact(doc) or "?", doc)
+}

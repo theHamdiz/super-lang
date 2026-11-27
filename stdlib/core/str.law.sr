@@ -1,0 +1,21 @@
+//! Laws for std.core.str — real string primitives via verify evaluator.
+//! Implementation: `byte_len` / `starts_with` in `str.sr` (host-backed at
+//! runtime; verify fuzz/comptime uses matching string builtins).
+
+#law("empty string has byte length zero")
+str_empty_byte_len() {
+    #assert(byte_len("") == 0)
+}
+
+#law("ascii byte_len matches character count")
+str_ascii_byte_len() {
+    #assert(byte_len("hello") == 5)
+}
+
+#law("starts_with accepts matching head and rejects longer needle")
+str_starts_with_cases() {
+    #assert(starts_with("foo", "f"))
+    #assert(starts_with("foo", "foo"))
+    #assert(!starts_with("foo", "food"))
+    #assert(starts_with("foo", ""))
+}

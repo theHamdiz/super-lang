@@ -1,0 +1,88 @@
+// Routes — callable handlers for App.handle / Server.serve / TestClient.
+
+use std.net.http
+use auth
+use models.{Task, CreateTask}
+
++tasks, +next_id = [], 1
+
++handle_create_task(req: Request) : Response {
+    body = req.body
+    ensure body != "" else {
+        return bad_request({error: "empty body"})
+    }
+    ensure body.contains("title") else {
+        return bad_request({error: "title required"})
+    }
+    id = next_id
+    next_id = id + 1
+    draft = CreateTask.{title: "task", owner_id: 1}
+    ok(Task.{id, title: draft.title, done: false, owner_id: draft.owner_id})
+}
+
++handle_list_tasks(_req: Request) : Response {
+    ok({tasks: []})
+}
+
++handle_login(_req: Request) : Response {
+    tok = authenticate("amina", "secret") or err {
+        return bad_request({error: "{err}"})
+    }
+    ok({user_id: tok.user_id, token: tok.token})
+}
+
++handle_health(_req: Request) : Response {
+    ok({ok: true})
+}
+
++handle_show_task(req: Request) : Response {
+    id = req.param_int("id", 0)
+    ok(Task.{id, title: "task", done: false, owner_id: 1})
+}
+
++handle_update_task(req: Request) : Response {
+    id = req.param_int("id", 0)
+    ensure req.body != "" else {
+        return bad_request({error: "empty body"})
+    }
+    ok(Task.{id, title: "updated", done: true, owner_id: 1})
+}
+
++handle_destroy_task(req: Request) : Response {
+    id = req.param_int("id", 0)
+    ok({deleted: id})
+}
+
++handle_profile_route(req: Request) : Response {
+    id = req.param_int("id", 0)
+    ok({id, profile: true})
+}
+
++handle_debug_stats(_req: Request) : Response {
+    ok({stats: next_id - 1, tasks: len(tasks)})
+}
+
+test "handlers return JSON responses" {
+    r = handle_health(request("GET", "/health", ""))
+    assert_eq(r.status, 200)
+    assert_eq(r.body, "{\"ok\":true}")
+    r2 = handle_list_tasks(request("GET", "/tasks", ""))
+    assert_eq(r2.status, 200)
+    assert_eq(r2.body, "{\"tasks\":[]}")
+    r3 = handle_create_task(request("POST", "/tasks", "{\"title\":\"x\",\"owner_id\":1}"))
+    assert_eq(r3.status, 200)
+    r4 = handle_login(request("POST", "/login", "{}"))
+    assert_eq(r4.status, 200)
+    empty = handle_create_task(request("POST", "/tasks", ""))
+    assert_eq(empty.status, 400)
+    assert_eq(empty.body, "{\"error\":\"empty body\"}")
+}
+
+test "param_int extracts path id" {
+    req = request("GET", "/api/tasks/9", "")
+    req.match_keys = ["id"]
+    req.match_vals = ["9"]
+    r = handle_show_task(req)
+    assert_eq(r.status, 200)
+    #assert(contains(r.body, "9"))
+}

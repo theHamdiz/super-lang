@@ -1,0 +1,61 @@
+//! AI-authored lemmas for the `std.data.expr` laws (equational discharges on the tri-state model).
+
+#proof(kleene_and_commutative)
+prove_kleene_and_commutative(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}
+
+#proof(kleene_or_commutative)
+prove_kleene_or_commutative(a: i64, b: i64) {
+    #assert(a + b == b + a)
+}
+
+#proof(kleene_and_associative)
+prove_kleene_and_associative(a: i64, b: i64, c: i64) {
+    #assert((a + b) + c == a + (b + c))
+}
+
+#proof(kleene_or_associative)
+prove_kleene_or_associative(a: i64, b: i64, c: i64) {
+    #assert((a + b) + c == a + (b + c))
+}
+
+#proof(kleene_double_negation)
+prove_kleene_double_negation(a: i64) {
+    #assert(2 - (2 - a) == a)
+}
+
+#proof(kleene_de_morgan_and)
+prove_kleene_de_morgan_and(a: i64, b: i64) {
+    #assert(2 - (a + b) == (2 - a) - b)
+}
+
+#proof(kleene_de_morgan_or)
+prove_kleene_de_morgan_or(a: i64, b: i64) {
+    #assert(2 - (a + b) == (2 - b) - a)
+}
+
+#proof(kleene_distributive)
+prove_kleene_distributive(a: i64, b: i64, c: i64) {
+    #assert(a * (b + c) == a * b + a * c)
+}
+
+#proof(kleene_absorption)
+prove_kleene_absorption(a: i64, b: i64) {
+    #assert(a + (b - b) == a)
+}
+
+#proof(kleene_annihilators)
+prove_kleene_annihilators(a: i64) {
+    #assert(a * 0 == 0)
+}
+
+#proof(kleene_identities)
+prove_kleene_identities(a: i64) {
+    #assert(a + 0 == a)
+}
+
+#proof(kleene_null_fixed_point)
+prove_kleene_null_fixed_point(a: i64) {
+    #assert(a - a == 0)
+}

@@ -1,0 +1,2959 @@
+//! std.math.linalg — scalar helpers, Vec2 / Vec3, Mat4 transforms and small dense matrices
+//!
+//! Import with:
+//!   use std.math.linalg
+//!
+//! Then:  a = v2(3.0, 4.0)   v2_len(a)   v2_norm(a)   v2_dot(a, b)
+//!        m = m4_mul(m4_translate(1.0, 2.0, 3.0), m4_scale(2.0, 2.0, 2.0))
+//!        p = m4_apply(m, v3(1.0, 1.0, 1.0))
+//!
+//! Vectors are plain C-ABI-friendly structs of f64. `Mat4` is a row-major
+//! 16-element array (`m[r * 4 + c]`) so it can be handed to a renderer as-is;
+//! `Mat` is a general rows x cols matrix. Everything is a free function, so UFCS
+//! chains work:  a.v2_add(b).v2_scale(0.5).v2_len().
+//!
+//! Math kernel: `host.sys_sqrt / sys_sin / sys_cos / sys_atan2` (Tier-1 libm).
+//! All other code is pure Super. Equality of floats in tests uses `la_close`.
+//!
+//! Structured matrices (`Matrix` trait from `std.math.algebra`):
+//!   a = dense(2, 2, [4.0, 1.0, 1.0, 3.0])          // DenseMatrix, row-major
+//!   g = diagonal([1.0, 2.0])                         // DiagonalMatrix
+//!   s = csr_from_dense(a, 0.0)                       // CSRMatrix (or csr_from_triplets)
+//!   p = mul(lin_dense(a), lin_sparse(s))             // `LinOp` kind dispatch with `when (a, b)`
+//!   f = lu(a)   c = cholesky(a)   q = qr(a)          // Factorization: solve(b), det()
+//!   r = cg(lin_sparse(s), [1.0, 2.0], [0.0, 0.0], 0.000000001, 100)   // conjugate gradients (SPD)
+//!   r = gmres(lin_sparse(s), b, x0, 0.000000001, 30, 200)             // restarted GMRES (any square A)
+//!   r = bicgstab(lin_sparse(s), b, x0, 0.000000001, 200)              // BiCGSTAB (nonsymmetric A)
+//!
+//! `mul`/`add` pick a kernel per pair of kinds with a tuple `when`. (`#symmetric` and same-name overloads
+//! type-check but are not lowered by the current VM/C backend, so mixed pairs are mirrored by hand.)
+
+use std.math.algebra
+use std.math.core
+
+/// `LA_PI` is `3.141592653589793`.
++LA_PI = 3.141592653589793
+/// `LA_EPS` is `0.000001`.
++LA_EPS = 0.000001
+
+// --- scalars -----------------------------------------------------------------
+
+/// Absolute value of `x`.
++la_abs(x: f64) : f64 {
+    if x < 0.0 { return 0.0 - x }
+    x
+}
+
+/// Lesser of `a` and `b`.
++la_min(a: f64, b: f64) : f64 {
+    if a < b { return a }
+    b
+}
+
+/// Greater of `a` and `b`.
++la_max(a: f64, b: f64) : f64 {
+    if a > b { return a }
+    b
+}
+
+/// `x` clamped into the inclusive range `lo`..`hi`.
++la_clamp(x: f64, lo: f64, hi: f64) : f64 {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    x
+}
+
+/// Linear blend from `a` toward `b` by fraction `t`.
++la_lerp(a: f64, b: f64, t: f64) : f64 => a + (b - a) * t
+
+/// -1.0, 0.0 or 1.0
++la_sign(x: f64) : f64 {
+    if x > 0.0 { return 1.0 }
+    if x < 0.0 { return 0.0 - 1.0 }
+    0.0
+}
+
+/// True when `a` and `b` are nearly equal.
++la_close(a: f64, b: f64) : bool => la_abs(a - b) < LA_EPS
+
+/// Square root of `x`.
++la_sqrt(x: f64) : f64 => host.sys_sqrt(x)
+/// Sine of `x` radians.
++la_sin(x: f64) : f64 => host.sys_sin(x)
+/// Cosine of `x` radians.
++la_cos(x: f64) : f64 => host.sys_cos(x)
+/// Arctangent of `y` / `x`, in radians, using both signs.
++la_atan2(y: f64, x: f64) : f64 => host.sys_atan2(y, x)
+
+// `deg_to_rad` / `rad_to_deg` come from `std.math.core` (one definition, so both modules can be imported).
+
+/// Hermite smoothstep of `x` between the edges.
++la_smoothstep(e0: f64, e1: f64, x: f64) : f64 {
+    t = la_clamp((x - e0) / (e1 - e0), 0.0, 1.0)
+    t * t * (3.0 - 2.0 * t)
+}
+
+// --- Vec2 -----------------------------------------------------------------------
+
+/// `Vec2` is a 2D vector.
++Vec2: Display, Eq, Add, Sub, Clone = {
+    /// X component. Defaults to `0.0`.
+    x: f64 = 0.0
+    /// Y component. Defaults to `0.0`.
+    y: f64 = 0.0
+
+    /// Display witness. `v2(1, 2) + v2(3, 4)` interpolates as `(4, 6)`.
+    display(self) : str => "({self.x}, {self.y})"
+    /// Exact component equality.
+    eq(self, other: Vec2) : bool => self.x == other.x && self.y == other.y
+    /// Component sum.
+    add(self, other: Vec2) : Vec2 => Vec2.{x: self.x + other.x, y: self.y + other.y}
+    /// Component difference.
+    sub(self, other: Vec2) : Vec2 => Vec2.{x: self.x - other.x, y: self.y - other.y}
+    /// A copy of this vector.
+    clone(self) : Vec2 => Vec2.{x: self.x, y: self.y}
+}
+
+/// 2D vector with components `x` and `y`.
++v2(x: f64, y: f64) : Vec2 => Vec2.{x, y}
+/// The 2D zero vector.
++v2_zero() : Vec2 => Vec2.{x: 0.0, y: 0.0}
+/// Sum of the 2D vectors `a` and `b`.
++v2_add(a: Vec2, b: Vec2) : Vec2 => Vec2.{x: a.x + b.x, y: a.y + b.y}
+/// Difference `a` minus `b`.
++v2_sub(a: Vec2, b: Vec2) : Vec2 => Vec2.{x: a.x - b.x, y: a.y - b.y}
+/// `a` scaled by `k`.
++v2_scale(a: Vec2, k: f64) : Vec2 => Vec2.{x: a.x * k, y: a.y * k}
+/// Negation of `a`.
++v2_neg(a: Vec2) : Vec2 => Vec2.{x: 0.0 - a.x, y: 0.0 - a.y}
+/// Dot product of `a` and `b`.
++v2_dot(a: Vec2, b: Vec2) : f64 => a.x * b.x + a.y * b.y
+/// z component of the 3D cross product (signed parallelogram area).
++v2_cross(a: Vec2, b: Vec2) : f64 => a.x * b.y - a.y * b.x
+/// Squared length of `a`.
++v2_len2(a: Vec2) : f64 => a.x * a.x + a.y * a.y
+/// Length of `a`.
++v2_len(a: Vec2) : f64 => host.sys_sqrt(v2_len2(a))
+/// Distance between `a` and `b`.
++v2_dist(a: Vec2, b: Vec2) : f64 => v2_len(v2_sub(a, b))
+/// Perpendicular of the 2D vector `a`.
++v2_perp(a: Vec2) : Vec2 => Vec2.{x: 0.0 - a.y, y: a.x}
+/// Linear blend from `a` toward `b` by `t`.
++v2_lerp(a: Vec2, b: Vec2, t: f64) : Vec2 => Vec2.{x: la_lerp(a.x, b.x, t), y: la_lerp(a.y, b.y, t)}
+/// True when `a` and `b` have the same components.
++v2_eq(a: Vec2, b: Vec2) : bool => la_close(a.x, b.x) && la_close(a.y, b.y)
+
+/// Unit vector; the zero vector stays zero.
++v2_norm(a: Vec2) : Vec2 {
+    n = v2_len(a)
+    ensure n > 0.0 else { return Vec2.{x: 0.0, y: 0.0} }
+    Vec2.{x: a.x / n, y: a.y / n}
+}
+
+/// `a` rotated by `radians` radians.
++v2_rotate(a: Vec2, radians: f64) : Vec2 {
+    c = host.sys_cos(radians)
+    s = host.sys_sin(radians)
+    Vec2.{x: a.x * c - a.y * s, y: a.x * s + a.y * c}
+}
+
+/// Angle of `a`, in radians.
++v2_angle(a: Vec2) : f64 => host.sys_atan2(a.y, a.x)
+
+/// Reflect `a` about the unit normal `n`.
++v2_reflect(a: Vec2, n: Vec2) : Vec2 {
+    d = 2.0 * v2_dot(a, n)
+    Vec2.{x: a.x - d * n.x, y: a.y - d * n.y}
+}
+
+/// Projection of `a` onto `b`.
++v2_project(a: Vec2, b: Vec2) : Vec2 {
+    d = v2_len2(b)
+    ensure d > 0.0 else { return Vec2.{x: 0.0, y: 0.0} }
+    k = v2_dot(a, b) / d
+    Vec2.{x: b.x * k, y: b.y * k}
+}
+
+// --- Vec3 -----------------------------------------------------------------------
+
+/// `Vec3` is a 3D vector.
++Vec3 = {
+    /// X component. Defaults to `0.0`.
+    x: f64 = 0.0
+    /// Y component. Defaults to `0.0`.
+    y: f64 = 0.0
+    /// Z component. Defaults to `0.0`.
+    z: f64 = 0.0
+}
+
+/// 3D vector with components `x`, `y`, and `z`.
++v3(x: f64, y: f64, z: f64) : Vec3 => Vec3.{x, y, z}
+/// The 3D zero vector.
++v3_zero() : Vec3 => Vec3.{x: 0.0, y: 0.0, z: 0.0}
+/// Sum of the 3D vectors `a` and `b`.
++v3_add(a: Vec3, b: Vec3) : Vec3 => Vec3.{x: a.x + b.x, y: a.y + b.y, z: a.z + b.z}
+/// Difference `a` minus `b`.
++v3_sub(a: Vec3, b: Vec3) : Vec3 => Vec3.{x: a.x - b.x, y: a.y - b.y, z: a.z - b.z}
+/// `a` scaled by `k`.
++v3_scale(a: Vec3, k: f64) : Vec3 => Vec3.{x: a.x * k, y: a.y * k, z: a.z * k}
+/// Negation of `a`.
++v3_neg(a: Vec3) : Vec3 => Vec3.{x: 0.0 - a.x, y: 0.0 - a.y, z: 0.0 - a.z}
+/// Dot product of `a` and `b`.
++v3_dot(a: Vec3, b: Vec3) : f64 => a.x * b.x + a.y * b.y + a.z * b.z
+/// Squared length of `a`.
++v3_len2(a: Vec3) : f64 => v3_dot(a, a)
+/// Length of `a`.
++v3_len(a: Vec3) : f64 => host.sys_sqrt(v3_len2(a))
+/// Distance between `a` and `b`.
++v3_dist(a: Vec3, b: Vec3) : f64 => v3_len(v3_sub(a, b))
+/// True when `a` and `b` have the same components.
++v3_eq(a: Vec3, b: Vec3) : bool => la_close(a.x, b.x) && la_close(a.y, b.y) && la_close(a.z, b.z)
+
+/// Cross product of `a` and `b`.
++v3_cross(a: Vec3, b: Vec3) : Vec3 {
+    return Vec3.{
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    }
+}
+
+/// Unit vector in the direction of `a`.
++v3_norm(a: Vec3) : Vec3 {
+    n = v3_len(a)
+    ensure n > 0.0 else { return Vec3.{x: 0.0, y: 0.0, z: 0.0} }
+    Vec3.{x: a.x / n, y: a.y / n, z: a.z / n}
+}
+
+/// Linear blend from `a` toward `b` by `t`.
++v3_lerp(a: Vec3, b: Vec3, t: f64) : Vec3 {
+    Vec3.{x: la_lerp(a.x, b.x, t), y: la_lerp(a.y, b.y, t), z: la_lerp(a.z, b.z, t)}
+}
+
+// --- Mat4 (row-major array of 16 f64) ---------------------------------------------
+
+/// The 4×4 identity matrix.
++m4_identity()  => [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+/// Element of a 16-float matrix at row `r`, column `c`.
++m4_get(m: _, r: i64, c: i64) : f64 => m[r * 4 + c]
+
+/// M4 translate (`tx`, `ty`, `tz`).
++m4_translate(tx: f64, ty: f64, tz: f64)  => [1.0, 0.0, 0.0, tx, 0.0, 1.0, 0.0, ty, 0.0, 0.0, 1.0, tz, 0.0, 0.0, 0.0, 1.0]
+
+/// `sx` scaled by `sy`.
++m4_scale(sx: f64, sy: f64, sz: f64)  => [sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, sz, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+/// M4 rot z (`radians`).
++m4_rot_z(radians: f64) {
+    c = host.sys_cos(radians)
+    s = host.sys_sin(radians)
+    return [c, 0.0 - s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// M4 rot x (`radians`).
++m4_rot_x(radians: f64) {
+    c = host.sys_cos(radians)
+    s = host.sys_sin(radians)
+    return [1.0, 0.0, 0.0, 0.0, 0.0, c, 0.0 - s, 0.0, 0.0, s, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// M4 rot y (`radians`).
++m4_rot_y(radians: f64) {
+    c = host.sys_cos(radians)
+    s = host.sys_sin(radians)
+    return [c, 0.0, s, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0 - s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// a * b (apply `b` first, then `a`, when transforming column vectors).
++m4_mul(a: _, b: _) {
+    out = []
+    for 0..16 {
+        r = it / 4
+        c = it % 4
+        acc = 0.0
+        for 0..4 {
+            k = it
+            acc += a[r * 4 + k] * b[k * 4 + c]
+        }
+        out = host.sys_arr_push(out, acc)
+    }
+    out
+}
+
+/// M4 transpose (`m`).
++m4_transpose(m: _) {
+    out = []
+    for 0..16 {
+        r = it / 4
+        c = it % 4
+        out = host.sys_arr_push(out, m[c * 4 + r])
+    }
+    out
+}
+
+/// Transform a point (w = 1) by `m`, dividing by w when it is not 1.
++m4_apply(m: _, p: Vec3) : Vec3 {
+    x = m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3]
+    y = m[4] * p.x + m[5] * p.y + m[6] * p.z + m[7]
+    z = m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]
+    w = m[12] * p.x + m[13] * p.y + m[14] * p.z + m[15]
+    if la_close(w, 1.0) || la_close(w, 0.0) { return Vec3.{x, y, z} }
+    Vec3.{x: x / w, y: y / w, z: z / w}
+}
+
+/// Transform a direction (w = 0): translation is ignored.
++m4_apply_dir(m: _, d: Vec3) : Vec3 {
+    return Vec3.{
+        x: m[0] * d.x + m[1] * d.y + m[2] * d.z,
+        y: m[4] * d.x + m[5] * d.y + m[6] * d.z,
+        z: m[8] * d.x + m[9] * d.y + m[10] * d.z,
+    }
+}
+
+/// True when every element of the two 4x4 matrices is close.
++m4_close(a: _, b: _) : bool {
+    ok = true
+    for 0..16 {
+        if !la_close(a[it], b[it]) { ok = false }
+    }
+    ok
+}
+
+// --- general dense matrix ------------------------------------------------------------
+
+/// `Mat` is a dense row-major matrix.
++Mat: Display, Eq, Add, Mul = {
+    /// Rows on `Mat` (`i64`). Defaults to `0`.
+    rows: i64 = 0
+
+    /// Display witness. The element buffer stays on the value; the text names the shape.
+    display(self) : str => "Mat({self.rows}x{self.cols})"
+    /// Cols on `Mat` (`i64`). Defaults to `0`.
+    cols: i64 = 0
+    /// Data on `Mat`. Defaults to `[]`.
+    data: _ = []
+
+    /// Create a fresh `Mat`.
+    new(rows: i64, cols: i64) : Mat => Mat.{rows, cols, data: host.sys_arr_new(rows * cols, 0.0)}
+
+    /// Element at row `r`, column `c`.
+    get(self, r: i64, c: i64) : f64 => self.data[r * self.cols + c]
+
+    /// Copy with row `r`, column `c` set to `v`.
+    set(@self, r: i64, c: i64, v: f64) : f64 {
+        self.data = host.sys_arr_set(self.data, r * self.cols + c, v)
+        v
+    }
+
+    /// Transpose of the value.
+    transpose(self) : Mat {
+        out = Mat.new(self.cols, self.rows)
+        d = out.data
+        for 0..(self.rows * self.cols) {
+            r = it / self.cols
+            c = it % self.cols
+            d = host.sys_arr_set(d, c * self.rows + r, self.data[it])
+        }
+        out.data = d
+        out
+    }
+
+    /// Product; self (n x k) times b (k x m). A shape mismatch yields a 0 x 0 matrix.
+    mul(self, b: Mat) : Mat {
+        ensure self.cols == b.rows else { return Mat.new(0, 0) }
+        out = Mat.new(self.rows, b.cols)
+        d = out.data
+        for 0..(self.rows * b.cols) {
+            r = it / b.cols
+            c = it % b.cols
+            acc = 0.0
+            for 0..(self.cols) {
+                k = it
+                acc += self.data[r * self.cols + k] * b.data[k * b.cols + c]
+            }
+            d = host.sys_arr_set(d, it_cell(r, c, b.cols), acc)
+        }
+        out.data = d
+        out
+    }
+
+    /// Element-wise sum of `b` and the value.
+    add(self, b: Mat) : Mat {
+        ensure self.rows == b.rows && self.cols == b.cols else { return Mat.new(0, 0) }
+        d = []
+        for 0..(self.rows * self.cols) { d = host.sys_arr_push(d, self.data[it] + b.data[it]) }
+        Mat.{rows: self.rows, cols: self.cols, data: d}
+    }
+
+    /// Copy of `k` with every element multiplied by the value.
+    scale(self, k: f64) : Mat {
+        d = []
+        for 0..(self.rows * self.cols) { d = host.sys_arr_push(d, self.data[it] * k) }
+        Mat.{rows: self.rows, cols: self.cols, data: d}
+    }
+
+    /// True when `b` and the value have the same shape and elements.
+    eq(self, b: Mat) : bool {
+        ensure self.rows == b.rows && self.cols == b.cols else { return false }
+        ok = true
+        for 0..(self.rows * self.cols) {
+            if !la_close(self.data[it], b.data[it]) { ok = false }
+        }
+        ok
+    }
+
+    /// Sum of the diagonal of the value.
+    trace(self) : f64 {
+        acc = 0.0
+        for 0..(self.rows) { acc += self.data[it * self.cols + it] }
+        acc
+    }
+
+    /// Determinant by Gaussian elimination with partial pivoting (square matrices).
+    det(self) : f64 {
+        ensure self.rows == self.cols else { return 0.0 }
+        n = self.rows
+        a = self.data
+        det = 1.0
+        alive = true
+        for 0..n {
+            col = it
+            if alive {
+                pivot = col
+                best = la_abs(a[col * n + col])
+                for (col + 1)..n {
+                    v = la_abs(a[it * n + col])
+                    if v > best {
+                        best = v
+                        pivot = it
+                    }
+                }
+                if best < 0.000000000001 {
+                    det = 0.0
+                    alive = false
+                } else {
+                    if pivot != col {
+                        for 0..n {
+                            t = a[col * n + it]
+                            a = host.sys_arr_set(a, col * n + it, a[pivot * n + it])
+                            a = host.sys_arr_set(a, pivot * n + it, t)
+                        }
+                        det = 0.0 - det
+                    }
+                    det = det * a[col * n + col]
+                    for (col + 1)..n {
+                        row = it
+                        f = a[row * n + col] / a[col * n + col]
+                        for col..n {
+                            a = host.sys_arr_set(a, row * n + it, a[row * n + it] - f * a[col * n + it])
+                        }
+                    }
+                }
+            }
+        }
+        det
+    }
+
+    /// Solve self x = b for square `self` (Gauss-Jordan); returns the solution array, or
+    /// an empty array when `self` is singular or the shapes disagree.
+    solve(self, b: _) {
+        n = self.rows
+        ensure self.rows == self.cols else { return [] }
+        // Augmented n x (n + 1) system.
+        w = n + 1
+        g = []
+        for 0..n {
+            r = it
+            for 0..n { g = host.sys_arr_push(g, self.data[r * n + it]) }
+            g = host.sys_arr_push(g, b[r])
+        }
+        singular = false
+        for 0..n {
+            col = it
+            if !singular {
+                pivot = col
+                best = la_abs(g[col * w + col])
+                for (col + 1)..n {
+                    v = la_abs(g[it * w + col])
+                    if v > best {
+                        best = v
+                        pivot = it
+                    }
+                }
+                if best < 0.000000000001 {
+                    singular = true
+                } else {
+                    if pivot != col {
+                        for 0..w {
+                            t = g[col * w + it]
+                            g = host.sys_arr_set(g, col * w + it, g[pivot * w + it])
+                            g = host.sys_arr_set(g, pivot * w + it, t)
+                        }
+                    }
+                    p = g[col * w + col]
+                    for 0..w { g = host.sys_arr_set(g, col * w + it, g[col * w + it] / p) }
+                    for 0..n {
+                        row = it
+                        if row != col {
+                            f = g[row * w + col]
+                            for 0..w {
+                                g = host.sys_arr_set(g, row * w + it, g[row * w + it] - f * g[col * w + it])
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if singular { return [] }
+        out = []
+        for 0..n { out = host.sys_arr_push(out, g[it * w + n]) }
+        out
+    }
+}
+
+/// Identity matrix of order `n`.
++mat_identity(n: i64) : Mat {
+    m = Mat.new(n, n)
+    d = m.data
+    for 0..n { d = host.sys_arr_set(d, it * n + it, 1.0) }
+    m.data = d
+    m
+}
+
+/// Matrix with `rows` rows and `cols` columns filled from `data`.
++mat_from(rows: i64, cols: i64, data: _) : Mat => Mat.{rows, cols, data}
+
+/// Column-major cell index used while iterating a matrix.
++it_cell(r: i64, c: i64, cols: i64) : i64 => r * cols + c
+
+// --- structured matrices: dense, diagonal, CSR ------------------------------------------------
+
+/// Pivots at or below this multiple of the largest matrix entry count as zero in `lu`.
++LA_SINGULAR_TOL = 0.0000000000001
+
+/// Exact float zero test (`==` is tolerance-based on the VM).
++la_is_zero(x: f64) : bool => !(x < 0.0) && !(x > 0.0)
+
+/// Row-major dense matrix (`data[r * cols + c]`); implements `Matrix`.
++DenseMatrix: Matrix, Display = {
+    rows: i64 = 0
+    cols: i64 = 0
+    data: _ = []
+
+    display(self) : str => "DenseMatrix({self.rows}x{self.cols})"
+
+    nrows(self) : i64 => self.rows
+
+    ncols(self) : i64 => self.cols
+
+    at(self, r: i64, c: i64) : f64 => self.data[r * self.cols + c]
+
+    /// `A x` for a vector of length `cols`.
+    matvec(self, x: _) {
+        out = []
+        r = 0
+        while r < self.rows {
+            s = 0.0
+            c = 0
+            while c < self.cols {
+                s += self.data[r * self.cols + c] * x[c]
+                c += 1
+            }
+            out = host.sys_arr_push(out, s)
+            r += 1
+        }
+        out
+    }
+
+    /// Transpose.
+    transpose(self) : DenseMatrix {
+        d = host.sys_arr_new(self.rows * self.cols, 0.0)
+        r = 0
+        while r < self.rows {
+            c = 0
+            while c < self.cols {
+                d = host.sys_arr_set(d, c * self.rows + r, self.data[r * self.cols + c])
+                c += 1
+            }
+            r += 1
+        }
+        DenseMatrix.{rows: self.cols, cols: self.rows, data: d}
+    }
+
+    /// Sum of the diagonal.
+    trace(self) : f64 {
+        s = 0.0
+        n = self.rows
+        if self.cols < n { n = self.cols }
+        i = 0
+        while i < n {
+            s += self.data[i * self.cols + i]
+            i += 1
+        }
+        s
+    }
+
+    /// Frobenius norm.
+    frobenius(self) : f64 {
+        s = 0.0
+        for self.data { s += it * it }
+        host.sys_sqrt(s)
+    }
+
+    /// Copy scaled by `k`.
+    scaled(self, k: f64) : DenseMatrix {
+        d = []
+        for self.data { d = host.sys_arr_push(d, it * k) }
+        DenseMatrix.{rows: self.rows, cols: self.cols, data: d}
+    }
+
+    /// True when `|a_ij - a_ji| <= tol` everywhere (square matrices only).
+    is_symmetric(self, tol: f64) : bool {
+        ensure self.rows == self.cols else { return false }
+        r = 0
+        while r < self.rows {
+            c = r + 1
+            while c < self.cols {
+                if la_abs(self.data[r * self.cols + c] - self.data[c * self.cols + r]) > tol { return false }
+                c += 1
+            }
+            r += 1
+        }
+        true
+    }
+}
+
+/// Dense matrix from a row-major buffer.
++dense(rows: i64, cols: i64, data: _) : DenseMatrix => DenseMatrix.{rows, cols, data}
+
+/// `rows x cols` zero matrix.
++dense_zeros(rows: i64, cols: i64) : DenseMatrix => DenseMatrix.{rows, cols, data: host.sys_arr_new(rows * cols, 0.0)}
+
+/// Identity matrix of order `n`.
++dense_identity(n: i64) : DenseMatrix {
+    d = host.sys_arr_new(n * n, 0.0)
+    i = 0
+    while i < n {
+        d = host.sys_arr_set(d, i * n + i, 1.0)
+        i += 1
+    }
+    DenseMatrix.{rows: n, cols: n, data: d}
+}
+
+/// Dense product `a b`; a shape mismatch yields a 0 x 0 matrix.
++dense_mul(a: DenseMatrix, b: DenseMatrix) : DenseMatrix {
+    ensure a.cols == b.rows else { return dense_zeros(0, 0) }
+    d = host.sys_arr_new(a.rows * b.cols, 0.0)
+    r = 0
+    while r < a.rows {
+        k = 0
+        while k < a.cols {
+            av = a.data[r * a.cols + k]
+            if !la_is_zero(av) {
+                c = 0
+                while c < b.cols {
+                    d = host.sys_arr_set(d, r * b.cols + c, d[r * b.cols + c] + av * b.data[k * b.cols + c])
+                    c += 1
+                }
+            }
+            k += 1
+        }
+        r += 1
+    }
+    DenseMatrix.{rows: a.rows, cols: b.cols, data: d}
+}
+
+/// Dense sum; a shape mismatch yields a 0 x 0 matrix.
++dense_add(a: DenseMatrix, b: DenseMatrix) : DenseMatrix {
+    ensure a.rows == b.rows && a.cols == b.cols else { return dense_zeros(0, 0) }
+    d = []
+    i = 0
+    n = a.rows * a.cols
+    while i < n {
+        d = host.sys_arr_push(d, a.data[i] + b.data[i])
+        i += 1
+    }
+    DenseMatrix.{rows: a.rows, cols: a.cols, data: d}
+}
+
+/// Square diagonal matrix stored as its diagonal; implements `Matrix`.
++DiagonalMatrix: Matrix, Display = {
+    diag: _ = []
+
+    display(self) : str => "DiagonalMatrix({host.sys_arr_len(self.diag)}x{host.sys_arr_len(self.diag)})"
+
+    nrows(self) : i64 => host.sys_arr_len(self.diag)
+
+    ncols(self) : i64 => host.sys_arr_len(self.diag)
+
+    at(self, r: i64, c: i64) : f64 {
+        if r == c { return self.diag[r] }
+        0.0
+    }
+
+    /// `D x` is an elementwise product.
+    matvec(self, x: _) {
+        out = []
+        i = 0
+        n = host.sys_arr_len(self.diag)
+        while i < n {
+            out = host.sys_arr_push(out, self.diag[i] * x[i])
+            i += 1
+        }
+        out
+    }
+
+    /// Inverse (zero diagonal entries yield an empty diagonal).
+    inverse(self) : DiagonalMatrix {
+        out = []
+        for self.diag {
+            if la_is_zero(it) { return DiagonalMatrix.{diag: []} }
+            out = host.sys_arr_push(out, 1.0 / it)
+        }
+        DiagonalMatrix.{diag: out}
+    }
+
+    /// Product of the diagonal entries.
+    det(self) : f64 {
+        d = 1.0
+        for self.diag { d *= it }
+        d
+    }
+}
+
+/// Diagonal matrix with the given diagonal.
++diagonal(diag: _) : DiagonalMatrix => DiagonalMatrix.{diag}
+
+/// Dense copy of a diagonal matrix.
++diag_to_dense(g: DiagonalMatrix) : DenseMatrix {
+    n = host.sys_arr_len(g.diag)
+    d = host.sys_arr_new(n * n, 0.0)
+    i = 0
+    while i < n {
+        d = host.sys_arr_set(d, i * n + i, g.diag[i])
+        i += 1
+    }
+    DenseMatrix.{rows: n, cols: n, data: d}
+}
+
+/// `G H` for two diagonal matrices.
++diag_mul_diag(a: DiagonalMatrix, b: DiagonalMatrix) : DiagonalMatrix {
+    ensure host.sys_arr_len(a.diag) == host.sys_arr_len(b.diag) else { return DiagonalMatrix.{diag: []} }
+    out = []
+    i = 0
+    n = host.sys_arr_len(a.diag)
+    while i < n {
+        out = host.sys_arr_push(out, a.diag[i] * b.diag[i])
+        i += 1
+    }
+    DiagonalMatrix.{diag: out}
+}
+
+/// `G H` for two diagonal matrices of the same order added.
++diag_add_diag(a: DiagonalMatrix, b: DiagonalMatrix) : DiagonalMatrix {
+    ensure host.sys_arr_len(a.diag) == host.sys_arr_len(b.diag) else { return DiagonalMatrix.{diag: []} }
+    out = []
+    i = 0
+    n = host.sys_arr_len(a.diag)
+    while i < n {
+        out = host.sys_arr_push(out, a.diag[i] + b.diag[i])
+        i += 1
+    }
+    DiagonalMatrix.{diag: out}
+}
+
+/// `D A`: scales row `i` of `a` by `g[i]`.
++diag_mul_dense(g: DiagonalMatrix, a: DenseMatrix) : DenseMatrix {
+    ensure host.sys_arr_len(g.diag) == a.rows else { return dense_zeros(0, 0) }
+    d = []
+    r = 0
+    while r < a.rows {
+        c = 0
+        while c < a.cols {
+            d = host.sys_arr_push(d, g.diag[r] * a.data[r * a.cols + c])
+            c += 1
+        }
+        r += 1
+    }
+    DenseMatrix.{rows: a.rows, cols: a.cols, data: d}
+}
+
+/// `A D`: scales column `j` of `a` by `g[j]`.
++dense_mul_diag(a: DenseMatrix, g: DiagonalMatrix) : DenseMatrix {
+    ensure host.sys_arr_len(g.diag) == a.cols else { return dense_zeros(0, 0) }
+    d = []
+    r = 0
+    while r < a.rows {
+        c = 0
+        while c < a.cols {
+            d = host.sys_arr_push(d, a.data[r * a.cols + c] * g.diag[c])
+            c += 1
+        }
+        r += 1
+    }
+    DenseMatrix.{rows: a.rows, cols: a.cols, data: d}
+}
+
+/// Compressed sparse row matrix: row `r` owns `values[indptr[r]..indptr[r+1])` at the sorted columns
+/// `indices[...]`; implements `Matrix`.
++CSRMatrix: Matrix, Display = {
+    rows: i64 = 0
+    cols: i64 = 0
+    indptr: _ = [0]
+    indices: _ = []
+    values: _ = []
+
+    display(self) : str => "CSRMatrix({self.rows}x{self.cols}, nnz={host.sys_arr_len(self.values)})"
+
+    nrows(self) : i64 => self.rows
+
+    ncols(self) : i64 => self.cols
+
+    /// Stored entries.
+    nnz(self) : i64 => host.sys_arr_len(self.values)
+
+    /// Entry `(r, c)` (zero when not stored); binary search inside the row.
+    at(self, r: i64, c: i64) : f64 {
+        lo = self.indptr[r]
+        hi = self.indptr[r + 1]
+        while lo < hi {
+            mid = (lo + hi) / 2
+            col = self.indices[mid]
+            if col == c { return self.values[mid] }
+            if col < c { lo = mid + 1 } else { hi = mid }
+        }
+        0.0
+    }
+
+    /// `A x` in `O(nnz)`.
+    matvec(self, x: _) {
+        out = []
+        r = 0
+        while r < self.rows {
+            s = 0.0
+            k = self.indptr[r]
+            hi = self.indptr[r + 1]
+            while k < hi {
+                s += self.values[k] * x[self.indices[k]]
+                k += 1
+            }
+            out = host.sys_arr_push(out, s)
+            r += 1
+        }
+        out
+    }
+
+    /// Dense copy.
+    to_dense(self) : DenseMatrix {
+        d = host.sys_arr_new(self.rows * self.cols, 0.0)
+        r = 0
+        while r < self.rows {
+            k = self.indptr[r]
+            hi = self.indptr[r + 1]
+            while k < hi {
+                d = host.sys_arr_set(d, r * self.cols + self.indices[k], self.values[k])
+                k += 1
+            }
+            r += 1
+        }
+        DenseMatrix.{rows: self.rows, cols: self.cols, data: d}
+    }
+
+    /// Transpose (as CSR).
+    transpose(self) : CSRMatrix {
+        ri = []
+        ci = []
+        r = 0
+        while r < self.rows {
+            k = self.indptr[r]
+            hi = self.indptr[r + 1]
+            while k < hi {
+                ri = host.sys_arr_push(ri, self.indices[k])
+                ci = host.sys_arr_push(ci, r)
+                k += 1
+            }
+            r += 1
+        }
+        csr_from_triplets(self.cols, self.rows, ri, ci, self.values)
+    }
+}
+
+/// CSR matrix from coordinate triplets; duplicates are summed and rows are sorted by column.
++csr_from_triplets(rows: i64, cols: i64, ri: _, ci: _, vs: _) : CSRMatrix {
+    m = host.sys_arr_len(vs)
+    counts = host.sys_arr_new(rows + 1, 0)
+    k = 0
+    while k < m {
+        r = ri[k]
+        counts = host.sys_arr_set(counts, r + 1, counts[r + 1] + 1)
+        k += 1
+    }
+    r = 0
+    while r < rows {
+        counts = host.sys_arr_set(counts, r + 1, counts[r + 1] + counts[r])
+        r += 1
+    }
+    fill = []
+    r = 0
+    while r < rows {
+        fill = host.sys_arr_push(fill, counts[r])
+        r += 1
+    }
+    cs = host.sys_arr_new(m, 0)
+    vv = host.sys_arr_new(m, 0.0)
+    k = 0
+    while k < m {
+        r = ri[k]
+        p = fill[r]
+        cs = host.sys_arr_set(cs, p, ci[k])
+        vv = host.sys_arr_set(vv, p, vs[k])
+        fill = host.sys_arr_set(fill, r, p + 1)
+        k += 1
+    }
+    indptr = [0]
+    indices = []
+    values = []
+    r = 0
+    while r < rows {
+        lo = counts[r]
+        hi = counts[r + 1]
+        i = lo + 1
+        while i < hi {
+            c = cs[i]
+            v = vv[i]
+            j = i - 1
+            while j >= lo && cs[j] > c {
+                cs = host.sys_arr_set(cs, j + 1, cs[j])
+                vv = host.sys_arr_set(vv, j + 1, vv[j])
+                j -= 1
+            }
+            cs = host.sys_arr_set(cs, j + 1, c)
+            vv = host.sys_arr_set(vv, j + 1, v)
+            i += 1
+        }
+        i = lo
+        while i < hi {
+            c = cs[i]
+            v = vv[i]
+            i += 1
+            while i < hi && cs[i] == c {
+                v += vv[i]
+                i += 1
+            }
+            indices = host.sys_arr_push(indices, c)
+            values = host.sys_arr_push(values, v)
+        }
+        indptr = host.sys_arr_push(indptr, host.sys_arr_len(indices))
+        r += 1
+    }
+    CSRMatrix.{rows, cols, indptr, indices, values}
+}
+
+/// CSR copy of a dense matrix keeping entries with `|a_ij| > tol`.
++csr_from_dense(a: DenseMatrix, tol: f64) : CSRMatrix {
+    indptr = [0]
+    indices = []
+    values = []
+    r = 0
+    while r < a.rows {
+        c = 0
+        while c < a.cols {
+            v = a.data[r * a.cols + c]
+            if la_abs(v) > tol {
+                indices = host.sys_arr_push(indices, c)
+                values = host.sys_arr_push(values, v)
+            }
+            c += 1
+        }
+        indptr = host.sys_arr_push(indptr, host.sys_arr_len(indices))
+        r += 1
+    }
+    CSRMatrix.{rows: a.rows, cols: a.cols, indptr, indices, values}
+}
+
+/// CSR copy of a diagonal matrix (zero entries are dropped).
++csr_from_diag(g: DiagonalMatrix) : CSRMatrix {
+    n = host.sys_arr_len(g.diag)
+    indptr = [0]
+    indices = []
+    values = []
+    i = 0
+    while i < n {
+        if !la_is_zero(g.diag[i]) {
+            indices = host.sys_arr_push(indices, i)
+            values = host.sys_arr_push(values, g.diag[i])
+        }
+        indptr = host.sys_arr_push(indptr, host.sys_arr_len(indices))
+        i += 1
+    }
+    CSRMatrix.{rows: n, cols: n, indptr, indices, values}
+}
+
+/// Insertion sort of a short array of column indices.
++la_sort_ints(a: _) {
+    out = a
+    i = 1
+    n = host.sys_arr_len(out)
+    while i < n {
+        v = out[i]
+        j = i - 1
+        while j >= 0 && out[j] > v {
+            out = host.sys_arr_set(out, j + 1, out[j])
+            j -= 1
+        }
+        out = host.sys_arr_set(out, j + 1, v)
+        i += 1
+    }
+    out
+}
+
+/// Sparse sum `a + b` (row-wise merge of sorted index lists); a shape mismatch yields an empty 0 x 0 matrix.
++csr_add(a: CSRMatrix, b: CSRMatrix) : CSRMatrix {
+    ensure a.rows == b.rows && a.cols == b.cols else { return CSRMatrix.{rows: 0, cols: 0, indptr: [0], indices: [], values: []} }
+    indptr = [0]
+    indices = []
+    values = []
+    r = 0
+    while r < a.rows {
+        i = a.indptr[r]
+        ie = a.indptr[r + 1]
+        j = b.indptr[r]
+        je = b.indptr[r + 1]
+        while i < ie || j < je {
+            if j >= je || (i < ie && a.indices[i] < b.indices[j]) {
+                indices = host.sys_arr_push(indices, a.indices[i])
+                values = host.sys_arr_push(values, a.values[i])
+                i += 1
+            } else {
+                if i >= ie || b.indices[j] < a.indices[i] {
+                    indices = host.sys_arr_push(indices, b.indices[j])
+                    values = host.sys_arr_push(values, b.values[j])
+                    j += 1
+                } else {
+                    indices = host.sys_arr_push(indices, a.indices[i])
+                    values = host.sys_arr_push(values, a.values[i] + b.values[j])
+                    i += 1
+                    j += 1
+                }
+            }
+        }
+        indptr = host.sys_arr_push(indptr, host.sys_arr_len(indices))
+        r += 1
+    }
+    CSRMatrix.{rows: a.rows, cols: a.cols, indptr, indices, values}
+}
+
+/// Sparse product `a b` (row-wise Gustavson with a dense accumulator).
++csr_mul(a: CSRMatrix, b: CSRMatrix) : CSRMatrix {
+    ensure a.cols == b.rows else { return CSRMatrix.{rows: 0, cols: 0, indptr: [0], indices: [], values: []} }
+    acc = host.sys_arr_new(b.cols, 0.0)
+    seen = host.sys_arr_new(b.cols, 0)
+    indptr = [0]
+    indices = []
+    values = []
+    r = 0
+    while r < a.rows {
+        touched = []
+        ka = a.indptr[r]
+        kae = a.indptr[r + 1]
+        while ka < kae {
+            k = a.indices[ka]
+            av = a.values[ka]
+            kb = b.indptr[k]
+            kbe = b.indptr[k + 1]
+            while kb < kbe {
+                c = b.indices[kb]
+                if seen[c] == 0 {
+                    seen = host.sys_arr_set(seen, c, 1)
+                    touched = host.sys_arr_push(touched, c)
+                }
+                acc = host.sys_arr_set(acc, c, acc[c] + av * b.values[kb])
+                kb += 1
+            }
+            ka += 1
+        }
+        sorted = la_sort_ints(touched)
+        for sorted {
+            indices = host.sys_arr_push(indices, it)
+            values = host.sys_arr_push(values, acc[it])
+            acc = host.sys_arr_set(acc, it, 0.0)
+            seen = host.sys_arr_set(seen, it, 0)
+        }
+        indptr = host.sys_arr_push(indptr, host.sys_arr_len(indices))
+        r += 1
+    }
+    CSRMatrix.{rows: a.rows, cols: b.cols, indptr, indices, values}
+}
+
+/// `A S` for dense `A` and sparse `S`.
++dense_mul_csr(a: DenseMatrix, s: CSRMatrix) : DenseMatrix {
+    ensure a.cols == s.rows else { return dense_zeros(0, 0) }
+    d = host.sys_arr_new(a.rows * s.cols, 0.0)
+    r = 0
+    while r < a.rows {
+        k = 0
+        while k < s.rows {
+            av = a.data[r * a.cols + k]
+            if !la_is_zero(av) {
+                p = s.indptr[k]
+                pe = s.indptr[k + 1]
+                while p < pe {
+                    idx = r * s.cols + s.indices[p]
+                    d = host.sys_arr_set(d, idx, d[idx] + av * s.values[p])
+                    p += 1
+                }
+            }
+            k += 1
+        }
+        r += 1
+    }
+    DenseMatrix.{rows: a.rows, cols: s.cols, data: d}
+}
+
+/// `S A` for sparse `S` and dense `A`.
++csr_mul_dense(s: CSRMatrix, a: DenseMatrix) : DenseMatrix {
+    ensure s.cols == a.rows else { return dense_zeros(0, 0) }
+    d = host.sys_arr_new(s.rows * a.cols, 0.0)
+    r = 0
+    while r < s.rows {
+        p = s.indptr[r]
+        pe = s.indptr[r + 1]
+        while p < pe {
+            k = s.indices[p]
+            sv = s.values[p]
+            c = 0
+            while c < a.cols {
+                idx = r * a.cols + c
+                d = host.sys_arr_set(d, idx, d[idx] + sv * a.data[k * a.cols + c])
+                c += 1
+            }
+            p += 1
+        }
+        r += 1
+    }
+    DenseMatrix.{rows: s.rows, cols: a.cols, data: d}
+}
+
+// --- operator dispatch over matrix kinds ----------------------------------------------------------
+
+/// Any of the three matrix kinds behind one value, so `mul` and `add` can dispatch with `when (a, b)`.
+/// (Overloaded free functions and `#symmetric` mirrors type-check but are not lowered by the current VM
+/// or C backend, so the kind dispatch is explicit and runs everywhere.)
++LinOp = {
+    Dense(d: DenseMatrix)
+    Diag(g: DiagonalMatrix)
+    Sparse(s: CSRMatrix)
+
+    /// The dense payload (an empty matrix for other kinds).
+    get_dense(self) : DenseMatrix {
+        when self {
+            LinOp.Dense { d } => d
+            else => dense_zeros(0, 0)
+        }
+    }
+
+    /// The diagonal payload (an empty diagonal for other kinds).
+    get_diag(self) : DiagonalMatrix {
+        when self {
+            LinOp.Diag { g } => g
+            else => DiagonalMatrix.{diag: []}
+        }
+    }
+
+    /// The CSR payload (an empty matrix for other kinds).
+    get_sparse(self) : CSRMatrix {
+        when self {
+            LinOp.Sparse { s } => s
+            else => CSRMatrix.{rows: 0, cols: 0, indptr: [0], indices: [], values: []}
+        }
+    }
+
+    /// Short kind name: `"dense"`, `"diagonal"` or `"csr"`.
+    kind_name(self) : str {
+        when self {
+            LinOp.Dense => "dense"
+            LinOp.Diag => "diagonal"
+            LinOp.Sparse => "csr"
+        }
+    }
+
+    nrows(self) : i64 {
+        when self {
+            LinOp.Dense { d } => d.rows
+            LinOp.Diag { g } => host.sys_arr_len(g.diag)
+            LinOp.Sparse { s } => s.rows
+        }
+    }
+
+    ncols(self) : i64 {
+        when self {
+            LinOp.Dense { d } => d.cols
+            LinOp.Diag { g } => host.sys_arr_len(g.diag)
+            LinOp.Sparse { s } => s.cols
+        }
+    }
+
+    /// `A x` through the payload's own kernel.
+    matvec(self, x: _) {
+        when self {
+            LinOp.Dense { d } => d.matvec(x)
+            LinOp.Diag { g } => g.matvec(x)
+            LinOp.Sparse { s } => s.matvec(x)
+        }
+    }
+
+    /// Dense copy of any kind.
+    to_dense(self) : DenseMatrix {
+        when self {
+            LinOp.Dense { d } => d
+            LinOp.Diag { g } => diag_to_dense(g)
+            LinOp.Sparse { s } => s.to_dense()
+        }
+    }
+}
+
+/// Wrap a dense matrix.
++lin_dense(m: DenseMatrix) : LinOp => LinOp.Dense(m)
+
+/// Wrap a diagonal matrix.
++lin_diag(m: DiagonalMatrix) : LinOp => LinOp.Diag(m)
+
+/// Wrap a CSR matrix.
++lin_sparse(m: CSRMatrix) : LinOp => LinOp.Sparse(m)
+
+/// Matrix sum, dispatching on both kinds. Dense with anything gives dense; diagonal with diagonal gives diagonal;
+/// sparse with sparse or diagonal gives sparse. Mixed pairs are handled symmetrically (`a + b == b + a`).
+/// A shape mismatch yields an empty dense matrix.
++add(a: LinOp, b: LinOp) : LinOp {
+    ensure a.nrows() == b.nrows() && a.ncols() == b.ncols() else { return lin_dense(dense_zeros(0, 0)) }
+    when (a, b) {
+        (LinOp.Dense, LinOp.Dense) => { return lin_dense(dense_add(a.get_dense(), b.get_dense())) }
+        (LinOp.Dense, LinOp.Diag) => { return lin_dense(dense_add(a.get_dense(), diag_to_dense(b.get_diag()))) }
+        (LinOp.Diag, LinOp.Dense) => { return lin_dense(dense_add(diag_to_dense(a.get_diag()), b.get_dense())) }
+        (LinOp.Dense, LinOp.Sparse) => { return lin_dense(dense_add(a.get_dense(), b.get_sparse().to_dense())) }
+        (LinOp.Sparse, LinOp.Dense) => { return lin_dense(dense_add(a.get_sparse().to_dense(), b.get_dense())) }
+        (LinOp.Diag, LinOp.Diag) => { return lin_diag(diag_add_diag(a.get_diag(), b.get_diag())) }
+        (LinOp.Diag, LinOp.Sparse) => { return lin_sparse(csr_add(csr_from_diag(a.get_diag()), b.get_sparse())) }
+        (LinOp.Sparse, LinOp.Diag) => { return lin_sparse(csr_add(a.get_sparse(), csr_from_diag(b.get_diag()))) }
+        (LinOp.Sparse, LinOp.Sparse) => { return lin_sparse(csr_add(a.get_sparse(), b.get_sparse())) }
+    }
+}
+
+/// Matrix product, dispatching on both kinds. Dense with anything gives dense; diagonal with diagonal gives
+/// diagonal; sparse with sparse or diagonal gives sparse. A shape mismatch yields an empty dense matrix.
++mul(a: LinOp, b: LinOp) : LinOp {
+    ensure a.ncols() == b.nrows() else { return lin_dense(dense_zeros(0, 0)) }
+    when (a, b) {
+        (LinOp.Dense, LinOp.Dense) => { return lin_dense(dense_mul(a.get_dense(), b.get_dense())) }
+        (LinOp.Dense, LinOp.Diag) => { return lin_dense(dense_mul_diag(a.get_dense(), b.get_diag())) }
+        (LinOp.Diag, LinOp.Dense) => { return lin_dense(diag_mul_dense(a.get_diag(), b.get_dense())) }
+        (LinOp.Dense, LinOp.Sparse) => { return lin_dense(dense_mul_csr(a.get_dense(), b.get_sparse())) }
+        (LinOp.Sparse, LinOp.Dense) => { return lin_dense(csr_mul_dense(a.get_sparse(), b.get_dense())) }
+        (LinOp.Diag, LinOp.Diag) => { return lin_diag(diag_mul_diag(a.get_diag(), b.get_diag())) }
+        (LinOp.Diag, LinOp.Sparse) => { return lin_sparse(csr_mul(csr_from_diag(a.get_diag()), b.get_sparse())) }
+        (LinOp.Sparse, LinOp.Diag) => { return lin_sparse(csr_mul(a.get_sparse(), csr_from_diag(b.get_diag()))) }
+        (LinOp.Sparse, LinOp.Sparse) => { return lin_sparse(csr_mul(a.get_sparse(), b.get_sparse())) }
+    }
+}
+
+// --- factorizations (Factorization trait) -------------------------------------------------------
+
+/// LU factorization `P A = L U` with partial pivoting; `lu` holds `L` (unit lower, below the diagonal) and `U`
+/// (upper) packed in one row-major buffer.
++LuFactor: Factorization = {
+    n: i64 = 0
+    lu: _ = []
+    piv: _ = []
+    sign: f64 = 1.0
+    singular: bool = false
+
+    kind(_self) : str => "lu"
+
+    /// Determinant (zero when singular).
+    det(self) : f64 {
+        if self.singular { return 0.0 }
+        d = self.sign
+        i = 0
+        while i < self.n {
+            d *= self.lu[i * self.n + i]
+            i += 1
+        }
+        d
+    }
+
+    /// Solve `A x = b`; an empty array when singular or `b` has the wrong length.
+    solve(self, b: _) {
+        n = self.n
+        ensure !self.singular && host.sys_arr_len(b) == n else { return [] }
+        x = []
+        i = 0
+        while i < n {
+            x = host.sys_arr_push(x, b[self.piv[i]])
+            i += 1
+        }
+        i = 1
+        while i < n {
+            s = x[i]
+            j = 0
+            while j < i {
+                s -= self.lu[i * n + j] * x[j]
+                j += 1
+            }
+            x = host.sys_arr_set(x, i, s)
+            i += 1
+        }
+        i = n - 1
+        while i >= 0 {
+            s = x[i]
+            j = i + 1
+            while j < n {
+                s -= self.lu[i * n + j] * x[j]
+                j += 1
+            }
+            x = host.sys_arr_set(x, i, s / self.lu[i * n + i])
+            i -= 1
+        }
+        x
+    }
+
+    /// Inverse matrix (0 x 0 when singular).
+    inverse(self) : DenseMatrix {
+        n = self.n
+        ensure !self.singular else { return dense_zeros(0, 0) }
+        d = host.sys_arr_new(n * n, 0.0)
+        c = 0
+        while c < n {
+            e = host.sys_arr_new(n, 0.0)
+            e = host.sys_arr_set(e, c, 1.0)
+            col = self.solve(e)
+            r = 0
+            while r < n {
+                d = host.sys_arr_set(d, r * n + c, col[r])
+                r += 1
+            }
+            c += 1
+        }
+        DenseMatrix.{rows: n, cols: n, data: d}
+    }
+
+    /// Unit lower-triangular factor `L`.
+    lower(self) : DenseMatrix {
+        n = self.n
+        d = host.sys_arr_new(n * n, 0.0)
+        r = 0
+        while r < n {
+            c = 0
+            while c < r {
+                d = host.sys_arr_set(d, r * n + c, self.lu[r * n + c])
+                c += 1
+            }
+            d = host.sys_arr_set(d, r * n + r, 1.0)
+            r += 1
+        }
+        DenseMatrix.{rows: n, cols: n, data: d}
+    }
+
+    /// Upper-triangular factor `U`.
+    upper(self) : DenseMatrix {
+        n = self.n
+        d = host.sys_arr_new(n * n, 0.0)
+        r = 0
+        while r < n {
+            c = r
+            while c < n {
+                d = host.sys_arr_set(d, r * n + c, self.lu[r * n + c])
+                c += 1
+            }
+            r += 1
+        }
+        DenseMatrix.{rows: n, cols: n, data: d}
+    }
+}
+
+/// LU factorization of a square matrix with partial pivoting. Pivots at most `1e-13` times the largest entry
+/// mark the matrix singular (`det` is then `0` and `solve` returns `[]`).
++lu(a: DenseMatrix) : LuFactor {
+    ensure a.rows == a.cols && a.rows > 0 else {
+        return LuFactor.{n: 0, lu: [], piv: [], sign: 1.0, singular: true}
+    }
+    n = a.rows
+    m = a.data
+    big = 0.0
+    for m { if la_abs(it) > big { big = la_abs(it) } }
+    piv = []
+    i = 0
+    while i < n {
+        piv = host.sys_arr_push(piv, i)
+        i += 1
+    }
+    sign = 1.0
+    singular = false
+    k = 0
+    while k < n {
+        p = k
+        best = la_abs(m[k * n + k])
+        i = k + 1
+        while i < n {
+            v = la_abs(m[i * n + k])
+            if v > best {
+                best = v
+                p = i
+            }
+            i += 1
+        }
+        if best <= LA_SINGULAR_TOL * big {
+            singular = true
+            break
+        }
+        if p != k {
+            j = 0
+            while j < n {
+                t = m[k * n + j]
+                m = host.sys_arr_set(m, k * n + j, m[p * n + j])
+                m = host.sys_arr_set(m, p * n + j, t)
+                j += 1
+            }
+            t2 = piv[k]
+            piv = host.sys_arr_set(piv, k, piv[p])
+            piv = host.sys_arr_set(piv, p, t2)
+            sign = 0.0 - sign
+        }
+        i = k + 1
+        while i < n {
+            f = m[i * n + k] / m[k * n + k]
+            m = host.sys_arr_set(m, i * n + k, f)
+            j = k + 1
+            while j < n {
+                m = host.sys_arr_set(m, i * n + j, m[i * n + j] - f * m[k * n + j])
+                j += 1
+            }
+            i += 1
+        }
+        k += 1
+    }
+    LuFactor.{n, lu: m, piv, sign, singular}
+}
+
+/// Cholesky factorization `A = L L^T` of a symmetric positive definite matrix (`l` is lower triangular).
++CholFactor: Factorization = {
+    n: i64 = 0
+    l: _ = []
+    ok: bool = false
+
+    kind(_self) : str => "cholesky"
+
+    /// Determinant `(prod l_ii)^2` (zero when the matrix was not positive definite).
+    det(self) : f64 {
+        if !self.ok { return 0.0 }
+        p = 1.0
+        i = 0
+        while i < self.n {
+            p *= self.l[i * self.n + i]
+            i += 1
+        }
+        p * p
+    }
+
+    /// Solve `A x = b` by forward then backward substitution; `[]` when not positive definite.
+    solve(self, b: _) {
+        n = self.n
+        ensure self.ok && host.sys_arr_len(b) == n else { return [] }
+        y = []
+        i = 0
+        while i < n {
+            s = b[i]
+            j = 0
+            while j < i {
+                s -= self.l[i * n + j] * y[j]
+                j += 1
+            }
+            y = host.sys_arr_push(y, s / self.l[i * n + i])
+            i += 1
+        }
+        x = y
+        i = n - 1
+        while i >= 0 {
+            s = x[i]
+            j = i + 1
+            while j < n {
+                s -= self.l[j * n + i] * x[j]
+                j += 1
+            }
+            x = host.sys_arr_set(x, i, s / self.l[i * n + i])
+            i -= 1
+        }
+        x
+    }
+
+    /// The lower-triangular factor `L`.
+    lower(self) : DenseMatrix => DenseMatrix.{rows: self.n, cols: self.n, data: self.l}
+}
+
+/// Cholesky factorization using the lower triangle of `a`; `ok` is false unless every pivot is positive.
++cholesky(a: DenseMatrix) : CholFactor {
+    ensure a.rows == a.cols && a.rows > 0 else { return CholFactor.{n: 0, l: [], ok: false} }
+    n = a.rows
+    l = host.sys_arr_new(n * n, 0.0)
+    j = 0
+    while j < n {
+        s = a.data[j * n + j]
+        k = 0
+        while k < j {
+            s -= l[j * n + k] * l[j * n + k]
+            k += 1
+        }
+        if !(s > 0.0) { return CholFactor.{n, l, ok: false} }
+        d = host.sys_sqrt(s)
+        l = host.sys_arr_set(l, j * n + j, d)
+        i = j + 1
+        while i < n {
+            t = a.data[i * n + j]
+            k = 0
+            while k < j {
+                t -= l[i * n + k] * l[j * n + k]
+                k += 1
+            }
+            l = host.sys_arr_set(l, i * n + j, t / d)
+            i += 1
+        }
+        j += 1
+    }
+    CholFactor.{n, l, ok: true}
+}
+
+/// Householder QR factorization `A = Q R` (`m x n`, `m >= n`). `vs` holds the reflector vectors column by column
+/// (rows `k..m` of column `k`), `betas` their scalings, `rm` the transformed matrix whose upper triangle is `R`.
++QrFactor: Factorization = {
+    rows: i64 = 0
+    cols: i64 = 0
+    vs: _ = []
+    betas: _ = []
+    rm: _ = []
+    full_rank: bool = false
+
+    kind(_self) : str => "qr"
+
+    /// Determinant of a square matrix (`(-1)^n prod r_kk`); zero for rectangular input.
+    det(self) : f64 {
+        ensure self.rows == self.cols && self.rows > 0 else { return 0.0 }
+        d = 1.0
+        i = 0
+        while i < self.cols {
+            d *= self.rm[i * self.cols + i]
+            i += 1
+        }
+        if self.cols % 2 == 1 { d = 0.0 - d }
+        d
+    }
+
+    /// `Q^T b` (length `rows`).
+    apply_qt(self, b: _) {
+        y = b
+        k = 0
+        while k < self.cols {
+            beta = self.betas[k]
+            if !la_is_zero(beta) {
+                s = 0.0
+                i = k
+                while i < self.rows {
+                    s += self.vs[i * self.cols + k] * y[i]
+                    i += 1
+                }
+                s = s * beta
+                i = k
+                while i < self.rows {
+                    y = host.sys_arr_set(y, i, y[i] - s * self.vs[i * self.cols + k])
+                    i += 1
+                }
+            }
+            k += 1
+        }
+        y
+    }
+
+    /// `Q x` (length `rows`) for `x` of length `rows`.
+    apply_q(self, x: _) {
+        y = x
+        k = self.cols - 1
+        while k >= 0 {
+            beta = self.betas[k]
+            if !la_is_zero(beta) {
+                s = 0.0
+                i = k
+                while i < self.rows {
+                    s += self.vs[i * self.cols + k] * y[i]
+                    i += 1
+                }
+                s = s * beta
+                i = k
+                while i < self.rows {
+                    y = host.sys_arr_set(y, i, y[i] - s * self.vs[i * self.cols + k])
+                    i += 1
+                }
+            }
+            k -= 1
+        }
+        y
+    }
+
+    /// Least-squares solution of `A x = b` (the exact solution for square systems); `[]` for rank-deficient `A`
+    /// or a `b` of the wrong length.
+    solve(self, b: _) {
+        ensure self.full_rank && host.sys_arr_len(b) == self.rows else { return [] }
+        n = self.cols
+        y = self.apply_qt(b)
+        x = host.sys_arr_new(n, 0.0)
+        i = n - 1
+        while i >= 0 {
+            s = y[i]
+            j = i + 1
+            while j < n {
+                s -= self.rm[i * n + j] * x[j]
+                j += 1
+            }
+            x = host.sys_arr_set(x, i, s / self.rm[i * n + i])
+            i -= 1
+        }
+        x
+    }
+
+    /// The `n x n` upper-triangular factor `R`.
+    r(self) : DenseMatrix {
+        n = self.cols
+        d = host.sys_arr_new(n * n, 0.0)
+        i = 0
+        while i < n {
+            j = i
+            while j < n {
+                d = host.sys_arr_set(d, i * n + j, self.rm[i * n + j])
+                j += 1
+            }
+            i += 1
+        }
+        DenseMatrix.{rows: n, cols: n, data: d}
+    }
+
+    /// The thin `m x n` factor `Q` with orthonormal columns.
+    q(self) : DenseMatrix {
+        m = self.rows
+        n = self.cols
+        d = host.sys_arr_new(m * n, 0.0)
+        j = 0
+        while j < n {
+            e = host.sys_arr_new(m, 0.0)
+            e = host.sys_arr_set(e, j, 1.0)
+            col = self.apply_q(e)
+            i = 0
+            while i < m {
+                d = host.sys_arr_set(d, i * n + j, col[i])
+                i += 1
+            }
+            j += 1
+        }
+        DenseMatrix.{rows: m, cols: n, data: d}
+    }
+}
+
+/// Householder QR of an `m x n` matrix with `m >= n`.
++qr(a: DenseMatrix) : QrFactor {
+    ensure a.rows >= a.cols && a.cols > 0 else {
+        return QrFactor.{rows: 0, cols: 0, vs: [], betas: [], rm: [], full_rank: false}
+    }
+    m = a.rows
+    n = a.cols
+    w = a.data
+    big = 0.0
+    for w { if la_abs(it) > big { big = la_abs(it) } }
+    vs = host.sys_arr_new(m * n, 0.0)
+    betas = host.sys_arr_new(n, 0.0)
+    full = true
+    k = 0
+    while k < n {
+        norm2 = 0.0
+        i = k
+        while i < m {
+            norm2 += w[i * n + k] * w[i * n + k]
+            i += 1
+        }
+        normx = host.sys_sqrt(norm2)
+        if normx <= LA_SINGULAR_TOL * big {
+            full = false
+            k += 1
+            continue
+        }
+        x0 = w[k * n + k]
+        alpha = 0.0 - normx
+        if x0 < 0.0 { alpha = normx }
+        v0 = x0 - alpha
+        vtv = v0 * v0
+        i = k + 1
+        while i < m {
+            vtv += w[i * n + k] * w[i * n + k]
+            i += 1
+        }
+        beta = 2.0 / vtv
+        vs = host.sys_arr_set(vs, k * n + k, v0)
+        i = k + 1
+        while i < m {
+            vs = host.sys_arr_set(vs, i * n + k, w[i * n + k])
+            i += 1
+        }
+        betas = host.sys_arr_set(betas, k, beta)
+        j = k + 1
+        while j < n {
+            s = 0.0
+            i = k
+            while i < m {
+                s += vs[i * n + k] * w[i * n + j]
+                i += 1
+            }
+            s = s * beta
+            i = k
+            while i < m {
+                w = host.sys_arr_set(w, i * n + j, w[i * n + j] - s * vs[i * n + k])
+                i += 1
+            }
+            j += 1
+        }
+        w = host.sys_arr_set(w, k * n + k, alpha)
+        i = k + 1
+        while i < m {
+            w = host.sys_arr_set(w, i * n + k, 0.0)
+            i += 1
+        }
+        k += 1
+    }
+    QrFactor.{rows: m, cols: n, vs, betas, rm: w, full_rank: full}
+}
+
+// --- conjugate gradients ---------------------------------------------------------------------
+
+/// Result of the Krylov solvers `cg`, `gmres` and `bicgstab`.
++CgResult = {
+    x: _ = []
+    /// Final relative residual `||b - A x|| / ||b||`.
+    residual: f64 = 0.0
+    iters: i64 = 0
+    converged: bool = false
+}
+
+/// Dot product of two arrays.
++la_dot(a: _, b: _) : f64 {
+    s = 0.0
+    i = 0
+    n = host.sys_arr_len(a)
+    while i < n {
+        s += a[i] * b[i]
+        i += 1
+    }
+    s
+}
+
+/// Conjugate gradient for a symmetric positive definite `A` of any kind, starting from `x0`.
+/// Stops when `||r|| <= tol ||b||` or after `max_iter` iterations. Each iteration costs one `matvec`
+/// (`O(nnz)` for sparse operators).
++cg(a: LinOp, b: _, x0: _, tol: f64, max_iter: i64) : CgResult {
+    n = host.sys_arr_len(b)
+    ensure a.nrows() == n && a.ncols() == n && host.sys_arr_len(x0) == n else {
+        return CgResult.{x: [], residual: 0.0, iters: 0, converged: false}
+    }
+    bnorm = host.sys_sqrt(la_dot(b, b))
+    if la_is_zero(bnorm) {
+        return CgResult.{x: host.sys_arr_new(n, 0.0), residual: 0.0, iters: 0, converged: true}
+    }
+    x = x0
+    ax = a.matvec(x)
+    r = []
+    i = 0
+    while i < n {
+        r = host.sys_arr_push(r, b[i] - ax[i])
+        i += 1
+    }
+    p = r
+    rs = la_dot(r, r)
+    iters = 0
+    while iters < max_iter && host.sys_sqrt(rs) > tol * bnorm {
+        ap = a.matvec(p)
+        pap = la_dot(p, ap)
+        if !(pap > 0.0) { break }
+        alpha = rs / pap
+        i = 0
+        while i < n {
+            x = host.sys_arr_set(x, i, x[i] + alpha * p[i])
+            r = host.sys_arr_set(r, i, r[i] - alpha * ap[i])
+            i += 1
+        }
+        rs_new = la_dot(r, r)
+        beta = rs_new / rs
+        i = 0
+        while i < n {
+            p = host.sys_arr_set(p, i, r[i] + beta * p[i])
+            i += 1
+        }
+        rs = rs_new
+        iters += 1
+    }
+    res = host.sys_sqrt(rs) / bnorm
+    CgResult.{x, residual: res, iters, converged: res <= tol}
+}
+
+// --- nonsymmetric Krylov solvers (GMRES, BiCGSTAB) --------------------------------------------
+
+/// Residual `b - A x` of a linear operator.
+kry_resid(a: LinOp, b: _, x: _) {
+    ax = a.matvec(x)
+    r = []
+    for 0..host.sys_arr_len(b) { r = host.sys_arr_push(r, b[it] - ax[it]) }
+    r
+}
+
+/// `y + k * d`.
+kry_axpy(y: _, k: f64, d: _) {
+    out = y
+    for 0..host.sys_arr_len(y) { out = host.sys_arr_set(out, it, y[it] + k * d[it]) }
+    out
+}
+
+/// Restarted GMRES(`restart`) for any square non-singular `A`, starting from `x0`: Arnoldi with
+/// modified Gram-Schmidt and Givens-rotated least squares. Stops when `||b - A x|| <= tol ||b||` or
+/// after `max_iter` inner iterations in total (one `matvec` each). `iters` counts inner iterations;
+/// `residual` is the true final relative residual. Mismatched sizes or `restart < 1` report
+/// `converged: false` with an empty `x`.
++gmres(a: LinOp, b: _, x0: _, tol: f64, restart: i64, max_iter: i64) : CgResult {
+    n = host.sys_arr_len(b)
+    ensure a.nrows() == n && a.ncols() == n && host.sys_arr_len(x0) == n && restart > 0 else {
+        return CgResult.{x: [], residual: 0.0, iters: 0, converged: false}
+    }
+    bnorm = host.sys_sqrt(la_dot(b, b))
+    if la_is_zero(bnorm) {
+        return CgResult.{x: host.sys_arr_new(n, 0.0), residual: 0.0, iters: 0, converged: true}
+    }
+    m = restart
+    if m > n { m = n }
+    x = x0
+    iters = 0
+    r = kry_resid(a, b, x)
+    beta = host.sys_sqrt(la_dot(r, r))
+    while beta > tol * bnorm && iters < max_iter {
+        vv = host.sys_arr_new((m + 1) * n, 0.0)
+        for 0..n { vv = host.sys_arr_set(vv, it, r[it] / beta) }
+        hh = host.sys_arr_new((m + 1) * m, 0.0)
+        cs = host.sys_arr_new(m, 0.0)
+        sn = host.sys_arr_new(m, 0.0)
+        g = host.sys_arr_new(m + 1, 0.0)
+        g = host.sys_arr_set(g, 0, beta)
+        k = 0
+        while k < m && iters < max_iter {
+            vk = []
+            for 0..n { vk = host.sys_arr_push(vk, vv[k * n + it]) }
+            w = a.matvec(vk)
+            for 0..(k + 1) {
+                i = it
+                h = 0.0
+                for 0..n { h += w[it] * vv[i * n + it] }
+                hh = host.sys_arr_set(hh, i * m + k, h)
+                for 0..n { w = host.sys_arr_set(w, it, w[it] - h * vv[i * n + it]) }
+            }
+            wn = host.sys_sqrt(la_dot(w, w))
+            for 0..k {
+                i = it
+                t = cs[i] * hh[i * m + k] + sn[i] * hh[(i + 1) * m + k]
+                hh = host.sys_arr_set(hh, (i + 1) * m + k, cs[i] * hh[(i + 1) * m + k] - sn[i] * hh[i * m + k])
+                hh = host.sys_arr_set(hh, i * m + k, t)
+            }
+            hkk = hh[k * m + k]
+            den = host.sys_sqrt(hkk * hkk + wn * wn)
+            if la_is_zero(den) { break }
+            cs = host.sys_arr_set(cs, k, hkk / den)
+            sn = host.sys_arr_set(sn, k, wn / den)
+            hh = host.sys_arr_set(hh, k * m + k, den)
+            g = host.sys_arr_set(g, k + 1, 0.0 - sn[k] * g[k])
+            g = host.sys_arr_set(g, k, cs[k] * g[k])
+            k += 1
+            iters += 1
+            if la_abs(g[k]) <= tol * bnorm || wn <= 0.00000000000001 * beta { break }
+            for 0..n { vv = host.sys_arr_set(vv, k * n + it, w[it] / wn) }
+        }
+        if k == 0 { break }
+        y = host.sys_arr_new(k, 0.0)
+        i = k - 1
+        while i >= 0 {
+            s = g[i]
+            j = i + 1
+            while j < k {
+                s -= hh[i * m + j] * y[j]
+                j += 1
+            }
+            y = host.sys_arr_set(y, i, s / hh[i * m + i])
+            i -= 1
+        }
+        for 0..k {
+            j = it
+            for 0..n { x = host.sys_arr_set(x, it, x[it] + y[j] * vv[j * n + it]) }
+        }
+        r = kry_resid(a, b, x)
+        beta = host.sys_sqrt(la_dot(r, r))
+    }
+    res = beta / bnorm
+    CgResult.{x, residual: res, iters, converged: res <= tol}
+}
+
+/// BiCGSTAB for a general square `A`, starting from `x0`. Each iteration costs two `matvec`s and
+/// uses constant memory (no restart parameter). Stops when `||b - A x|| <= tol ||b||`, on breakdown
+/// (zero `rho` or `omega`), or after `max_iter` iterations. `iters` counts iterations; `residual`
+/// is the true final relative residual. Mismatched sizes report `converged: false` with an empty `x`.
++bicgstab(a: LinOp, b: _, x0: _, tol: f64, max_iter: i64) : CgResult {
+    n = host.sys_arr_len(b)
+    ensure a.nrows() == n && a.ncols() == n && host.sys_arr_len(x0) == n else {
+        return CgResult.{x: [], residual: 0.0, iters: 0, converged: false}
+    }
+    bnorm = host.sys_sqrt(la_dot(b, b))
+    if la_is_zero(bnorm) {
+        return CgResult.{x: host.sys_arr_new(n, 0.0), residual: 0.0, iters: 0, converged: true}
+    }
+    x = x0
+    r = kry_resid(a, b, x)
+    r0 = r
+    p = host.sys_arr_new(n, 0.0)
+    v = host.sys_arr_new(n, 0.0)
+    rho = 1.0
+    alpha = 1.0
+    omega = 1.0
+    iters = 0
+    while host.sys_sqrt(la_dot(r, r)) > tol * bnorm && iters < max_iter {
+        rho_new = la_dot(r0, r)
+        if la_is_zero(rho_new) { break }
+        beta = (rho_new / rho) * (alpha / omega)
+        p = kry_axpy(r, beta, kry_axpy(p, 0.0 - omega, v))
+        v = a.matvec(p)
+        rv = la_dot(r0, v)
+        if la_is_zero(rv) { break }
+        alpha = rho_new / rv
+        sv = kry_axpy(r, 0.0 - alpha, v)
+        iters += 1
+        if host.sys_sqrt(la_dot(sv, sv)) <= tol * bnorm {
+            x = kry_axpy(x, alpha, p)
+            r = sv
+            break
+        }
+        t = a.matvec(sv)
+        tt = la_dot(t, t)
+        if la_is_zero(tt) { break }
+        omega = la_dot(t, sv) / tt
+        x = kry_axpy(kry_axpy(x, alpha, p), omega, sv)
+        r = kry_axpy(sv, 0.0 - omega, t)
+        rho = rho_new
+        if la_is_zero(omega) { break }
+    }
+    final = kry_resid(a, b, x)
+    res = host.sys_sqrt(la_dot(final, final)) / bnorm
+    CgResult.{x, residual: res, iters, converged: res <= tol}
+}
+
+// --- tests ---------------------------------------------------------------------------
+
+/// Test that scalar helpers.
+test "scalar helpers" {
+    assert_eq(la_abs(0.0 - 2.5), 2.5)
+    assert_eq(la_abs(2.5), 2.5)
+    assert_eq(la_min(1.0, 2.0), 1.0)
+    assert_eq(la_max(1.0, 2.0), 2.0)
+    assert_eq(la_clamp(5.0, 0.0, 3.0), 3.0)
+    assert_eq(la_clamp(0.0 - 5.0, 0.0, 3.0), 0.0)
+    assert_eq(la_clamp(1.5, 0.0, 3.0), 1.5)
+    assert_eq(la_lerp(10.0, 20.0, 0.25), 12.5)
+    assert_eq(la_sign(0.0 - 3.0), 0.0 - 1.0)
+    assert_eq(la_sign(3.0), 1.0)
+    assert_eq(la_sign(0.0), 0.0)
+    #assert(la_close(0.1 + 0.2, 0.3))
+    #assert(!(la_close(1.0, 1.1)))
+    assert_eq(la_sqrt(81.0), 9.0)
+}
+
+/// Test that angles and trig.
+test "angles and trig" {
+    #assert(la_close(deg_to_rad(180.0), LA_PI))
+    #assert(la_close(rad_to_deg(LA_PI / 2.0), 90.0))
+    #assert(la_close(la_sin(0.0), 0.0))
+    #assert(la_close(la_cos(0.0), 1.0))
+    #assert(la_close(la_sin(LA_PI / 2.0), 1.0))
+    #assert(la_close(la_atan2(1.0, 1.0), LA_PI / 4.0))
+}
+
+/// Test that smoothstep.
+test "smoothstep" {
+    assert_eq(la_smoothstep(0.0, 1.0, 0.0 - 1.0), 0.0)
+    assert_eq(la_smoothstep(0.0, 1.0, 2.0), 1.0)
+    assert_eq(la_smoothstep(0.0, 1.0, 0.5), 0.5)
+}
+
+/// Test that Vec2 arithmetic.
+test "Vec2 arithmetic" {
+    a = v2(3.0, 4.0)
+    b = v2(1.0, 2.0)
+    assert_eq(v2_add(a, b).x, 4.0)
+    assert_eq(v2_add(a, b).y, 6.0)
+    assert_eq(v2_sub(a, b).x, 2.0)
+    assert_eq(v2_scale(a, 2.0).y, 8.0)
+    assert_eq(v2_neg(a).x, 0.0 - 3.0)
+    assert_eq(v2_dot(a, b), 11.0)
+    assert_eq(v2_cross(a, b), 2.0)
+    assert_eq(v2_len2(a), 25.0)
+    assert_eq(v2_len(a), 5.0)
+    assert_eq(v2_dist(a, v2_zero()), 5.0)
+    #assert(v2_eq(v2_perp(a), v2(0.0 - 4.0, 3.0)))
+    #assert(v2_eq(v2_lerp(a, b, 0.5), v2(2.0, 3.0)))
+}
+
+/// Test that Vec2 UFCS chains.
+test "Vec2 UFCS chains" {
+    a = v2(3.0, 4.0)
+    #assert(a.v2_add(v2(1.0, 1.0)).v2_scale(0.5).v2_len() > 0.0)
+    assert_eq(a.v2_norm().v2_len(), 1.0)
+}
+
+/// Test that Vec2 normalize keeps zero and unit length.
+test "Vec2 normalize keeps zero and unit length" {
+    z = v2_norm(v2_zero())
+    assert_eq(z.x, 0.0)
+    assert_eq(z.y, 0.0)
+    n = v2_norm(v2(0.0, 10.0))
+    assert_eq(n.x, 0.0)
+    assert_eq(n.y, 1.0)
+}
+
+/// Test that Vec2 rotate reflect project.
+test "Vec2 rotate reflect project" {
+    r = v2_rotate(v2(1.0, 0.0), LA_PI / 2.0)
+    #assert(v2_eq(r, v2(0.0, 1.0)))
+    #assert(la_close(v2_angle(v2(0.0, 2.0)), LA_PI / 2.0))
+    bounce = v2_reflect(v2(1.0, 0.0 - 1.0), v2(0.0, 1.0))
+    #assert(v2_eq(bounce, v2(1.0, 1.0)))
+    p = v2_project(v2(3.0, 4.0), v2(2.0, 0.0))
+    #assert(v2_eq(p, v2(3.0, 0.0)))
+    #assert(v2_eq(v2_project(v2(3.0, 4.0), v2_zero()), v2_zero()))
+}
+
+/// Test that Vec3 arithmetic.
+test "Vec3 arithmetic" {
+    a = v3(1.0, 2.0, 3.0)
+    b = v3(4.0, 5.0, 6.0)
+    assert_eq(v3_add(a, b).z, 9.0)
+    assert_eq(v3_sub(b, a).x, 3.0)
+    assert_eq(v3_scale(a, 2.0).y, 4.0)
+    assert_eq(v3_neg(a).z, 0.0 - 3.0)
+    assert_eq(v3_dot(a, b), 32.0)
+    assert_eq(v3_len2(a), 14.0)
+    #assert(la_close(v3_len(v3(2.0, 3.0, 6.0)), 7.0))
+    #assert(la_close(v3_dist(a, a), 0.0))
+    #assert(v3_eq(v3_lerp(a, b, 0.5), v3(2.5, 3.5, 4.5)))
+}
+
+/// Test that Vec3 cross product is orthogonal and anticommutative.
+test "Vec3 cross product is orthogonal and anticommutative" {
+    x = v3(1.0, 0.0, 0.0)
+    y = v3(0.0, 1.0, 0.0)
+    z = v3_cross(x, y)
+    #assert(v3_eq(z, v3(0.0, 0.0, 1.0)))
+    #assert(v3_eq(v3_cross(y, x), v3(0.0, 0.0, 0.0 - 1.0)))
+    a = v3(1.0, 2.0, 3.0)
+    b = v3(4.0, 5.0, 6.0)
+    c = v3_cross(a, b)
+    #assert(la_close(v3_dot(c, a), 0.0))
+    #assert(la_close(v3_dot(c, b), 0.0))
+    #assert(la_close(v3_len(v3_norm(a)), 1.0))
+    #assert(v3_eq(v3_norm(v3_zero()), v3_zero()))
+}
+
+/// Test that Mat4 identity translate scale.
+test "Mat4 identity translate scale" {
+    id = m4_identity()
+    p = v3(1.0, 2.0, 3.0)
+    #assert(v3_eq(m4_apply(id, p), p))
+    t = m4_translate(10.0, 20.0, 30.0)
+    #assert(v3_eq(m4_apply(t, p), v3(11.0, 22.0, 33.0)))
+    s = m4_scale(2.0, 3.0, 4.0)
+    #assert(v3_eq(m4_apply(s, p), v3(2.0, 6.0, 12.0)))
+    assert_eq(m4_get(t, 0, 3), 10.0)
+    assert_eq(m4_get(t, 3, 3), 1.0)
+}
+
+/// Test that Mat4 multiplication order.
+test "Mat4 multiplication order" {
+    p = v3(1.0, 1.0, 1.0)
+    t = m4_translate(1.0, 0.0, 0.0)
+    s = m4_scale(2.0, 2.0, 2.0)
+    scale_then_move = m4_mul(t, s)
+    move_then_scale = m4_mul(s, t)
+    #assert(v3_eq(m4_apply(scale_then_move, p), v3(3.0, 2.0, 2.0)))
+    #assert(v3_eq(m4_apply(move_then_scale, p), v3(4.0, 2.0, 2.0)))
+    #assert(m4_close(m4_mul(m4_identity(), t), t))
+    #assert(m4_close(m4_mul(t, m4_identity()), t))
+}
+
+/// Test that Mat4 rotations.
+test "Mat4 rotations" {
+    q = v3(0.0, 0.0, 0.0)
+    rz = m4_rot_z(LA_PI / 2.0)
+    #assert(v3_eq(m4_apply(rz, v3(1.0, 0.0, 0.0)), v3(0.0, 1.0, 0.0)))
+    rx = m4_rot_x(LA_PI / 2.0)
+    #assert(v3_eq(m4_apply(rx, v3(0.0, 1.0, 0.0)), v3(0.0, 0.0, 1.0)))
+    ry = m4_rot_y(LA_PI / 2.0)
+    #assert(v3_eq(m4_apply(ry, v3(0.0, 0.0, 1.0)), v3(1.0, 0.0, 0.0)))
+    full = m4_mul(rz, m4_rot_z(0.0 - LA_PI / 2.0))
+    #assert(m4_close(full, m4_identity()))
+    #assert(v3_eq(m4_apply(rz, q), q))
+}
+
+/// Test that Mat4 transpose and directions.
+test "Mat4 transpose and directions" {
+    t = m4_translate(5.0, 6.0, 7.0)
+    tt = m4_transpose(t)
+    assert_eq(m4_get(tt, 3, 0), 5.0)
+    assert_eq(m4_get(tt, 3, 2), 7.0)
+    #assert(m4_close(m4_transpose(tt), t))
+    d = m4_apply_dir(t, v3(1.0, 0.0, 0.0))
+    #assert(v3_eq(d, v3(1.0, 0.0, 0.0)))
+    sd = m4_apply_dir(m4_scale(2.0, 2.0, 2.0), v3(1.0, 1.0, 1.0))
+    #assert(v3_eq(sd, v3(2.0, 2.0, 2.0)))
+}
+
+/// Test that Mat4 perspective divide when w != 1.
+test "Mat4 perspective divide when w != 1" {
+    m = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0]
+    #assert(v3_eq(m4_apply(m, v3(2.0, 4.0, 6.0)), v3(1.0, 2.0, 3.0)))
+}
+
+/// Test that Mat construct get set identity.
+test "Mat construct get set identity" {
+    m = Mat.new(2, 3)
+    assert_eq(m.rows, 2)
+    assert_eq(m.cols, 3)
+    assert_eq(m.get(1, 2), 0.0)
+    @m.set(1, 2, 7.5)
+    assert_eq(m.get(1, 2), 7.5)
+    assert_eq(m.get(0, 0), 0.0)
+    id = mat_identity(3)
+    assert_eq(id.trace(), 3.0)
+    assert_eq(id.get(1, 1), 1.0)
+    assert_eq(id.get(1, 2), 0.0)
+}
+
+/// Test that Mat multiply transpose add scale.
+test "Mat multiply transpose add scale" {
+    a = mat_from(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    b = mat_from(3, 2, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    c = a.mul(b)
+    assert_eq(c.rows, 2)
+    assert_eq(c.cols, 2)
+    assert_eq(c.get(0, 0), 58.0)
+    assert_eq(c.get(0, 1), 64.0)
+    assert_eq(c.get(1, 0), 139.0)
+    assert_eq(c.get(1, 1), 154.0)
+    at = a.transpose()
+    assert_eq(at.rows, 3)
+    assert_eq(at.get(2, 1), 6.0)
+    #assert(at.transpose().eq(a))
+    #assert(a.mul(mat_identity(3)).eq(a))
+    assert_eq(a.add(a).get(1, 2), 12.0)
+    assert_eq(a.scale(0.5).get(0, 1), 1.0)
+    assert_eq(a.mul(a).rows, 0)
+    assert_eq(a.add(b).cols, 0)
+}
+
+/// Test that Mat determinant.
+test "Mat determinant" {
+    #assert(la_close(mat_identity(4).det(), 1.0))
+    m2 = mat_from(2, 2, [3.0, 8.0, 4.0, 6.0])
+    #assert(la_close(m2.det(), 0.0 - 14.0))
+    m3 = mat_from(3, 3, [6.0, 1.0, 1.0, 4.0, 0.0 - 2.0, 5.0, 2.0, 8.0, 7.0])
+    #assert(la_close(m3.det(), 0.0 - 306.0))
+    singular = mat_from(2, 2, [1.0, 2.0, 2.0, 4.0])
+    assert_eq(singular.det(), 0.0)
+    swap = mat_from(2, 2, [0.0, 1.0, 1.0, 0.0])
+    #assert(la_close(swap.det(), 0.0 - 1.0))
+    assert_eq(Mat.new(2, 3).det(), 0.0)
+}
+
+/// Test that Mat solve linear systems.
+test "Mat solve linear systems" {
+    a = mat_from(2, 2, [2.0, 1.0, 1.0, 3.0])
+    x = a.solve([5.0, 10.0])
+    #assert(la_close(x[0], 1.0))
+    #assert(la_close(x[1], 3.0))
+    a3 = mat_from(3, 3, [1.0, 1.0, 1.0, 0.0, 2.0, 5.0, 2.0, 5.0, 0.0 - 1.0])
+    y = a3.solve([6.0, 0.0 - 4.0, 27.0])
+    #assert(la_close(y[0], 5.0))
+    #assert(la_close(y[1], 3.0))
+    #assert(la_close(y[2], 0.0 - 2.0))
+    swap = mat_from(2, 2, [0.0, 1.0, 1.0, 0.0])
+    z = swap.solve([7.0, 9.0])
+    #assert(la_close(z[0], 9.0))
+    #assert(la_close(z[1], 7.0))
+    sing = mat_from(2, 2, [1.0, 2.0, 2.0, 4.0])
+    assert_eq(host.sys_arr_len(sing.solve([1.0, 2.0])), 0)
+    assert_eq(host.sys_arr_len(Mat.new(2, 3).solve([1.0, 2.0])), 0)
+}
+
+// --- structured matrix tests ---------------------------------------------------------------
+
+/// Largest absolute difference between two dense matrices of the same shape (huge when shapes differ).
+la_max_diff(a: DenseMatrix, b: DenseMatrix) : f64 {
+    ensure a.rows == b.rows && a.cols == b.cols else { return 1.0e300 }
+    m = 0.0
+    i = 0
+    n = a.rows * a.cols
+    while i < n {
+        d = la_abs(a.data[i] - b.data[i])
+        if d > m { m = d }
+        i += 1
+    }
+    m
+}
+
+/// A 5 x 5 test matrix with a mixed sparsity pattern.
+la_sample_dense() : DenseMatrix => dense(5, 5, [
+    4.0, 0.0, 1.0, 0.0, 0.0,
+    0.0, 3.0, 0.0, 2.0, 0.0,
+    1.0, 0.0, 5.0, 0.0, 1.0,
+    0.0, 2.0, 0.0, 6.0, 0.0,
+    0.0, 0.0, 1.0, 0.0, 7.0])
+
+/// A 1-D Laplacian (tridiagonal 2, -1) of order `n` as a CSR matrix.
+la_laplacian(n: i64) : CSRMatrix {
+    ri = []
+    ci = []
+    vs = []
+    i = 0
+    while i < n {
+        ri = host.sys_arr_push(ri, i)
+        ci = host.sys_arr_push(ci, i)
+        vs = host.sys_arr_push(vs, 2.0)
+        if i > 0 {
+            ri = host.sys_arr_push(ri, i)
+            ci = host.sys_arr_push(ci, i - 1)
+            vs = host.sys_arr_push(vs, 0.0 - 1.0)
+        }
+        if i < n - 1 {
+            ri = host.sys_arr_push(ri, i)
+            ci = host.sys_arr_push(ci, i + 1)
+            vs = host.sys_arr_push(vs, 0.0 - 1.0)
+        }
+        i += 1
+    }
+    csr_from_triplets(n, n, ri, ci, vs)
+}
+
+test "DenseMatrix basics" {
+    a = dense(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    assert_eq(a.nrows(), 2)
+    assert_eq(a.ncols(), 3)
+    assert_eq(a.at(1, 2), 6.0)
+    assert_eq(a.at(0, 1), 2.0)
+    mv = a.matvec([1.0, 0.0, -1.0])
+    assert_eq(mv[0], -2.0)
+    assert_eq(mv[1], -2.0)
+    t = a.transpose()
+    assert_eq(t.nrows(), 3)
+    assert_eq(t.ncols(), 2)
+    assert_eq(t.at(2, 1), 6.0)
+    assert_eq(t.at(1, 0), 2.0)
+    assert_eq(la_max_diff(t.transpose(), a), 0.0)
+    sq = dense(3, 3, [1.0, 2.0, 3.0, 2.0, 5.0, 6.0, 3.0, 6.0, 9.0])
+    assert_eq(sq.trace(), 15.0)
+    #assert(sq.is_symmetric(0.0))
+    #assert(!(dense(2, 2, [1.0, 2.0, 2.5, 1.0]).is_symmetric(0.1)))
+    #assert(dense(2, 2, [1.0, 2.0, 2.05, 1.0]).is_symmetric(0.1))
+    #assert(!(a.is_symmetric(1.0)))
+    #assert(la_close(dense(2, 2, [3.0, 0.0, 0.0, 4.0]).frobenius(), 5.0))
+    sc = a.scaled(2.0)
+    assert_eq(sc.at(1, 1), 10.0)
+    assert_eq(a.at(1, 1), 5.0)
+    assert_eq(dense_zeros(2, 2).trace(), 0.0)
+    id3 = dense_identity(3)
+    assert_eq(id3.trace(), 3.0)
+    assert_eq(id3.at(0, 1), 0.0)
+    assert_eq(la_max_diff(dense_mul(sq, id3), sq), 0.0)
+    assert_eq(la_max_diff(dense_mul(id3, sq), sq), 0.0)
+}
+
+test "dense_mul and dense_add" {
+    a = dense(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    b = dense(3, 2, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    p = dense_mul(a, b)
+    assert_eq(p.nrows(), 2)
+    assert_eq(p.ncols(), 2)
+    assert_eq(p.at(0, 0), 58.0)
+    assert_eq(p.at(0, 1), 64.0)
+    assert_eq(p.at(1, 0), 139.0)
+    assert_eq(p.at(1, 1), 154.0)
+    bad = dense_mul(a, a)
+    assert_eq(bad.nrows(), 0)
+    s = dense_add(a, a)
+    assert_eq(s.at(1, 2), 12.0)
+    assert_eq(dense_add(a, b).nrows(), 0)
+    // matvec agrees with the product by a column
+    col = dense(3, 1, [1.0, 2.0, 3.0])
+    pc = dense_mul(a, col)
+    mv = a.matvec([1.0, 2.0, 3.0])
+    assert_eq(pc.at(0, 0), mv[0])
+    assert_eq(pc.at(1, 0), mv[1])
+    assert_eq(mv[0], 14.0)
+    assert_eq(mv[1], 32.0)
+    // (AB)^T = B^T A^T
+    assert_eq(la_max_diff(p.transpose(), dense_mul(b.transpose(), a.transpose())), 0.0)
+    // inputs are not modified
+    assert_eq(a.at(0, 0), 1.0)
+    assert_eq(b.at(2, 1), 12.0)
+}
+
+test "DiagonalMatrix" {
+    g = diagonal([2.0, 3.0, 4.0])
+    assert_eq(g.nrows(), 3)
+    assert_eq(g.ncols(), 3)
+    assert_eq(g.at(1, 1), 3.0)
+    assert_eq(g.at(0, 2), 0.0)
+    assert_eq(g.det(), 24.0)
+    mv = g.matvec([1.0, 1.0, 0.5])
+    assert_eq(mv[0], 2.0)
+    assert_eq(mv[1], 3.0)
+    assert_eq(mv[2], 2.0)
+    inv = g.inverse()
+    #assert(la_close(inv.diag[0], 0.5))
+    #assert(la_close(inv.diag[2], 0.25))
+    assert_eq(host.sys_arr_len(diagonal([1.0, 0.0]).inverse().diag), 0)
+    d = diag_to_dense(g)
+    assert_eq(d.at(2, 2), 4.0)
+    assert_eq(d.at(2, 1), 0.0)
+    h = diag_mul_diag(g, diagonal([1.0, 2.0, 3.0]))
+    assert_eq(h.diag[2], 12.0)
+    assert_eq(host.sys_arr_len(diag_mul_diag(g, diagonal([1.0])).diag), 0)
+    a = diag_add_diag(g, diagonal([1.0, 1.0, 1.0]))
+    assert_eq(a.diag[0], 3.0)
+    // D A scales rows; A D scales columns
+    m = dense(3, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+    da = diag_mul_dense(g, m)
+    assert_eq(da.at(0, 0), 2.0)
+    assert_eq(da.at(1, 2), 18.0)
+    assert_eq(da.at(2, 1), 32.0)
+    ad = dense_mul_diag(m, g)
+    assert_eq(ad.at(0, 0), 2.0)
+    assert_eq(ad.at(1, 2), 24.0)
+    assert_eq(ad.at(2, 1), 24.0)
+    assert_eq(la_max_diff(da, dense_mul(d, m)), 0.0)
+    assert_eq(la_max_diff(ad, dense_mul(m, d)), 0.0)
+    assert_eq(diag_mul_dense(diagonal([1.0]), m).nrows(), 0)
+    assert_eq(dense_mul_diag(m, diagonal([1.0])).nrows(), 0)
+}
+
+test "CSRMatrix from triplets" {
+    // unsorted input with a duplicate (1,1)
+    ri = [2, 0, 1, 1, 0, 2]
+    ci = [2, 1, 1, 1, 0, 0]
+    vs = [9.0, 2.0, 3.0, 4.0, 1.0, 7.0]
+    s = csr_from_triplets(3, 3, ri, ci, vs)
+    assert_eq(s.nrows(), 3)
+    assert_eq(s.ncols(), 3)
+    assert_eq(s.nnz(), 5)
+    assert_eq(s.at(0, 0), 1.0)
+    assert_eq(s.at(0, 1), 2.0)
+    assert_eq(s.at(0, 2), 0.0)
+    assert_eq(s.at(1, 1), 7.0)
+    assert_eq(s.at(2, 0), 7.0)
+    assert_eq(s.at(2, 2), 9.0)
+    assert_eq(s.at(2, 1), 0.0)
+    assert_eq(s.indptr[0], 0)
+    assert_eq(s.indptr[1], 2)
+    assert_eq(s.indptr[2], 3)
+    assert_eq(s.indptr[3], 5)
+    // columns sorted inside each row
+    assert_eq(s.indices[0], 0)
+    assert_eq(s.indices[1], 1)
+    assert_eq(s.indices[3], 0)
+    assert_eq(s.indices[4], 2)
+    mv = s.matvec([1.0, 2.0, 3.0])
+    assert_eq(mv[0], 5.0)
+    assert_eq(mv[1], 14.0)
+    assert_eq(mv[2], 34.0)
+    d = s.to_dense()
+    assert_eq(d.at(1, 1), 7.0)
+    assert_eq(d.at(0, 2), 0.0)
+    t = s.transpose()
+    assert_eq(t.at(1, 0), 2.0)
+    assert_eq(t.at(0, 2), 7.0)
+    assert_eq(la_max_diff(t.to_dense(), d.transpose()), 0.0)
+    assert_eq(la_max_diff(t.transpose().to_dense(), d), 0.0)
+    // empty rows
+    e = csr_from_triplets(4, 2, [3], [1], [5.0])
+    assert_eq(e.nnz(), 1)
+    assert_eq(e.indptr[3], 0)
+    assert_eq(e.indptr[4], 1)
+    assert_eq(e.at(3, 1), 5.0)
+    assert_eq(e.at(0, 0), 0.0)
+    mv2 = e.matvec([1.0, 2.0])
+    assert_eq(mv2[3], 10.0)
+    assert_eq(mv2[0], 0.0)
+}
+
+test "CSR dense round trip and arithmetic" {
+    a = la_sample_dense()
+    s = csr_from_dense(a, 0.0)
+    assert_eq(s.nnz(), 11)
+    assert_eq(la_max_diff(s.to_dense(), a), 0.0)
+    x = [1.0, -1.0, 2.0, 0.5, 3.0]
+    ms = s.matvec(x)
+    md = a.matvec(x)
+    k = 0
+    while k < 5 {
+        #assert(la_abs(ms[k] - md[k]) < 1.0e-14)
+        k += 1
+    }
+    assert_eq(s.at(0, 2), 1.0)
+    assert_eq(s.at(0, 3), 0.0)
+    // tolerance drops small entries
+    near = csr_from_dense(dense(2, 2, [1.0, 0.001, 0.0, 2.0]), 0.01)
+    assert_eq(near.nnz(), 2)
+    // sparse + sparse and sparse * sparse agree with the dense results
+    t = csr_from_dense(dense(5, 5, [
+        0.0, 1.0, 0.0, 0.0, 2.0,
+        3.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 4.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 5.0,
+        6.0, 0.0, 0.0, 7.0, 0.0]), 0.0)
+    assert_eq(la_max_diff(csr_add(s, t).to_dense(), dense_add(a, t.to_dense())), 0.0)
+    assert_eq(la_max_diff(csr_mul(s, t).to_dense(), dense_mul(a, t.to_dense())), 0.0)
+    assert_eq(la_max_diff(csr_mul(t, s).to_dense(), dense_mul(t.to_dense(), a)), 0.0)
+    // cancellation keeps an explicit zero structurally but numerically zero
+    neg = csr_from_dense(a.scaled(-1.0), 0.0)
+    z = csr_add(s, neg)
+    assert_eq(la_max_diff(z.to_dense(), dense_zeros(5, 5)), 0.0)
+    // dense x sparse and sparse x dense kernels
+    assert_eq(la_max_diff(dense_mul_csr(a, t), dense_mul(a, t.to_dense())), 0.0)
+    assert_eq(la_max_diff(csr_mul_dense(t, a), dense_mul(t.to_dense(), a)), 0.0)
+    // shape mismatches
+    assert_eq(csr_add(s, csr_from_dense(dense(2, 2, [1.0, 0.0, 0.0, 1.0]), 0.0)).nrows(), 0)
+    assert_eq(csr_mul(s, csr_from_dense(dense(2, 2, [1.0, 0.0, 0.0, 1.0]), 0.0)).nrows(), 0)
+    assert_eq(dense_mul_csr(dense(2, 2, [1.0, 0.0, 0.0, 1.0]), s).nrows(), 0)
+    assert_eq(csr_mul_dense(s, dense(2, 2, [1.0, 0.0, 0.0, 1.0])).nrows(), 0)
+    // diagonal conversion
+    g = csr_from_diag(diagonal([2.0, 0.0, 5.0]))
+    assert_eq(g.nnz(), 2)
+    assert_eq(g.at(2, 2), 5.0)
+    assert_eq(g.at(1, 1), 0.0)
+    // a 1-D Laplacian times a vector
+    lap = la_laplacian(6)
+    assert_eq(lap.nnz(), 16)
+    lv = lap.matvec([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    assert_eq(lv[0], 1.0)
+    assert_eq(lv[3], 0.0)
+    assert_eq(lv[5], 1.0)
+}
+
+test "LinOp add and mul dispatch over all 9 kind pairs" {
+    dn = la_sample_dense()
+    g = diagonal([1.0, 2.0, 3.0, 4.0, 5.0])
+    sp = csr_from_dense(dense(5, 5, [
+        0.0, 1.0, 0.0, 0.0, 2.0,
+        3.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 4.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 5.0,
+        6.0, 0.0, 0.0, 7.0, 0.0]), 0.0)
+    ops = [lin_dense(dn), lin_diag(g), lin_sparse(sp)]
+    names = ["dense", "diagonal", "csr"]
+    assert_eq(ops[0].kind_name(), "dense")
+    assert_eq(ops[1].kind_name(), "diagonal")
+    assert_eq(ops[2].kind_name(), "csr")
+    i = 0
+    while i < 3 {
+        j = 0
+        while j < 3 {
+            a = ops[i]
+            b = ops[j]
+            sum = add(a, b)
+            prod = mul(a, b)
+            want_sum = dense_add(a.to_dense(), b.to_dense())
+            want_prod = dense_mul(a.to_dense(), b.to_dense())
+            #assert(la_max_diff(sum.to_dense(), want_sum) < 1.0e-13)
+            #assert(la_max_diff(prod.to_dense(), want_prod) < 1.0e-12)
+            j += 1
+        }
+        i += 1
+    }
+    // result kinds
+    assert_eq(add(ops[0], ops[0]).kind_name(), "dense")
+    assert_eq(add(ops[0], ops[1]).kind_name(), "dense")
+    assert_eq(add(ops[1], ops[0]).kind_name(), "dense")
+    assert_eq(add(ops[0], ops[2]).kind_name(), "dense")
+    assert_eq(add(ops[2], ops[0]).kind_name(), "dense")
+    assert_eq(add(ops[1], ops[1]).kind_name(), "diagonal")
+    assert_eq(add(ops[1], ops[2]).kind_name(), "csr")
+    assert_eq(add(ops[2], ops[1]).kind_name(), "csr")
+    assert_eq(add(ops[2], ops[2]).kind_name(), "csr")
+    assert_eq(mul(ops[0], ops[0]).kind_name(), "dense")
+    assert_eq(mul(ops[0], ops[1]).kind_name(), "dense")
+    assert_eq(mul(ops[1], ops[0]).kind_name(), "dense")
+    assert_eq(mul(ops[0], ops[2]).kind_name(), "dense")
+    assert_eq(mul(ops[2], ops[0]).kind_name(), "dense")
+    assert_eq(mul(ops[1], ops[1]).kind_name(), "diagonal")
+    assert_eq(mul(ops[1], ops[2]).kind_name(), "csr")
+    assert_eq(mul(ops[2], ops[1]).kind_name(), "csr")
+    assert_eq(mul(ops[2], ops[2]).kind_name(), "csr")
+    // add is symmetric across every mixed pair
+    p = 0
+    while p < 3 {
+        q = p + 1
+        while q < 3 {
+            ab = add(ops[p], ops[q]).to_dense()
+            ba = add(ops[q], ops[p]).to_dense()
+            assert_eq(la_max_diff(ab, ba), 0.0)
+            q += 1
+        }
+        p += 1
+    }
+    // mul is not commutative for a diagonal and a dense matrix with different rows and columns
+    dg = mul(ops[1], ops[0]).to_dense()
+    gd = mul(ops[0], ops[1]).to_dense()
+    #assert(la_max_diff(dg, gd) > 0.5)
+    assert_eq(dg.at(0, 0), 4.0)
+    assert_eq(gd.at(0, 0), 4.0)
+    assert_eq(dg.at(2, 0), 3.0)
+    assert_eq(gd.at(2, 0), 1.0)
+    // accessors and shapes
+    assert_eq(ops[0].nrows(), 5)
+    assert_eq(ops[1].ncols(), 5)
+    assert_eq(ops[2].nrows(), 5)
+    mv = ops[2].matvec([1.0, 1.0, 1.0, 1.0, 1.0])
+    assert_eq(mv[0], 3.0)
+    assert_eq(mv[4], 13.0)
+    assert_eq(ops[1].matvec([1.0, 1.0, 1.0, 1.0, 1.0])[3], 4.0)
+    assert_eq(ops[0].matvec([1.0, 1.0, 1.0, 1.0, 1.0])[2], 7.0)
+    assert_eq(host.sys_arr_len(names), 3)
+    // shape mismatches produce an empty dense matrix
+    small = lin_dense(dense(2, 2, [1.0, 2.0, 3.0, 4.0]))
+    assert_eq(add(ops[0], small).nrows(), 0)
+    assert_eq(mul(ops[0], small).nrows(), 0)
+    assert_eq(add(ops[1], small).kind_name(), "dense")
+    assert_eq(mul(ops[2], small).ncols(), 0)
+    // rectangular dense * dense through the dispatcher
+    r1 = lin_dense(dense(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+    r2 = lin_dense(dense(3, 2, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]))
+    rp = mul(r1, r2).to_dense()
+    assert_eq(rp.at(1, 1), 154.0)
+    assert_eq(mul(r1, r1).nrows(), 0)
+    // payload accessors on the wrong kind give empties
+    assert_eq(ops[0].get_diag().nrows(), 0)
+    assert_eq(ops[1].get_dense().nrows(), 0)
+    assert_eq(ops[0].get_sparse().nnz(), 0)
+}
+
+test "LU factorization" {
+    a = dense(3, 3, [4.0, 3.0, 2.0, 1.0, 3.0, 1.0, 2.0, 1.0, 5.0])
+    f = lu(a)
+    assert_eq(f.kind(), "lu")
+    #assert(!(f.singular))
+    #assert(la_abs(f.det() - 37.0) < 1.0e-12)
+    x = f.solve([1.0, 2.0, 3.0])
+    #assert(la_abs(x[0] + 0.5675675675675675) < 1.0e-14)
+    #assert(la_abs(x[1] - 0.6216216216216216) < 1.0e-14)
+    #assert(la_abs(x[2] - 0.7027027027027027) < 1.0e-14)
+    // residual
+    r = a.matvec(x)
+    #assert(la_abs(r[0] - 1.0) < 1.0e-13)
+    #assert(la_abs(r[1] - 2.0) < 1.0e-13)
+    #assert(la_abs(r[2] - 3.0) < 1.0e-13)
+    // inverse matches numpy.linalg.inv
+    inv = f.inverse()
+    #assert(la_abs(inv.at(0, 0) - 0.37837837837837834) < 1.0e-14)
+    #assert(la_abs(inv.at(0, 1) + 0.35135135135135137) < 1.0e-14)
+    #assert(la_abs(inv.at(1, 1) - 0.43243243243243246) < 1.0e-14)
+    #assert(la_abs(inv.at(2, 0) + 0.13513513513513514) < 1.0e-14)
+    #assert(la_max_diff(dense_mul(a, inv), dense_identity(3)) < 1.0e-13)
+    // P A = L U with the recorded permutation
+    prod = dense_mul(f.lower(), f.upper())
+    pa = dense_zeros(3, 3)
+    i = 0
+    while i < 3 {
+        j = 0
+        while j < 3 {
+            pa = dense(3, 3, host.sys_arr_set(pa.data, i * 3 + j, a.at(f.piv[i], j)))
+            j += 1
+        }
+        i += 1
+    }
+    #assert(la_max_diff(prod, pa) < 1.0e-13)
+    // the input matrix is left untouched
+    assert_eq(a.at(0, 0), 4.0)
+    assert_eq(a.at(2, 2), 5.0)
+    // a zero leading pivot forces a row swap and flips the determinant sign
+    b = dense(3, 3, [0.0, 2.0, 1.0, 1.0, 1.0, 1.0, 3.0, 0.0, 1.0])
+    fb = lu(b)
+    #assert(la_abs(fb.det() - 1.0) < 1.0e-12)
+    xb = fb.solve([1.0, 2.0, 3.0])
+    #assert(la_abs(xb[0]) < 1.0e-12)
+    #assert(la_abs(xb[1] + 1.0) < 1.0e-12)
+    #assert(la_abs(xb[2] - 3.0) < 1.0e-12)
+    // singular, rectangular and bad right-hand sides
+    sing = lu(dense(2, 2, [1.0, 2.0, 2.0, 4.0]))
+    #assert(sing.singular)
+    assert_eq(sing.det(), 0.0)
+    assert_eq(host.sys_arr_len(sing.solve([1.0, 1.0])), 0)
+    assert_eq(sing.inverse().nrows(), 0)
+    #assert(lu(dense(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])).singular)
+    assert_eq(host.sys_arr_len(f.solve([1.0, 2.0])), 0)
+    #assert(lu(dense(0, 0, [])).singular)
+    // 1 x 1 and identity
+    one = lu(dense(1, 1, [4.0]))
+    assert_eq(one.det(), 4.0)
+    assert_eq(one.solve([8.0])[0], 2.0)
+    idf = lu(dense_identity(4))
+    assert_eq(idf.det(), 1.0)
+    assert_eq(idf.solve([1.0, 2.0, 3.0, 4.0])[3], 4.0)
+    // the existing Mat.solve agrees
+    m = mat_from(3, 3, [4.0, 3.0, 2.0, 1.0, 3.0, 1.0, 2.0, 1.0, 5.0])
+    xm = m.solve([1.0, 2.0, 3.0])
+    #assert(la_abs(xm[0] - x[0]) < 1.0e-12)
+    #assert(la_abs(xm[2] - x[2]) < 1.0e-12)
+}
+
+test "Cholesky factorization" {
+    s = dense(3, 3, [4.0, 1.0, 2.0, 1.0, 3.0, 0.0, 2.0, 0.0, 5.0])
+    c = cholesky(s)
+    assert_eq(c.kind(), "cholesky")
+    #assert(c.ok)
+    l = c.lower()
+    #assert(la_abs(l.at(0, 0) - 2.0) < 1.0e-14)
+    #assert(la_abs(l.at(1, 0) - 0.5) < 1.0e-14)
+    #assert(la_abs(l.at(1, 1) - 1.6583123951777) < 1.0e-13)
+    #assert(la_abs(l.at(2, 0) - 1.0) < 1.0e-14)
+    #assert(la_abs(l.at(2, 1) + 0.30151134457776363) < 1.0e-13)
+    #assert(la_abs(l.at(2, 2) - 1.9771421064483223) < 1.0e-13)
+    assert_eq(l.at(0, 2), 0.0)
+    #assert(la_max_diff(dense_mul(l, l.transpose()), s) < 1.0e-13)
+    #assert(la_abs(c.det() - 43.0) < 1.0e-12)
+    x = c.solve([1.0, 2.0, 3.0])
+    #assert(la_abs(x[0] + 0.3023255813953489) < 1.0e-14)
+    #assert(la_abs(x[1] - 0.7674418604651163) < 1.0e-14)
+    #assert(la_abs(x[2] - 0.7209302325581396) < 1.0e-14)
+    // agrees with LU
+    xl = lu(s).solve([1.0, 2.0, 3.0])
+    #assert(la_abs(xl[1] - x[1]) < 1.0e-13)
+    // not positive definite
+    bad = cholesky(dense(2, 2, [1.0, 2.0, 2.0, 1.0]))
+    #assert(!(bad.ok))
+    assert_eq(bad.det(), 0.0)
+    assert_eq(host.sys_arr_len(bad.solve([1.0, 1.0])), 0)
+    #assert(!(cholesky(dense(2, 2, [0.0, 0.0, 0.0, 1.0])).ok))
+    #assert(!(cholesky(dense(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])).ok))
+    assert_eq(host.sys_arr_len(c.solve([1.0])), 0)
+    // 1 x 1
+    one = cholesky(dense(1, 1, [9.0]))
+    assert_eq(one.lower().at(0, 0), 3.0)
+    assert_eq(one.det(), 9.0)
+    assert_eq(one.solve([18.0])[0], 2.0)
+    // identity
+    assert_eq(cholesky(dense_identity(5)).det(), 1.0)
+    // a random-ish SPD matrix B^T B + I
+    b = dense(3, 3, [1.0, 2.0, 0.5, -1.0, 0.0, 2.0, 3.0, 1.0, -2.0])
+    spd = dense_add(dense_mul(b.transpose(), b), dense_identity(3))
+    cs = cholesky(spd)
+    #assert(cs.ok)
+    #assert(la_max_diff(dense_mul(cs.lower(), cs.lower().transpose()), spd) < 1.0e-12)
+    xs = cs.solve([1.0, -2.0, 3.0])
+    rs = spd.matvec(xs)
+    #assert(la_abs(rs[0] - 1.0) < 1.0e-12)
+    #assert(la_abs(rs[1] + 2.0) < 1.0e-12)
+    #assert(la_abs(rs[2] - 3.0) < 1.0e-12)
+}
+
+test "QR factorization and least squares" {
+    // Householder reference: numpy.linalg.qr of a 4 x 2 design matrix
+    x = dense(4, 2, [1.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 3.0])
+    f = qr(x)
+    assert_eq(f.kind(), "qr")
+    #assert(f.full_rank)
+    r = f.r()
+    assert_eq(r.nrows(), 2)
+    #assert(la_abs(r.at(0, 0) + 2.0) < 1.0e-13)
+    #assert(la_abs(r.at(0, 1) + 3.0) < 1.0e-13)
+    assert_eq(r.at(1, 0), 0.0)
+    #assert(la_abs(r.at(1, 1) + 2.23606797749979) < 1.0e-13)
+    q = f.q()
+    assert_eq(q.nrows(), 4)
+    assert_eq(q.ncols(), 2)
+    #assert(la_abs(q.at(0, 0) + 0.5) < 1.0e-13)
+    #assert(la_abs(q.at(0, 1) - 0.6708203932499368) < 1.0e-13)
+    #assert(la_abs(q.at(3, 1) + 0.6708203932499369) < 1.0e-13)
+    // Q^T Q = I and Q R = A
+    #assert(la_max_diff(dense_mul(q.transpose(), q), dense_identity(2)) < 1.0e-13)
+    #assert(la_max_diff(dense_mul(q, r), x) < 1.0e-13)
+    // least-squares line fit: numpy.linalg.lstsq -> [0.93, 2.08]
+    c = f.solve([1.0, 2.9, 5.1, 7.2])
+    #assert(la_abs(c[0] - 0.9300000000000006) < 1.0e-12)
+    #assert(la_abs(c[1] - 2.0799999999999996) < 1.0e-12)
+    // normal-equations residual is orthogonal to the columns
+    fit = x.matvec(c)
+    res = [1.0 - fit[0], 2.9 - fit[1], 5.1 - fit[2], 7.2 - fit[3]]
+    xt = x.transpose().matvec(res)
+    #assert(la_abs(xt[0]) < 1.0e-12)
+    #assert(la_abs(xt[1]) < 1.0e-12)
+    // square system and determinant
+    a = dense(3, 3, [4.0, 3.0, 2.0, 1.0, 3.0, 1.0, 2.0, 1.0, 5.0])
+    fa = qr(a)
+    #assert(la_abs(fa.det() - 37.0) < 1.0e-11)
+    xa = fa.solve([1.0, 2.0, 3.0])
+    #assert(la_abs(xa[0] + 0.5675675675675675) < 1.0e-13)
+    #assert(la_abs(xa[2] - 0.7027027027027027) < 1.0e-13)
+    b = dense(3, 3, [0.0, 2.0, 1.0, 1.0, 1.0, 1.0, 3.0, 0.0, 1.0])
+    #assert(la_abs(qr(b).det() - 1.0) < 1.0e-12)
+    #assert(la_max_diff(dense_mul(fa.q(), fa.r()), a) < 1.0e-12)
+    #assert(la_max_diff(dense_mul(fa.q().transpose(), fa.q()), dense_identity(3)) < 1.0e-13)
+    // apply_q and apply_qt are inverse
+    v = [1.0, -2.0, 0.5]
+    back = fa.apply_q(fa.apply_qt(v))
+    #assert(la_abs(back[0] - 1.0) < 1.0e-13)
+    #assert(la_abs(back[1] + 2.0) < 1.0e-13)
+    #assert(la_abs(back[2] - 0.5) < 1.0e-13)
+    // rank-deficient and shape errors
+    rd = qr(dense(3, 2, [1.0, 2.0, 2.0, 4.0, 3.0, 6.0]))
+    #assert(!(rd.full_rank))
+    assert_eq(host.sys_arr_len(rd.solve([1.0, 2.0, 3.0])), 0)
+    wide = qr(dense(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+    #assert(!(wide.full_rank))
+    assert_eq(wide.det(), 0.0)
+    assert_eq(host.sys_arr_len(f.solve([1.0, 2.0])), 0)
+    assert_eq(qr(dense(3, 2, [1.0, 2.0, 2.0, 4.0, 3.0, 6.0])).det(), 0.0)
+    // 1 x 1 and negative entry
+    neg = qr(dense(1, 1, [0.0 - 3.0]))
+    #assert(la_abs(neg.det() + 3.0) < 1.0e-14)
+    #assert(la_abs(neg.solve([6.0])[0] + 2.0) < 1.0e-14)
+    // zero column below the diagonal needs no reflection
+    tri = qr(dense(2, 2, [2.0, 1.0, 0.0, 3.0]))
+    #assert(la_abs(tri.det() - 6.0) < 1.0e-12)
+    #assert(la_abs(tri.solve([5.0, 6.0])[0] - 1.5) < 1.0e-12)
+}
+
+test "factorizations share the Factorization interface" {
+    a = dense(3, 3, [4.0, 1.0, 2.0, 1.0, 3.0, 0.0, 2.0, 0.0, 5.0])
+    b = [1.0, 2.0, 3.0]
+    xl = lu(a).solve(b)
+    xc = cholesky(a).solve(b)
+    xq = qr(a).solve(b)
+    k = 0
+    while k < 3 {
+        #assert(la_abs(xl[k] - xc[k]) < 1.0e-13)
+        #assert(la_abs(xl[k] - xq[k]) < 1.0e-13)
+        k += 1
+    }
+    #assert(la_abs(lu(a).det() - cholesky(a).det()) < 1.0e-11)
+    #assert(la_abs(lu(a).det() - qr(a).det()) < 1.0e-11)
+    // Matrix interface agrees across kinds for the same matrix
+    d = a
+    s = csr_from_dense(a, 0.0)
+    i = 0
+    while i < 3 {
+        j = 0
+        while j < 3 {
+            assert_eq(d.at(i, j), s.at(i, j))
+            j += 1
+        }
+        i += 1
+    }
+    assert_eq(d.nrows(), s.nrows())
+    assert_eq(d.ncols(), s.ncols())
+}
+
+test "conjugate gradients" {
+    // small dense SPD system with a known solution
+    a = dense(3, 3, [4.0, 1.0, 2.0, 1.0, 3.0, 0.0, 2.0, 0.0, 5.0])
+    b = [1.0, 2.0, 3.0]
+    x0 = [0.0, 0.0, 0.0]
+    r = cg(lin_dense(a), b, x0, 0.000000000001, 100)
+    #assert(r.converged)
+    #assert(r.iters <= 3)
+    #assert(la_abs(r.x[0] + 0.3023255813953489) < 1.0e-10)
+    #assert(la_abs(r.x[1] - 0.7674418604651163) < 1.0e-10)
+    #assert(la_abs(r.x[2] - 0.7209302325581396) < 1.0e-10)
+    #assert(r.residual < 1.0e-11)
+    // the starting point and right-hand side are not modified
+    assert_eq(x0[0], 0.0)
+    assert_eq(x0[2], 0.0)
+    assert_eq(b[0], 1.0)
+    assert_eq(b[2], 3.0)
+    // sparse 1-D Laplacian: exact in at most n iterations
+    n = 40
+    lap = la_laplacian(n)
+    rhs = host.sys_arr_new(n, 1.0)
+    rs = cg(lin_sparse(lap), rhs, host.sys_arr_new(n, 0.0), 0.0000000001, 200)
+    #assert(rs.converged)
+    #assert(rs.iters <= n + 2)
+    // known solution x_i = (i + 1)(n - i) / 2
+    k = 0
+    while k < n {
+        want = host.sys_to_float((k + 1) * (n - k)) / 2.0
+        #assert(la_abs(rs.x[k] - want) < 1.0e-6)
+        k += 1
+    }
+    // dense and sparse operators give the same iterates
+    rd = cg(lin_dense(lap.to_dense()), rhs, host.sys_arr_new(n, 0.0), 0.0000000001, 200)
+    assert_eq(rd.iters, rs.iters)
+    #assert(la_abs(rd.x[7] - rs.x[7]) < 1.0e-9)
+    // diagonal operator converges in one step
+    g = lin_diag(diagonal([2.0, 4.0, 8.0]))
+    rg = cg(g, [2.0, 4.0, 8.0], [0.0, 0.0, 0.0], 0.000000001, 10)
+    #assert(rg.converged)
+    #assert(la_abs(rg.x[0] - 1.0) < 1.0e-9)
+    #assert(la_abs(rg.x[2] - 1.0) < 1.0e-9)
+    // warm start at the solution needs no iterations
+    warm = cg(lin_dense(a), b, [-0.3023255813953489, 0.7674418604651163, 0.7209302325581396], 0.000000001, 10)
+    assert_eq(warm.iters, 0)
+    #assert(warm.converged)
+    // zero right-hand side
+    z = cg(lin_dense(a), [0.0, 0.0, 0.0], x0, 0.000001, 10)
+    #assert(z.converged)
+    assert_eq(z.iters, 0)
+    assert_eq(z.x[1], 0.0)
+    // iteration cap reports non-convergence
+    cap = cg(lin_sparse(la_laplacian(200)), host.sys_arr_new(200, 1.0), host.sys_arr_new(200, 0.0), 0.0000000000001, 5)
+    #assert(!(cap.converged))
+    assert_eq(cap.iters, 5)
+    #assert(cap.residual > 0.0001)
+    // mismatched sizes
+    mis = cg(lin_dense(a), [1.0, 2.0], [0.0, 0.0], 0.001, 10)
+    #assert(!(mis.converged))
+    assert_eq(host.sys_arr_len(mis.x), 0)
+    // indefinite matrix stops cleanly instead of diverging
+    ind = cg(lin_dense(dense(2, 2, [1.0, 0.0, 0.0, 0.0 - 1.0])), [1.0, 1.0], [0.0, 0.0], 0.000000001, 50)
+    #assert(ind.iters <= 50)
+}
+
+/// Nonsymmetric convection-diffusion matrix of order `n` (diag `2 + c`, sub `-1 - c`, super `-1`) as CSR.
+la_convdiff(n: i64, c: f64) : CSRMatrix {
+    ri = []
+    ci = []
+    vs = []
+    for 0..n {
+        i = it
+        ri = host.sys_arr_push(ri, i)
+        ci = host.sys_arr_push(ci, i)
+        vs = host.sys_arr_push(vs, 2.0 + c)
+        if i > 0 {
+            ri = host.sys_arr_push(ri, i)
+            ci = host.sys_arr_push(ci, i - 1)
+            vs = host.sys_arr_push(vs, 0.0 - 1.0 - c)
+        }
+        if i < n - 1 {
+            ri = host.sys_arr_push(ri, i)
+            ci = host.sys_arr_push(ci, i + 1)
+            vs = host.sys_arr_push(vs, 0.0 - 1.0)
+        }
+    }
+    csr_from_triplets(n, n, ri, ci, vs)
+}
+
+test "GMRES solves general systems" {
+    // nonsymmetric dense 3x3 with a known direct solution
+    a = dense(3, 3, [4.0, 1.0, 0.0 - 2.0, 3.0, 5.0, 1.0, 0.0, 2.0, 6.0])
+    b = [1.0, 2.0, 3.0]
+    x0 = [0.0, 0.0, 0.0]
+    want = lu(a).solve(b)
+    r = gmres(lin_dense(a), b, x0, 0.000000000001, 3, 20)
+    #assert(r.converged)
+    #assert(r.iters <= 3)
+    for 0..3 { #assert(la_abs(r.x[it] - want[it]) < 1.0e-10) }
+    #assert(r.residual < 1.0e-11)
+    assert_eq(x0[0], 0.0)
+    assert_eq(b[2], 3.0)
+    // sparse nonsymmetric convection-diffusion, full Krylov space: exact in <= n iterations
+    n = 30
+    cd = la_convdiff(n, 0.6)
+    rhs = host.sys_arr_new(n, 1.0)
+    exact = lu(cd.to_dense()).solve(rhs)
+    full = gmres(lin_sparse(cd), rhs, host.sys_arr_new(n, 0.0), 0.0000000001, n, 200)
+    #assert(full.converged)
+    #assert(full.iters <= n)
+    for 0..n { #assert(la_abs(full.x[it] - exact[it]) < 1.0e-7) }
+    // restarted GMRES(8) still converges, using more iterations than the full space
+    rest = gmres(lin_sparse(cd), rhs, host.sys_arr_new(n, 0.0), 0.0000000001, 8, 500)
+    #assert(rest.converged)
+    #assert(rest.iters >= full.iters)
+    for 0..n { #assert(la_abs(rest.x[it] - exact[it]) < 1.0e-7) }
+    // dense and sparse operators agree
+    dn = gmres(lin_dense(cd.to_dense()), rhs, host.sys_arr_new(n, 0.0), 0.0000000001, n, 200)
+    assert_eq(dn.iters, full.iters)
+    #assert(la_abs(dn.x[11] - full.x[11]) < 1.0e-9)
+    // also solves SPD systems (matches CG)
+    lap = la_laplacian(20)
+    gl = gmres(lin_sparse(lap), host.sys_arr_new(20, 1.0), host.sys_arr_new(20, 0.0), 0.000000001, 20, 100)
+    #assert(gl.converged)
+    #assert(la_abs(gl.x[3] - 0.5 * 4.0 * 17.0) < 1.0e-6)
+    // warm start at the solution, zero right-hand side
+    warm = gmres(lin_dense(a), b, want, 0.000000001, 3, 10)
+    assert_eq(warm.iters, 0)
+    #assert(warm.converged)
+    z = gmres(lin_dense(a), [0.0, 0.0, 0.0], x0, 0.000001, 3, 10)
+    #assert(z.converged)
+    assert_eq(z.iters, 0)
+    // iteration cap, bad sizes, bad restart
+    cap = gmres(lin_sparse(la_convdiff(200, 0.6)), host.sys_arr_new(200, 1.0), host.sys_arr_new(200, 0.0), 0.0000000000001, 5, 5)
+    #assert(!(cap.converged))
+    assert_eq(cap.iters, 5)
+    #assert(cap.residual > 0.0001)
+    mis = gmres(lin_dense(a), [1.0, 2.0], [0.0, 0.0], 0.001, 3, 10)
+    #assert(!(mis.converged))
+    assert_eq(host.sys_arr_len(mis.x), 0)
+    #assert(!(gmres(lin_dense(a), b, x0, 0.001, 0, 10).converged))
+    // diagonal operator converges in one step
+    g = gmres(lin_diag(diagonal([2.0, 4.0, 8.0])), [2.0, 4.0, 8.0], [0.0, 0.0, 0.0], 0.000000001, 3, 10)
+    #assert(g.converged)
+    #assert(la_abs(g.x[2] - 1.0) < 1.0e-9)
+    // a rotation matrix (indefinite, nonsymmetric) is solved exactly
+    rot = gmres(lin_dense(dense(2, 2, [0.0, 0.0 - 1.0, 1.0, 0.0])), [1.0, 0.0], [0.0, 0.0], 0.000000001, 2, 10)
+    #assert(rot.converged)
+    #assert(la_abs(rot.x[0]) < 1.0e-9)
+    #assert(la_abs(rot.x[1] + 1.0) < 1.0e-9)
+}
+
+test "BiCGSTAB solves nonsymmetric systems" {
+    a = dense(3, 3, [4.0, 1.0, 0.0 - 2.0, 3.0, 5.0, 1.0, 0.0, 2.0, 6.0])
+    b = [1.0, 2.0, 3.0]
+    x0 = [0.0, 0.0, 0.0]
+    want = lu(a).solve(b)
+    r = bicgstab(lin_dense(a), b, x0, 0.000000000001, 50)
+    #assert(r.converged)
+    #assert(r.iters <= 6)
+    for 0..3 { #assert(la_abs(r.x[it] - want[it]) < 1.0e-9) }
+    assert_eq(x0[1], 0.0)
+    assert_eq(b[0], 1.0)
+    n = 60
+    cd = la_convdiff(n, 0.6)
+    rhs = host.sys_arr_new(n, 1.0)
+    exact = lu(cd.to_dense()).solve(rhs)
+    s = bicgstab(lin_sparse(cd), rhs, host.sys_arr_new(n, 0.0), 0.0000000001, 300)
+    #assert(s.converged)
+    #assert(s.residual <= 0.0000000001)
+    for 0..n { #assert(la_abs(s.x[it] - exact[it]) < 1.0e-6) }
+    d = bicgstab(lin_dense(cd.to_dense()), rhs, host.sys_arr_new(n, 0.0), 0.0000000001, 300)
+    assert_eq(d.iters, s.iters)
+    #assert(la_abs(d.x[17] - s.x[17]) < 1.0e-9)
+    // SPD system works too
+    lap = la_laplacian(25)
+    l = bicgstab(lin_sparse(lap), host.sys_arr_new(25, 1.0), host.sys_arr_new(25, 0.0), 0.000000001, 200)
+    #assert(l.converged)
+    #assert(la_abs(l.x[4] - 0.5 * 5.0 * 21.0) < 1.0e-5)
+    warm = bicgstab(lin_dense(a), b, want, 0.000000001, 10)
+    assert_eq(warm.iters, 0)
+    #assert(warm.converged)
+    z = bicgstab(lin_dense(a), [0.0, 0.0, 0.0], x0, 0.000001, 10)
+    #assert(z.converged)
+    assert_eq(z.iters, 0)
+    cap = bicgstab(lin_sparse(la_convdiff(200, 0.6)), host.sys_arr_new(200, 1.0), host.sys_arr_new(200, 0.0), 0.0000000000001, 3)
+    #assert(!(cap.converged))
+    #assert(cap.iters <= 3)
+    mis = bicgstab(lin_dense(a), [1.0, 2.0], [0.0, 0.0], 0.001, 10)
+    #assert(!(mis.converged))
+    assert_eq(host.sys_arr_len(mis.x), 0)
+    g = bicgstab(lin_diag(diagonal([2.0, 4.0, 8.0])), [2.0, 4.0, 8.0], [0.0, 0.0, 0.0], 0.000000001, 10)
+    #assert(g.converged)
+    #assert(la_abs(g.x[1] - 1.0) < 1.0e-9)
+}

@@ -1,0 +1,248 @@
+//! std.math.stats — descriptive statistics over contiguous f64 slices
+//!
+//! Import with:
+//!   use std.math.stats
+//!
+//!   xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+//!   assert_eq(mean(xs), 3.0)
+//!   p95 = percentile(xs, 0.95)
+//!
+//! Streaming reductions (`sum`, `mean`, `variance`) are O(n) time / O(1) space
+//! via Iterable pipelines / Welford. Order statistics (`median`, `quantile`,
+//! `percentile`) require a contiguous indexable slice and use in-place
+//! selection (introselect) — they are not available on unsized streams.
+
+/// `ST_EPS` is `0.0000001`.
++ST_EPS = 0.0000001
+
+/// Number of elements in `a`.
++st_len(a: _) : i64 => host.sys_arr_len(a)
+
+/// Sum of samples in `a` (Iterable.sum pipeline).
++st_sum(a: _) : f64 => a.sum()
+
+/// Arithmetic mean via Welford (single pass, O(n) time, O(1) space).
++mean(a: _) : f64 {
+    n = st_len(a)
+    ensure n > 0 else { return 0.0 }
+    a.mean()
+}
+
+/// Lesser of samples in `a`.
++st_min(a: _) : f64 {
+    n = st_len(a)
+    ensure n > 0 else { return 0.0 }
+    a.min()
+}
+
+/// Greater of samples in `a`.
++st_max(a: _) : f64 {
+    n = st_len(a)
+    ensure n > 0 else { return 0.0 }
+    a.max()
+}
+
+/// Same as `st_max - st_min`.
++st_range(a: _) : f64 => st_max(a) - st_min(a)
+
+/// Population variance via Welford (single pass).
++variance(a: _) : f64 {
+    n = st_len(a)
+    ensure n > 0 else { return 0.0 }
+    a.variance()
+}
+
+/// Sample variance (Bessel's correction) via one Welford pass.
++sample_var(a: _) : f64 {
+    n = st_len(a)
+    ensure n > 1 else { return 0.0 }
+    // Welford M2 / (n-1): reuse pipeline variance * n / (n-1)
+    variance(a) * host.sys_to_float(n) / host.sys_to_float(n - 1)
+}
+
+/// Stddev of the samples in `a`.
++stddev(a: _) : f64 => host.sys_sqrt(variance(a))
+/// Sample stddev of the samples in `a`.
++sample_stddev(a: _) : f64 => host.sys_sqrt(sample_var(a))
+
+/// Copy of `a` into a fresh buffer (selection mutates the copy).
++st_copy(a: _) {
+    out = []
+    for a { out = host.sys_arr_push(out, it) }
+    out
+}
+
+/// k-th smallest value (0-based) via introselect / introselect
+/// quickselect with median-of-three pivots. Contiguous slices only.
+/// Average O(n) time, O(1) auxiliary space beyond the working copy.
++st_select_value(a: _, k: i64) : f64 {
+    n = st_len(a)
+    ensure n > 0 && k >= 0 && k < n else { return 0.0 }
+    s = st_copy(a)
+    lo = 0
+    hi = n - 1
+    for 0..n {
+        ensure lo < hi else { return s[k] }
+        mid = lo + (hi - lo) / 2
+        // median-of-three → swap into `hi`
+        if s[mid] < s[lo] {
+            t = s[lo]
+            s = host.sys_arr_set(s, lo, s[mid])
+            s = host.sys_arr_set(s, mid, t)
+        }
+        if s[hi] < s[lo] {
+            t = s[lo]
+            s = host.sys_arr_set(s, lo, s[hi])
+            s = host.sys_arr_set(s, hi, t)
+        }
+        if s[hi] < s[mid] {
+            t = s[mid]
+            s = host.sys_arr_set(s, mid, s[hi])
+            s = host.sys_arr_set(s, hi, t)
+        }
+        t = s[mid]
+        s = host.sys_arr_set(s, mid, s[hi])
+        s = host.sys_arr_set(s, hi, t)
+        pivot = s[hi]
+        store = lo
+        i = lo
+        for lo..hi {
+            if s[i] < pivot {
+                t = s[store]
+                s = host.sys_arr_set(s, store, s[i])
+                s = host.sys_arr_set(s, i, t)
+                store += 1
+            }
+            i += 1
+        }
+        t = s[store]
+        s = host.sys_arr_set(s, store, s[hi])
+        s = host.sys_arr_set(s, hi, t)
+        p = store
+        if p == k { return s[k] }
+        if p < k { lo = p + 1 } else { hi = p - 1 }
+    }
+    s[k]
+}
+
+/// Median via introselect on a working copy (contiguous slices only).
++median(a: _) : f64 {
+    n = st_len(a)
+    ensure n > 0 else { return 0.0 }
+    mid = n / 2
+    if n % 2 == 1 { return st_select_value(a, mid) }
+    low = st_select_value(a, mid - 1)
+    upper = st_select_value(a, mid)
+    return (low + upper) * 0.5
+}
+
+/// Linear-interpolated percentile; p in [0, 1]. Uses selection, not full sort.
++percentile(a: _, p: f64) : f64 {
+    n = st_len(a)
+    ensure n > 0 else { return 0.0 }
+    if p <= 0.0 { return st_select_value(a, 0) }
+    if p >= 1.0 { return st_select_value(a, n - 1) }
+    pos = p * host.sys_to_float(n - 1)
+    lo_i = host.sys_to_int(host.sys_floor(pos))
+    hi_i = lo_i + 1
+    lo_v = st_select_value(a, lo_i)
+    if hi_i >= n { return lo_v }
+    hi_v = st_select_value(a, hi_i)
+    t = pos - host.sys_to_float(lo_i)
+    lo_v + (hi_v - lo_v) * t
+}
+
+/// Same as `percentile`.
++quantile(a: _, q: f64) : f64 => percentile(a, q)
+
+/// Pearson correlation; returns 0 when variance is zero.
++correlation(xs: _, ys: _) : f64 {
+    n = st_len(xs)
+    ensure n > 0 && n == st_len(ys) else { return 0.0 }
+    mx = mean(xs)
+    my = mean(ys)
+    num = 0.0
+    dx = 0.0
+    dy = 0.0
+    for 0..n {
+        i = it
+        ax = xs[i] - mx
+        ay = ys[i] - my
+        num += ax * ay
+        dx += ax * ax
+        dy += ay * ay
+    }
+    den = host.sys_sqrt(dx * dy)
+    ensure den > ST_EPS else { return 0.0 }
+    num / den
+}
+
+/// `Histogram` counts samples that fall into successive edges.
++Histogram = {
+    /// Edges on `Histogram`. Defaults to `[]`.
+    edges: _ = []
+    /// Counts on `Histogram`. Defaults to `[]`.
+    counts: _ = []
+
+    /// Build equal-width bins over [lo, hi) with `bins` buckets (+ overflow in last).
+    equal_width(a: _, bins: i64, lo: f64, hi: f64) : Histogram {
+        ensure bins > 0 && hi > lo else { return Histogram.{edges: [], counts: []} }
+        width = (hi - lo) / host.sys_to_float(bins)
+        edges = []
+        counts = []
+        for 0..(bins + 1) {
+            edges = host.sys_arr_push(edges, lo + host.sys_to_float(it) * width)
+        }
+        for 0..bins { counts = host.sys_arr_push(counts, 0) }
+        for a {
+            x = it
+            idx = host.sys_to_int(host.sys_floor((x - lo) / width))
+            if idx < 0 { idx = 0 }
+            if idx >= bins { idx = bins - 1 }
+            counts = host.sys_arr_set(counts, idx, counts[idx] + 1)
+        }
+        Histogram.{edges, counts}
+    }
+
+    /// Total on this `Histogram`. Returns `i64`.
+    total(self) : i64 => self.counts.sum()
+}
+
+/// Zscore (`a`).
++zscore(a: _) {
+    mu = mean(a)
+    sd = sample_stddev(a)
+    out = []
+    ensure sd > ST_EPS else {
+        for a { out = host.sys_arr_push(out, 0.0) }
+        return out
+    }
+    for a { out = host.sys_arr_push(out, (it - mu) / sd) }
+    out
+}
+
+/// Test that mean median variance.
+test "mean median variance" {
+    xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert_eq(mean(xs), 3.0)
+    assert_eq(median(xs), 3.0)
+    assert_eq(st_min(xs), 1.0)
+    assert_eq(st_max(xs), 5.0)
+    #assert(host.sys_abs(variance(xs) - 2.0) < 0.0001)
+    #assert(host.sys_abs(sample_var(xs) - 2.5) < 0.0001)
+    #assert(host.sys_abs(stddev(xs) - host.sys_sqrt(2.0)) < 0.0001)
+}
+
+/// Test that percentile correlation histogram.
+test "percentile correlation histogram" {
+    xs = [1.0, 2.0, 3.0, 4.0, 5.0]
+    #assert(host.sys_abs(percentile(xs, 0.0) - 1.0) < 0.0001)
+    #assert(host.sys_abs(percentile(xs, 1.0) - 5.0) < 0.0001)
+    #assert(host.sys_abs(percentile(xs, 0.5) - 3.0) < 0.0001)
+    ys = [2.0, 4.0, 6.0, 8.0, 10.0]
+    #assert(host.sys_abs(correlation(xs, ys) - 1.0) < 0.0001)
+    h = Histogram.equal_width(xs, 5, 1.0, 6.0)
+    assert_eq(h.total(), 5)
+    z = zscore(xs)
+    assert_eq(host.sys_arr_len(z), 5)
+}

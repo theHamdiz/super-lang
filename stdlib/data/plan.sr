@@ -1,0 +1,1242 @@
+//! std.data.plan — lazy query plans over data frames
+//!
+//! Import with:
+//!   use std.data.plan
+//!
+//!   lf = lazy(frame)                                       // or lazy_csv(text, true), or scan_csv(path) from std.data.io
+//!   top = lf.where("price * qty >= 20")
+//!           .with_expr("revenue", "price * qty")
+//!           .group_by(["region"], [agg_sum("revenue", "total"), agg_rows("n")])
+//!           .sort_by("total", true)
+//!           .limit(2)
+//!   print(top.explain())                                   // Scan(...) -> Filter(...) -> ...
+//!   out = top.optimize().collect() or Frame.new()          // run the plan; optimize() is optional and result-preserving
+//!
+//! A `LazyFrame` is a source (an in-memory `Frame`, or CSV text parsed with type inference at `collect()` time) plus
+//! an ordered list of `PlanOp` steps. Building a plan never touches the data and never mutates the receiver: every
+//! builder method returns a new `LazyFrame`. `collect()` runs the steps in order with the eager `Frame` operations
+//! and returns `Frame!`; it fails when the plan has no source, when an expression string given to `where` /
+//! `with_expr` did not parse, or when a joined plan fails.
+//!
+//! `optimize()` rewrites the plan without changing its result: filters move in front of sorts, `with_column` steps
+//! that they do not read, and projections that keep every column they read; adjacent filters fuse into one `and`;
+//! adjacent limits fuse into the smaller one. Public helpers are prefixed `pl_`.
+//!
+//! Beyond the eager basics a plan can record windows (`over` / `over_desc` with `win_*` specs), as-of joins
+//! (`join_asof`), dynamic time windows (`group_by_dynamic`), dtype selectors (`select_dtype`, `exclude`) and run in
+//! bounded memory with `collect_streaming(batch_size)`: the leading filter / select / drop / with / rename / limit steps
+//! run batch by batch, a following `group_by` of sum / mean / min / max / count / rows / first / last is aggregated per
+//! batch and merged, and everything after that (or any other blocking step) runs on the materialized rest. Results equal
+//! `collect()` (float sums may differ in the last bits because batches add in a different order).
+
+use std.core.str
+use std.core.collections
+use std.data.column
+use std.data.expr
+use std.data.frame
+use std.fmt.csv
+
+/// Plan step: keep rows where the expression is true.
++PL_FILTER = 0
+/// Plan step: keep the named columns.
++PL_SELECT = 1
+/// Plan step: remove the named columns.
++PL_DROP = 2
+/// Plan step: add or replace a computed column.
++PL_WITH = 3
+/// Plan step: stable multi-key sort.
++PL_SORT = 4
+/// Plan step: first `n` rows.
++PL_LIMIT = 5
+/// Plan step: last `n` rows.
++PL_TAIL = 6
+/// Plan step: group and aggregate.
++PL_GROUP = 7
+/// Plan step: join with another plan.
++PL_JOIN = 8
+/// Plan step: rename a column.
++PL_RENAME = 9
+/// Plan step: drop duplicate rows.
++PL_UNIQUE = 10
+/// Plan step: window columns (`over`).
++PL_WINDOW = 11
+/// Plan step: as-of join with another plan.
++PL_ASOF = 12
+/// Plan step: dynamic (time) window aggregation.
++PL_DYNAMIC = 13
+/// Plan step: keep the columns of one dtype.
++PL_SELECT_DTYPE = 14
+
+/// One step of a plan. Which fields matter depends on `kind` (`name`/`name2` for rename and with/join, `names` for
+/// column lists and keys, `flags` for sort directions, `ex` for filter/with expressions, `aggs` for group_by,
+/// `right` + `has_right` for a joined partner frame (materialized when the join step is recorded — keeps `PlanOp`
+/// free of a LazyFrame cycle so AOT can unbox filter/join/run), `n` for limit/tail). Newer steps also use `names2`
+/// (order-by columns of a window), `n2` / `n3` (period / offset of dynamic windows) and `x` (as-of tolerance).
++PlanOp = {
+    kind: i64
+    name: str = ""
+    name2: str = ""
+    // Typed empty seeds (not bare `[]`) so filter/where/pl_apply stay AOT-unboxable.
+    names: _ = host.sys_arr_new(0, "")
+    flags: _ = host.sys_arr_new(0, 0)
+    ex: Expr = Expr.{
+        ops: host.sys_arr_new(0, 0),
+        a: host.sys_arr_new(0, 0),
+        b: host.sys_arr_new(0, 0),
+        ints: host.sys_arr_new(0, 0),
+        floats: host.sys_arr_new(0, 0.0),
+        strs: host.sys_arr_new(0, ""),
+        root: -1,
+    }
+    // ArrEmpty: widens to ArrStruct(AggSpec) at the first group_by / window push.
+    aggs: _ = []
+    right: Frame = Frame.{names: [], kinds: [], slots: [], ints: [], floats: [], bools: [], strs: [], nrows: 0}
+    has_right: bool = false
+    n: i64 = 0
+    names2: _ = host.sys_arr_new(0, "")
+    n2: i64 = 0
+    n3: i64 = 0
+    x: f64 = 0.0
+}
+
+/// Empty expression payload for steps that do not carry an `ex`.
++pl_no_ex() : Expr => Expr.new()
+
+/// Fully specified step (no join partner).
++pl_op(kind: i64, name: str, name2: str, names: _, flags: _, ex: Expr, aggs: _, n: i64) : PlanOp =>
+    PlanOp.{kind, name, name2, names, flags, ex, aggs, n}
+
+/// Plain step that only needs a kind.
++pl_simple(kind: i64) : PlanOp => pl_op(kind, "", "", [], [], pl_no_ex(), [], 0)
+
+/// Fuse two expressions into `a and b` (a fresh arena; inputs are untouched).
++pl_and(a: Expr, b: Expr) : Expr {
+    out = Expr.new()
+    na = a.size()
+    i = 0
+    while i < na {
+        @out.push_node(a.ops[i], a.a[i], a.b[i], a.ints[i], a.floats[i], a.strs[i])
+        i += 1
+    }
+    nb = b.size()
+    j = 0
+    while j < nb {
+        ca = b.a[j]
+        cb = b.b[j]
+        iv = b.ints[j]
+        if ca >= 0 { ca += na }
+        if cb >= 0 { cb += na }
+        if b.ops[j] == EX_WHEN { iv += na }
+        @out.push_node(b.ops[j], ca, cb, iv, b.floats[j], b.strs[j])
+        j += 1
+    }
+    joined = @out.bin(EX_AND, a.root, b.root + na)
+    @out.finish(joined)
+    out
+}
+
+/// Text of an aggregate function name.
++pl_agg_name(op: i64) : str {
+    if op == AG_SUM { return "sum" }
+    if op == AG_MEAN { return "mean" }
+    if op == AG_MIN { return "min" }
+    if op == AG_MAX { return "max" }
+    if op == AG_COUNT { return "count" }
+    if op == AG_ROWS { return "rows" }
+    if op == AG_FIRST { return "first" }
+    if op == AG_LAST { return "last" }
+    if op == AG_STD { return "std" }
+    if op == AG_NUNIQUE { return "nunique" }
+    "agg"
+}
+
+/// Text of a window function name.
++pl_win_name(op: i64) : str {
+    if op <= AG_NUNIQUE { return pl_agg_name(op) }
+    if op == WN_ROW_NUMBER { return "row_number" }
+    if op == WN_RANK { return "rank" }
+    if op == WN_DENSE_RANK { return "dense_rank" }
+    if op == WN_LAG { return "lag" }
+    if op == WN_LEAD { return "lead" }
+    if op == WN_CUM_SUM { return "cum_sum" }
+    if op == WN_CUM_MIN { return "cum_min" }
+    if op == WN_CUM_MAX { return "cum_max" }
+    if op == WN_CUM_COUNT { return "cum_count" }
+    if op == WN_ROLL_SUM { return "rolling_sum" }
+    if op == WN_ROLL_MEAN { return "rolling_mean" }
+    if op == WN_ROLL_STD { return "rolling_std" }
+    if op == WN_ROLL_MIN { return "rolling_min" }
+    if op == WN_ROLL_MAX { return "rolling_max" }
+    "window"
+}
+
+/// True when `needle` is in the string array `xs`.
++pl_has(xs: _, needle: str) : bool {
+    for xs { if it == needle { return true } }
+    false
+}
+
+/// True when every entry of `need` is in `have`.
++pl_covers(have: _, need: _) : bool {
+    for need { if !pl_has(have, it) { return false } }
+    true
+}
+
+/// `names` joined with `, `.
++pl_list(names: _) : str {
+    out = ""
+    first = true
+    for names {
+        if first { out = it } else { out = "{out}, {it}" }
+        first = false
+    }
+    out
+}
+
+/// One-line description of a step.
++pl_describe(op: PlanOp) : str {
+    if (op.kind == PL_FILTER) {
+        e: Expr = op.ex
+        return "Filter({e.show()})"
+    }
+    if op.kind == PL_SELECT { return "Select({pl_list(op.names)})" }
+    if op.kind == PL_DROP { return "Drop({pl_list(op.names)})" }
+    if (op.kind == PL_WITH) {
+        e: Expr = op.ex
+        return "With({op.name} = {e.show()})"
+    }
+    if op.kind == PL_SORT {
+        parts = []
+        i = 0
+        for op.names {
+            part = it
+            if op.flags[i] { part = "{it} desc" }
+            parts = host.sys_arr_push(parts, part)
+            i += 1
+        }
+        return "Sort({pl_list(parts)})"
+    }
+    if op.kind == PL_LIMIT { return "Limit({op.n})" }
+    if op.kind == PL_TAIL { return "Tail({op.n})" }
+    if op.kind == PL_GROUP {
+        parts = []
+        for op.aggs {
+            item = it
+            spec: AggSpec = item
+            parts = host.sys_arr_push(parts, "{pl_agg_name(spec.op)}({spec.col}) as {spec.out}")
+        }
+        return "GroupBy([{pl_list(op.names)}]; {pl_list(parts)})"
+    }
+    if op.kind == PL_JOIN { return "Join({op.name} on {pl_list(op.names)})" }
+    if op.kind == PL_RENAME { return "Rename({op.name} -> {op.name2})" }
+    if op.kind == PL_WINDOW {
+        parts = []
+        for op.aggs {
+            item = it
+            spec: WinSpec = item
+            parts = host.sys_arr_push(parts, "{pl_win_name(spec.op)}({spec.col}) as {spec.out}")
+        }
+        return "Over(partition [{pl_list(op.names)}] order [{pl_list(op.names2)}]; {pl_list(parts)})"
+    }
+    if op.kind == PL_ASOF { return "JoinAsof({op.name2} on {op.name} by [{pl_list(op.names)}] tolerance {op.x})" }
+    if op.kind == PL_DYNAMIC {
+        parts = []
+        for op.aggs {
+            item = it
+            spec: AggSpec = item
+            parts = host.sys_arr_push(parts, "{pl_agg_name(spec.op)}({spec.col}) as {spec.out}")
+        }
+        return "GroupByDynamic({op.name} every {op.n} period {op.n2} offset {op.n3} by [{pl_list(op.names)}]; {pl_list(parts)})"
+    }
+    if op.kind == PL_SELECT_DTYPE { return "SelectDtype({dt_kind_name(op.n)})" }
+    "Unique"
+}
+
+/// Run one infallible step on an eager frame (joins are handled by `LazyFrame.collect`).
++pl_apply(cur: Frame, op: PlanOp) : Frame {
+    if (op.kind == PL_FILTER) {
+        e: Expr = op.ex
+        return cur.filter(e)
+    }
+    if op.kind == PL_SELECT { return cur.select(op.names) }
+    if op.kind == PL_DROP { return cur.drop(op.names) }
+    if (op.kind == PL_WITH) {
+        e: Expr = op.ex
+        return cur.with_column(op.name, e)
+    }
+    if op.kind == PL_SORT { return cur.sort_by_many(op.names, op.flags) }
+    if op.kind == PL_LIMIT { return cur.head(op.n) }
+    if op.kind == PL_TAIL { return cur.tail(op.n) }
+    if op.kind == PL_GROUP { return cur.group_by(op.names, op.aggs) }
+    if op.kind == PL_RENAME { return cur.rename(op.name, op.name2) }
+    if op.kind == PL_UNIQUE { return cur.unique() }
+    if op.kind == PL_WINDOW { return fr_over(cur, op.names, op.names2, op.flags, op.aggs) }
+    if op.kind == PL_DYNAMIC { return fr_group_dynamic(cur, op.name, op.n, op.n2, op.n3, op.names, op.aggs) }
+    if op.kind == PL_SELECT_DTYPE { return cur.select_dtype(op.n) }
+    cur
+}
+
+/// True for steps that work on one batch at a time (their result for a batch does not depend on other rows).
++pl_streamable(op: PlanOp) : bool {
+    k = op.kind
+    k == PL_FILTER || k == PL_SELECT || k == PL_DROP || k == PL_WITH || k == PL_LIMIT || k == PL_RENAME
+}
+
+/// True when every aggregate can be merged from per-batch partial results.
++pl_mergeable(aggs: _) : bool {
+    for aggs {
+        item = it
+        spec: AggSpec = item
+        o = spec.op
+        if !(o == AG_SUM || o == AG_MEAN || o == AG_MIN || o == AG_MAX || o == AG_COUNT || o == AG_ROWS || o == AG_FIRST || o == AG_LAST) { return false }
+    }
+    true
+}
+
+/// Per-batch partial aggregates for a mergeable `aggs` list; partial `i` is named `__p{i}` (a mean also gets the count
+/// `__q{i}`).
++pl_partial_specs(aggs: _) {
+    out = []
+    i = 0
+    for aggs {
+        item = it
+        spec: AggSpec = item
+        pname = "__p{i}"
+        if spec.op == AG_MEAN {
+            out = host.sys_arr_push(out, agg_sum(spec.col, pname))
+            out = host.sys_arr_push(out, agg_count(spec.col, "__q{i}"))
+        } else {
+            out = host.sys_arr_push(out, AggSpec.{op: spec.op, col: spec.col, out: pname})
+        }
+        i += 1
+    }
+    return out
+}
+
+/// Aggregates that merge the partials of `pl_partial_specs` into the final `aggs`: sums of counts / sums / rows, min of
+/// mins, and so on. A mean becomes the hidden sums `__p{i}` / `__q{i}` (divided afterwards by `pl_merge_groups`).
++pl_final_specs(aggs: _) {
+    out = []
+    i = 0
+    for aggs {
+        item = it
+        spec: AggSpec = item
+        pname = "__p{i}"
+        if spec.op == AG_MEAN {
+            out = host.sys_arr_push(out, agg_sum(pname, pname))
+            out = host.sys_arr_push(out, agg_sum("__q{i}", "__q{i}"))
+        } else {
+            merge = spec.op
+            if spec.op == AG_COUNT || spec.op == AG_ROWS { merge = AG_SUM }
+            out = host.sys_arr_push(out, AggSpec.{op: merge, col: pname, out: spec.out})
+        }
+        i += 1
+    }
+    return out
+}
+
+/// Merge concatenated per-batch partial group frames into the final grouped frame of the `PL_GROUP` step `op`.
++pl_merge_groups(partials: Frame, op: PlanOp) : Frame {
+    merged = partials.group_by(op.names, pl_final_specs(op.aggs))
+    ensure merged.width() > 0 else { return merged }
+    outs = []
+    for op.names { outs = host.sys_arr_push(outs, it) }
+    i = 0
+    for op.aggs {
+        item = it
+        spec: AggSpec = item
+        if spec.op == AG_MEAN {
+            e = expr("__p{i} / __q{i}") or fail_expr()
+            merged = merged.with_column(spec.out, e)
+        }
+        outs = host.sys_arr_push(outs, spec.out)
+        i += 1
+    }
+    merged.select(outs)
+}
+
+/// A deferred query: a source plus an ordered list of steps.
++LazyFrame = {
+    source: _ = []
+    has_frame: bool = false
+    csv: str = ""
+    has_csv: bool = false
+    header: bool = true
+    ops: _ = []
+    error: str = ""
+
+    /// A plan with no source; `collect()` on it fails until a source is attached by `lazy` / `lazy_csv`.
+    empty() : LazyFrame =>
+        LazyFrame.{source: [], has_frame: false, csv: "", has_csv: false, header: true, ops: [], error: ""}
+
+    /// Number of steps.
+    op_count(self) : i64 => host.sys_arr_len(self.ops)
+
+    /// Recorded construction error (`""` when none).
+    failure(self) : str => self.error
+
+    /// Copy with one more step.
+    -with_op(self, op: PlanOp) : LazyFrame =>
+        LazyFrame.{source: self.source, has_frame: self.has_frame, csv: self.csv, has_csv: self.has_csv,
+            header: self.header, ops: host.sys_arr_push(self.ops, op), error: self.error}
+
+    /// Copy carrying `msg` as its first error.
+    -with_error(self, msg: str) : LazyFrame {
+        keep = self.error
+        if keep == "" { keep = msg }
+        LazyFrame.{source: self.source, has_frame: self.has_frame, csv: self.csv, has_csv: self.has_csv,
+            header: self.header, ops: self.ops, error: keep}
+    }
+
+    /// Keep rows where `e` is true.
+    /// Construct `PlanOp` via field defaults (no bare `[]`) so AOT unboxes filter/where/pl_apply.
+    filter(self, e: Expr) : LazyFrame => self.with_op(PlanOp.{kind: PL_FILTER, ex: e})
+
+    /// Keep rows where the expression text `src` is true (parse errors surface at `collect()`).
+    where(self, src: str) : LazyFrame {
+        e = expr(src) or err { return self.with_error("where: {err}") }
+        self.filter(e)
+    }
+
+    /// Keep only the named columns, in that order.
+    select(self, names: _) : LazyFrame => self.with_op(pl_op(PL_SELECT, "", "", names, [], pl_no_ex(), [], 0))
+
+    /// Remove the named columns.
+    drop(self, names: _) : LazyFrame => self.with_op(pl_op(PL_DROP, "", "", names, [], pl_no_ex(), [], 0))
+
+    /// Add or replace column `name` computed by `e`.
+    with_column(self, name: str, e: Expr) : LazyFrame => self.with_op(pl_op(PL_WITH, name, "", [], [], e, [], 0))
+
+    /// Add or replace column `name` computed by the expression text `src`.
+    with_expr(self, name: str, src: str) : LazyFrame {
+        e = expr(src) or err { return self.with_error("with_expr {name}: {err}") }
+        self.with_column(name, e)
+    }
+
+    /// Stable sort by one column (nulls last).
+    sort_by(self, name: str, descending: bool) : LazyFrame =>
+        self.with_op(pl_op(PL_SORT, "", "", [name], [descending], pl_no_ex(), [], 0))
+
+    /// Stable sort by several columns with one direction flag per column.
+    sort_by_many(self, names: _, descending: _) : LazyFrame =>
+        self.with_op(pl_op(PL_SORT, "", "", names, descending, pl_no_ex(), [], 0))
+
+    /// First `n` rows.
+    limit(self, n: i64) : LazyFrame => self.with_op(pl_op(PL_LIMIT, "", "", [], [], pl_no_ex(), [], n))
+
+    /// Last `n` rows.
+    tail(self, n: i64) : LazyFrame => self.with_op(pl_op(PL_TAIL, "", "", [], [], pl_no_ex(), [], n))
+
+    /// Group by `keys` and aggregate with `agg_*` specs.
+    group_by(self, keys: _, aggs: _) : LazyFrame => self.with_op(pl_op(PL_GROUP, "", "", keys, [], pl_no_ex(), aggs, 0))
+
+    /// Join with another plan on `on` (`inner` | `left` | `right` | `outer`).
+    /// The partner is collected when the step is recorded so `PlanOp` stays free of a LazyFrame cycle.
+    join(self, other: LazyFrame, on: _, how: str) : LazyFrame {
+        right = other.collect() or err { return self.with_error("join: {err}") }
+        self.with_op(PlanOp.{kind: PL_JOIN, name: how, names: on, right, has_right: true})
+    }
+
+    /// Rename a column.
+    rename(self, old: str, new_name: str) : LazyFrame =>
+        self.with_op(pl_op(PL_RENAME, old, new_name, [], [], pl_no_ex(), [], 0))
+
+    /// Drop duplicate rows.
+    unique(self) : LazyFrame => self.with_op(pl_simple(PL_UNIQUE))
+
+    /// Window columns: one per `win_*` spec, evaluated inside the `partition_by` groups ordered by `order_by`
+    /// (ascending). Rows keep their order. See `Frame.over`.
+    over(self, partition_by: _, order_by: _, wins: _) : LazyFrame =>
+        self.with_op(PlanOp.{kind: PL_WINDOW, names: partition_by, names2: order_by, aggs: wins})
+
+    /// `over` with one descending flag per `order_by` column.
+    over_desc(self, partition_by: _, order_by: _, descending: _, wins: _) : LazyFrame =>
+        self.with_op(PlanOp.{kind: PL_WINDOW, names: partition_by, names2: order_by, flags: descending, aggs: wins})
+
+    /// As-of join with another plan; see `Frame.join_asof` (`tolerance < 0.0` means unlimited).
+    join_asof(self, other: LazyFrame, on: str, by: _, strategy: str, tolerance: f64) : LazyFrame {
+        right = other.collect() or err { return self.with_error("join_asof: {err}") }
+        self.with_op(PlanOp.{kind: PL_ASOF, name: on, name2: strategy, names: by, right, has_right: true, x: tolerance})
+    }
+
+    /// Tumbling windows of width `every` over the int column `ts_col`; see `Frame.group_by_dynamic`.
+    group_by_dynamic(self, ts_col: str, every: i64, by: _, aggs: _) : LazyFrame =>
+        self.with_op(PlanOp.{kind: PL_DYNAMIC, name: ts_col, names: by, aggs, n: every, n2: every, n3: 0})
+
+    /// Dynamic windows with an explicit `period` and `offset`; see `Frame.group_by_dynamic_with`.
+    group_by_dynamic_with(self, ts_col: str, every: i64, period: i64, offset: i64, by: _, aggs: _) : LazyFrame =>
+        self.with_op(PlanOp.{kind: PL_DYNAMIC, name: ts_col, names: by, aggs, n: every, n2: period, n3: offset})
+
+    /// Keep only the columns of dtype `kind` (`DT_INT` ...), resolved against the frame when the plan runs.
+    select_dtype(self, kind: i64) : LazyFrame => self.with_op(PlanOp.{kind: PL_SELECT_DTYPE, n: kind})
+
+    /// Every column except `names` (same as `drop`).
+    exclude(self, names: _) : LazyFrame => self.drop(names)
+
+    /// Human-readable plan: `Scan(...) -> Step -> Step`.
+    explain(self) : str {
+        out = "Scan(csv)"
+        if (self.has_frame) {
+            f: Frame = self.source
+            out = "Scan(frame {f.height()}x{f.width()})"
+        }
+        if !self.has_frame && !self.has_csv { out = "Scan(none)" }
+        for self.ops {
+            item = it
+            op: PlanOp = item
+            out = "{out} -> {pl_describe(op)}"
+        }
+        out
+    }
+
+    /// The source frame (parsing CSV text when needed). Fails with the recorded construction error or a missing source.
+    -source_frame(self) : Frame! {
+        if self.error != "" {
+            fail self.error
+            return
+        }
+        if (self.has_frame) {
+            src: Frame = self.source
+            return src
+        }
+        if self.has_csv { return frame_from_rows(csv_parse(self.csv), self.header) }
+        fail "plan has no source"
+        return
+    }
+
+    /// Apply steps `from ..` to `cur`, collecting joined plans as needed.
+    -run(self, start: Frame, from: i64) : Frame! {
+        cur = start
+        i = from
+        n = host.sys_arr_len(self.ops)
+        while i < n {
+            item = self.ops[i]
+            op: PlanOp = item
+            if (op.kind == PL_JOIN) {
+                cur = cur.join(op.right, op.names, op.name)
+            } else {
+                if (op.kind == PL_ASOF) {
+                    cur = cur.join_asof(op.right, op.name, op.names, op.name2, op.x)
+                } else {
+                    cur = pl_apply(cur, op)
+                }
+            }
+            i += 1
+        }
+        cur
+    }
+
+    /// Run the plan. Fails with the recorded construction error, a missing source, or a joined plan's failure.
+    collect(self) : Frame! {
+        src = self.source_frame() or err {
+            fail "{err}"
+            return
+        }
+        self.run(src, 0)
+    }
+
+    /// Run the plan in bounded memory: the source is cut into batches of `batch_size` rows, the leading streamable steps
+    /// (filter, select, drop, with, rename, limit) run per batch, and a `group_by` made of sum / mean / min / max / count /
+    /// rows / first / last is aggregated per batch and merged; the remaining steps run on the combined result. Stops
+    /// reading once a `limit` is satisfied. Same result as `collect()`; fails when `batch_size <= 0`. A CSV source is
+    /// parsed once up front, since column types need the whole file.
+    collect_streaming(self, batch_size: i64) : Frame! {
+        if batch_size <= 0 {
+            fail "collect_streaming: batch_size must be positive"
+            return
+        }
+        src = self.source_frame() or err {
+            fail "{err}"
+            return
+        }
+        ops = self.ops
+        n = host.sys_arr_len(ops)
+        pre = 0
+        while pre < n {
+            item = ops[pre]
+            probe: PlanOp = item
+            if !pl_streamable(probe) { break }
+            pre += 1
+        }
+        rem = []
+        i = 0
+        while i < pre {
+            item = ops[i]
+            lim: PlanOp = item
+            rem = host.sys_arr_push(rem, lim.n)
+            i += 1
+        }
+        gop = pl_simple(PL_UNIQUE)
+        merge = false
+        if pre < n {
+            item = ops[pre]
+            cand: PlanOp = item
+            if cand.kind == PL_GROUP && pl_mergeable(cand.aggs) {
+                gop = cand
+                merge = true
+            }
+        }
+        parts = []
+        start = 0
+        done = false
+        first = true
+        while !done && (first || start < src.nrows) {
+            first = false
+            cur = fr_slice(src, start, batch_size)
+            start += batch_size
+            i = 0
+            while i < pre {
+                item = ops[i]
+                op: PlanOp = item
+                if op.kind == PL_LIMIT {
+                    cur = cur.head(rem[i])
+                    rem = host.sys_arr_set(rem, i, rem[i] - cur.height())
+                    if rem[i] <= 0 { done = true }
+                } else {
+                    cur = pl_apply(cur, op)
+                }
+                i += 1
+            }
+            if merge { cur = cur.group_by(gop.names, pl_partial_specs(gop.aggs)) }
+            parts = host.sys_arr_push(parts, cur)
+        }
+        merged = fr_concat(parts)
+        resume = pre
+        if merge {
+            merged = pl_merge_groups(merged, gop)
+            resume = pre + 1
+        }
+        self.run(merged, resume)
+    }
+
+    /// Result-preserving rewrite: pushes filters in front of sorts, unrelated `with_column`s and projections that
+    /// keep their columns, then fuses adjacent filters (`and`) and adjacent limits (`min`).
+    optimize(self) : LazyFrame {
+        ops = self.ops
+        moved = true
+        while moved {
+            moved = false
+            i = 0
+            n = host.sys_arr_len(ops)
+            while i + 1 < n {
+                p1 = ops[i]
+                p2 = ops[i + 1]
+                prev: PlanOp = p1
+                next: PlanOp = p2
+                swap = false
+                if (next.kind == PL_FILTER) {
+                    e: Expr = next.ex
+                    reads = e.columns()
+                    if prev.kind == PL_SORT { swap = true }
+                    if prev.kind == PL_WITH { swap = !pl_has(reads, prev.name) }
+                    if prev.kind == PL_SELECT { swap = pl_covers(prev.names, reads) }
+                }
+                if swap {
+                    ops = pl_swap(ops, i)
+                    moved = true
+                }
+                i += 1
+            }
+        }
+        fused = []
+        i = 0
+        n = host.sys_arr_len(ops)
+        while i < n {
+            item = ops[i]
+            op: PlanOp = item
+            m = host.sys_arr_len(fused)
+            merged = false
+            if m > 0 {
+                last_item = fused[m - 1]
+                last: PlanOp = last_item
+                if (last.kind == PL_FILTER && op.kind == PL_FILTER) {
+                    ea: Expr = last.ex
+                    eb: Expr = op.ex
+                    both = pl_op(PL_FILTER, "", "", [], [], pl_and(ea, eb), [], 0)
+                    fused = pl_set(fused, m - 1, both)
+                    merged = true
+                }
+                if last.kind == PL_LIMIT && op.kind == PL_LIMIT {
+                    smaller = last.n
+                    if op.n < smaller { smaller = op.n }
+                    fused = pl_set(fused, m - 1, pl_op(PL_LIMIT, "", "", [], [], pl_no_ex(), [], smaller))
+                    merged = true
+                }
+            }
+            if !merged { fused = host.sys_arr_push(fused, op) }
+            i += 1
+        }
+        LazyFrame.{source: self.source, has_frame: self.has_frame, csv: self.csv, has_csv: self.has_csv,
+            header: self.header, ops: fused, error: self.error}
+    }
+}
+
+/// Copy of `ops` with entries `i` and `i + 1` exchanged.
++pl_swap(ops: _, i: i64) {
+    out = []
+    j = 0
+    n = host.sys_arr_len(ops)
+    while j < n {
+        if j == i {
+            out = host.sys_arr_push(out, ops[i + 1])
+        } else {
+            if j == i + 1 {
+                out = host.sys_arr_push(out, ops[i])
+            } else {
+                out = host.sys_arr_push(out, ops[j])
+            }
+        }
+        j += 1
+    }
+    return out
+}
+
+/// Copy of `ops` with entry `i` replaced by `op`.
++pl_set(ops: _, i: i64, op: PlanOp) {
+    out = []
+    j = 0
+    n = host.sys_arr_len(ops)
+    while j < n {
+        if j == i { out = host.sys_arr_push(out, op) } else { out = host.sys_arr_push(out, ops[j]) }
+        j += 1
+    }
+    return out
+}
+
+/// Plan over an in-memory frame.
++lazy(f: Frame) : LazyFrame =>
+    LazyFrame.{source: f, has_frame: true, csv: "", has_csv: false, header: true, ops: [], error: ""}
+
+/// Plan over CSV text; the text is parsed (with per-column type inference) when the plan is collected.
++lazy_csv(text: str, has_header: bool) : LazyFrame =>
+    LazyFrame.{source: [], has_frame: false, csv: text, has_csv: true, header: has_header, ops: [], error: ""}
+
+// --- tests ------------------------------------------------------------------------------------------
+
+pl_sales_csv() : str => "region,price,qty,rush\nEU,10.0,3,true\nUS,20.0,1,false\nEU,30.0,2,false\nAPAC,5.0,10,true\nUS,8.0,4,false\nEU,4.0,5,true\n"
+
+pl_sales() : Frame => frame_from_rows(csv_parse(pl_sales_csv()), true)
+
+test "building a plan is lazy and immutable" {
+    base = lazy(pl_sales())
+    assert_eq(base.op_count(), 0)
+    a = base.where("price > 5")
+    b = a.select(["region", "qty"])
+    assert_eq(base.op_count(), 0)
+    assert_eq(a.op_count(), 1)
+    assert_eq(b.op_count(), 2)
+    assert_eq(base.explain(), "Scan(frame 6x4)")
+    assert_eq(a.explain(), "Scan(frame 6x4) -> Filter((price > 5))")
+    assert_eq(b.explain(), "Scan(frame 6x4) -> Filter((price > 5)) -> Select(region, qty)")
+    // a sibling plan from the same base does not see the first branch
+    c = base.limit(2)
+    assert_eq(c.op_count(), 1)
+    assert_eq(a.op_count(), 1)
+    out = base.collect() or Frame.new()
+    assert_eq(out.height(), 6)
+    assert_eq(out.width(), 4)
+}
+
+test "collect matches eager frame operations" {
+    f = pl_sales()
+    lf = lazy(f).where("price * qty >= 20")
+        .with_expr("revenue", "price * qty")
+        .group_by(["region"], [agg_sum("revenue", "total"), agg_rows("n")])
+        .sort_by("total", true)
+        .limit(2)
+    got = lf.collect() or Frame.new()
+    kept = f.filter(expr("price * qty >= 20") or fail_expr())
+    withrev = kept.with_column("revenue", expr("price * qty") or fail_expr())
+    grouped = withrev.group_by(["region"], [agg_sum("revenue", "total"), agg_rows("n")])
+    want = grouped.sort_by("total", true).head(2)
+    #assert(got.same_as(want))
+    assert_eq(got.height(), 2)
+    // price*qty per row: EU 30, US 20, EU 60, APAC 50, US 32, EU 20 -> EU 110, US 52, APAC 50
+    assert_eq(got.text_at(0, 0), "EU")
+    assert_eq(got.get_float("total").get(0), 110.0)
+    assert_eq(got.get_int("n").get(0), 3)
+    assert_eq(got.text_at(1, 0), "US")
+    assert_eq(got.get_float("total").get(1), 52.0)
+}
+
+test "every step kind" {
+    base = lazy(pl_sales())
+    assert_eq((base.tail(2).collect() or Frame.new()).height(), 2)
+    assert_eq((base.tail(2).collect() or Frame.new()).text_at(0, 0), "US")
+    assert_eq((base.drop(["rush", "price"]).collect() or Frame.new()).width(), 2)
+    assert_eq((base.select(["qty"]).collect() or Frame.new()).names[0], "qty")
+    ren = base.rename("qty", "units").collect() or Frame.new()
+    #assert(ren.has_col("units"))
+    #assert(!(ren.has_col("qty")))
+    uniq = base.select(["region"]).unique().collect() or Frame.new()
+    assert_eq(uniq.height(), 3)
+    srt = base.sort_by_many(["region", "price"], [false, true]).collect() or Frame.new()
+    assert_eq(srt.text_at(0, 0), "APAC")
+    assert_eq(srt.get_float("price").get(1), 30.0)
+    lim = base.limit(0).collect() or Frame.new()
+    assert_eq(lim.height(), 0)
+    assert_eq(lim.width(), 4)
+    wc = base.with_column("x", expr("qty + 1") or fail_expr()).collect() or Frame.new()
+    assert_eq(wc.get_int("x").total(), 31)
+    ex_filter = base.filter(expr("rush") or fail_expr()).collect() or Frame.new()
+    assert_eq(ex_filter.height(), 3)
+}
+
+test "explain describes every step" {
+    lf = lazy(pl_sales()).where("rush")
+        .with_expr("rev", "price * qty")
+        .sort_by_many(["region", "rev"], [false, true])
+        .group_by(["region"], [agg_mean("rev", "avg"), agg_nunique("qty", "q")])
+        .rename("avg", "average")
+        .tail(5)
+        .limit(3)
+        .drop(["q"])
+        .select(["region", "average"])
+        .unique()
+    want = "Scan(frame 6x4) -> Filter(rush) -> With(rev = (price * qty)) -> Sort(region, rev desc) -> GroupBy([region]; mean(rev) as avg, nunique(qty) as q) -> Rename(avg -> average) -> Tail(5) -> Limit(3) -> Drop(q) -> Select(region, average) -> Unique"
+    assert_eq(lf.explain(), want)
+    assert_eq(lf.op_count(), 10)
+    assert_eq(LazyFrame.empty().explain(), "Scan(none)")
+    assert_eq(lazy_csv("a\n1\n", true).explain(), "Scan(csv)")
+}
+
+test "csv source is parsed at collect time" {
+    lf = lazy_csv(pl_sales_csv(), true).where("qty >= 3").sort_by("price", false)
+    assert_eq(lf.op_count(), 2)
+    out = lf.collect() or Frame.new()
+    assert_eq(out.height(), 4)
+    assert_eq(out.kind_of("price"), DT_FLOAT)
+    assert_eq(out.kind_of("qty"), DT_INT)
+    assert_eq(out.kind_of("rush"), DT_BOOL)
+    assert_eq(out.get_float("price").get(0), 4.0)
+    assert_eq(out.text_at(3, 0), "EU")
+    // headerless
+    raw = lazy_csv("1,2\n3,4\n5,6\n", false).where("c0 > 1").collect() or Frame.new()
+    assert_eq(raw.height(), 2)
+    assert_eq(raw.get_int("c1").total(), 10)
+}
+
+test "joined plans execute their own steps first" {
+    prices = lazy_csv("region,tax\nEU,0.2\nUS,0.1\n", true).where("tax > 0.0")
+    lf = lazy(pl_sales()).join(prices, ["region"], "left").with_expr("net", "price * (1.0 - tax)")
+    out = lf.collect() or Frame.new()
+    assert_eq(out.height(), 6)
+    #assert(out.has_col("tax"))
+    assert_eq(out.get_float("tax").null_count(), 1)
+    assert_eq(out.get_float("net").null_count(), 1)
+    assert_eq(out.get_float("net").get(0), 8.0)
+    inner = lazy(pl_sales()).join(prices, ["region"], "inner").collect() or Frame.new()
+    assert_eq(inner.height(), 5)
+    assert_eq(lf.explain(), "Scan(frame 6x4) -> Join(left on region) -> With(net = (price * (1 - tax)))")
+    // a failing inner plan fails the outer plan
+    broken = lazy_csv("a\n1\n", true).where("a >")
+    bad = lazy(pl_sales()).join(broken, ["region"], "inner")
+    sentinel = bad.collect() or Frame.new()
+    assert_eq(sentinel.width(), 0)
+}
+
+test "errors surface at collect" {
+    bad = lazy(pl_sales()).where("price >")
+    #assert(bad.failure() != "")
+    assert_eq(bad.op_count(), 0)
+    res = bad.collect() or err { return }
+    assert_eq(res.width(), 0)
+}
+
+test "construction errors keep the first message and later steps still build" {
+    bad = lazy(pl_sales()).where("price >").with_expr("x", "qty +").limit(1)
+    assert_eq(bad.op_count(), 1)
+    assert_eq(bad.failure(), bad.failure())
+    msg = bad.collect() or err { "{err}" }
+    #assert(starts_with(msg, "where:"))
+}
+
+test "missing source fails" {
+    e = LazyFrame.empty().limit(3)
+    out = e.collect() or Frame.new()
+    assert_eq(out.width(), 0)
+    msg = e.collect() or err { "{err}" }
+    assert_eq(msg, "plan has no source")
+}
+
+test "optimize pushes filters past sorts and fuses them" {
+    lf = lazy(pl_sales()).sort_by("price", true).where("qty > 1").where("rush")
+    assert_eq(lf.explain(), "Scan(frame 6x4) -> Sort(price desc) -> Filter((qty > 1)) -> Filter(rush)")
+    opt = lf.optimize()
+    assert_eq(opt.op_count(), 2)
+    assert_eq(opt.explain(), "Scan(frame 6x4) -> Filter(((qty > 1) and rush)) -> Sort(price desc)")
+    a = lf.collect() or Frame.new()
+    b = opt.collect() or Frame.new()
+    #assert(a.same_as(b))
+    assert_eq(a.height(), 3)
+    assert_eq(a.get_float("price").get(0), 10.0)
+    // the original plan is untouched
+    assert_eq(lf.op_count(), 3)
+}
+
+test "optimize respects column dependencies" {
+    // the filter reads the computed column, so it must stay behind with_column
+    dep = lazy(pl_sales()).with_expr("rev", "price * qty").where("rev > 40")
+    assert_eq(dep.optimize().explain(), dep.explain())
+    // an unrelated with_column lets the filter move ahead of it
+    free = lazy(pl_sales()).with_expr("rev", "price * qty").where("qty > 2")
+    assert_eq(free.optimize().explain(), "Scan(frame 6x4) -> Filter((qty > 2)) -> With(rev = (price * qty))")
+    // a projection that drops a column the filter reads blocks the move
+    narrow = lazy(pl_sales()).select(["region"]).where("region == 'EU'")
+    assert_eq(narrow.optimize().explain(), "Scan(frame 6x4) -> Filter((region == 'EU')) -> Select(region)")
+    keep = lazy(pl_sales()).select(["region", "qty"]).where("qty > 1")
+    assert_eq(keep.optimize().explain(), "Scan(frame 6x4) -> Filter((qty > 1)) -> Select(region, qty)")
+    for 0..1 {
+        #assert((dep.collect() or Frame.new()).same_as(dep.optimize().collect() or Frame.new()))
+        #assert((free.collect() or Frame.new()).same_as(free.optimize().collect() or Frame.new()))
+        #assert((keep.collect() or Frame.new()).same_as(keep.optimize().collect() or Frame.new()))
+    }
+}
+
+test "optimize fuses limits" {
+    lf = lazy(pl_sales()).limit(5).limit(2).limit(4)
+    opt = lf.optimize()
+    assert_eq(opt.op_count(), 1)
+    assert_eq(opt.explain(), "Scan(frame 6x4) -> Limit(2)")
+    assert_eq((opt.collect() or Frame.new()).height(), 2)
+    #assert((lf.collect() or Frame.new()).same_as(opt.collect() or Frame.new()))
+    // a non-limit step in between blocks the fuse
+    mixed = lazy(pl_sales()).limit(3).sort_by("price", false).limit(2)
+    assert_eq(mixed.optimize().op_count(), 3)
+}
+
+test "pl_and fuses expression arenas" {
+    a = expr("qty > 1") or fail_expr()
+    b = expr("rush or price > 25") or fail_expr()
+    both = pl_and(a, b)
+    assert_eq(both.size(), a.size() + b.size() + 1)
+    assert_eq(both.show(), "((qty > 1) and (rush or (price > 25)))")
+    f = pl_sales()
+    fused = f.filter(both)
+    chained = f.filter(a).filter(b)
+    #assert(fused.same_as(chained))
+    // the inputs are unchanged
+    assert_eq(a.show(), "(qty > 1)")
+    assert_eq(b.show(), "(rush or (price > 25))")
+}
+
+test "plan helper functions" {
+    #assert(pl_has(["a", "b"], "b"))
+    #assert(!(pl_has(["a", "b"], "c")))
+    #assert(!(pl_has([], "c")))
+    #assert(pl_covers(["a", "b", "c"], ["c", "a"]))
+    #assert(!(pl_covers(["a"], ["a", "z"])))
+    #assert(pl_covers(["a"], []))
+    assert_eq(pl_list([]), "")
+    assert_eq(pl_list(["x"]), "x")
+    assert_eq(pl_list(["x", "y", "z"]), "x, y, z")
+    assert_eq(pl_agg_name(AG_SUM), "sum")
+    assert_eq(pl_agg_name(AG_STD), "std")
+    assert_eq(pl_agg_name(99), "agg")
+    swapped = pl_swap([1, 2, 3, 4], 1)
+    assert_eq(swapped[0], 1)
+    assert_eq(swapped[1], 3)
+    assert_eq(swapped[2], 2)
+    assert_eq(swapped[3], 4)
+    replaced = pl_set([1, 2, 3], 2, pl_simple(PL_UNIQUE))
+    assert_eq(host.sys_arr_len(replaced), 3)
+}
+
+test "optimizer conformance: fused limits equal the min model for every size" {
+    for 0..7 {
+        n = it
+        f = Frame.new()
+        xs = []
+        for 0..n { xs = host.sys_arr_push(xs, it) }
+        @f.add_int(int_col("x", xs))
+        for 0..7 {
+            a = it
+            for 0..7 {
+                b = it
+                lf = lazy(f).limit(a).limit(b)
+                m = a
+                if b < m { m = b }
+                want = n
+                if m < want { want = m }
+                got = lf.optimize().collect() or Frame.new()
+                assert_eq(got.height(), want)
+                assert_eq(lf.optimize().op_count(), 1)
+                assert_eq((lf.collect() or Frame.new()).height(), want)
+            }
+        }
+    }
+}
+
+test "optimizer conformance: fused and pushed filters keep exactly the rows that pass every predicate" {
+    f = pl_sales()
+    for ["price > 5", "qty >= 2", "rush", "not rush", "region == 'EU'", "price * qty > 25"] {
+        first = it
+        for ["price < 30", "qty != 3", "rush or price > 8", "region != 'US'"] {
+            second = it
+            lf = lazy(f).sort_by("price", true).where(first).where(second)
+            eager = f.sort_by("price", true).filter(expr(first) or fail_expr()).filter(expr(second) or fail_expr())
+            plain = lf.collect() or Frame.new()
+            opt = lf.optimize().collect() or Frame.new()
+            #assert(plain.same_as(eager))
+            #assert(opt.same_as(eager))
+            assert_eq(lf.optimize().op_count(), 2)
+        }
+    }
+}
+
+pl_quotes() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("sym", ["A", "A", "A", "B"]))
+    @f.add_int(int_col("t", [1, 5, 10, 2]))
+    @f.add_float(float_col("bid", [100.0, 101.0, 102.0, 50.0]))
+    f
+}
+
+pl_trades() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("sym", ["A", "A", "B", "A", "C"]))
+    @f.add_int(int_col("t", [2, 5, 3, 12, 1]))
+    @f.add_int(int_col("qty", [1, 2, 3, 4, 5]))
+    f
+}
+
+pl_ticks() : Frame {
+    f = Frame.new()
+    @f.add_int(int_col("ts", [0, 1, 2, 5, 6, 11, 12]))
+    @f.add_int(int_col("v", [1, 2, 3, 4, 5, 6, 7]))
+    @f.add_str(str_col("k", ["x", "x", "y", "x", "y", "x", "x"]))
+    f
+}
+
+pl_events() : Frame {
+    f = Frame.new()
+    @f.add_str(str_col("grp", ["a", "a", "a", "b", "b", "a"]))
+    @f.add_int(int_col("t", [3, 1, 2, 2, 1, 4]))
+    @f.add_float(float_col("v", [10.0, 20.0, 30.0, 5.0, 7.0, 40.0]))
+    f
+}
+
+test "lazy windows match the eager over and explain themselves" {
+    f = pl_events()
+    wins = [win_cum_sum("v", "cs"), win_rank("r"), win_rolling_mean("v", "m2", 2), win_lag("v", "p", 1)]
+    lf = lazy(f).over(["grp"], ["t"], wins)
+    assert_eq(lf.explain(), "Scan(frame 6x3) -> Over(partition [grp] order [t]; cum_sum(v) as cs, rank() as r, rolling_mean(v) as m2, lag(v) as p)")
+    got = lf.collect() or Frame.new()
+    #assert(got.same_as(f.over(["grp"], ["t"], wins)))
+    assert_eq(got.width(), 7)
+    // descending variant and chaining after a window
+    d = lazy(f).over_desc(["grp"], ["t"], [true], [win_row_number("rn")]).where("rn <= 2").sort_by("t", false).collect() or Frame.new()
+    assert_eq(d.height(), 4)
+    assert_eq(d.get_int("rn").total(), 1 + 2 + 1 + 2)
+    // a filter after a window must not move in front of it (that would change the window input)
+    late = lazy(f).over(["grp"], [], [win_sum("v", "s")]).where("v > 8.0")
+    assert_eq(late.optimize().explain(), late.explain())
+    #assert((late.optimize().collect() or Frame.new()).same_as(late.collect() or Frame.new()))
+    assert_eq((late.collect() or Frame.new()).get_float("s").get(0), 100.0)
+    // unknown columns give an empty frame, like the eager call
+    assert_eq((lazy(f).over(["ghost"], [], [win_sum("v", "s")]).collect() or Frame.new()).width(), 0)
+    assert_eq(pl_win_name(WN_ROLL_STD), "rolling_std")
+    assert_eq(pl_win_name(AG_SUM), "sum")
+    assert_eq(pl_win_name(99), "window")
+}
+
+test "lazy as-of joins run the other plan first" {
+    q = lazy(pl_quotes()).where("bid > 50.0")
+    t = lazy(pl_trades())
+    j = t.join_asof(q, "t", ["sym"], "backward", -1.0)
+    assert_eq(j.explain(), "Scan(frame 5x3) -> JoinAsof(backward on t by [sym] tolerance -1)")
+    got = j.collect() or Frame.new()
+    #assert(got.same_as(pl_trades().join_asof(pl_quotes().filter(expr("bid > 50.0") or fail_expr()), "t", ["sym"], "backward", -1.0)))
+    assert_eq(got.get_float("bid").get(0), 100.0)
+    // the B quote (50.0) was filtered out of the right plan, so B trades find nothing
+    #assert(got.get_float("bid").is_null(2))
+    // a failing right plan fails the outer plan
+    broken = lazy_csv("a\n1\n", true).where("a >")
+    bad = t.join_asof(broken, "t", ["sym"], "backward", -1.0)
+    msg = bad.collect() or err { "{err}" }
+    #assert(starts_with(msg, "join_asof:"))
+    // steps after the join see its columns
+    net = t.join_asof(lazy(pl_quotes()), "t", ["sym"], "nearest", -1.0).with_expr("notional", "qty * bid").collect() or Frame.new()
+    assert_eq(net.get_float("notional").get(0), 100.0)
+    #assert(net.get_float("notional").is_null(4))
+}
+
+test "lazy dynamic windows, selectors and exclude" {
+    ticks = pl_ticks()
+    lf = lazy(ticks).group_by_dynamic("ts", 5, ["k"], [agg_sum("v", "s")])
+    assert_eq(lf.explain(), "Scan(frame 7x3) -> GroupByDynamic(ts every 5 period 5 offset 0 by [k]; sum(v) as s)")
+    got = lf.collect() or Frame.new()
+    #assert(got.same_as(ticks.group_by_dynamic("ts", 5, ["k"], [agg_sum("v", "s")])))
+    assert_eq(got.height(), 5)
+    ov = lazy(ticks).group_by_dynamic_with("ts", 5, 10, 0, [], [agg_rows("n")])
+    assert_eq(ov.explain(), "Scan(frame 7x3) -> GroupByDynamic(ts every 5 period 10 offset 0 by []; rows() as n)")
+    assert_eq((ov.collect() or Frame.new()).height(), 4)
+    sales = lazy(pl_sales())
+    assert_eq(sales.select_dtype(DT_FLOAT).explain(), "Scan(frame 6x4) -> SelectDtype(float)")
+    assert_eq((sales.select_dtype(DT_FLOAT).collect() or Frame.new()).names[0], "price")
+    assert_eq((sales.select_dtype(DT_STR).collect() or Frame.new()).width(), 1)
+    // selectors resolve against the frame produced by earlier steps
+    derived = sales.with_expr("rev", "price * qty").select_dtype(DT_FLOAT).collect() or Frame.new()
+    assert_eq(derived.width(), 2)
+    ex = sales.exclude(["rush", "price"])
+    assert_eq(ex.explain(), "Scan(frame 6x4) -> Drop(rush, price)")
+    assert_eq((ex.collect() or Frame.new()).width(), 2)
+}
+
+test "plans accept when / coalesce expressions and fuse them" {
+    lf = lazy(pl_sales())
+        .with_column("size", when_expr(expr("qty > 3") or fail_expr()).then(str_expr("big")).otherwise(str_expr("small")))
+        .where("size == 'big'")
+    out = lf.collect() or Frame.new()
+    assert_eq(out.height(), 3)
+    // fusing two filters keeps nodes of `if(...)` intact
+    a = expr("if(rush, qty > 2, qty < 5)") or fail_expr()
+    b = expr("price > 4.5") or fail_expr()
+    both = pl_and(a, b)
+    f = pl_sales()
+    #assert(f.filter(both).same_as(f.filter(a).filter(b)))
+    fused = lazy(f).where("if(rush, qty > 2, qty < 5)").where("price > 4.5")
+    #assert((fused.optimize().collect() or Frame.new()).same_as(fused.collect() or Frame.new()))
+    assert_eq(fused.optimize().op_count(), 1)
+    // a `when` on the right of a fusion (its third child is stored in `ints`)
+    rev = pl_and(b, a)
+    #assert(f.filter(rev).same_as(f.filter(b).filter(a)))
+    assert_eq(rev.show(), "((price > 4.5) and if(rush, (qty > 2), (qty < 5)))")
+}
+
+pl_stream_plans() {
+    base = lazy(pl_sales())
+    return [
+        base,
+        base.where("qty > 2"),
+        base.where("qty > 2").with_expr("rev", "price * qty").select(["region", "rev"]),
+        base.drop(["rush"]).rename("qty", "units").limit(4),
+        base.where("price > 4.5").limit(2),
+        base.where("rush").limit(2).with_expr("x", "qty + 1"),
+        base.group_by(["region"], [agg_sum("qty", "q"), agg_rows("n"), agg_min("price", "lo"), agg_max("price", "hi")]),
+        base.where("qty > 1").group_by(["region"], [agg_mean("price", "avg"), agg_count("qty", "c"), agg_first("price", "f"), agg_last("price", "l")]),
+        base.group_by(["rush"], [agg_sum("qty", "q")]).sort_by("q", true),
+        base.group_by(["region", "rush"], [agg_rows("n")]).limit(3),
+        base.with_expr("rev", "price * qty").group_by(["region"], [agg_sum("rev", "total")]).sort_by("total", true).limit(2),
+        base.group_by(["region"], [agg_std("price", "sd")]),
+        base.group_by(["region"], [agg_nunique("qty", "u")]),
+        base.sort_by("price", true).limit(3),
+        base.over(["region"], ["qty"], [win_cum_sum("qty", "cs")]),
+        base.unique(),
+        base.tail(2),
+        base.where("qty > 100"),
+        base.limit(0),
+        base.where("qty > 100").group_by(["region"], [agg_sum("qty", "q")]),
+        base.group_by(["ghost"], [agg_rows("n")]),
+        base.select_dtype(DT_FLOAT).where("price > 5.0")
+    ]
+}
+
+test "collect_streaming equals collect for every batch size" {
+    plans = pl_stream_plans()
+    pi = 0
+    for plans {
+        item = it
+        lf: LazyFrame = item
+        want = lf.collect() or Frame.new()
+        for 1..9 {
+            got = lf.collect_streaming(it) or Frame.new()
+            #assert(got.same_as(want))
+            assert_eq(got.height(), want.height())
+            assert_eq(got.width(), want.width())
+        }
+        got = lf.collect_streaming(1000) or Frame.new()
+        #assert(got.same_as(want))
+        pi += 1
+    }
+    assert_eq(pi, 22)
+}
+
+test "collect_streaming keeps dtypes and null handling of merged groups" {
+    f = Frame.new()
+    k = StrCol.new("k")
+    v = IntCol.new("v")
+    @k.push("a")
+    @v.push(1)
+    @k.push("a")
+    @v.push_null()
+    @k.push_null()
+    @v.push(5)
+    @k.push("b")
+    @v.push_null()
+    @k.push("a")
+    @v.push(4)
+    @k.push_null()
+    @v.push(2)
+    @f.add_str(k)
+    @f.add_int(v)
+    lf = lazy(f).group_by(["k"], [agg_sum("v", "s"), agg_mean("v", "m"), agg_count("v", "c"), agg_rows("n"), agg_min("v", "lo"), agg_first("v", "fi"), agg_last("v", "la")])
+    want = lf.collect() or Frame.new()
+    for 1..7 {
+        got = lf.collect_streaming(it) or Frame.new()
+        #assert(got.same_as(want))
+        assert_eq(got.kind_of("s"), want.kind_of("s"))
+        assert_eq(got.kind_of("m"), DT_FLOAT)
+        assert_eq(got.get_int("c").total(), want.get_int("c").total())
+    }
+    // a group whose values are all null stays null (not zero)
+    b = lf.collect_streaming(1) or Frame.new()
+    #assert(b.filter(expr("k == 'b'") or fail_expr()).get_int("s").is_null(0))
+    #assert(b.filter(expr("k == 'b'") or fail_expr()).get_float("m").is_null(0))
+    assert_eq(b.filter(expr("k == 'b'") or fail_expr()).get_int("c").get(0), 0)
+}
+
+test "collect_streaming stops reading once a limit is satisfied" {
+    lf = lazy(pl_sales()).where("qty > 0").limit(2)
+    got = lf.collect_streaming(1) or Frame.new()
+    assert_eq(got.height(), 2)
+    assert_eq(got.text_at(0, 0), "EU")
+    assert_eq(got.text_at(1, 0), "US")
+    // a limit after a selective filter keeps reading until it has enough rows
+    sel = lazy(pl_sales()).where("rush").limit(2).collect_streaming(2) or Frame.new()
+    assert_eq(sel.height(), 2)
+    assert_eq(sel.get_int("qty").get(1), 10)
+    // two limits compose
+    both = lazy(pl_sales()).limit(5).limit(3).collect_streaming(2) or Frame.new()
+    assert_eq(both.height(), 3)
+}
+
+test "collect_streaming sources and errors" {
+    csv = lazy_csv(pl_sales_csv(), true).where("qty >= 3").group_by(["region"], [agg_sum("qty", "q")])
+    #assert((csv.collect_streaming(2) or Frame.new()).same_as(csv.collect() or Frame.new()))
+    assert_eq(pl_sales().height(), 6)
+    msg = lazy(pl_sales()).collect_streaming(0) or err { "{err}" }
+    assert_eq(msg, "collect_streaming: batch_size must be positive")
+    msg2 = lazy(pl_sales()).collect_streaming(-3) or err { "{err}" }
+    assert_eq(msg2, "collect_streaming: batch_size must be positive")
+    nosrc = LazyFrame.empty().collect_streaming(2) or err { "{err}" }
+    assert_eq(nosrc, "plan has no source")
+    bad = lazy(pl_sales()).where("price >").collect_streaming(2) or err { "{err}" }
+    #assert(starts_with(bad, "where:"))
+    // joins are blocking steps that still run after the streamed prefix
+    prices = lazy_csv("region,tax\nEU,0.2\nUS,0.1\n", true)
+    j = lazy(pl_sales()).where("qty > 1").join(prices, ["region"], "left").with_expr("net", "price * (1.0 - tax)")
+    #assert((j.collect_streaming(2) or Frame.new()).same_as(j.collect() or Frame.new()))
+    broken = lazy_csv("a\n1\n", true).where("a >")
+    fail_join = lazy(pl_sales()).join(broken, ["region"], "inner").collect_streaming(2) or err { "{err}" }
+    #assert(starts_with(fail_join, "join:"))
+    // empty source
+    empty = lazy(pl_sales().take([])).where("qty > 1").with_expr("x", "qty + 1").collect_streaming(3) or Frame.new()
+    assert_eq(empty.height(), 0)
+    assert_eq(empty.kind_of("qty"), DT_INT)
+}
+
+test "plan helpers for streaming" {
+    #assert(pl_mergeable([agg_sum("a", "x"), agg_mean("a", "y"), agg_rows("n")]))
+    #assert(!(pl_mergeable([agg_sum("a", "x"), agg_std("a", "y")])))
+    #assert(!(pl_mergeable([agg_nunique("a", "u")])))
+    #assert(pl_mergeable([]))
+    #assert(!(pl_streamable(pl_simple(PL_UNIQUE))))
+    #assert(pl_streamable(pl_simple(PL_LIMIT)))
+    #assert(!(pl_streamable(PlanOp.{kind: PL_WINDOW})))
+    #assert(!(pl_streamable(PlanOp.{kind: PL_SELECT_DTYPE})))
+    partial = pl_partial_specs([agg_mean("p", "avg"), agg_rows("n")])
+    assert_eq(host.sys_arr_len(partial), 3)
+    final = pl_final_specs([agg_mean("p", "avg"), agg_rows("n")])
+    assert_eq(host.sys_arr_len(final), 3)
+}

@@ -1,0 +1,122 @@
+# --- Build outputs ---
+/target/
+**/target/
+*.superb
+*.superb-dev
+*.check.c
+**/*.check.c
+**/*.o
+**/*.a
+**/*.so
+**/*.dylib
+**/*.dll
+**/__pycache__/
+**/*.pyc
+
+# --- Editor / IDE local state ---
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Agent / AI tooling (never publish) ---
+.cursor/
+.claude/
+.codex/
+.agents/
+.agent/
+.continue/
+.windsurf/
+.gemini/
+.copilot/
+.taste-skill/
+benchmarks/.taste-skill/
+AGENTS.md
+CLAUDE.md
+CODEX.md
+GEMINI.md
+.cursorrules
+.cursorignore
+**/CLAUDE.md
+**/CODEX.md
+**/AGENTS.md
+prompts/
+**/prompts/
+scratch/
+**/scratch/
+scratchpads/
+**/scratchpads/
+*.prompt.md
+*.agent.md
+*.plan.md
+!docs/**/*.md
+
+# Private local workspace (publish plans, hooks, scratch)
+.local/
+PRIVATE_PUBLISH_PLAN.md
+PRIVATE_*.md
+.private/
+
+# Historical internal notes / friction audits / directives
+notes/
+docs/superpowers/
+**/superpowers/
+
+# First-party vendor Pods under pods/ are tracked (kind=lib SDKs).
+# Keep local clone scratch out if ever added beside the tree:
+# pods/_scratch/
+
+# Zed temporary LSP heal file
+.super-zed-lsp-nudge.sr
+
+# --- Benchmark harness local artifacts (sources + frozen data ARE tracked) ---
+benchmarks/.work/
+benchmarks/.taste-skill/
+benchmarks/__pycache__/
+benchmarks/**/__pycache__/
+benchmarks/www
+benchmarks/results/
+benchmarks/run_final.log
+benchmarks/report.html
+benchmarks/report.pdf
+benchmarks/*.superb
+benchmarks/**/*.superb
+benchmarks/site_assets/
+
+# HTTP / RSS soak outputs (CI uploads workflow artifacts; never commit)
+benchmarks-memory/
+
+# Local ad-hoc experiment tests (crate tests ship under crates/*/tests)
+/tests/
+
+# --- Packaging / extension build artifacts ---
+**/node_modules/
+editors/vscode/out/
+editors/vscode/*.vsix
+editors/zed/target/
+editors/zed/dist/.content-hash
+
+# --- Secrets / credentials (never publish) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+id_rsa
+id_rsa.pub
+credentials.json
+**/secrets/
+**/credentials/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# runner.py output; the published measurement is docs/REPORT.md
+benchmarks/REPORT.md
+
+# Release bundles are built by scripts/package_release.sh and CI, never committed
+/dist/

@@ -1,0 +1,504 @@
+//! std.core.regex — small backtracking regular-expression engine
+//!
+//! Import with:
+//!   use std.core.regex
+//!
+//! Then:  re = compile("^[a-z]+[-9]*$") or return
+//!        is_match(re, "abc42")           // true
+//!        match_text(re, "id=42", ...)    // leftmost-greedy match text
+//!
+//! Supported syntax: literals, `.`, `[abc]` / `[a-z]` / `[^-9]`, escapes
+//! `\d \w \s` and `\.`-style literal escapes, greedy quantifiers `* + ?`,
+//! and the anchors `^` (start of pattern) and `$` (end of pattern).
+//!
+//! Matching is leftmost, greedy, with backtracking over quantifiers.
+//!
+//! `compile` also records the pattern's required first literal character (`Regex.first`, empty
+//! when the pattern can start with a class, `.`, `\d`-style escape or an optional atom). The
+//! scanners (`find_first`, `count_matches`, `replace_all`) use it as a prefilter: a start offset
+//! whose character differs is rejected with one comparison instead of entering the matcher.
+
+/// `RX_ORDER` is `" !#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklm...`.
++RX_ORDER = " !#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz|~"
+/// `RX_DIGITS` is `"0123456789"`.
++RX_DIGITS = "0123456789"
+/// `RX_WORD` is `"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"`.
++RX_WORD = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+/// `Regex` is a compiled regular-expression pattern.
++Regex = {
+    /// Body on `Regex` (`str`). Defaults to `""`.
+    body: str = ""
+    /// Blen on `Regex` (`i64`). Defaults to `0`.
+    blen: i64 = 0
+    /// Anchored on `Regex` (`bool`). Defaults to `false`.
+    anchored: bool = false
+    /// Literal character every match must begin with, or "" when there is no such prefilter. Defaults to `""`.
+    first: str = ""
+}
+
+/// String length in characters.
++rx_len(s: str) : i64 => host.sys_str_len(s)
+
+/// Index of `c` inside `set`, or -1.
++rx_pos(set: str, c: str) : i64 {
+    for 0..rx_len(set) {
+        if set[it] == c { return it }
+    }
+    -1
+}
+
+/// Rx is space (`c`).
++rx_is_space(c: str) : bool => c == " " || c == "\t" || c == "\n" || c == "\r"
+
+// --- compile --------------------------------------------------------------
+
+/// Compile the regular expression `pattern`, or fail.
++compile(pattern: str) : Regex! {
+    n = rx_len(pattern)
+    anchored = false
+    start = 0
+    if n > 0 && pattern[0] == "^" {
+        anchored = true
+        start = 1
+    }
+    body = pattern[start..n]
+    blen = n - start
+    depth = 0
+    bad_escape = false
+    bad_quant = false
+    prev_atom = false
+    skip = 0
+    for 0..blen {
+        c = body[it]
+        if it >= skip {
+            if c == "\\" {
+                if it + 1 >= blen { bad_escape = true }
+                skip = it + 2
+                prev_atom = true
+            } else {
+                if c == "[" {
+                    depth += 1
+                    prev_atom = true
+                } else {
+                    if c == "]" && depth > 0 { depth -= 1 } else {
+                        if c == "*" || c == "+" || c == "?" {
+                            if !prev_atom { bad_quant = true }
+                            prev_atom = false
+                        } else {
+                            prev_atom = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ensure !bad_escape else {
+        fail "regex: trailing backslash"
+        return
+    }
+    ensure depth == 0 else {
+        fail "regex: unclosed character class"
+        return
+    }
+    ensure !bad_quant else {
+        fail "regex: quantifier has nothing to repeat"
+        return
+    }
+    Regex.{body, blen, anchored, first: rx_first_literal(body, blen)}
+}
+
+/// Literal character every match of `body` must start with, or "" when the first atom is a
+/// class, `.`, `\d` / `\w` / `\s`, an end anchor, or is optional (`*` / `?`).
++rx_first_literal(body: str, blen: i64) : str {
+    if blen <= 0 { return "" }
+    c = body[0]
+    lit = c
+    ae = 1
+    if c == "." || c == "[" || c == "$" { return "" }
+    if c == "\\" {
+        e = body[1]
+        if e == "d" || e == "w" || e == "s" { return "" }
+        lit = e
+        ae = 2
+    }
+    if ae < blen {
+        q = body[ae]
+        if q == "*" || q == "?" { return "" }
+    }
+    lit
+}
+
+/// A `Regex` that matches nothing.
++regex_none() : Regex => Regex.{body: "", blen: -1, anchored: false, first: ""}
+
+/// True when `pattern` is a pattern this engine can compile.
++is_valid(pattern: str) : bool {
+    re = compile(pattern) or regex_none()
+    re.blen >= 0
+}
+
+// --- atoms ------------------------------------------------------------------
+
+/// Index just past the atom starting at `pi`.
++rx_atom_end(pat: str, pi: i64, plen: i64) : i64 {
+    c = pat[pi]
+    if c == "\\" { return pi + 2 }
+    if c == "[" {
+        close = -1
+        for (pi + 1)..plen {
+            if close < 0 && pat[it] == "]" { close = it }
+        }
+        if close < 0 { return plen }
+        close + 1
+    } else {
+        pi + 1
+    }
+}
+
+/// Rx class has (`pat`, `pi`, `c`).
++rx_class_has(pat: str, pi: i64, c: str) : bool => rx_class_has_n(pat, pi, rx_len(pat), c)
+
+/// Class membership with the pattern length `plen` supplied by the caller (no length probe),
+/// and the position of `c` in `RX_ORDER` looked up once.
++rx_class_has_n(pat: str, pi: i64, plen: i64, c: str) : bool {
+    j = pi + 1
+    negate = pat[j] == "^"
+    if negate { j = j + 1 }
+    hit = false
+    skip = j
+    x = rx_pos(RX_ORDER, c)
+    for j..plen {
+        if it >= skip && pat[it] != "]" {
+            lo = pat[it]
+            if pat[it + 1] == "-" && pat[it + 2] != "]" && pat[it + 2] != "" {
+                hi = pat[it + 2]
+                if x >= 0 && x >= rx_pos(RX_ORDER, lo) && x <= rx_pos(RX_ORDER, hi) { hit = true }
+                skip = it + 3
+            } else {
+                if lo == "-" && pat[it + 1] != "]" && pat[it + 1] != "" {
+                    hi = pat[it + 1]
+                    if x >= 0 && x >= rx_pos(RX_ORDER, lo) && x <= rx_pos(RX_ORDER, hi) { hit = true }
+                    skip = it + 2
+                } else {
+                    if lo == c { hit = true }
+                    skip = it + 1
+                }
+            }
+        }
+    }
+    hit != negate
+}
+
+/// Rx atom matches (`pat`, `pi`, `c`).
++rx_atom_matches(pat: str, pi: i64, c: str) : bool => rx_atom_matches_n(pat, pi, rx_len(pat), c)
+
+/// Atom match with the pattern length supplied by the caller.
++rx_atom_matches_n(pat: str, pi: i64, plen: i64, c: str) : bool {
+    ensure c != "" else { return false }
+    a = pat[pi]
+    if a == "." { return true }
+    if a == "\\" {
+        e = pat[pi + 1]
+        if e == "d" { return rx_pos(RX_DIGITS, c) >= 0 }
+        if e == "w" { return rx_pos(RX_WORD, c) >= 0 }
+        if e == "s" { return rx_is_space(c) }
+        e == c
+    } else {
+        if a == "[" { return rx_class_has_n(pat, pi, plen, c) }
+        a == c
+    }
+}
+
+// --- matcher ----------------------------------------------------------------
+
+/// Try to match pat[pi..] at text[ti..]; returns the end index or -1.
++rx_here(pat: str, pi: i64, plen: i64, text: str, ti: i64, tlen: i64) : i64 {
+    if pi >= plen { return ti }
+    if pat[pi] == "$" && pi + 1 == plen {
+        if ti == tlen { return ti }
+        -1
+    } else {
+        ae = rx_atom_end(pat, pi, plen)
+        q = ""
+        if ae < plen { q = pat[ae] }
+        if q == "*" || q == "+" || q == "?" {
+            limit = tlen - ti
+            if q == "?" && limit > 1 { limit = 1 }
+            cnt = 0
+            live = true
+            for 0..limit {
+                if live && rx_atom_matches_n(pat, pi, plen, text[ti + cnt]) { cnt += 1 } else { live = false }
+            }
+            least = 0
+            if q == "+" { least = 1 }
+            result = -1
+            for 0..(cnt + 1) {
+                take = cnt - it
+                if result < 0 && take >= least {
+                    r = rx_here(pat, ae + 1, plen, text, ti + take, tlen)
+                    if r >= 0 { result = r }
+                }
+            }
+            result
+        } else {
+            if ti < tlen && rx_atom_matches_n(pat, pi, plen, text[ti]) {
+                rx_here(pat, ae, plen, text, ti + 1, tlen)
+            } else {
+                -1
+            }
+        }
+    }
+}
+
+/// End index of a match starting exactly at `start`, or -1.
++match_end_at(re: Regex, text: str, start: i64) : i64 {
+    rx_here(re.body, 0, re.blen, text, start, rx_len(text))
+}
+
+/// Start index of the leftmost match, or -1. Offsets whose character cannot begin a match
+/// (`Regex.first` prefilter) are skipped with a single comparison; stops at the first hit.
++find_first(re: Regex, text: str) : i64 {
+    tlen = rx_len(text)
+    last = tlen
+    if (re.anchored) { last = 0 }
+    lit = re.first
+    for 0..(last + 1) {
+        if lit == "" || text[it] == lit {
+            if rx_here(re.body, 0, re.blen, text, it, tlen) >= 0 { return it }
+        }
+    }
+    -1
+}
+
+/// True when `text` matches the pattern `re`.
++is_match(re: Regex, text: str) : bool => find_first(re, text) >= 0
+
+/// Length of the leftmost match, or -1.
++match_len(re: Regex, text: str) : i64 {
+    at = find_first(re, text)
+    ensure at >= 0 else { return -1 }
+    match_end_at(re, text, at) - at
+}
+
+/// Text of the leftmost match, or "".
++match_text(re: Regex, text: str) : str {
+    at = find_first(re, text)
+    ensure at >= 0 else { return "" }
+    text[at..match_end_at(re, text, at)]
+}
+
+/// Number of non-overlapping matches (empty matches advance by one).
++count_matches(re: Regex, text: str) : i64 {
+    tlen = rx_len(text)
+    lit = re.first
+    total = 0
+    next = 0
+    for 0..(tlen + 1) {
+        if it >= next {
+            e = -1
+            if lit == "" || text[it] == lit { e = rx_here(re.body, 0, re.blen, text, it, tlen) }
+            if e >= 0 && !(re.anchored && it > 0) {
+                total += 1
+                next = e
+                if e == it { next = it + 1 }
+            }
+        }
+    }
+    total
+}
+
+/// Replace every non-overlapping, non-empty match.
++replace_all(re: Regex, text: str, with: str) : str {
+    tlen = rx_len(text)
+    lit = re.first
+    out = ""
+    next = 0
+    for 0..tlen {
+        if it >= next {
+            e = -1
+            if lit == "" || text[it] == lit { e = rx_here(re.body, 0, re.blen, text, it, tlen) }
+            if e > it && !(re.anchored && it > 0) {
+                out = "{out}{with}"
+                next = e
+            } else {
+                c = text[it]
+                out = "{out}{c}"
+                next = it + 1
+            }
+        }
+    }
+    out
+}
+
+// --- tests --------------------------------------------------------------------
+
+/// Test that literal patterns match as substrings.
+test "literal patterns match as substrings" {
+    re = compile("super") or regex_none()
+    #assert(is_match(re, "i love super lang"))
+    #assert(!(is_match(re, "i love go")))
+    assert_eq(find_first(re, "i love super"), 7)
+}
+
+/// Test that dot and star.
+test "dot and star" {
+    re = compile("a.c") or regex_none()
+    #assert(is_match(re, "xxabcxx"))
+    #assert(!(is_match(re, "ac")))
+    re2 = compile("ab*c") or regex_none()
+    #assert(is_match(re2, "ac"))
+    #assert(is_match(re2, "abbbc"))
+    #assert(!(is_match(re2, "adc")))
+}
+
+/// Test that plus and question.
+test "plus and question" {
+    plus = compile("ab+c") or regex_none()
+    #assert(!(is_match(plus, "ac")))
+    #assert(is_match(plus, "abc"))
+    opt = compile("colou?r") or regex_none()
+    #assert(is_match(opt, "color"))
+    #assert(is_match(opt, "colour"))
+    #assert(!(is_match(opt, "colouur")))
+}
+
+/// Test that anchors.
+test "anchors" {
+    re = compile("^abc$") or regex_none()
+    #assert(is_match(re, "abc"))
+    #assert(!(is_match(re, "xabc")))
+    #assert(!(is_match(re, "abcx")))
+    start = compile("^ab") or regex_none()
+    #assert(is_match(start, "abz"))
+    #assert(!(is_match(start, "zab")))
+    tail = compile("ab$") or regex_none()
+    #assert(is_match(tail, "zab"))
+    #assert(!(is_match(tail, "abz")))
+}
+
+/// Test that character classes and ranges.
+test "character classes and ranges" {
+    re = compile("^[a-c]+$") or regex_none()
+    #assert(is_match(re, "abcabc"))
+    #assert(!(is_match(re, "abd")))
+    neg = compile("^[^-9]+$") or regex_none()
+    #assert(is_match(neg, "abc"))
+    #assert(!(is_match(neg, "ab1")))
+    mixed = compile("^[xz0-2]+$") or regex_none()
+    #assert(is_match(mixed, "x1z0"))
+    #assert(!(is_match(mixed, "x3")))
+}
+
+/// Test that escapes d w s and literal dot.
+test "escapes d w s and literal dot" {
+    ident = compile("^\\w+$") or regex_none()
+    #assert(is_match(ident, "user_42"))
+    #assert(!(is_match(ident, "user-42")))
+    num = compile("^\\d+\\.\\d+$") or regex_none()
+    #assert(is_match(num, "3.14"))
+    #assert(!(is_match(num, "314")))
+    #assert(!(is_match(num, "3x14")))
+    sp = compile("a\\sb") or regex_none()
+    #assert(is_match(sp, "a b"))
+    #assert(!(is_match(sp, "ab")))
+}
+
+/// Test that greedy match with backtracking.
+test "greedy match with backtracking" {
+    re = compile("a.*b") or regex_none()
+    assert_eq(match_text(re, "xxaYYbZZbQ"), "aYYbZZb")
+    assert_eq(match_len(re, "xxaYYbZZbQ"), 7)
+    assert_eq(match_text(re, "nothing"), "")
+    assert_eq(match_len(re, "nothing"), -1)
+    tail = compile("\\d+x") or regex_none()
+    assert_eq(match_text(tail, "id 1234x!"), "1234x")
+}
+
+/// Test that count_matches and replace_all.
+test "count_matches and replace_all" {
+    digits = compile("\\d+") or regex_none()
+    assert_eq(count_matches(digits, "a1b22c333"), 3)
+    assert_eq(count_matches(digits, "abc"), 0)
+    assert_eq(replace_all(digits, "a1b22c333", "#"), "a#b#c#")
+    vowels = compile("[aeiou]") or regex_none()
+    assert_eq(replace_all(vowels, "banana", "_"), "b_n_n_")
+}
+
+/// Test that compile rejects malformed patterns.
+test "compile rejects malformed patterns" {
+    #assert(!(is_valid("[abc")))
+    #assert(!(is_valid("*a")))
+    #assert(!(is_valid("a\\")))
+    #assert(!(is_valid("a+*")))
+    #assert(is_valid("[a-z]+\\d*"))
+    #assert(is_valid(""))
+}
+
+/// Test that compile records the first-literal prefilter only when it is sound.
+test "first-literal prefilter is recorded only for required literals" {
+    assert_eq((compile("abc") or regex_none()).first, "a")
+    assert_eq((compile("^abc") or regex_none()).first, "a")
+    assert_eq((compile("a+b") or regex_none()).first, "a")
+    assert_eq((compile("a*b") or regex_none()).first, "")
+    assert_eq((compile("a?b") or regex_none()).first, "")
+    assert_eq((compile(".bc") or regex_none()).first, "")
+    assert_eq((compile("[ab]c") or regex_none()).first, "")
+    assert_eq((compile("\\dx") or regex_none()).first, "")
+    assert_eq((compile("\\wx") or regex_none()).first, "")
+    assert_eq((compile("\\sx") or regex_none()).first, "")
+    assert_eq((compile("\\.x") or regex_none()).first, ".")
+    assert_eq((compile("\\.*x") or regex_none()).first, "")
+    assert_eq((compile("$") or regex_none()).first, "")
+    assert_eq((compile("") or regex_none()).first, "")
+    assert_eq(regex_none().first, "")
+}
+
+/// Test that prefiltered scans give the same answers as unfiltered ones.
+test "prefilter preserves find, count and replace results" {
+    lit = compile("ab+c") or regex_none()
+    assert_eq(find_first(lit, "xxabbbcxx"), 2)
+    assert_eq(find_first(lit, "aabc"), 1)
+    assert_eq(find_first(lit, "ac abc"), 3)
+    assert_eq(find_first(lit, "nothing here"), -1)
+    assert_eq(find_first(lit, ""), -1)
+    assert_eq(count_matches(lit, "abc abbc ac abc"), 3)
+    assert_eq(replace_all(lit, "abc-abbc-ac", "#"), "#-#-ac")
+    dot = compile("\\.txt") or regex_none()
+    assert_eq(find_first(dot, "a.txt"), 1)
+    assert_eq(find_first(dot, "atxt"), -1)
+    assert_eq(count_matches(dot, "a.txt b.txt"), 2)
+    anch = compile("^ab") or regex_none()
+    assert_eq(find_first(anch, "abab"), 0)
+    assert_eq(find_first(anch, "xab"), -1)
+    assert_eq(count_matches(anch, "abab"), 1)
+    opt = compile("a*b") or regex_none()
+    assert_eq(find_first(opt, "xxb"), 2)
+    assert_eq(find_first(opt, "xaab"), 1)
+    tail = compile("x$") or regex_none()
+    assert_eq(find_first(tail, "xax"), 2)
+    assert_eq(find_first(tail, "xa"), -1)
+    first_only = compile("z") or regex_none()
+    assert_eq(count_matches(first_only, "zzz"), 3)
+    assert_eq(replace_all(first_only, "azbz", ""), "ab")
+}
+
+/// Test that class matching with the hoisted pattern length keeps range, negation and dash semantics.
+test "class matching with cached length" {
+    word = compile("[a-c][0-2]+") or regex_none()
+    assert_eq(match_text(word, "zz b12 c9"), "b12")
+    assert_eq(find_first(word, "d1 a0"), 3)
+    neg = compile("[^a-c]+") or regex_none()
+    assert_eq(match_text(neg, "abxyzc"), "xyz")
+    dash = compile("[-9]+") or regex_none()
+    assert_eq(match_text(dash, "ab-9-c"), "-9-")
+    big = compile("[a-zA-Z0-9]+") or regex_none()
+    assert_eq(match_text(big, "!!Hello42!!"), "Hello42")
+    #assert(rx_class_has("[a-c]", 0, "b"))
+    #assert(!(rx_class_has("[a-c]", 0, "d")))
+    #assert(rx_atom_matches("[x-z]", 0, "y"))
+    #assert(rx_atom_matches("\\d", 0, "7"))
+    assert_eq(rx_pos("abc", "c"), 2)
+    assert_eq(rx_pos("abc", "z"), -1)
+    assert_eq(rx_pos("", "a"), -1)
+}

@@ -1,0 +1,43 @@
+name: Benchmark result
+description: Submit optional harness output from your hardware (does not replace frozen Stage-1 board)
+labels: ["benchmarks"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [docs/REPRODUCE_BENCHMARKS.md](https://github.com/theHamdiz/super-lang/blob/main/docs/REPRODUCE_BENCHMARKS.md). Do **not** ask to overwrite `docs/REPORT.md` or `docs/results.json` without a protocol version bump.
+  - type: input
+    id: commit
+    attributes:
+      label: Git commit
+      placeholder: abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: CPU, OS, governor, compiler versions
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Algorithms run
+      description: e.g. `--only 01_nbody` or full suite
+    validations:
+      required: true
+  - type: textarea
+    id: checksums
+    attributes:
+      label: CHECKSUM lines
+      description: Paste `CHECKSUM=` output; attach JSON if large
+    validations:
+      required: true
+  - type: textarea
+    id: dispute
+    attributes:
+      label: Methodology dispute (optional)
+      description: Only if challenging checksum methodology — cite `benchmarks/data/results.json` row
+    validations:
+      required: false

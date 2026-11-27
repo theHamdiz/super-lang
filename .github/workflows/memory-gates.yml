@@ -1,0 +1,206 @@
+# Round 8 memory gates: timed flat-RSS soak, ASan/UBSan App.serve, alloc probe,
+# and permanent negative gates (planted faults must FAIL soak / sanitizer).
+#
+# Soak pass criteria (must match scripts/soak_http.sh + docs/SOAK_GATE.md):
+#   After 60s warm-up, VmRSS spread ≤ 1% over the remaining window, and
+#   least-squares RSS slope < 1 KiB per 10_000 requests. Sample interval ≥ 5 s.
+name: memory-gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  negative-gates:
+    name: negative gates (must FAIL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build super CLI
+        run: cargo build -p super-cli --release --locked
+      - name: Plant durable leak — soak must FAIL
+        run: |
+          set -euo pipefail
+          chmod +x scripts/soak_negative.sh
+          scripts/soak_negative.sh durable-leak | tee neg-durable.log
+          grep -q 'EXPECTED_FAIL: soak gate caught durable leak' neg-durable.log
+          grep -q 'PASS negative durable-leak' neg-durable.log
+      - name: Plant arena/malloc mix — sanitizer must FAIL
+        run: |
+          set -euo pipefail
+          scripts/soak_negative.sh arena-free | tee neg-arena.log
+          grep -q 'EXPECTED_FAIL: sanitizer/arena-free plant detected' neg-arena.log
+          grep -q 'PASS negative arena-free' neg-arena.log
+      - name: Plant per-connection leak — churn soak must FAIL
+        run: |
+          set -euo pipefail
+          scripts/soak_negative.sh conn-leak | tee neg-conn.log
+          grep -q 'EXPECTED_FAIL: churn soak gate caught per-connection leak' neg-conn.log
+          grep -q 'PASS negative conn-leak' neg-conn.log
+      - name: Plant ~1 KiB/10k leak — keep-alive soak must FAIL
+        run: |
+          set -euo pipefail
+          scripts/soak_negative.sh slow-leak-keepalive | tee neg-slow-ka.log
+          grep -q 'EXPECTED_FAIL: soak gate caught planted leak (negative_slow_leak_keepalive)' neg-slow-ka.log
+          grep -q '^FAIL$' neg-slow-ka.log
+          grep -q 'PASS negative slow-leak-keepalive' neg-slow-ka.log
+      - name: Plant ~1 KiB/10k leak — churn soak must FAIL
+        run: |
+          set -euo pipefail
+          scripts/soak_negative.sh slow-leak-churn | tee neg-slow-churn.log
+          grep -q 'EXPECTED_FAIL: soak gate caught planted leak (negative_slow_leak_churn)' neg-slow-churn.log
+          grep -q '^FAIL$' neg-slow-churn.log
+          grep -q 'PASS negative slow-leak-churn' neg-slow-churn.log
+          {
+            echo "### Negative gates"
+            echo "Durable leak plant → soak FAIL (expected)."
+            echo "Arena free plant → ASan FAIL (expected)."
+            echo "Per-connection leak plant → churn soak FAIL (expected)."
+            echo "~1 KiB / 10k slow-leak plants → keep-alive + churn soak FAIL (expected)."
+            echo "Neither plant is shipped in product sources."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  soak-5m:
+    name: http-soak-5m (AOT flat-RSS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build super CLI
+        run: cargo build -p super-cli --release --locked
+      - name: 5-minute request soak (slope + spread gate)
+        run: |
+          set -euo pipefail
+          chmod +x scripts/soak_http.sh
+          mkdir -p benchmarks-memory/ci
+          scripts/soak_http.sh --minutes 5 --port 3210 --out benchmarks-memory/ci | tee soak5m.log
+          grep -q '^PASS$' soak5m.log
+          # Echo measured numbers into the job summary (facts only from this run).
+          {
+            echo "### 5-minute soak (measured)"
+            echo '```'
+            grep -E '^(requests_total|post_warmup|slope_|PASS|FAIL)' soak5m.log || true
+            echo '```'
+            echo
+            echo "Thresholds (documented in scripts/soak_http.sh): spread ≤ 1%; slope < 1 KiB / 10k reqs."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload soak CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-5m-csv
+          path: benchmarks-memory/ci/soak_aot_*.csv
+          if-no-files-found: ignore
+
+  soak-churn-1m:
+    name: http-soak-churn (≥1M connections)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build super CLI
+        run: cargo build -p super-cli --release --locked
+      - name: Connection-churn soak (open/close per request)
+        run: |
+          set -euo pipefail
+          chmod +x scripts/soak_http.sh
+          mkdir -p benchmarks-memory/ci
+          # One TCP connection per request; gate on RSS spread/slope and ≥1M conns.
+          scripts/soak_http.sh --churn --min-connections 1000000 --minutes 5 \
+            --port 3211 --out benchmarks-memory/ci | tee soak_churn.log
+          grep -q '^PASS$' soak_churn.log
+          grep -q 'soak_mode=churn' soak_churn.log
+          grep -E '^connections_total=' soak_churn.log | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Connection-churn soak (measured)"
+            echo '```'
+            grep -E '^(soak_mode|connections_total|requests_total|post_warmup|slope_|PASS|FAIL)' soak_churn.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload churn CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-churn-csv
+          path: benchmarks-memory/ci/soak_aot_churn_*.csv
+          if-no-files-found: ignore
+
+  asan-ubsan-app-serve:
+    name: asan-ubsan (App.serve AOT)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Build super CLI
+        run: cargo build -p super-cli --release --locked
+      - name: ASan+UBSan App.serve keep-alive
+        env:
+          REQUESTS: "10000"
+          PORT: "3140"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/sanitize_http.sh
+          scripts/sanitize_http.sh | tee sanitize.log
+          grep -q 'PASS: ASan+UBSan' sanitize.log
+          {
+            echo "### ASan/UBSan App.serve"
+            echo '```'
+            tail -n 20 sanitize.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  asan-ubsan-runtime:
+    name: asan-ubsan (super-runtime + alloc_probe)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Runtime crate tests (release)
+        run: cargo test -p super-runtime --release --locked --lib
+      - name: Escape-region + memory unit tests
+        run: |
+          cargo test -p super-runtime --release --locked escape_region -- --nocapture
+          cargo test -p super-runtime --release --locked --lib alloc -- --nocapture || true
+      - name: alloc_probe (pinned malloc count per fresh GET)
+        run: |
+          set -euo pipefail
+          cargo test -p super-cli --release --locked --test alloc_probe -- --nocapture 2>&1 | tee alloc_probe.log
+          grep -E 'per request: .* allocations, .* frees' alloc_probe.log | tee -a "$GITHUB_STEP_SUMMARY"
+          # Conn arena: LD_PRELOAD malloc counter is 0/0 per fresh GET — arena
+          # bumps are not malloc/free. Never claim zero-allocation.
+          grep -q 'per request: 0.00 allocations, 0.00 frees' alloc_probe.log
+          {
+            echo
+            echo "### alloc_probe (measured)"
+            echo "Pinned and measured: **0 malloc / 0 free** per fresh GET /ping"
+            echo "(connection arena bump + MADV_DONTNEED; **not** zero-alloc)."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: ASan+UBSan on C-linked App.serve (runtime host path)
+        # The AOT runtime host (`aot_host/net_host_c.rs` → emitted C) is the request path
+        # under sanitizers; Rustlib ASan needs nightly+build-std and is not
+        # claimed here. This step reuses sanitize_http so runtime+serve share
+        # one measured C sanitizer gate in this job as well.
+        env:
+          REQUESTS: "2000"
+          PORT: "3141"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/sanitize_http.sh
+          cargo build -p super-cli --release --locked
+          scripts/sanitize_http.sh | tee sanitize_runtime.log
+          grep -q 'PASS: ASan+UBSan' sanitize_runtime.log

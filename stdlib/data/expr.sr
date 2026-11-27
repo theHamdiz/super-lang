@@ -1,0 +1,1197 @@
+//! std.data.expr — column expressions for filters, projections and aggregations
+//!
+//! Import with:
+//!   use std.data.expr
+//!
+//!   e = expr("price * qty > 100 and region == 'EU'") or fail_expr()   // parse text
+//!   e.show()                                   // ((price * qty) > 100) and (region == 'EU')
+//!   e.columns()                                // ["price", "qty", "region"]
+//!
+//!   b = Expr.new()                             // or build nodes by hand
+//!   x = @b.col("price")
+//!   y = @b.float(10.0)
+//!   @b.finish(@b.bin(EX_GT, x, y))
+//!
+//! An `Expr` is a flat node arena (op, two child links, and an int / float / string payload per node), so
+//! parsing and evaluation allocate no trees. Evaluation happens against a frame (`std.data.frame`), one row
+//! at a time, producing `Cell` values: arithmetic promotes int to float, `/` always yields float, any null
+//! operand gives null (except `and`/`or`, which follow Kleene logic, and `coalesce`). Grammar, loosest first:
+//!   or  <  and  <  not  <  == != < <= > >=  <  + -  <  * / %  <  unary -  <  call / atom
+//! with `x is null`, `x is not null`, strings in `'..'` or `".."`, and the functions `abs sqrt len coalesce
+//! contains starts_with ends_with`. Public helpers are prefixed `ex_` / `cell_`.
+
+use std.core.str
+use std.core.collections
+use std.data.column
+
+/// Column reference.
++EX_COL = 0
+/// Integer literal.
++EX_INT = 1
+/// Float literal.
++EX_FLOAT = 2
+/// String literal.
++EX_STR = 3
+/// Boolean literal.
++EX_BOOL = 4
+/// `a + b` (numbers; strings concatenate).
++EX_ADD = 10
+/// `a - b`.
++EX_SUB = 11
+/// `a * b`.
++EX_MUL = 12
+/// `a / b` (always float).
++EX_DIV = 13
+/// `a % b`.
++EX_MOD = 14
+/// `a == b`.
++EX_EQ = 20
+/// `a != b`.
++EX_NE = 21
+/// `a < b`.
++EX_LT = 22
+/// `a <= b`.
++EX_LE = 23
+/// `a > b`.
++EX_GT = 24
+/// `a >= b`.
++EX_GE = 25
+/// `a and b` (Kleene).
++EX_AND = 30
+/// `a or b` (Kleene).
++EX_OR = 31
+/// `not a`.
++EX_NOT = 40
+/// `-a`.
++EX_NEG = 41
+/// `a is null`.
++EX_ISNULL = 42
+/// `a is not null`.
++EX_NOTNULL = 43
+/// `abs(a)`.
++EX_ABS = 50
+/// `sqrt(a)`.
++EX_SQRT = 51
+/// `len(a)` (string length).
++EX_LEN = 52
+/// `coalesce(a, b)`.
++EX_COALESCE = 60
+/// `contains(a, b)` (substring).
++EX_CONTAINS = 61
+/// `starts_with(a, b)`.
++EX_STARTS = 62
+/// `ends_with(a, b)`.
++EX_ENDS = 63
+/// `concat_str(a, b)`: both operands rendered as text and joined (null when either is null).
++EX_CONCAT = 64
+/// `if(cond, then, otherwise)`: node `a` is the condition, `b` the `then` branch and `ints` holds the `otherwise` node.
++EX_WHEN = 70
+
+// --- cells --------------------------------------------------------------------------------------
+
+/// A dynamically typed scalar produced by expression evaluation.
++Cell = {
+    kind: i64 = 0
+    i: i64 = 0
+    f: f64 = 0.0
+    s: str = ""
+    b: bool = false
+    null: bool = true
+
+    /// Numeric value as a float (ints are converted).
+    num(self) : f64 {
+        if self.kind == DT_INT { return host.sys_to_float(self.i) }
+        self.f
+    }
+
+    /// True for ints and floats.
+    is_num(self) : bool => !self.null && (self.kind == DT_INT || self.kind == DT_FLOAT)
+
+    /// Display text (`""` for a null).
+    text(self) : str {
+        if self.null { return "" }
+        if self.kind == DT_INT { return "{self.i}" }
+        if self.kind == DT_FLOAT { return "{self.f}" }
+        if self.kind == DT_BOOL {
+            if self.b { return "true" }
+            return "false"
+        }
+        self.s
+    }
+
+    /// True only for a non-null boolean `true` (how filters treat a predicate result).
+    truthy(self) : bool => !self.null && self.kind == DT_BOOL && self.b
+}
+
+/// The null cell.
++cell_null() : Cell => Cell.{kind: DT_INT, i: 0, f: 0.0, s: "", b: false, null: true}
+
+/// Integer cell.
++cell_int(v: i64) : Cell => Cell.{kind: DT_INT, i: v, f: 0.0, s: "", b: false, null: false}
+
+/// Float cell.
++cell_float(v: f64) : Cell => Cell.{kind: DT_FLOAT, i: 0, f: v, s: "", b: false, null: false}
+
+/// Boolean cell.
++cell_bool(v: bool) : Cell => Cell.{kind: DT_BOOL, i: 0, f: 0.0, s: "", b: v, null: false}
+
+/// String cell.
++cell_str(v: str) : Cell => Cell.{kind: DT_STR, i: 0, f: 0.0, s: v, b: false, null: false}
+
+/// Kleene `and` / `or` over boolean cells; a non-boolean operand counts as null.
++cell_logic(op: i64, l: Cell, r: Cell) : Cell {
+    lv = 0
+    rv = 0
+    if !l.null && l.kind == DT_BOOL { if l.b { lv = 1 } else { lv = -1 } }
+    if !r.null && r.kind == DT_BOOL { if r.b { rv = 1 } else { rv = -1 } }
+    if op == EX_AND {
+        if lv == -1 || rv == -1 { return cell_bool(false) }
+        if lv == 1 && rv == 1 { return cell_bool(true) }
+        return cell_null()
+    }
+    if lv == 1 || rv == 1 { return cell_bool(true) }
+    if lv == -1 && rv == -1 { return cell_bool(false) }
+    cell_null()
+}
+
+/// Comparison of two non-null cells (numbers with numbers, strings with strings, booleans for `==`/`!=`).
++cell_compare(op: i64, l: Cell, r: Cell) : Cell {
+    c = 0
+    if l.kind == DT_INT && r.kind == DT_INT {
+        if l.i < r.i { c = -1 }
+        if l.i > r.i { c = 1 }
+    } else {
+        if l.is_num() && r.is_num() {
+            a = l.num()
+            b = r.num()
+            if a < b { c = -1 }
+            if a > b { c = 1 }
+        } else {
+            if l.kind == DT_STR && r.kind == DT_STR {
+                c = compare(l.s, r.s)
+            } else {
+                if l.kind == DT_BOOL && r.kind == DT_BOOL && (op == EX_EQ || op == EX_NE) {
+                    if l.b != r.b { c = 1 }
+                } else {
+                    return cell_null()
+                }
+            }
+        }
+    }
+    if op == EX_EQ { return cell_bool(c == 0) }
+    if op == EX_NE { return cell_bool(c != 0) }
+    if op == EX_LT { return cell_bool(c < 0) }
+    if op == EX_LE { return cell_bool(c <= 0) }
+    if op == EX_GT { return cell_bool(c > 0) }
+    cell_bool(c >= 0)
+}
+
+/// Arithmetic on two non-null numeric cells.
++cell_arith(op: i64, l: Cell, r: Cell) : Cell {
+    if l.kind == DT_INT && r.kind == DT_INT {
+        if op == EX_ADD { return cell_int(l.i + r.i) }
+        if op == EX_SUB { return cell_int(l.i - r.i) }
+        if op == EX_MUL { return cell_int(l.i * r.i) }
+        if op == EX_DIV {
+            ensure r.i != 0 else { return cell_null() }
+            return cell_float(host.sys_to_float(l.i) / host.sys_to_float(r.i))
+        }
+        ensure r.i != 0 else { return cell_null() }
+        return cell_int(l.i % r.i)
+    }
+    a = l.num()
+    b = r.num()
+    if op == EX_ADD { return cell_float(a + b) }
+    if op == EX_SUB { return cell_float(a - b) }
+    if op == EX_MUL { return cell_float(a * b) }
+    if op == EX_DIV { return cell_float(a / b) }
+    ensure b < 0.0 || b > 0.0 else { return cell_null() }
+    cell_float(a - b * host.sys_floor(a / b))
+}
+
+/// Apply a binary or two-argument operator to two cells.
++cell_binary(op: i64, l: Cell, r: Cell) : Cell {
+    if op == EX_AND || op == EX_OR { return cell_logic(op, l, r) }
+    if op == EX_COALESCE {
+        if l.null { return r }
+        return l
+    }
+    if l.null || r.null { return cell_null() }
+    if op == EX_CONCAT { return cell_str("{l.text()}{r.text()}") }
+    if op >= EX_EQ && op <= EX_GE { return cell_compare(op, l, r) }
+    if op == EX_CONTAINS || op == EX_STARTS || op == EX_ENDS {
+        ensure l.kind == DT_STR && r.kind == DT_STR else { return cell_null() }
+        if op == EX_CONTAINS { return cell_bool(contains(l.s, r.s)) }
+        if op == EX_STARTS { return cell_bool(starts_with(l.s, r.s)) }
+        return cell_bool(ends_with(l.s, r.s))
+    }
+    if op == EX_ADD && l.kind == DT_STR && r.kind == DT_STR { return cell_str("{l.s}{r.s}") }
+    ensure l.is_num() && r.is_num() else { return cell_null() }
+    cell_arith(op, l, r)
+}
+
+/// Apply a unary operator to a cell.
++cell_unary(op: i64, x: Cell) : Cell {
+    if op == EX_ISNULL { return cell_bool(x.null) }
+    if op == EX_NOTNULL { return cell_bool(!x.null) }
+    if x.null { return cell_null() }
+    if op == EX_NOT {
+        ensure x.kind == DT_BOOL else { return cell_null() }
+        return cell_bool(!x.b)
+    }
+    if op == EX_LEN {
+        ensure x.kind == DT_STR else { return cell_null() }
+        return cell_int(char_count(x.s))
+    }
+    ensure x.is_num() else { return cell_null() }
+    if op == EX_NEG {
+        if x.kind == DT_INT { return cell_int(0 - x.i) }
+        return cell_float(0.0 - x.f)
+    }
+    if op == EX_ABS {
+        if x.kind == DT_INT {
+            if x.i < 0 { return cell_int(0 - x.i) }
+            return x
+        }
+        return cell_float(dt_abs(x.f))
+    }
+    v = x.num()
+    ensure !(v < 0.0) else { return cell_null() }
+    cell_float(host.sys_sqrt(v))
+}
+
+// --- the expression arena ---------------------------------------------------------------------
+
+/// A flat expression tree: node `k` has operator `ops[k]`, children `a[k]` / `b[k]` (or the bound column
+/// index for `EX_COL` in `a[k]`), and literal payloads in `ints[k]`, `floats[k]`, `strs[k]`.
++Expr = {
+    // Typed empty arrays (not bare `[]`) so AOT can unbox `fr_bind` / `fr_eval` / `Frame.filter`
+    // without an "indexing ArrEmpty" bottom that forces the boxed bytecode path.
+    ops: _ = host.sys_arr_new(0, 0)
+    a: _ = host.sys_arr_new(0, 0)
+    b: _ = host.sys_arr_new(0, 0)
+    ints: _ = host.sys_arr_new(0, 0)
+    floats: _ = host.sys_arr_new(0, 0.0)
+    strs: _ = host.sys_arr_new(0, "")
+    root: i64 = -1
+
+    /// Empty arena.
+    new() : Expr =>
+        Expr.{
+            ops: host.sys_arr_new(0, 0),
+            a: host.sys_arr_new(0, 0),
+            b: host.sys_arr_new(0, 0),
+            ints: host.sys_arr_new(0, 0),
+            floats: host.sys_arr_new(0, 0.0),
+            strs: host.sys_arr_new(0, ""),
+            root: -1,
+        }
+
+    /// Number of nodes.
+    size(self) : i64 => host.sys_arr_len(self.ops)
+
+    /// Append a node and return its id.
+    push_node(@self, op: i64, a: i64, b: i64, iv: i64, fv: f64, sv: str) : i64 {
+        id = host.sys_arr_len(self.ops)
+        self.ops = host.sys_arr_push(self.ops, op)
+        self.a = host.sys_arr_push(self.a, a)
+        self.b = host.sys_arr_push(self.b, b)
+        self.ints = host.sys_arr_push(self.ints, iv)
+        self.floats = host.sys_arr_push(self.floats, fv)
+        self.strs = host.sys_arr_push(self.strs, sv)
+        id
+    }
+
+    /// Column reference node.
+    col(@self, name: str) : i64 => @self.push_node(EX_COL, -1, -1, 0, 0.0, name)
+
+    /// Integer literal node.
+    int(@self, v: i64) : i64 => @self.push_node(EX_INT, -1, -1, v, 0.0, "")
+
+    /// Float literal node.
+    float(@self, v: f64) : i64 => @self.push_node(EX_FLOAT, -1, -1, 0, v, "")
+
+    /// String literal node.
+    text(@self, v: str) : i64 => @self.push_node(EX_STR, -1, -1, 0, 0.0, v)
+
+    /// Boolean literal node.
+    flag(@self, v: bool) : i64 {
+        n = 0
+        if v { n = 1 }
+        @self.push_node(EX_BOOL, -1, -1, n, 0.0, "")
+    }
+
+    /// Binary (or two-argument) operator node.
+    bin(@self, op: i64, l: i64, r: i64) : i64 => @self.push_node(op, l, r, 0, 0.0, "")
+
+    /// Unary operator node.
+    un(@self, op: i64, x: i64) : i64 => @self.push_node(op, x, -1, 0, 0.0, "")
+
+    /// Conditional node: `then_node` when `cond` is a non-null `true`, otherwise `else_node`.
+    when_node(@self, cond: i64, then_node: i64, else_node: i64) : i64 =>
+        @self.push_node(EX_WHEN, cond, then_node, else_node, 0.0, "")
+
+    /// Right-nested chain `op(nodes[0], op(nodes[1], ...))` for variadic `coalesce` / `concat_str` (`-1` when empty).
+    fold(@self, op: i64, nodes: _) : i64 {
+        n = host.sys_arr_len(nodes)
+        ensure n > 0 else { return -1 }
+        acc = nodes[n - 1]
+        i = n - 2
+        while i >= 0 {
+            acc = @self.bin(op, nodes[i], acc)
+            i -= 1
+        }
+        acc
+    }
+
+    /// Copy every node of `src` into this arena and return where `src`'s root landed (`-1` when `src` is empty).
+    absorb(@self, src: Expr) : i64 {
+        base = host.sys_arr_len(self.ops)
+        n = src.size()
+        i = 0
+        while i < n {
+            ca = src.a[i]
+            cb = src.b[i]
+            iv = src.ints[i]
+            if src.ops[i] != EX_COL && ca >= 0 { ca += base }
+            if src.ops[i] != EX_COL && cb >= 0 { cb += base }
+            if src.ops[i] == EX_WHEN { iv += base }
+            @self.push_node(src.ops[i], ca, cb, iv, src.floats[i], src.strs[i])
+            i += 1
+        }
+        ensure src.root >= 0 else { return -1 }
+        src.root + base
+    }
+
+    /// Mark `node` as the expression result.
+    finish(@self, node: i64) : i64 {
+        self.root = node
+        node
+    }
+
+    /// Distinct column names the expression reads, in first-use order.
+    columns(self) {
+        out = []
+        i = 0
+        n = host.sys_arr_len(self.ops)
+        while i < n {
+            if self.ops[i] == EX_COL {
+                seen = false
+                for out { if it == self.strs[i] { seen = true } }
+                if !seen { out = host.sys_arr_push(out, self.strs[i]) }
+            }
+            i += 1
+        }
+        out
+    }
+
+    /// Infix rendering of the whole expression (`""` when empty).
+    show(self) : str {
+        ensure self.root >= 0 else { return "" }
+        ex_show(self, self.root)
+    }
+}
+
+// --- when / then / otherwise ----------------------------------------------------------------------
+
+/// A `when_expr(cond)` waiting for its `then` branch. Chain: `when_expr(c1).then(a).and_when(c2).then(b).otherwise(z)`.
++When = {
+    conds: _ = []
+    thens: _ = []
+
+    /// Value produced when the pending condition holds.
+    then(self, e: Expr) : WhenThen => WhenThen.{conds: self.conds, thens: host.sys_arr_push(self.thens, e)}
+}
+
+/// A completed `when ... then ...` arm list; add more arms with `and_when` or close with `otherwise`.
++WhenThen = {
+    conds: _ = []
+    thens: _ = []
+
+    /// Another arm: tried after every earlier arm failed (a null condition counts as failed).
+    and_when(self, cond: Expr) : When => When.{conds: host.sys_arr_push(self.conds, cond), thens: self.thens}
+
+    /// Close the chain; rows matching no arm get `e`. Arms are tried in order and only the chosen branch is evaluated.
+    otherwise(self, e: Expr) : Expr {
+        out = Expr.new()
+        acc = @out.absorb(e)
+        i = host.sys_arr_len(self.conds) - 1
+        while i >= 0 {
+            c: Expr = self.conds[i]
+            t: Expr = self.thens[i]
+            cn = @out.absorb(c)
+            tn = @out.absorb(t)
+            acc = @out.when_node(cn, tn, acc)
+            i -= 1
+        }
+        @out.finish(acc)
+        out
+    }
+}
+
+/// Start a conditional expression: `when_expr(cond).then(a).otherwise(b)` (text form: `if(cond, a, b)`).
++when_expr(cond: Expr) : When => When.{conds: [cond], thens: []}
+
+/// Expression for the constant column reference `name` (shorthand for building selector-style expressions).
++col_expr(name: str) : Expr {
+    e = Expr.new()
+    n = @e.col(name)
+    @e.finish(n)
+    e
+}
+
+/// Expression for an integer literal.
++int_expr(v: i64) : Expr {
+    e = Expr.new()
+    n = @e.int(v)
+    @e.finish(n)
+    e
+}
+
+/// Expression for a float literal.
++float_expr(v: f64) : Expr {
+    e = Expr.new()
+    n = @e.float(v)
+    @e.finish(n)
+    e
+}
+
+/// Expression for a string literal.
++str_expr(v: str) : Expr {
+    e = Expr.new()
+    n = @e.text(v)
+    @e.finish(n)
+    e
+}
+
+/// `coalesce(parts[0], parts[1], ...)`: the first non-null expression (an empty arena for no parts).
++coalesce_expr(parts: _) : Expr {
+    out = Expr.new()
+    nodes = []
+    k = 0
+    while k < host.sys_arr_len(parts) {
+        p: Expr = parts[k]
+        node = @out.absorb(p)
+        nodes = host.sys_arr_push(nodes, node)
+        k += 1
+    }
+    root = @out.fold(EX_COALESCE, nodes)
+    if root >= 0 { @out.finish(root) }
+    out
+}
+
+/// `concat_str(parts...)`: every part rendered as text and joined with `sep` (null if any part is null).
++concat_str_expr(parts: _, sep: str) : Expr {
+    out = Expr.new()
+    n = host.sys_arr_len(parts)
+    ensure n > 0 else { return out }
+    acc = -1
+    i = n - 1
+    while i >= 0 {
+        p: Expr = parts[i]
+        node = @out.absorb(p)
+        if acc < 0 {
+            acc = node
+        } else {
+            if sep != "" {
+                s = @out.text(sep)
+                acc = @out.bin(EX_CONCAT, s, acc)
+            }
+            acc = @out.bin(EX_CONCAT, node, acc)
+        }
+        i -= 1
+    }
+    @out.finish(acc)
+    out
+}
+
+/// Source text of an operator.
++ex_op_text(op: i64) : str {
+    if op == EX_ADD { return "+" }
+    if op == EX_SUB { return "-" }
+    if op == EX_MUL { return "*" }
+    if op == EX_DIV { return "/" }
+    if op == EX_MOD { return "%" }
+    if op == EX_EQ { return "==" }
+    if op == EX_NE { return "!=" }
+    if op == EX_LT { return "<" }
+    if op == EX_LE { return "<=" }
+    if op == EX_GT { return ">" }
+    if op == EX_GE { return ">=" }
+    if op == EX_AND { return "and" }
+    "or"
+}
+
+/// Name of a function-style operator.
++ex_fn_name(op: i64) : str {
+    if op == EX_ABS { return "abs" }
+    if op == EX_SQRT { return "sqrt" }
+    if op == EX_LEN { return "len" }
+    if op == EX_COALESCE { return "coalesce" }
+    if op == EX_CONTAINS { return "contains" }
+    if op == EX_STARTS { return "starts_with" }
+    if op == EX_CONCAT { return "concat_str" }
+    "ends_with"
+}
+
+/// Render node `k` (and its subtree) as text.
++ex_show(e: Expr, k: i64) : str {
+    op = e.ops[k]
+    if op == EX_COL { return e.strs[k] }
+    if op == EX_INT { return "{e.ints[k]}" }
+    if op == EX_FLOAT { return "{e.floats[k]}" }
+    if op == EX_STR { return "'{e.strs[k]}'" }
+    if op == EX_BOOL {
+        if e.ints[k] == 1 { return "true" }
+        return "false"
+    }
+    if op == EX_NOT { return "(not {ex_show(e, e.a[k])})" }
+    if op == EX_NEG { return "(-{ex_show(e, e.a[k])})" }
+    if op == EX_ISNULL { return "({ex_show(e, e.a[k])} is null)" }
+    if op == EX_NOTNULL { return "({ex_show(e, e.a[k])} is not null)" }
+    if op >= EX_ABS && op <= EX_LEN { return "{ex_fn_name(op)}({ex_show(e, e.a[k])})" }
+    if op == EX_WHEN { return "if({ex_show(e, e.a[k])}, {ex_show(e, e.b[k])}, {ex_show(e, e.ints[k])})" }
+    if op >= EX_COALESCE { return "{ex_fn_name(op)}({ex_show(e, e.a[k])}, {ex_show(e, e.b[k])})" }
+    "({ex_show(e, e.a[k])} {ex_op_text(op)} {ex_show(e, e.b[k])})"
+}
+
+// --- tokenizer ---------------------------------------------------------------------------------
+
+/// Token kind: number.
++TK_NUM = 0
+/// Token kind: identifier.
++TK_ID = 1
+/// Token kind: string literal.
++TK_STR = 2
+/// Token kind: operator or punctuation.
++TK_OP = 3
+/// Token kind: end of input.
++TK_END = 4
+
+/// Parallel token streams from `ex_tokenize` (homogeneous arrays — AOT-unboxable, unlike `[kinds, texts]`).
++ExToks = {
+    kinds: _ = []
+    texts: _ = []
+}
+
+/// Split expression text into parallel kind/text arrays (ending with `TK_END`); a text token of kind `-1`
+/// marks an unterminated string or unknown character.
++ex_tokenize(src: str) : ExToks {
+    kinds = []
+    texts = []
+    n = char_count(src)
+    i = 0
+    while i < n {
+        c = src[i]
+        if c == " " || c == "\t" || c == "\n" || c == "\r" {
+            i += 1
+        } else {
+            if is_digit(c) {
+                j = i
+                dots = 0
+                while j < n && (is_digit(src[j]) || (src[j] == "." && dots == 0)) {
+                    if src[j] == "." { dots += 1 }
+                    j += 1
+                }
+                kinds = host.sys_arr_push(kinds, TK_NUM)
+                texts = host.sys_arr_push(texts, src[i..j])
+                i = j
+            } else {
+                if is_ascii_alpha(c) || c == "_" {
+                    j = i
+                    while j < n && (is_ascii_alnum(src[j]) || src[j] == "_") { j += 1 }
+                    kinds = host.sys_arr_push(kinds, TK_ID)
+                    texts = host.sys_arr_push(texts, src[i..j])
+                    i = j
+                } else {
+                    if c == "'" || c == "\"" {
+                        j = i + 1
+                        while j < n && src[j] != c { j += 1 }
+                        if j >= n {
+                            kinds = host.sys_arr_push(kinds, -1)
+                            texts = host.sys_arr_push(texts, "unterminated string")
+                            return ExToks.{kinds, texts}
+                        }
+                        kinds = host.sys_arr_push(kinds, TK_STR)
+                        texts = host.sys_arr_push(texts, src[(i + 1)..j])
+                        i = j + 1
+                    } else {
+                        two = ""
+                        if i + 1 < n { two = src[i..(i + 2)] }
+                        if two == "==" || two == "!=" || two == "<=" || two == ">=" {
+                            kinds = host.sys_arr_push(kinds, TK_OP)
+                            texts = host.sys_arr_push(texts, two)
+                            i += 2
+                        } else {
+                            if find("+-*/%<>(),", c) >= 0 {
+                                kinds = host.sys_arr_push(kinds, TK_OP)
+                                texts = host.sys_arr_push(texts, c)
+                                i += 1
+                            } else {
+                                kinds = host.sys_arr_push(kinds, -1)
+                                texts = host.sys_arr_push(texts, "unexpected character '{c}'")
+                                return ExToks.{kinds, texts}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    kinds = host.sys_arr_push(kinds, TK_END)
+    texts = host.sys_arr_push(texts, "")
+    ExToks.{kinds, texts}
+}
+
+// --- parser (precedence climbing; every function returns [node, next_position], node < 0 on error) ----
+
+/// True when token `p` is the identifier `word`.
++ex_is_word(tk: _, tt: _, p: i64, word: str) : bool => tk[p] == TK_ID && tt[p] == word
+
+/// True when token `p` is the operator `op`.
++ex_is_op(tk: _, tt: _, p: i64, op: str) : bool => tk[p] == TK_OP && tt[p] == op
+
+/// `or` level.
++ex_parse_or(@e: Expr, tk: _, tt: _, pos: i64) {
+    l = ex_parse_and(@e, tk, tt, pos)
+    node = l[0]
+    p = l[1]
+    while node >= 0 && ex_is_word(tk, tt, p, "or") {
+        r = ex_parse_and(@e, tk, tt, p + 1)
+        if r[0] < 0 { return [-1, r[1]] }
+        node = @e.bin(EX_OR, node, r[0])
+        p = r[1]
+    }
+    return [node, p]
+}
+
+/// `and` level.
++ex_parse_and(@e: Expr, tk: _, tt: _, pos: i64) {
+    l = ex_parse_not(@e, tk, tt, pos)
+    node = l[0]
+    p = l[1]
+    while node >= 0 && ex_is_word(tk, tt, p, "and") {
+        r = ex_parse_not(@e, tk, tt, p + 1)
+        if r[0] < 0 { return [-1, r[1]] }
+        node = @e.bin(EX_AND, node, r[0])
+        p = r[1]
+    }
+    return [node, p]
+}
+
+/// `not` level.
++ex_parse_not(@e: Expr, tk: _, tt: _, pos: i64) {
+    if ex_is_word(tk, tt, pos, "not") {
+        r = ex_parse_not(@e, tk, tt, pos + 1)
+        if r[0] < 0 { return [-1, r[1]] }
+        return [@e.un(EX_NOT, r[0]), r[1]]
+    }
+    ex_parse_cmp(@e, tk, tt, pos)
+}
+
+/// Comparison level (non-associative) plus `is [not] null`.
++ex_parse_cmp(@e: Expr, tk: _, tt: _, pos: i64) {
+    l = ex_parse_add(@e, tk, tt, pos)
+    node = l[0]
+    p = l[1]
+    if node < 0 { return [-1, p] }
+    if ex_is_word(tk, tt, p, "is") {
+        if ex_is_word(tk, tt, p + 1, "null") { return [@e.un(EX_ISNULL, node), p + 2] }
+        if ex_is_word(tk, tt, p + 1, "not") && ex_is_word(tk, tt, p + 2, "null") {
+            return [@e.un(EX_NOTNULL, node), p + 3]
+        }
+        return [-1, p]
+    }
+    op = -1
+    if ex_is_op(tk, tt, p, "==") { op = EX_EQ }
+    if ex_is_op(tk, tt, p, "!=") { op = EX_NE }
+    if ex_is_op(tk, tt, p, "<") { op = EX_LT }
+    if ex_is_op(tk, tt, p, "<=") { op = EX_LE }
+    if ex_is_op(tk, tt, p, ">") { op = EX_GT }
+    if ex_is_op(tk, tt, p, ">=") { op = EX_GE }
+    if op < 0 { return [node, p] }
+    r = ex_parse_add(@e, tk, tt, p + 1)
+    if r[0] < 0 { return [-1, r[1]] }
+    return [@e.bin(op, node, r[0]), r[1]]
+}
+
+/// `+` / `-` level.
++ex_parse_add(@e: Expr, tk: _, tt: _, pos: i64) {
+    l = ex_parse_mul(@e, tk, tt, pos)
+    node = l[0]
+    p = l[1]
+    while node >= 0 && (ex_is_op(tk, tt, p, "+") || ex_is_op(tk, tt, p, "-")) {
+        op = EX_ADD
+        if tt[p] == "-" { op = EX_SUB }
+        r = ex_parse_mul(@e, tk, tt, p + 1)
+        if r[0] < 0 { return [-1, r[1]] }
+        node = @e.bin(op, node, r[0])
+        p = r[1]
+    }
+    return [node, p]
+}
+
+/// `*` `/` `%` level.
++ex_parse_mul(@e: Expr, tk: _, tt: _, pos: i64) {
+    l = ex_parse_unary(@e, tk, tt, pos)
+    node = l[0]
+    p = l[1]
+    while node >= 0 && (ex_is_op(tk, tt, p, "*") || ex_is_op(tk, tt, p, "/") || ex_is_op(tk, tt, p, "%")) {
+        op = EX_MUL
+        if tt[p] == "/" { op = EX_DIV }
+        if tt[p] == "%" { op = EX_MOD }
+        r = ex_parse_unary(@e, tk, tt, p + 1)
+        if r[0] < 0 { return [-1, r[1]] }
+        node = @e.bin(op, node, r[0])
+        p = r[1]
+    }
+    return [node, p]
+}
+
+/// Unary minus.
++ex_parse_unary(@e: Expr, tk: _, tt: _, pos: i64) {
+    if ex_is_op(tk, tt, pos, "-") {
+        r = ex_parse_unary(@e, tk, tt, pos + 1)
+        if r[0] < 0 { return [-1, r[1]] }
+        return [@e.un(EX_NEG, r[0]), r[1]]
+    }
+    ex_parse_atom(@e, tk, tt, pos)
+}
+
+/// Function operator for a call name, or `-1`.
++ex_fn_op(name: str) : i64 {
+    if name == "abs" { return EX_ABS }
+    if name == "sqrt" { return EX_SQRT }
+    if name == "len" { return EX_LEN }
+    if name == "coalesce" { return EX_COALESCE }
+    if name == "contains" { return EX_CONTAINS }
+    if name == "starts_with" { return EX_STARTS }
+    if name == "ends_with" { return EX_ENDS }
+    if name == "concat_str" { return EX_CONCAT }
+    if name == "if" { return EX_WHEN }
+    -1
+}
+
+/// Atoms: numbers, strings, `true`/`false`, columns, calls and parenthesised expressions.
++ex_parse_atom(@e: Expr, tk: _, tt: _, pos: i64) {
+    kind = tk[pos]
+    text = tt[pos]
+    if kind == TK_NUM {
+        if contains(text, ".") {
+            v = to_f64(text) or 0.0
+            return [@e.float(v), pos + 1]
+        }
+        v = to_i64(text) or 0
+        return [@e.int(v), pos + 1]
+    }
+    if kind == TK_STR { return [@e.text(text), pos + 1] }
+    if kind == TK_OP && text == "(" {
+        r = ex_parse_or(@e, tk, tt, pos + 1)
+        if r[0] < 0 { return [-1, r[1]] }
+        if !ex_is_op(tk, tt, r[1], ")") { return [-1, r[1]] }
+        return [r[0], r[1] + 1]
+    }
+    if kind == TK_ID {
+        if text == "true" { return [@e.flag(true), pos + 1] }
+        if text == "false" { return [@e.flag(false), pos + 1] }
+        fop = ex_fn_op(text)
+        if fop >= 0 && ex_is_op(tk, tt, pos + 1, "(") {
+            first = ex_parse_or(@e, tk, tt, pos + 2)
+            if first[0] < 0 { return [-1, first[1]] }
+            p = first[1]
+            if fop == EX_WHEN {
+                if !ex_is_op(tk, tt, p, ",") { return [-1, p] }
+                second = ex_parse_or(@e, tk, tt, p + 1)
+                if second[0] < 0 { return [-1, second[1]] }
+                if !ex_is_op(tk, tt, second[1], ",") { return [-1, second[1]] }
+                third = ex_parse_or(@e, tk, tt, second[1] + 1)
+                if third[0] < 0 { return [-1, third[1]] }
+                if !ex_is_op(tk, tt, third[1], ")") { return [-1, third[1]] }
+                return [@e.when_node(first[0], second[0], third[0]), third[1] + 1]
+            }
+            if fop == EX_COALESCE || fop == EX_CONCAT {
+                if !ex_is_op(tk, tt, p, ",") { return [-1, p] }
+                nodes = [first[0]]
+                while ex_is_op(tk, tt, p, ",") {
+                    nxt = ex_parse_or(@e, tk, tt, p + 1)
+                    if nxt[0] < 0 { return [-1, nxt[1]] }
+                    nodes = host.sys_arr_push(nodes, nxt[0])
+                    p = nxt[1]
+                }
+                if !ex_is_op(tk, tt, p, ")") { return [-1, p] }
+                return [@e.fold(fop, nodes), p + 1]
+            }
+            if fop >= EX_COALESCE {
+                if !ex_is_op(tk, tt, p, ",") { return [-1, p] }
+                second = ex_parse_or(@e, tk, tt, p + 1)
+                if second[0] < 0 { return [-1, second[1]] }
+                if !ex_is_op(tk, tt, second[1], ")") { return [-1, second[1]] }
+                return [@e.bin(fop, first[0], second[0]), second[1] + 1]
+            }
+            if !ex_is_op(tk, tt, p, ")") { return [-1, p] }
+            return [@e.un(fop, first[0]), p + 1]
+        }
+        return [@e.col(text), pos + 1]
+    }
+    return [-1, pos]
+}
+
+/// Parse expression text into an `Expr`, or fail with the offending token.
++expr(src: str) : Expr! {
+    toks = ex_tokenize(src)
+    tk = toks.kinds
+    tt = toks.texts
+    bad = host.sys_arr_len(tk) - 1
+    if tk[bad] == -1 {
+        fail "expression: {tt[bad]}"
+        return
+    }
+    e = Expr.new()
+    r = ex_parse_or(@e, tk, tt, 0)
+    if r[0] < 0 {
+        fail "expression: unexpected '{tt[r[1]]}' at token {r[1]}"
+        return
+    }
+    if tk[r[1]] != TK_END {
+        fail "expression: unexpected '{tt[r[1]]}' at token {r[1]}"
+        return
+    }
+    @e.finish(r[0])
+    e
+}
+
+/// Fallback for `expr(...) or ...` when only a placeholder is needed (an expression that is always `null`).
++fail_expr() : Expr {
+    e = Expr.new()
+    zero = @e.int(0)
+    built = @e.un(EX_ISNULL, zero)
+    @e.finish(built)
+    e
+}
+
+// --- tests ------------------------------------------------------------------------------------------
+
+test "cell arithmetic promotes and propagates null" {
+    a = cell_int(7)
+    b = cell_int(2)
+    assert_eq(cell_binary(EX_ADD, a, b).i, 9)
+    assert_eq(cell_binary(EX_SUB, a, b).i, 5)
+    assert_eq(cell_binary(EX_MUL, a, b).i, 14)
+    assert_eq(cell_binary(EX_MOD, a, b).i, 1)
+    d = cell_binary(EX_DIV, a, b)
+    assert_eq(d.kind, DT_FLOAT)
+    assert_eq(d.f, 3.5)
+    #assert(cell_binary(EX_DIV, a, cell_int(0)).null)
+    #assert(cell_binary(EX_MOD, a, cell_int(0)).null)
+    mixed = cell_binary(EX_ADD, a, cell_float(0.5))
+    assert_eq(mixed.kind, DT_FLOAT)
+    assert_eq(mixed.f, 7.5)
+    assert_eq(cell_binary(EX_MUL, cell_float(1.5), cell_float(4.0)).f, 6.0)
+    assert_eq(cell_binary(EX_MOD, cell_float(7.5), cell_float(2.0)).f, 1.5)
+    assert_eq(cell_binary(EX_MOD, cell_float(-1.0), cell_float(3.0)).f, 2.0)
+    #assert(cell_binary(EX_MOD, cell_float(1.0), cell_float(0.0)).null)
+    #assert(cell_binary(EX_ADD, a, cell_null()).null)
+    #assert(cell_binary(EX_ADD, cell_null(), a).null)
+    assert_eq(cell_binary(EX_ADD, cell_str("a"), cell_str("b")).s, "ab")
+    #assert(cell_binary(EX_ADD, cell_str("a"), a).null)
+    #assert(cell_binary(EX_SUB, cell_bool(true), a).null)
+    assert_eq(cell_unary(EX_NEG, a).i, -7)
+    assert_eq(cell_unary(EX_NEG, cell_float(2.5)).f, -2.5)
+    assert_eq(cell_unary(EX_ABS, cell_int(-4)).i, 4)
+    assert_eq(cell_unary(EX_ABS, cell_int(4)).i, 4)
+    assert_eq(cell_unary(EX_ABS, cell_float(-4.5)).f, 4.5)
+    assert_eq(cell_unary(EX_SQRT, cell_int(9)).f, 3.0)
+    #assert(cell_unary(EX_SQRT, cell_int(-9)).null)
+    #assert(cell_unary(EX_NEG, cell_null()).null)
+    #assert(cell_unary(EX_NEG, cell_str("x")).null)
+    assert_eq(cell_unary(EX_LEN, cell_str("abcd")).i, 4)
+    #assert(cell_unary(EX_LEN, a).null)
+    #assert(cell_unary(EX_ISNULL, cell_null()).b)
+    #assert(!(cell_unary(EX_ISNULL, a).b))
+    #assert(cell_unary(EX_NOTNULL, a).b)
+    #assert(cell_unary(EX_NOT, cell_bool(false)).b)
+    #assert(cell_unary(EX_NOT, a).null)
+    #assert(cell_unary(EX_NOT, cell_null()).null)
+}
+
+test "cell comparisons, logic and strings" {
+    #assert(cell_binary(EX_GT, cell_int(3), cell_float(2.5)).b)
+    #assert(!(cell_binary(EX_LT, cell_int(3), cell_int(3)).b))
+    #assert(cell_binary(EX_LE, cell_int(3), cell_int(3)).b)
+    #assert(cell_binary(EX_GE, cell_float(1.5), cell_float(1.5)).b)
+    #assert(cell_binary(EX_EQ, cell_int(2), cell_float(2.0)).b)
+    #assert(!(cell_binary(EX_NE, cell_int(2), cell_float(2.0)).b))
+    #assert(cell_binary(EX_LT, cell_str("apple"), cell_str("banana")).b)
+    #assert(cell_binary(EX_EQ, cell_str("x"), cell_str("x")).b)
+    #assert(cell_binary(EX_NE, cell_str("x"), cell_str("y")).b)
+    #assert(cell_binary(EX_EQ, cell_bool(true), cell_bool(true)).b)
+    #assert(cell_binary(EX_NE, cell_bool(true), cell_bool(false)).b)
+    #assert(cell_binary(EX_LT, cell_bool(true), cell_bool(false)).null)
+    #assert(cell_binary(EX_EQ, cell_str("1"), cell_int(1)).null)
+    #assert(cell_binary(EX_EQ, cell_null(), cell_int(1)).null)
+    // Kleene logic
+    t = cell_bool(true)
+    f = cell_bool(false)
+    n = cell_null()
+    #assert(cell_binary(EX_AND, t, t).b)
+    #assert(!(cell_binary(EX_AND, t, f).b))
+    #assert(!(cell_binary(EX_AND, n, f).b))
+    #assert(!(cell_binary(EX_AND, f, n).b))
+    #assert(cell_binary(EX_AND, n, t).null)
+    #assert(cell_binary(EX_AND, n, n).null)
+    #assert(!(cell_binary(EX_OR, f, f).b))
+    #assert(cell_binary(EX_OR, n, t).b)
+    #assert(cell_binary(EX_OR, t, n).b)
+    #assert(cell_binary(EX_OR, n, f).null)
+    #assert(cell_binary(EX_OR, cell_int(1), t).b)
+    // coalesce and string functions
+    assert_eq(cell_binary(EX_COALESCE, n, cell_int(5)).i, 5)
+    assert_eq(cell_binary(EX_COALESCE, cell_int(1), cell_int(5)).i, 1)
+    #assert(cell_binary(EX_COALESCE, n, n).null)
+    #assert(cell_binary(EX_CONTAINS, cell_str("hello world"), cell_str("lo w")).b)
+    #assert(!(cell_binary(EX_CONTAINS, cell_str("hello"), cell_str("xyz")).b))
+    #assert(cell_binary(EX_STARTS, cell_str("hello"), cell_str("he")).b)
+    #assert(cell_binary(EX_ENDS, cell_str("hello"), cell_str("llo")).b)
+    #assert(!(cell_binary(EX_ENDS, cell_str("hello"), cell_str("he")).b))
+    #assert(cell_binary(EX_CONTAINS, cell_int(1), cell_str("a")).null)
+    // text and truthiness
+    assert_eq(cell_int(5).text(), "5")
+    assert_eq(cell_float(2.5).text(), "2.5")
+    assert_eq(cell_bool(true).text(), "true")
+    assert_eq(cell_str("hi").text(), "hi")
+    assert_eq(cell_null().text(), "")
+    #assert(t.truthy())
+    #assert(!(f.truthy()))
+    #assert(!(n.truthy()))
+    #assert(!(cell_int(1).truthy()))
+}
+
+test "builder API and show" {
+    e = Expr.new()
+    x = @e.col("price")
+    y = @e.float(10.0)
+    z = @e.col("qty")
+    m = @e.bin(EX_MUL, x, z)
+    g = @e.bin(EX_GT, m, y)
+    @e.finish(g)
+    assert_eq(e.size(), 5)
+    assert_eq(e.root, g)
+    assert_eq(e.show(), "((price * qty) > 10)")
+    cols = e.columns()
+    assert_eq(host.sys_arr_len(cols), 2)
+    assert_eq(cols[0], "price")
+    assert_eq(cols[1], "qty")
+    // repeated column is listed once
+    r = Expr.new()
+    a = @r.col("a")
+    b = @r.col("a")
+    built = @r.bin(EX_ADD, a, b)
+    @r.finish(built)
+    assert_eq(host.sys_arr_len(r.columns()), 1)
+    assert_eq(Expr.new().show(), "")
+    s = Expr.new()
+    lit = @s.flag(true)
+    built = @s.un(EX_NOT, lit)
+    @s.finish(built)
+    assert_eq(s.show(), "(not true)")
+    t = Expr.new()
+    cn = @t.col("name")
+    cl = @t.text("ab")
+    built = @t.bin(EX_CONTAINS, cn, cl)
+    @t.finish(built)
+    assert_eq(t.show(), "contains(name, 'ab')")
+    u = Expr.new()
+    cv = @u.col("v")
+    built = @u.un(EX_ISNULL, cv)
+    @u.finish(built)
+    assert_eq(u.show(), "(v is null)")
+}
+
+test "tokenizer" {
+    t = ex_tokenize("a >= 10.5 and name == 'x y'")
+    tk = t.kinds
+    tt = t.texts
+    assert_eq(host.sys_arr_len(tk), 8)
+    assert_eq(tk[0], TK_ID)
+    assert_eq(tt[0], "a")
+    assert_eq(tk[1], TK_OP)
+    assert_eq(tt[1], ">=")
+    assert_eq(tk[2], TK_NUM)
+    assert_eq(tt[2], "10.5")
+    assert_eq(tt[3], "and")
+    assert_eq(tk[6], TK_STR)
+    assert_eq(tt[6], "x y")
+    assert_eq(tk[7], TK_END)
+    assert_eq(ex_tokenize("a $ b").kinds[1], -1)
+    assert_eq(ex_tokenize("name == 'oops").kinds[2], -1)
+    assert_eq(host.sys_arr_len(ex_tokenize("").kinds), 1)
+    d = ex_tokenize("f(1, 2) % 3 != -4")
+    assert_eq(host.sys_arr_len(d.kinds), 12)
+}
+
+test "parser precedence and shape" {
+    assert_eq((expr("1 + 2 * 3") or fail_expr()).show(), "(1 + (2 * 3))")
+    assert_eq((expr("(1 + 2) * 3") or fail_expr()).show(), "((1 + 2) * 3)")
+    assert_eq((expr("a - b - c") or fail_expr()).show(), "((a - b) - c)")
+    assert_eq((expr("a / b / c") or fail_expr()).show(), "((a / b) / c)")
+    assert_eq((expr("-a * b") or fail_expr()).show(), "((-a) * b)")
+    assert_eq((expr("a or b and c") or fail_expr()).show(), "(a or (b and c))")
+    assert_eq((expr("not a and b") or fail_expr()).show(), "((not a) and b)")
+    assert_eq((expr("a + 1 > b * 2") or fail_expr()).show(), "((a + 1) > (b * 2))")
+    assert_eq((expr("price * qty > 100 and region == 'EU'") or fail_expr()).show(), "(((price * qty) > 100) and (region == 'EU'))")
+    assert_eq((expr("x is null") or fail_expr()).show(), "(x is null)")
+    assert_eq((expr("x is not null and y > 0") or fail_expr()).show(), "((x is not null) and (y > 0))")
+    assert_eq((expr("abs(a - b) < 0.5") or fail_expr()).show(), "(abs((a - b)) < 0.5)")
+    assert_eq((expr("coalesce(a, 0) + 1") or fail_expr()).show(), "(coalesce(a, 0) + 1)")
+    assert_eq((expr("contains(name, \"ab\") or starts_with(name, 'z')") or fail_expr()).show(), "(contains(name, 'ab') or starts_with(name, 'z'))")
+    assert_eq((expr("len(s) % 2 == 0") or fail_expr()).show(), "((len(s) % 2) == 0)")
+    assert_eq((expr("true and not false") or fail_expr()).show(), "(true and (not false))")
+    assert_eq((expr("  7  ") or fail_expr()).show(), "7")
+    assert_eq((expr("sqrt(16.0)") or fail_expr()).show(), "sqrt(16)")
+    cols = (expr("a + b * a - c") or fail_expr()).columns()
+    assert_eq(host.sys_arr_len(cols), 3)
+    assert_eq(cols[0], "a")
+    assert_eq(cols[1], "b")
+    assert_eq(cols[2], "c")
+}
+
+test "parser reports errors" {
+    #assert(host.sys_arr_len((expr("") or fail_expr()).ops) > 0)
+    bad = [")", "(1 + 2", "1 +", "a b", "a >", "f(", "abs(1", "coalesce(1)", "x is", "x is not", "1 2", "'open", "a $ b", "not"]
+    for bad {
+        e = expr(it) or fail_expr()
+        // every failure is replaced by the placeholder (`0 is null`)
+        assert_eq(e.show(), "(0 is null)")
+    }
+    // the failure message names the problem
+    msg = expr("a $ b") or err { "{err}" }
+    #assert(contains(msg, "unexpected character"))
+    msg2 = expr("1 +") or err { "{err}" }
+    #assert(contains(msg2, "unexpected"))
+}
+
+tri_cell(t: i64) : Cell {
+    if t == 0 { return cell_bool(false) }
+    if t == 1 { return cell_null() }
+    cell_bool(true)
+}
+
+tri_value(c: Cell) : i64 {
+    if c.null { return 1 }
+    if c.b { return 2 }
+    0
+}
+
+test "kleene conformance: cell logic equals the min/max/2-x model on every input" {
+    for 0..3 {
+        a = it
+        assert_eq(tri_value(tri_cell(a)), a)
+        assert_eq(tri_value(cell_unary(EX_NOT, tri_cell(a))), 2 - a)
+        assert_eq(tri_value(cell_unary(EX_NOT, cell_unary(EX_NOT, tri_cell(a)))), a)
+        // identities and annihilators
+        assert_eq(tri_value(cell_logic(EX_AND, cell_bool(true), tri_cell(a))), a)
+        assert_eq(tri_value(cell_logic(EX_OR, cell_bool(false), tri_cell(a))), a)
+        assert_eq(tri_value(cell_logic(EX_AND, cell_bool(false), tri_cell(a))), 0)
+        assert_eq(tri_value(cell_logic(EX_OR, cell_bool(true), tri_cell(a))), 2)
+        for 0..3 {
+            b = it
+            lo = a
+            hi = b
+            if b < a {
+                lo = b
+                hi = a
+            }
+            and_ab = cell_logic(EX_AND, tri_cell(a), tri_cell(b))
+            or_ab = cell_logic(EX_OR, tri_cell(a), tri_cell(b))
+            assert_eq(tri_value(and_ab), lo)
+            assert_eq(tri_value(or_ab), hi)
+            assert_eq(tri_value(cell_logic(EX_AND, tri_cell(b), tri_cell(a))), lo)
+            assert_eq(tri_value(cell_logic(EX_OR, tri_cell(b), tri_cell(a))), hi)
+            // De Morgan
+            assert_eq(tri_value(cell_unary(EX_NOT, and_ab)), tri_value(cell_logic(EX_OR, cell_unary(EX_NOT, tri_cell(a)), cell_unary(EX_NOT, tri_cell(b)))))
+            assert_eq(tri_value(cell_unary(EX_NOT, or_ab)), tri_value(cell_logic(EX_AND, cell_unary(EX_NOT, tri_cell(a)), cell_unary(EX_NOT, tri_cell(b)))))
+            // absorption
+            assert_eq(tri_value(cell_logic(EX_OR, tri_cell(a), and_ab)), a)
+            for 0..3 {
+                c = it
+                left = cell_logic(EX_OR, tri_cell(a), cell_logic(EX_AND, tri_cell(b), tri_cell(c)))
+                right = cell_logic(EX_AND, cell_logic(EX_OR, tri_cell(a), tri_cell(b)), cell_logic(EX_OR, tri_cell(a), tri_cell(c)))
+                assert_eq(tri_value(left), tri_value(right))
+                l2 = cell_logic(EX_AND, cell_logic(EX_AND, tri_cell(a), tri_cell(b)), tri_cell(c))
+                r2 = cell_logic(EX_AND, tri_cell(a), cell_logic(EX_AND, tri_cell(b), tri_cell(c)))
+                assert_eq(tri_value(l2), tri_value(r2))
+                l3 = cell_logic(EX_OR, cell_logic(EX_OR, tri_cell(a), tri_cell(b)), tri_cell(c))
+                r3 = cell_logic(EX_OR, tri_cell(a), cell_logic(EX_OR, tri_cell(b), tri_cell(c)))
+                assert_eq(tri_value(l3), tri_value(r3))
+            }
+        }
+    }
+    // a predicate keeps a row only for true: that is what makes filter fusion with `and` exact
+    for 0..3 {
+        a = it
+        for 0..3 {
+            both = cell_logic(EX_AND, tri_cell(a), tri_cell(it))
+            assert_eq(both.truthy(), tri_cell(a).truthy() && tri_cell(it).truthy())
+        }
+    }
+}
+
+test "comparison and arithmetic follow null propagation and trichotomy" {
+    for -3..4 {
+        a = it
+        #assert(cell_binary(EX_ADD, cell_null(), cell_int(a)).null)
+        #assert(cell_binary(EX_MUL, cell_int(a), cell_null()).null)
+        #assert(cell_binary(EX_LT, cell_null(), cell_int(a)).null)
+        #assert(cell_binary(EX_EQ, cell_int(a), cell_null()).null)
+        for -3..4 {
+            b = it
+            assert_eq(cell_arith(EX_ADD, cell_int(a), cell_int(b)).i, a + b)
+            assert_eq(cell_arith(EX_SUB, cell_int(a), cell_int(b)).i, a - b)
+            assert_eq(cell_arith(EX_MUL, cell_int(a), cell_int(b)).i, a * b)
+            n = 0
+            if cell_compare(EX_LT, cell_int(a), cell_int(b)).b { n += 1 }
+            if cell_compare(EX_GT, cell_int(a), cell_int(b)).b { n += 1 }
+            if cell_compare(EX_EQ, cell_int(a), cell_int(b)).b { n += 1 }
+            assert_eq(n, 1)
+        }
+    }
+}
+
+test "when / then / otherwise builds a lazy conditional" {
+    big = expr("qty > 10") or fail_expr()
+    one = int_expr(1)
+    zero = int_expr(0)
+    w = when_expr(big).then(one).otherwise(zero)
+    assert_eq(w.show(), "if((qty > 10), 1, 0)")
+    chain = when_expr(expr("a > 5") or fail_expr()).then(str_expr("hi")).and_when(expr("a > 2") or fail_expr()).then(str_expr("mid")).otherwise(str_expr("lo"))
+    assert_eq(chain.show(), "if((a > 5), 'hi', if((a > 2), 'mid', 'lo'))")
+    assert_eq(host.sys_arr_len(chain.columns()), 1)
+    parsed = expr("if(x is null, 0, x + 1)") or fail_expr()
+    assert_eq(parsed.show(), "if((x is null), 0, (x + 1))")
+    assert_eq(host.sys_arr_len(parsed.columns()), 1)
+    // the text form round-trips
+    assert_eq((expr(parsed.show()) or fail_expr()).show(), parsed.show())
+    // malformed
+    assert_eq((expr("if(a, b)") or fail_expr()).show(), "(0 is null)")
+    assert_eq((expr("if(a, b, c") or fail_expr()).show(), "(0 is null)")
+}
+
+test "variadic coalesce and concat_str parse right-nested" {
+    c = expr("coalesce(a, b, c, 0)") or fail_expr()
+    assert_eq(c.show(), "coalesce(a, coalesce(b, coalesce(c, 0)))")
+    assert_eq((expr("coalesce(a, b)") or fail_expr()).show(), "coalesce(a, b)")
+    assert_eq((expr("coalesce(a)") or fail_expr()).show(), "(0 is null)")
+    assert_eq((expr("coalesce(a, b,") or fail_expr()).show(), "(0 is null)")
+    k = expr("concat_str(first, ' ', last)") or fail_expr()
+    assert_eq(k.show(), "concat_str(first, concat_str(' ', last))")
+    assert_eq(cell_binary(EX_CONCAT, cell_str("a"), cell_int(7)).s, "a7")
+    assert_eq(cell_binary(EX_CONCAT, cell_float(1.5), cell_bool(true)).s, "1.5true")
+    #assert(cell_binary(EX_CONCAT, cell_str("a"), cell_null()).null)
+    built = coalesce_expr([col_expr("x"), col_expr("y"), int_expr(9)])
+    assert_eq(built.show(), "coalesce(x, coalesce(y, 9))")
+    assert_eq(coalesce_expr([]).size(), 0)
+    joined = concat_str_expr([col_expr("a"), col_expr("b")], "-")
+    assert_eq(joined.show(), "concat_str(a, concat_str('-', b))")
+    assert_eq(concat_str_expr([col_expr("a")], "-").show(), "a")
+    assert_eq(concat_str_expr([], "-").size(), 0)
+}

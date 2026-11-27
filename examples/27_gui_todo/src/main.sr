@@ -1,0 +1,185 @@
+// Todos. The list lives in std.db.sqlite. The window is std.gui.
+//
+// Run: super test examples/27_gui_todo/
+
+use std.gui
+use std.db.sqlite
+use std.core.str
+use std.gui.window
+use std.sys.time
+
++TodoApp: Widget = {
+    conn: SqliteConn
+    filter: str = "all"
+    notice: str = ""
+    width: i64 = 420
+    height: i64 = 480
+
+    open() : TodoApp {
+        conn = sqlite_memory()
+        conn = sqlite_create(conn, "todos", ["id", "title", "done", "live"]) or conn
+        TodoApp{conn, filter: "all", notice: ""}
+    }
+
+    add(@self, title: str) : i64 {
+        if title == "" {
+            self.notice = "Title required"
+            return 0
+        }
+        self.conn = sqlite_insert_auto(self.conn, "todos", [title, "0", "1"]) or self.conn
+        self.notice = "Saved"
+        sqlite_last_insert_rowid(self.conn)
+    }
+
+    toggle(@self, id: str) : str {
+        rows = sqlite_find(self.conn, "todos", "id", id)
+        ensure len(rows) > 0 else { return "" }
+        row = rows[0]
+        next = "1"
+        if row[2] == "1" { next = "0" }
+        self.conn = sqlite_update(self.conn, "todos", "id", id, "done", next) or self.conn
+        self.notice = ""
+        next
+    }
+
+    remove(@self, id: str) : i64 {
+        before = sqlite_count(self.conn, "todos")
+        self.conn = sqlite_delete(self.conn, "todos", "id", id) or self.conn
+        before - sqlite_count(self.conn, "todos")
+    }
+
+    set_filter(@self, name: str) : str {
+        self.filter = name
+        self.filter
+    }
+
+    shows(self, done: str) : bool {
+        if self.filter == "open" { return done == "0" }
+        if self.filter == "done" { return done == "1" }
+        true
+    }
+
+    lines(self) : str {
+        rows = sqlite_find(self.conn, "todos", "live", "1")
+        out = ""
+        for row in rows {
+            if self.shows(row[2]) {
+                mark = " "
+                if row[2] == "1" { mark = "x" }
+                out = "{out}{row[0]} [{mark}] {row[1]}\n"
+            }
+        }
+        out
+    }
+
+    screen(self, draft: str) : Gui {
+        app = Gui.new("Todos", self.width, self.height)
+        root = @app.column("root")
+        @app.titlebar(root, "bar", "Todos")
+        @app.chrome(root, "win")
+        filters = @app.row(root, "filters")
+        @app.button(filters, "all", "All")
+        @app.button(filters, "open", "Open")
+        @app.button(filters, "done", "Done")
+        @app.field(root, "title", "New todo")
+        @app.write_text("title", draft)
+        @app.button(root, "add", "Add")
+        n = sqlite_count(self.conn, "todos")
+        @app.badge(root, "count", "{n}")
+        rows = sqlite_find(self.conn, "todos", "live", "1")
+        for row in rows {
+            if self.shows(row[2]) {
+                mark = " "
+                if row[2] == "1" { mark = "x" }
+                @app.button(root, "row{row[0]}", "{row[0]} [{mark}] {row[1]}")
+            }
+        }
+        if self.notice != "" { @app.toast(root, "note", self.notice) }
+        @app.label(root, "hint", "Type in the field, Enter adds, click a row, Esc closes")
+        app
+    }
+
+    paint(self) : str {
+        app = self.screen("")
+        @app.layout()
+        @app.paint()
+    }
+
+    /// Open the window and edit the list until the window closes.
+    run(@self) : i64 {
+        opened = window_open(self.width, self.height, "Todos")
+        gui_open(self.width, self.height, "Todos")
+        view = self.screen("")
+        draft = ""
+        frames = 0
+        quit = false
+        while quit == false {
+            gui_present(self.width, self.height, view.describe())
+            click = gui_click()
+            key = gui_key()
+            typed = gui_value("title")
+            if typed != "" { draft = typed }
+            if click == "add" || key == "enter" {
+                @self.add(draft)
+                draft = ""
+                view = self.screen("")
+            }
+            if click == "all" || click == "open" || click == "done" {
+                @self.set_filter(click)
+                view = self.screen(draft)
+            }
+            if starts_with(click, "row") {
+                @self.toggle(strip_prefix(click, "row"))
+                view = self.screen(draft)
+            }
+            poll = window_poll()
+            if poll.quit || gui_quit() || key == "esc" || opened.headless {
+                quit = true
+            }
+            if quit == false { sleep_ms(16) }
+            frames = frames + 1
+        }
+        frames
+    }
+
+    hit(self, x: i64, y: i64) : bool => widget_hit(x, y, 0, 0, self.width, self.height)
+
+    measure(self, max_w: i64) : i64 => widget_measure(max_w, self.width)
+}
+
++main() {
+    app = TodoApp.open()
+    @app.add("Buy milk")
+    @app.add("Ship the build")
+    @app.run()
+}
+
+test "add, toggle, filter, and delete a todo" {
+    app = TodoApp.open()
+    id = @app.add("Buy milk")
+    assert_eq(id, 1)
+    assert_eq(sqlite_count(app.conn, "todos"), 1)
+    assert_eq(@app.add(""), 0)
+    assert_eq(app.notice, "Title required")
+    frame = app.paint()
+    #assert(contains(frame, "Buy milk"))
+    #assert(contains(frame, "Title required"))
+    #assert(contains(frame, "Todos"))
+    #assert(contains(frame, "New todo"))
+    assert_eq(@app.toggle("1"), "1")
+    assert_eq(@app.set_filter("open"), "open")
+    assert_eq(app.lines(), "")
+    assert_eq(@app.set_filter("done"), "done")
+    #assert(contains(app.lines(), "[x] Buy milk"))
+    assert_eq(@app.remove("1"), 1)
+    assert_eq(sqlite_count(app.conn, "todos"), 0)
+}
+
+test "the window is a Widget" {
+    app = TodoApp.open()
+    @app.add("Ship")
+    #assert(app.hit(10, 10))
+    #assert(!(app.hit(-1, 0)))
+    assert_eq(app.measure(100), 100)
+    assert_eq(app.measure(800), 420)
+}

@@ -1,0 +1,247 @@
+// 16_crypto_pq_argon2_suite — Argon2id-like KDF (m=8KiB t=2 p=1) x32 over std.sec.sha2, SHA-256
+// Merkle root of the tags, toy lattice negacyclic NTT poly-mul over Z_12289[x]/(x^256+1) with
+// std.math.algebra `ModP` twiddles, checked against schoolbook multiplication.
+use std.sec.sha2
+use std.math.algebra
+use std.core.collections
+
++MOD = 1000000007
++NH = 32
++BW = 64
++NB = 32
++PASSES = 2
++Q = 12289
++N = 256
++PAIRS = 6
++M32 = 0xFFFFFFFF
+
+// MINSTD (Park–Miller) stream shared by salts and lattice coefficients.
+// ---- Argon2id-like memory-hard KDF ------------------------------------------------------------------
+
+rot32(x: i64, r: i64) : i64 => ((x >> r) | (x << (32 - r))) & M32
+blamka(x: i64, y: i64) : i64 => (x + y + 2 * (x & 0xFFFF) * (y & 0xFFFF)) & M32
+
+// BlaMka quarter-round on four words of a 64-word block.
+g_mix(@z, ia: i64, ib: i64, ic: i64, id: i64) {
+    a, b, c, d = z[ia], z[ib], z[ic], z[id]
+    a = blamka(a, b)
+    d = rot32(d ^ a, 16)
+    c = blamka(c, d)
+    b = rot32(b ^ c, 12)
+    a = blamka(a, b)
+    d = rot32(d ^ a, 8)
+    c = blamka(c, d)
+    b = rot32(b ^ c, 7)
+    z[ia], z[ib], z[ic], z[id] = a, b, c, d
+}
+
+// Columns then diagonals of the 8 words `base + k * stride`.
+p_round(@z, base: i64, s: i64) {
+    g_mix(@z, base, base + 2 * s, base + 4 * s, base + 6 * s)
+    g_mix(@z, base + s, base + 3 * s, base + 5 * s, base + 7 * s)
+    g_mix(@z, base, base + 3 * s, base + 4 * s, base + 7 * s)
+    g_mix(@z, base + s, base + 2 * s, base + 5 * s, base + 6 * s)
+}
+
+be32(d, k: i64) : i64 => d[4 * k] * 16777216 + d[4 * k + 1] * 65536 + d[4 * k + 2] * 256 + d[4 * k + 3]
+
+// NB blocks of BW 32-bit words, row-major; `r`/`out` are per-compression scratch blocks.
+Memory = {
+    w: _
+    r: _
+    out: _
+
+    // Block j = SHA-256(h0 ‖ j) stretched to BW words by a lagged generator.
+    seed(@self, h0, j: i64) {
+        msg = [0; 33]
+        for 0..32 { msg[it] = h0[it] }
+        msg[32] = j
+        d = sha2_256(msg)
+        o = j * BW
+        for 0..8 { self.w[o + it] = be32(d, it) }
+        for k in 8..BW {
+            self.w[o + k] = (self.w[o + k - 8] + (self.w[o + k - 3] & 0xFFFF) * 40503 + (self.w[o + k - 1] >> 16) * 69069) & M32
+        }
+    }
+
+    // Data-independent (pass 0, first half) then data-dependent reference block for `idx`.
+    reference(self, pass: i64, idx: i64) : i64 {
+        r = self.w[(idx + NB - 1) % NB * BW]
+        if pass == 0 && idx < NB / 2 { r = ((pass * 131 + idx) * 40503 + 12345) * 69069 % 4294967296 }
+        r16 = r >> 16
+        x = (r16 * r16) >> 16
+        if pass == 0 {
+            area = idx - 1
+            area - 1 - ((area * x) >> 16)
+        } else {
+            area = NB - 2
+            (idx + 1 + area - 1 - ((area * x) >> 16)) % NB
+        }
+    }
+
+    // out = P_cols(P_rows(prev ^ ref)) ^ (prev ^ ref), then written (pass 0) or xored into `idx`.
+    fill(@self, pass: i64, idx: i64) {
+        po, ro, o = (idx + NB - 1) % NB * BW, self.reference(pass, idx) * BW, idx * BW
+        for 0..BW {
+            self.r[it] = self.w[po + it] ^ self.w[ro + it]
+            self.out[it] = self.r[it]
+        }
+        for row in 0..8 { p_round(@self.out, row * 8, 1) }
+        for col in 0..8 { p_round(@self.out, col, 8) }
+        for 0..BW {
+            v = self.out[it] ^ self.r[it]
+            self.w[o + it] = if pass == 0 { v } else { self.w[o + it] ^ v }
+        }
+    }
+
+    // SHA-256 of the last block, big-endian.
+    tag(self) {
+        bytes = [0; BW * 4]
+        lo = (NB - 1) * BW
+        for 0..BW {
+            v = self.w[lo + it]
+            bytes[4 * it], bytes[4 * it + 1], bytes[4 * it + 2], bytes[4 * it + 3] = v >> 24, (v >> 16) & 255, (v >> 8) & 255, v & 255
+        }
+        sha2_256(bytes)
+    }
+}
+
+argon2_like(idx_pw: i64, @rng: Lcg) {
+    msg = [0; 36]
+    msg[0], msg[1], msg[2], msg[3] = idx_pw, NB * 256 / 1024, PASSES, 1
+    for 4..36 { msg[it] = @rng.roll() & 255 }
+    h0 = sha2_256(msg)
+    m = Memory.{w: [0; NB * BW], r: [0; BW], out: [0; BW]}
+    @m.seed(h0, 0)
+    @m.seed(h0, 1)
+    for pass in 0..PASSES {
+        start = if pass == 0 { 2 } else { 0 }
+        for idx in start..NB { @m.fill(pass, idx) }
+    }
+    m.tag()
+}
+
+// Pairwise SHA-256 up the tree; an odd node is paired with itself.
+merkle_root(leaves, n0: i64) {
+    level, n = leaves, n0
+    while n > 1 {
+        m = (n + 1) / 2
+        up = []
+        for i in 0..m {
+            a = level[2 * i]
+            b = if 2 * i + 1 < n { level[2 * i + 1] } else { a }
+            cat = [0; 64]
+            for 0..32 { cat[it], cat[it + 32] = a[it], b[it] }
+            up = arr_push(up, sha2_256(cat))
+        }
+        level, n = up, m
+    }
+    level[0]
+}
+
+// ---- toy lattice: negacyclic NTT over Z_q[x]/(x^N+1) ------------------------------------------------
+
+// psi is a primitive 2N-th root of unity: x^N = -1 twists into a cyclic NTT of size N.
+Ring = {
+    psi: ModP
+    psi_inv: ModP
+    omega: ModP
+    omega_inv: ModP
+    n_inv: ModP
+
+    ntt(_self, @a, w: ModP) {
+        j = 0
+        for i in 1..N {
+            bit = N >> 1
+            while (j & bit) != 0 {
+                j = j ^ bit
+                bit = bit >> 1
+            }
+            j = j ^ bit
+            if i < j { a[i], a[j] = a[j], a[i] }
+        }
+        len = 2
+        while len <= N {
+            wl, half = w.pow(N / len), len / 2
+            for blk in 0..(N / len) {
+                i = blk * len
+                wn = modp(1, Q)
+                for k in 0..half {
+                    u, v = a[i + k], a[i + k + half] * wn.v % Q
+                    a[i + k], a[i + k + half] = (u + v) % Q, (u + Q - v) % Q
+                    wn = wn.mul(wl)
+                }
+            }
+            len = len * 2
+        }
+    }
+
+    mul(self, a0, b0) {
+        a, b, c = [0; N], [0; N], [0; N]
+        p = modp(1, Q)
+        for 0..N {
+            a[it], b[it] = a0[it] * p.v % Q, b0[it] * p.v % Q
+            p = p.mul(self.psi)
+        }
+        self.ntt(@a, self.omega)
+        self.ntt(@b, self.omega)
+        for 0..N { c[it] = a[it] * b[it] % Q }
+        self.ntt(@c, self.omega_inv)
+        p = self.n_inv
+        for 0..N {
+            c[it] = c[it] * p.v % Q
+            p = p.mul(self.psi_inv)
+        }
+        c
+    }
+}
+
+ring() : Ring {
+    psi = modp(11, Q).pow((Q - 1) / (2 * N))
+    omega = psi.mul(psi)
+    Ring.{
+        psi: psi
+        psi_inv: psi.inv()
+        omega: omega
+        omega_inv: omega.inv()
+        n_inv: modp(N, Q).inv()
+    }
+}
+
+schoolbook(a, b) {
+    c = [0; N]
+    for i in 0..N {
+        for j in 0..N {
+            pr, k = a[i] * b[j] % Q, i + j
+            if k >= N { c[k - N] = (c[k - N] + Q - pr) % Q } else { c[k] = (c[k] + pr) % Q }
+        }
+    }
+    c
+}
+
++main() {
+    rng = Lcg.{s: 16001}
+    tags = []
+    for 0..NH { tags = arr_push(tags, argon2_like(it, @rng)) }
+    root = merkle_root(tags, NH)
+    cs = 0
+    for 0..32 { cs = (cs * 131 + root[it]) % MOD }
+
+    rq = ring()
+    ok = rq.psi.pow(N).v == Q - 1
+    for pr in 0..PAIRS {
+        a, b = [0; N], [0; N]
+        for 0..N { a[it] = @rng.roll() % Q }
+        for 0..N { b[it] = @rng.roll() % Q }
+        c = rq.mul(a, b)
+        if pr < 2 {
+            want = schoolbook(a, b)
+            for 0..N {
+                if want[it] != c[it] { ok = false }
+            }
+        }
+        for 0..N { cs = (cs * 131 + c[it]) % MOD }
+    }
+    cs = (cs * 131 + (if ok { 1 } else { 0 })) % MOD
+    print("CHECKSUM={cs}")
+}

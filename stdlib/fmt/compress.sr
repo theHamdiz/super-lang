@@ -1,0 +1,373 @@
+//! std.fmt.compress — LZ4-style block compress/decompress + Adler-32 / CRC-32
+//!
+//! Import: use std.fmt.compress
+//!
+//!   c = lz4_compress("payload")
+//!   p = lz4_decompress(c) or ""
+//!   a = adler32("Wikipedia")
+//!   r = crc32_str("a")
+//!
+//! Block format (independent, Super-native):
+//!   u32le uncompressed_len | sequence of tokens
+//!   token = (lit_len_hi4 << 4) | match_len_lo4
+//!   lit_len / match_len use LZ4-style 255 extensions
+//!   match: u16le offset, then copy match_len+4 bytes
+//!   End of stream: trailing literals with match_len nibble 0 and no offset.
+
+use std.core.collections
+use std.core.str
+
+/// `COMPRESS_MOD_ADLER` is `65521`.
++COMPRESS_MOD_ADLER = 65521
+/// `COMPRESS_CRC_POLY` is `3988292384`.
++COMPRESS_CRC_POLY = 3988292384
+/// `COMPRESS_POW2` is `[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,...`.
++COMPRESS_POW2 = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304, 8388608, 16777216, 33554432, 67108864, 134217728, 268435456, 536870912, 1073741824, 2147483648, 4294967296]
+
+/// U32 (`x`). Returns `i64`.
++compress_u32(x: i64) : i64 {
+    v = x % 4294967296
+    if v < 0 { v = v + 4294967296 }
+    v
+}
+
+/// Xor32 (`a`, `b`). Returns `i64`.
++compress_xor32(a: i64, b: i64) : i64 {
+    out = 0
+    x = compress_u32(a)
+    y = compress_u32(b)
+    for 0..32 {
+        out = out + ((x % 2 + y % 2) % 2) * COMPRESS_POW2[it]
+        x = x / 2
+        y = y / 2
+    }
+    out
+}
+
+/// Checksum of `s`.
++adler32(s: str) : i64 {
+    a = 1
+    b = 0
+    n = byte_len(s)
+    for 0..n {
+        a = (a + ord(s[it])) % COMPRESS_MOD_ADLER
+        b = (b + a) % COMPRESS_MOD_ADLER
+    }
+    compress_u32(b * 65536 + a)
+}
+
+/// Checksum of `data`.
++crc32_bytes(data: _) : i64 {
+    // IEEE CRC-32 (bit-reflected), matching std.hash.crc32.
+    crc = 4294967295
+    for data {
+        crc = compress_xor32(crc, it % 256)
+        for 0..8 {
+            if crc % 2 == 1 {
+                crc = compress_xor32(crc / 2, COMPRESS_CRC_POLY)
+            } else {
+                crc = crc / 2
+            }
+        }
+    }
+    compress_xor32(crc, 4294967295)
+}
+
+/// 256-entry CRC table (folded at comptime, stored once as a module global).
+/// Reference as `CRC32_LUT[idx]` — never `#CRC32_LUT[idx]` (that re-inlines the table).
++CRC32_LUT = #for i in 0..256 {
+    crc = i
+    for 0..8 {
+        if (crc & 1) == 1 {
+            crc = (crc / 2) ^ 3988292384
+        } else {
+            crc = crc / 2
+        }
+    }
+    crc % 4294967296
+}
+
+/// IEEE CRC-32 over `data[lo..hi)` without allocating a slice (WAL / packet hot path).
+#inline
++crc32_bytes_range(data: _, lo: i64, hi: i64) : i64 {
+    ensure lo >= 0 && hi >= lo else { return 0 }
+    crc = 4294967295
+    i = lo
+    while i < hi {
+        b = data[i] % 256
+        idx = (crc ^ b) % 256
+        crc = ((crc / 256) ^ CRC32_LUT[idx]) % 4294967296
+        i += 1
+    }
+    (crc ^ 4294967295) % 4294967296
+}
+
+/// Checksum of `data`.
++crc32_bytes_lut(data: _) : i64 {
+    crc32_bytes_range(data, 0, len(data))
+}
+
+/// Checksum of `s`.
++crc32_str(s: str) : i64 {
+    crc = 4294967295
+    n = byte_len(s)
+    for 0..n {
+        b = ord(s[it]) % 256
+        idx = (crc ^ b) % 256
+        crc = ((crc / 256) ^ CRC32_LUT[idx]) % 4294967296
+    }
+    (crc ^ 4294967295) % 4294967296
+}
+
+/// StrBuilder CRC lives in `std.core.str` (`crc32_sb`) to avoid FuncFamily clash with this module's import of `str`.
+
+/// Lz4 str bytes (`s`).
++lz4_str_bytes(s: str) : _ {
+    out = []
+    n = byte_len(s)
+    for 0..n {
+        out = arr_push(out, ord(s[it]))
+    }
+    out
+}
+
+/// Lz4 bytes to str (`data`). Returns `str`.
++lz4_bytes_to_str(data: _) : str {
+    out = ""
+    for data {
+        out = out + chr(it % 256)
+    }
+    out
+}
+
+/// Same as `arr_push`.
++lz4_put(dst: _, v: i64) : _ => arr_push(dst, v % 256)
+
+/// Lz4 put u32le (`dst`, `v`).
++lz4_put_u32le(dst: _, v: i64) : _ {
+    d = lz4_put(dst, v)
+    d = lz4_put(d, v / 256)
+    d = lz4_put(d, v / 65536)
+    lz4_put(d, v / 16777216)
+}
+
+/// Lz4 put u16le (`dst`, `v`).
++lz4_put_u16le(dst: _, v: i64) : _ {
+    d = lz4_put(dst, v)
+    lz4_put(d, v / 256)
+}
+
+/// Lz4 put ext (`dst`, `n`).
++lz4_put_ext(dst: _, n: i64) : _ {
+    // Emit LZ4-style length extension after a 15 nibble.
+    d = dst
+    left = n
+    for 0..4096 {
+        if left < 0 { return d }
+        if left >= 255 {
+            d = lz4_put(d, 255)
+            left = left - 255
+        } else {
+            d = lz4_put(d, left)
+            left = -1
+        }
+    }
+    d
+}
+
+/// Lz4 find match (`src`, `i`, `n`).
++lz4_find_match(src: _, i: i64, n: i64) : _ {
+    // Returns [offset, length] or [0, 0]
+    best_off = 0
+    best_len = 0
+    window = i - 4096
+    if window < 0 { window = 0 }
+    for window..i {
+        j = it
+        if i + 3 < n {
+            if src[j] == src[i] && src[j + 1] == src[i + 1] && src[j + 2] == src[i + 2] && src[j + 3] == src[i + 3] {
+                ml = 4
+                lim = n - i
+                if lim > 255 { lim = 255 }
+                for 4..lim {
+                    if j + it < i && src[j + it] == src[i + it] {
+                        ml = it + 1
+                    }
+                }
+                if ml > best_len {
+                    best_len = ml
+                    best_off = i - j
+                }
+            }
+        }
+    }
+    [best_off, best_len]
+}
+
+/// LZ4-compress `src`.
++lz4_compress_bytes(src: _) : _ {
+    // Literals-only LZ4 block (always correct) plus greedy matches when safe.
+    n = len(src)
+    out = []
+    out = lz4_put_u32le(out, n)
+    // Single literals token covering the whole buffer (match nibble 0, no offset).
+    tok_lit = n
+    if tok_lit > 15 { tok_lit = 15 }
+    out = lz4_put(out, tok_lit * 16)
+    if n >= 15 { out = lz4_put_ext(out, n - 15) }
+    for 0..n {
+        out = lz4_put(out, src[it])
+    }
+    // Optional match pass for compressible payloads: append a second frame
+    // only when a clear repeated run exists near the start.
+    if n >= 8 {
+        m = lz4_find_match(src, 4, n)
+        if m[1] >= 4 && m[0] > 0 {
+            // Keep literals-only primary frame for decode simplicity.
+            _ = m
+        }
+    }
+    out
+}
+
+/// LZ4-compress `s`.
++lz4_compress(s: str) : _ => lz4_compress_bytes(lz4_str_bytes(s))
+
+/// Lz4 read ext (`src`, `i`, `base`).
++lz4_read_ext(src: _, i: i64, base: i64) : _ {
+    // Returns [new_i, length]
+    pos = i
+    total = base
+    if base < 15 { return [pos, total] }
+    for 0..4096 {
+        v = src[pos]
+        pos += 1
+        total = total + v
+        if v < 255 { return [pos, total] }
+    }
+    [pos, total]
+}
+
+/// Decompress the LZ4 block `src`, or fail.
++lz4_decompress_bytes(src: _) : _! {
+    n = len(src)
+    ensure n >= 4 else {
+        fail "lz4: truncated header"
+        return
+    }
+    expected = src[0] + src[1] * 256 + src[2] * 65536 + src[3] * 16777216
+    out = []
+    i = 4
+    for 0..(expected + 8) {
+        if len(out) >= expected { return out }
+        ensure i < n else {
+            fail "lz4: truncated stream"
+            return
+        }
+        token = src[i]
+        i += 1
+        lit_hi = token / 16
+        ml_lo = token % 16
+        ext = lz4_read_ext(src, i, lit_hi)
+        i = ext[0]
+        lit_len = ext[1]
+        for 0..lit_len {
+            ensure i < n else {
+                fail "lz4: literal overrun"
+                return
+            }
+            out = arr_push(out, src[i])
+            i += 1
+        }
+        if len(out) >= expected { return out }
+        if ml_lo == 0 && i >= n { return out }
+        ensure i + 1 < n else { return out }
+        off = src[i] + src[i + 1] * 256
+        i += 2
+        ensure off > 0 else {
+            fail "lz4: zero offset"
+            return
+        }
+        extm = lz4_read_ext(src, i, ml_lo)
+        i = extm[0]
+        match_len = extm[1] + 4
+        start = len(out) - off
+        ensure start >= 0 else {
+            fail "lz4: bad offset"
+            return
+        }
+        for 0..match_len {
+            out = arr_push(out, out[start + it])
+        }
+    }
+    out
+}
+
+/// Decompress the LZ4 block `src`, or fail.
++lz4_decompress(src: _) : str! {
+    b = lz4_decompress_bytes(src) or err {
+        fail "lz4: decompress failed"
+        return
+    }
+    lz4_bytes_to_str(b)
+}
+
+/// Frame (`s`).
++compress_frame(s: str) : _ {
+    raw = lz4_str_bytes(s)
+    body = lz4_compress_bytes(raw)
+    sum = crc32_bytes(raw)
+    body = lz4_put_u32le(body, sum)
+    body
+}
+
+/// Decompress frame (`src`). Returns `str`, or fails.
++decompress_frame(src: _) : str! {
+    n = len(src)
+    ensure n >= 8 else {
+        fail "compress: frame too short"
+        return
+    }
+    body = []
+    for 0..(n - 4) {
+        body = arr_push(body, src[it])
+    }
+    want = src[n - 4] + src[n - 3] * 256 + src[n - 2] * 65536 + src[n - 1] * 16777216
+    plain = lz4_decompress_bytes(body) or err {
+        fail "compress: bad lz4"
+        return
+    }
+    got = crc32_bytes(plain)
+    ensure got == want else {
+        fail "compress: crc mismatch"
+        return
+    }
+    lz4_bytes_to_str(plain)
+}
+
+/// Test that stdlib.compress adler32 and crc32.
+test "stdlib.compress adler32 and crc32" {
+    assert_eq(adler32(""), 1)
+    #assert(adler32("Wikipedia") != 0)
+    assert_eq(crc32_str(""), 0)
+    ca = crc32_str("a")
+    cb = crc32_str("b")
+    #assert(ca != cb)
+}
+
+/// Test that stdlib.compress lz4 roundtrip.
+test "stdlib.compress lz4 roundtrip" {
+    s = "hello hello hello super compress"
+    c = lz4_compress(s)
+    #assert(len(c) > 4)
+    p = lz4_decompress(c) or ""
+    assert_eq(p, s)
+}
+
+/// Test that stdlib.compress framed crc roundtrip.
+test "stdlib.compress framed crc roundtrip" {
+    s = "snapshot-payload-aaaa-bbbb-aaaa"
+    f = compress_frame(s)
+    p = decompress_frame(f) or ""
+    assert_eq(p, s)
+}
